@@ -1,0 +1,12 @@
+# Example-only plaintext key. Generate a unique 32-byte secp256k1 key for real use.
+private_key = "0101010101010101010101010101010101010101010101010101010101010101"
+listen_address = "127.0.0.1:9100"
+peers_file = "storm/config/discovery-peers.toml"
+domain = "basic.message"
+
+# The complete participant set. Including this node's key is allowed.
+public_keys = [
+  "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+  "024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
+  "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337",
+]
