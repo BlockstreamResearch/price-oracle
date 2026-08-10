@@ -96,7 +96,8 @@ pub(super) async fn handle(
             replace_discovered_peers(&mut state, peers_socket_info, context.peer_public_key)?;
             true
         } else {
-            update_known_peers(&mut state, peers_socket_info)?
+            validate_known_peer_keys(&state, &peers_socket_info)?;
+            false
         }
     };
 
@@ -107,11 +108,10 @@ pub(super) async fn handle(
     Ok(())
 }
 
-fn update_known_peers(
-    state: &mut StormState,
-    peers_socket_info: Vec<ValidatedPeerSocketInfo>,
-) -> Result<bool, (StormErrorCode, String)> {
-    let local_public_key = state.initializer_public_key;
+fn validate_known_peer_keys(
+    state: &StormState,
+    peers_socket_info: &[ValidatedPeerSocketInfo],
+) -> Result<(), (StormErrorCode, String)> {
     let received_keys = peers_socket_info
         .iter()
         .map(|info| info.compressed_public_key)
@@ -129,27 +129,7 @@ fn update_known_peers(
         ));
     }
 
-    let mut changed = false;
-    for info in peers_socket_info {
-        if info.compressed_public_key == local_public_key {
-            continue;
-        }
-
-        let peer = state
-            .peers
-            .iter_mut()
-            .find(|peer| peer.compressed_public_key == info.compressed_public_key)
-            .expect("peer key sets were checked");
-
-        if peer.status == PeerStatus::Inactive
-            && peer.socket_address.as_deref() != Some(info.socket_address.as_str())
-        {
-            peer.socket_address = Some(info.socket_address);
-            changed = true;
-        }
-    }
-
-    Ok(changed)
+    Ok(())
 }
 
 fn validate(
@@ -271,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn known_table_updates_only_inactive_remote_peers() {
+    fn known_table_cannot_update_peer_addresses() {
         let (local_secret_key, mut local_peer) = generated_peer();
         local_peer.socket_address = Some("127.0.0.1:1000".to_string());
         let (_, mut active_peer) = generated_peer();
@@ -279,7 +259,7 @@ mod tests {
         active_peer.socket_address = Some("127.0.0.1:2000".to_string());
         let (_, mut inactive_peer) = generated_peer();
         inactive_peer.socket_address = Some("127.0.0.1:3000".to_string());
-        let mut state = StormState::new(
+        let state = StormState::new(
             local_secret_key,
             vec![
                 local_peer.clone(),
@@ -288,9 +268,9 @@ mod tests {
             ],
         );
 
-        let changed = update_known_peers(
-            &mut state,
-            vec![
+        validate_known_peer_keys(
+            &state,
+            &[
                 socket_info(&local_peer, "127.0.0.1:1001"),
                 socket_info(&active_peer, "127.0.0.1:2001"),
                 socket_info(&inactive_peer, "127.0.0.1:3001"),
@@ -298,13 +278,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(changed);
         assert_eq!(state.peers[0].socket_address, local_peer.socket_address);
         assert_eq!(state.peers[1].socket_address, active_peer.socket_address);
-        assert_eq!(
-            state.peers[2].socket_address.as_deref(),
-            Some("127.0.0.1:3001")
-        );
+        assert_eq!(state.peers[2].socket_address, inactive_peer.socket_address);
     }
 
     #[test]
@@ -312,11 +288,11 @@ mod tests {
         let (local_secret_key, local_peer) = generated_peer();
         let (_, known_peer) = generated_peer();
         let (_, unknown_peer) = generated_peer();
-        let mut state = StormState::new(local_secret_key, vec![local_peer.clone(), known_peer]);
+        let state = StormState::new(local_secret_key, vec![local_peer.clone(), known_peer]);
 
-        let error = update_known_peers(
-            &mut state,
-            vec![
+        let error = validate_known_peer_keys(
+            &state,
+            &[
                 socket_info(&local_peer, "127.0.0.1:1000"),
                 socket_info(&unknown_peer, "127.0.0.1:2000"),
             ],
@@ -338,9 +314,12 @@ mod tests {
             local_secret_key,
             vec![local_peer.clone(), discovery_peer.clone()],
         );
-        let (discovery_sender, _discovery_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (retained_sender, _retained_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (omitted_sender, mut omitted_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (discovery_sender, _discovery_receiver) =
+            tokio::sync::mpsc::channel(constants::OUTBOUND_QUEUE_CAPACITY);
+        let (retained_sender, _retained_receiver) =
+            tokio::sync::mpsc::channel(constants::OUTBOUND_QUEUE_CAPACITY);
+        let (omitted_sender, mut omitted_receiver) =
+            tokio::sync::mpsc::channel(constants::OUTBOUND_QUEUE_CAPACITY);
         state
             .connections
             .insert(discovery_peer.compressed_public_key, discovery_sender);
@@ -407,7 +386,8 @@ mod tests {
                 banned_peer.clone(),
             ],
         );
-        let (banned_sender, banned_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (banned_sender, banned_receiver) =
+            tokio::sync::mpsc::channel(constants::OUTBOUND_QUEUE_CAPACITY);
         state
             .connections
             .insert(banned_peer.compressed_public_key, banned_sender);

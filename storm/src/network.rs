@@ -10,7 +10,8 @@ use secp256k1_zkp::PublicKey;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, RwLock, mpsc},
+    sync::{Mutex, RwLock, Semaphore, mpsc},
+    time::timeout,
 };
 
 use crate::{
@@ -79,12 +80,20 @@ impl Storm {
     }
 
     async fn run_listener(listener: TcpListener, state: Arc<RwLock<StormState>>) {
+        let connection_limit = Arc::new(Semaphore::new(constants::MAX_INBOUND_CONNECTIONS));
+
         loop {
+            let permit = match Arc::clone(&connection_limit).acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+
             match listener.accept().await {
                 Ok((stream, peer_address)) => {
                     let state = Arc::clone(&state);
 
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = Self::handle_connection(stream, peer_address, state).await {
                             log::error!("Connection with {} failed: {e}", peer_address);
                         }
@@ -108,8 +117,12 @@ impl Storm {
             state.initializer_secret_key.secret_bytes()
         };
 
-        let (transport, remote_public_key, advertised_port) =
-            Self::perform_responder_handshake(&mut stream, &initializer_secret_key).await?;
+        let (transport, remote_public_key, advertised_port) = timeout(
+            constants::HANDSHAKE_TIMEOUT,
+            Self::perform_responder_handshake(&mut stream, &initializer_secret_key),
+        )
+        .await
+        .map_err(|_| Error::ConnectionTimeout("performing the responder handshake"))??;
 
         let advertised_address = advertised_port
             .map(|port| SocketAddr::new(peer_address.ip(), port))
@@ -135,8 +148,8 @@ impl Storm {
         state: &Arc<RwLock<StormState>>,
         peer_public_key: [u8; 33],
         peer_address: Option<SocketAddr>,
-    ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>, Error> {
-        let (sender, receiver) = mpsc::unbounded_channel();
+    ) -> Result<mpsc::Receiver<Vec<u8>>, Error> {
+        let (sender, receiver) = mpsc::channel(constants::OUTBOUND_QUEUE_CAPACITY);
         let mut state = state.write().await;
         let peer_index = state
             .peers
@@ -160,8 +173,23 @@ impl Storm {
             if let Some(peer_address) = peer_address {
                 peer.socket_address = Some(peer_address.to_string());
             }
-        } else if !state.accepts_unregistered_connections() {
-            return Err(Error::UnauthorizedConnection);
+        } else {
+            if !state.accepts_unregistered_connections() {
+                return Err(Error::UnauthorizedConnection);
+            }
+            let provisional_connections = state
+                .connections
+                .keys()
+                .filter(|public_key| {
+                    !state
+                        .peers
+                        .iter()
+                        .any(|peer| peer.compressed_public_key == **public_key)
+                })
+                .count();
+            if provisional_connections >= constants::MAX_PROVISIONAL_CONNECTIONS {
+                return Err(Error::ProvisionalConnectionLimit);
+            }
         }
 
         state.connections.insert(peer_public_key, sender);
@@ -190,7 +218,7 @@ impl Storm {
         transport: snow::TransportState,
         peer_public_key: [u8; 33],
         state: &'a Arc<RwLock<StormState>>,
-        mut receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+        mut receiver: mpsc::Receiver<Vec<u8>>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
         Box::pin(async move {
             let (mut reader, mut writer) = stream.into_split();
@@ -202,7 +230,12 @@ impl Storm {
                 let mut decoder = message::MessageDecoder::new();
 
                 loop {
-                    let ciphertext = read_frame(&mut reader).await?;
+                    let ciphertext =
+                        timeout(constants::CONNECTION_IDLE_TIMEOUT, read_frame(&mut reader))
+                            .await
+                            .map_err(|_| {
+                                Error::ConnectionTimeout("waiting for a peer message")
+                            })??;
                     let plaintext_length = reader_transport
                         .lock()
                         .await
@@ -222,7 +255,12 @@ impl Storm {
                     for chunk in message.chunks(constants::NOISE_MAX_PLAINTEXT_SIZE) {
                         let ciphertext_length =
                             transport.lock().await.write_message(chunk, &mut buffer)?;
-                        write_frame(&mut writer, &buffer[..ciphertext_length]).await?;
+                        timeout(
+                            constants::WRITE_TIMEOUT,
+                            write_frame(&mut writer, &buffer[..ciphertext_length]),
+                        )
+                        .await
+                        .map_err(|_| Error::ConnectionTimeout("writing to a peer"))??;
                     }
                 }
 
@@ -241,23 +279,23 @@ impl Storm {
         peer_public_key: [u8; 33],
         message: StormMessage,
     ) -> Result<(), Error> {
+        let received_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let context = {
             let mut state = state.write().await;
-            let peer = state
+            let peer_index = state
                 .peers
-                .iter_mut()
-                .find(|peer| peer.compressed_public_key == peer_public_key)
+                .iter()
+                .position(|peer| peer.compressed_public_key == peer_public_key)
                 .ok_or(Error::UnauthorizedConnection)?;
-            if peer.status == PeerStatus::Banned {
+            if state.peers[peer_index].status == PeerStatus::Banned {
                 return Err(Error::UnauthorizedConnection);
             }
 
-            peer.last_seen = Some(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            );
+            state.register_message(peer_public_key, &message, received_at)?;
+            state.peers[peer_index].last_seen = Some(received_at);
 
             MessageContext { peer_public_key }
         };

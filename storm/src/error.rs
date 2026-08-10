@@ -12,9 +12,21 @@ pub enum Error {
     /// A Noise handshake or transport operation failed.
     #[error("Noise protocol error occurred: {0}")]
     Noise(#[from] snow::Error),
+    /// A connection operation exceeded its deadline.
+    #[error("Connection timed out while {0}")]
+    ConnectionTimeout(&'static str),
     /// Application message encoding, decoding, or sizing failed.
     #[error("Application message error occurred: {0}")]
     Message(#[from] MessageError),
+    /// The message timestamp falls outside the accepted clock-skew window.
+    #[error("Message timestamp is outside the accepted clock-skew window")]
+    MessageTimestampOutsideWindow,
+    /// The authenticated peer repeated a recently received message.
+    #[error("Peer replayed a recently received message")]
+    ReplayedMessage,
+    /// The peer exceeded the bounded message count within the freshness window.
+    #[error("Peer exceeded the message rate limit")]
+    MessageRateLimit,
     /// The Noise handshake did not provide the remote static public key.
     #[error("Remote public key is absent")]
     AbsentRemotePublicKey,
@@ -24,12 +36,18 @@ pub enum Error {
     /// A second connection was attempted for an already-connected peer.
     #[error("Peer already has an active connection")]
     PeerAlreadyConnected,
+    /// Discovery already has the maximum number of provisional peer connections.
+    #[error("Provisional discovery connection limit reached")]
+    ProvisionalConnectionLimit,
     /// No active connection exists for the peer identified by the hexadecimal key.
     #[error("No active connection exists for peer {0}")]
     PeerNotConnected(String),
     /// The peer connection closed before the message could be queued.
     #[error("Connection to peer {0} closed before the message could be queued")]
     PeerConnectionClosed(String),
+    /// The peer is not draining its bounded outbound queue.
+    #[error("Outbound queue for peer {0} is full")]
+    PeerQueueFull(String),
     /// The peer identified by the hexadecimal key is not in the peer table.
     #[error("Peer {0} is not registered")]
     PeerNotFound(String),

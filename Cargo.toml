@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "storm",
+    "storm"
 ]
-
 resolver = "2"

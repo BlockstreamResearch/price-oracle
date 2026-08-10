@@ -1,9 +1,18 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::SocketAddr,
+};
 
 use secp256k1_zkp::{Secp256k1, SecretKey};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-use crate::{CustomHandler, Peer, PeerStatus};
+use crate::{CustomHandler, Error, Peer, PeerStatus, StormMessage, constants};
+
+struct RecentMessage {
+    fingerprint: [u8; 32],
+    received_at: u64,
+}
 
 pub(crate) struct ConnectionPlan {
     pub(crate) initializer_secret_key: [u8; 32],
@@ -37,9 +46,10 @@ pub(crate) struct StormState {
     pub(crate) initializer_secret_key: SecretKey,
     pub(crate) initializer_public_key: [u8; 33],
     pub(crate) peers: Vec<Peer>,
-    pub(crate) connections: HashMap<[u8; 33], mpsc::UnboundedSender<Vec<u8>>>,
+    pub(crate) connections: HashMap<[u8; 33], mpsc::Sender<Vec<u8>>>,
     pub(crate) discovery_table_received: bool,
     pub(crate) custom_handler: Option<CustomHandler>,
+    recent_messages: HashMap<[u8; 33], VecDeque<RecentMessage>>,
 }
 
 impl StormState {
@@ -55,6 +65,7 @@ impl StormState {
             connections: HashMap::new(),
             discovery_table_received: false,
             custom_handler: None,
+            recent_messages: HashMap::new(),
         }
     }
 
@@ -93,5 +104,45 @@ impl StormState {
             && self.peers.iter().any(|peer| {
                 peer.compressed_public_key != self.initializer_public_key && peer.discovery
             })
+    }
+
+    pub(crate) fn register_message(
+        &mut self,
+        peer_public_key: [u8; 33],
+        message: &StormMessage,
+        received_at: u64,
+    ) -> Result<(), Error> {
+        if message.header.timestamp.abs_diff(received_at) > constants::MESSAGE_CLOCK_SKEW.as_secs()
+        {
+            return Err(Error::MessageTimestampOutsideWindow);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"storm-message-v1");
+        hasher.update(message.header.payload_id.to_be_bytes());
+        hasher.update(message.header.timestamp.to_be_bytes());
+        hasher.update(message.header.protocol_version.to_be_bytes());
+        hasher.update(&message.payload);
+        let fingerprint = hasher.finalize().into();
+
+        let recent_messages = self.recent_messages.entry(peer_public_key).or_default();
+        recent_messages.retain(|entry| {
+            received_at.saturating_sub(entry.received_at) <= constants::MESSAGE_CLOCK_SKEW.as_secs()
+        });
+        if recent_messages
+            .iter()
+            .any(|entry| entry.fingerprint == fingerprint)
+        {
+            return Err(Error::ReplayedMessage);
+        }
+        if recent_messages.len() >= constants::REPLAY_CACHE_CAPACITY {
+            return Err(Error::MessageRateLimit);
+        }
+        recent_messages.push_back(RecentMessage {
+            fingerprint,
+            received_at,
+        });
+
+        Ok(())
     }
 }
