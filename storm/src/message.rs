@@ -10,6 +10,9 @@ pub struct StormMessageHeader {
     /// Numeric identifier used to select the payload handler.
     pub payload_id: u32,
     /// Message creation time as seconds since the Unix epoch.
+    ///
+    /// Receivers reject messages outside the protocol's clock-skew window and
+    /// recently received messages with the same authenticated contents.
     pub timestamp: u64,
     /// Storm protocol version used to construct the message.
     pub protocol_version: u32,

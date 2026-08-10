@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use secp256k1_zkp::PublicKey;
 use tokio::net::TcpStream;
+use tokio::task::{JoinError, JoinSet};
+use tokio::time::timeout;
 
 use crate::{
-    Error, MessageContext, Peer, PeerStatus, Storm, StormHandle, StormMessage, message_handlers,
-    state::ConnectionPlan,
+    Error, MessageContext, Peer, PeerStatus, Storm, StormHandle, StormMessage, constants,
+    message_handlers, state::ConnectionPlan,
 };
 
 impl StormHandle {
@@ -64,8 +66,15 @@ impl StormHandle {
 
         for (peer_public_key, connection) in connections {
             connection
-                .send(framed_message.clone())
-                .map_err(|_| Error::PeerConnectionClosed(hex::encode(peer_public_key)))?;
+                .try_send(framed_message.clone())
+                .map_err(|error| match error {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        Error::PeerQueueFull(hex::encode(peer_public_key))
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        Error::PeerConnectionClosed(hex::encode(peer_public_key))
+                    }
+                })?;
         }
 
         Ok(())
@@ -84,25 +93,52 @@ impl StormHandle {
     }
 
     async fn connect_targets(&self, plan: &ConnectionPlan) {
+        let mut attempts = JoinSet::new();
+
         for target in plan
             .targets
             .iter()
             .filter(|target| plan.should_connect(target))
         {
-            if let Err(error) = self
-                .connect_peer(
-                    target.public_key,
-                    target.socket_address.clone(),
-                    &plan.initializer_secret_key,
-                    plan.listener_port,
-                )
-                .await
+            let handle = self.clone();
+            let peer_public_key = target.public_key;
+            let socket_address = target.socket_address.clone();
+            let initializer_secret_key = plan.initializer_secret_key;
+            let listener_port = plan.listener_port;
+            attempts.spawn(async move {
+                let result = handle
+                    .connect_peer(
+                        peer_public_key,
+                        socket_address,
+                        &initializer_secret_key,
+                        listener_port,
+                    )
+                    .await;
+                (peer_public_key, result)
+            });
+
+            if attempts.len() >= constants::MAX_CONCURRENT_OUTBOUND_CONNECTIONS
+                && let Some(result) = attempts.join_next().await
             {
+                Self::log_connection_attempt(result);
+            }
+        }
+
+        while let Some(result) = attempts.join_next().await {
+            Self::log_connection_attempt(result);
+        }
+    }
+
+    fn log_connection_attempt(result: Result<([u8; 33], Result<(), Error>), JoinError>) {
+        match result {
+            Ok((_, Ok(()))) => {}
+            Ok((peer_public_key, Err(error))) => {
                 log::debug!(
                     "Failed to connect to peer {}: {error}",
-                    hex::encode(target.public_key)
+                    hex::encode(peer_public_key)
                 );
             }
+            Err(error) => log::error!("Peer connection task failed: {error}"),
         }
     }
 
@@ -113,14 +149,23 @@ impl StormHandle {
         initializer_secret_key: &[u8],
         listener_port: Option<u16>,
     ) -> Result<(), Error> {
-        let mut stream = TcpStream::connect(socket_address).await?;
-        let transport = Storm::perform_initiator_handshake(
-            &mut stream,
-            initializer_secret_key,
-            &peer_public_key,
-            listener_port,
+        let mut stream = timeout(
+            constants::CONNECT_TIMEOUT,
+            TcpStream::connect(socket_address),
         )
-        .await?;
+        .await
+        .map_err(|_| Error::ConnectionTimeout("connecting to a peer"))??;
+        let transport = timeout(
+            constants::HANDSHAKE_TIMEOUT,
+            Storm::perform_initiator_handshake(
+                &mut stream,
+                initializer_secret_key,
+                &peer_public_key,
+                listener_port,
+            ),
+        )
+        .await
+        .map_err(|_| Error::ConnectionTimeout("performing the initiator handshake"))??;
         let receiver = Storm::claim_connection(&self.inner, peer_public_key, None).await?;
         self.finish_client_discovery_if_connected().await;
         let state = Arc::clone(&self.inner);
