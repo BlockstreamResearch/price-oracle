@@ -1,13 +1,34 @@
+import html
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 
 
 API_URL = "https://api.openai.com/v1/responses"
+REPORT_PATH = os.environ.get("SECURITY_REVIEW_REPORT", "security-review.md")
+
+
+def write_report(content):
+    with open(REPORT_PATH, "w", encoding="utf-8") as report:
+        report.write(content.rstrip())
+        report.write("\n")
+
+
+def markdown_text(value):
+    text = html.escape(str(value), quote=False).replace("@", "&#64;")
+    for character in "\\`*_{}[]()#+-.!|>":
+        text = text.replace(character, f"\\{character}")
+    return text.replace("\n", "<br>")
+
+
+def fail(message):
+    print(message)
+    write_report(f"## AI security review\n\nReview failed: {markdown_text(message)}")
+    sys.exit(1)
 
 api_key = os.environ["OPENAI_API_KEY"]
-pr_number = os.environ["PR_NUMBER"]
 
 with open("pr.diff", "r", encoding="utf-8") as f:
     diff = f.read()
@@ -16,12 +37,14 @@ with open("pr.diff", "r", encoding="utf-8") as f:
 MAX_DIFF_SIZE = 100_000
 
 if len(diff) > MAX_DIFF_SIZE:
-    print(f"PR diff is too large ({len(diff)} bytes).")
-    print(f"Maximum allowed size is {MAX_DIFF_SIZE} bytes.")
-    sys.exit(1)
+    fail(
+        f"PR diff is too large ({len(diff)} bytes); "
+        f"the maximum is {MAX_DIFF_SIZE} bytes."
+    )
 
 if not diff.strip():
     print("No diff found.")
+    write_report("## AI security review\n\nNo diff found.")
     sys.exit(0)
 
 
@@ -154,9 +177,8 @@ try:
     with urllib.request.urlopen(request) as response:
         result = json.loads(response.read())
 
-except Exception as e:
-    print(f"OpenAI API request failed: {e}")
-    sys.exit(1)
+except (urllib.error.URLError, json.JSONDecodeError) as e:
+    fail(f"OpenAI API request failed: {e}")
 
 
 # Extract the structured output.
@@ -177,31 +199,46 @@ for item in output_text:
                 pass
 
 if findings is None:
-    print("Could not parse security review result.")
-    sys.exit(1)
+    fail("Could not parse the security review result.")
 
 
 if not findings:
-    print("✅ No HIGH or CRITICAL vulnerabilities found.")
+    message = "No HIGH or CRITICAL vulnerabilities found."
+    print(message)
+    write_report(f"## AI security review\n\n{message}")
     sys.exit(0)
 
 
-print()
-print("🚨 HIGH / CRITICAL SECURITY FINDINGS")
-print()
+report = ["## AI security review", "", "**HIGH / CRITICAL findings detected**", ""]
 
 for finding in findings:
-    print(f"[{finding['severity']}] {finding['title']}")
-    print(f"File: {finding['file']}:{finding['line']}")
-    print(f"CWE: {finding['cwe']}")
-    print()
-    print(finding["description"])
-    print()
-    print(f"Attack scenario: {finding['attack_scenario']}")
-    print()
-    print(f"Recommendation: {finding['recommendation']}")
-    print()
-    print("-" * 80)
+    severity = markdown_text(finding["severity"])
+    title = markdown_text(finding["title"])
+    file = markdown_text(finding["file"])
+    line = finding["line"]
+    cwe = markdown_text(finding["cwe"])
+    description = markdown_text(finding["description"])
+    attack_scenario = markdown_text(finding["attack_scenario"])
+    recommendation = markdown_text(finding["recommendation"])
+
+    report.extend(
+        [
+            f"### {severity}: {title}",
+            "",
+            f"**Location:** `{file}:{line}`  ",
+            f"**CWE:** `{cwe}`",
+            "",
+            description,
+            "",
+            f"**Attack scenario:** {attack_scenario}",
+            "",
+            f"**Recommendation:** {recommendation}",
+            "",
+        ]
+    )
+
+write_report("\n".join(report))
+print(f"Found {len(findings)} HIGH or CRITICAL security issue(s).")
 
 # Any HIGH/CRITICAL finding fails the job.
 sys.exit(1)
