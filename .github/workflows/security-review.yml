@@ -1,0 +1,61 @@
+name: AI Security Review
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  security-review:
+    # Only run for PR comments, exact command, and your GitHub account.
+    if: >
+      github.event.issue.pull_request &&
+      github.event.comment.body == '/scan-diff' &&
+      github.event.comment.user.login == 'ivanlele'
+
+    runs-on: ubuntu-latest
+
+    environment: Security
+
+    steps:
+      - name: Get PR information
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh pr view "$PR_NUMBER" \
+            --json baseRefName,headRefName,baseRefOid,headRefOid \
+            > pr.json
+
+          cat pr.json
+
+      - name: Get PR diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh pr diff "$PR_NUMBER" > pr.diff
+
+          echo "Diff size:"
+          wc -c pr.diff
+
+      - name: Run security review
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          python .github/security-review.py
+
+      - name: Comment command result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          echo "Security review finished."
