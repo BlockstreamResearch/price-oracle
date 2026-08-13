@@ -48,17 +48,32 @@ jobs:
           wc -c pr.diff
 
       - name: Run security review
+        id: review
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.issue.number }}
+          SECURITY_REVIEW_REPORT: security-review.md
         run: |
           python .github/security-review.py
 
-      - name: Comment command result
+      - name: Comment security review result
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.issue.number }}
+          COMMAND_URL: ${{ github.event.comment.html_url }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          echo "Security review finished."
+          if [[ ! -s security-review.md ]]; then
+            printf '%s\n\n%s\n\n%s\n' \
+              '## AI security review' \
+              "The review could not produce a report (step outcome: **${REVIEW_OUTCOME}**)." \
+              "[View workflow logs](${RUN_URL})" \
+              > security-review.md
+          fi
+
+          printf '\n---\n[Requested by `/scan-diff`](%s)\n' "$COMMAND_URL" \
+            >> security-review.md
+
+          gh pr comment "$PR_NUMBER" --body-file security-review.md
