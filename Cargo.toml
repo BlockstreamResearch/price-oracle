@@ -1,5 +1,5 @@
 [workspace]
 members = [
     "storm"
-]
+, "storm-tree"]
 resolver = "2"
