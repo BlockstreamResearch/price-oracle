@@ -1,0 +1,27 @@
+name: Sync AI Security Context
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-security-context
+  cancel-in-progress: false
+
+jobs:
+  sync-context:
+    runs-on: ubuntu-latest
+    environment: Security
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Replace OpenAI security context
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python .github/security-review.py --sync-context
