@@ -1,0 +1,13 @@
+[service]
+port = 9000
+
+[service.signer]
+# Development-only deterministic key. Do not use in production.
+private_key = "0303030303030303030303030303030303030303030303030303030303030303"
+
+[service.db]
+url = "postgres:5432"
+username = "high-storm"
+password = "high-storm"
+database = "high-storm-node-3"
+max_connections = 5

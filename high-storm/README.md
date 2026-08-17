@@ -1,0 +1,67 @@
+# high-storm
+
+`high-storm` persists Storm discovery state in PostgreSQL and restores it on later runs.
+
+## Three-node Docker deployment
+
+The included Compose stack starts PostgreSQL and three preconfigured development
+nodes. On the first start, node 1 hosts discovery and nodes 2 and 3 join it. Later
+starts restore each node from its own database. Manage it from any directory with:
+
+```sh
+high-storm/docker.sh create # Reset data, rebuild, and start everything.
+high-storm/docker.sh up     # Start while preserving initialized state.
+high-storm/docker.sh rebuild # Rebuild Rust and restart nodes, preserving state.
+high-storm/docker.sh down   # Stop while preserving initialized state.
+high-storm/docker.sh connections 1 # List node 1's active connections.
+```
+
+The Storm listeners are exposed on host ports `9000`, `9001`, and `9002`.
+PostgreSQL is exposed on `5432`. Follow the node logs with:
+
+```sh
+docker compose -f high-storm/compose.yml logs -f node-1 node-2 node-3
+```
+
+Heartbeat send and receive events are emitted at trace level. Enable them with
+`RUST_LOG=info,high_storm=debug,storm=debug,storm::heartbeat=trace`.
+
+The checked-in identities and database password are for local development only.
+
+## Configuration
+
+Copy `config.example.toml` to `config.toml`, then set the listener port, signer key,
+and PostgreSQL connection fields. The `service.db.url` value is the database host
+and optional port, for example `localhost:5432`.
+
+## Initialize a network
+
+Start the discovery host with every other member's compressed secp256k1 public key.
+The host public key is derived from the signer private key in `config.toml`:
+
+```sh
+cargo run -p high-storm -- initialize host \
+  --config config.toml \
+  --public-key <member-public-key>
+```
+
+Each other member joins through the host:
+
+```sh
+cargo run -p high-storm -- initialize join \
+  --config config.toml \
+  --discovery-public-key <host-public-key> \
+  --discovery-address <host:port>
+```
+
+Initialization remains running after the complete peer table is saved. Stop it with
+Ctrl-C after all members report successful initialization.
+
+## Run an initialized node
+
+```sh
+cargo run -p high-storm -- run --config config.toml
+```
+
+The integration harness in `tests/common` creates isolated in-memory SQLx stores,
+deterministic identities, and available listener ports for future node-level tests.

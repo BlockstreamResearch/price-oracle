@@ -1,0 +1,15 @@
+
+[service]
+port = 9000
+
+[service.signer]
+# secpr256k1 32-byte hex-encoded private key, used for signing,
+# this is a example key, do not use it anywhere else
+private_key = "804622cda0d8e634317a12651d91751ceff5c081f2b5f63ef7912725c7275e5d"
+
+[service.db]
+url = "localhost:5432"
+username = "high-storm"
+password = "high-storm"
+database = "high-storm"
+max_connections = 5

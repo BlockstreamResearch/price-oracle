@@ -1,0 +1,106 @@
+name: high-storm-local
+
+x-node: &node
+  build:
+    context: ..
+    dockerfile: high-storm/Dockerfile
+  environment:
+    RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=debug,sqlx=warn}
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    storm:
+
+services:
+  postgres:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: high-storm
+      POSTGRES_PASSWORD: high-storm
+      POSTGRES_DB: high-storm-node-1
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/001-create-node-databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U high-storm -d high-storm-node-1"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "5432:5432"
+    networks:
+      storm:
+        ipv4_address: 172.28.0.10
+
+  node-1:
+    <<: *node
+    volumes:
+      - ./docker/node-1.toml:/etc/high-storm/config.toml:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        high-storm run --config /etc/high-storm/config.toml ||
+        exec high-storm initialize host --config /etc/high-storm/config.toml
+        --public-key 024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766
+        --public-key 02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337
+    ports:
+      - "9000:9000"
+    networks:
+      storm:
+        ipv4_address: 172.28.0.11
+
+  node-2:
+    <<: *node
+    depends_on:
+      postgres:
+        condition: service_healthy
+      node-1:
+        condition: service_started
+    volumes:
+      - ./docker/node-2.toml:/etc/high-storm/config.toml:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        high-storm run --config /etc/high-storm/config.toml ||
+        exec high-storm initialize join --config /etc/high-storm/config.toml
+        --discovery-public-key 031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f
+        --discovery-address 172.28.0.11:9000
+    ports:
+      - "9001:9000"
+    networks:
+      storm:
+        ipv4_address: 172.28.0.12
+
+  node-3:
+    <<: *node
+    depends_on:
+      postgres:
+        condition: service_healthy
+      node-1:
+        condition: service_started
+    volumes:
+      - ./docker/node-3.toml:/etc/high-storm/config.toml:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        high-storm run --config /etc/high-storm/config.toml ||
+        exec high-storm initialize join --config /etc/high-storm/config.toml
+        --discovery-public-key 031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f
+        --discovery-address 172.28.0.11:9000
+    ports:
+      - "9002:9000"
+    networks:
+      storm:
+        ipv4_address: 172.28.0.13
+
+volumes:
+  postgres-data:
+
+networks:
+  storm:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

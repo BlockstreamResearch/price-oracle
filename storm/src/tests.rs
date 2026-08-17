@@ -27,6 +27,18 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+fn ordered_key_pair() -> (SecretKey, SecretKey) {
+    let secp = Secp256k1::new();
+    let mut random = rand::thread_rng();
+    let first = SecretKey::new(&mut random);
+    let second = SecretKey::new(&mut random);
+    if first.public_key(&secp).serialize() < second.public_key(&secp).serialize() {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
 async fn connect(
     address: SocketAddr,
     listener: &TcpListener,
@@ -775,9 +787,8 @@ async fn handler_failure_sends_error_without_error_response_loops() {
 async fn connects_available_addressed_peers_and_reports_missing_message_recipient() {
     let secp = Secp256k1::new();
     let mut random = rand::thread_rng();
-    let sender_secret_key = SecretKey::new(&mut random);
+    let (sender_secret_key, receiver_secret_key) = ordered_key_pair();
     let sender_public_key = sender_secret_key.public_key(&secp);
-    let receiver_secret_key = SecretKey::new(&mut random);
     let receiver_public_key = receiver_secret_key.public_key(&secp);
     let disconnected_secret_key = SecretKey::new(&mut random);
     let disconnected_public_key = disconnected_secret_key.public_key(&secp);
@@ -833,10 +844,8 @@ async fn connects_available_addressed_peers_and_reports_missing_message_recipien
 #[tokio::test]
 async fn connections_close_on_shutdown_and_drop() {
     let secp = Secp256k1::new();
-    let mut random = rand::thread_rng();
-    let sender_secret_key = SecretKey::new(&mut random);
+    let (sender_secret_key, receiver_secret_key) = ordered_key_pair();
     let sender_public_key = sender_secret_key.public_key(&secp);
-    let receiver_secret_key = SecretKey::new(&mut random);
     let receiver_public_key = receiver_secret_key.public_key(&secp);
     let mut receiver = Storm::from_peers(
         receiver_secret_key,
@@ -875,6 +884,49 @@ async fn connections_close_on_shutdown_and_drop() {
         PeerStatus::Inactive,
     )
     .await;
+}
+
+#[tokio::test]
+async fn connected_peers_exchange_heartbeats() {
+    let secp = Secp256k1::new();
+    let (dialer_secret_key, listener_secret_key) = ordered_key_pair();
+    let dialer_public_key = dialer_secret_key.public_key(&secp).serialize();
+    let listener_public_key = listener_secret_key.public_key(&secp).serialize();
+    let mut listener = Storm::from_peers(listener_secret_key, vec![Peer::new(dialer_public_key)]);
+    listener.start(Some("127.0.0.1:0".into())).await.unwrap();
+
+    let mut listener_peer = Peer::new(listener_public_key);
+    listener_peer.socket_address = Some(listener.listener_address.unwrap().to_string());
+    let mut dialer = Storm::from_peers(dialer_secret_key, vec![listener_peer]);
+    dialer.start(Some("127.0.0.1:0".into())).await.unwrap();
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let dialer_received = dialer
+                .peers()
+                .await
+                .iter()
+                .find(|peer| peer.compressed_public_key == listener_public_key)
+                .and_then(|peer| peer.last_seen)
+                .is_some();
+            let listener_received = listener
+                .peers()
+                .await
+                .iter()
+                .find(|peer| peer.compressed_public_key == dialer_public_key)
+                .and_then(|peer| peer.last_seen)
+                .is_some();
+            if dialer_received && listener_received {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both peers should receive a heartbeat");
+
+    dialer.shutdown().await;
+    listener.shutdown().await;
 }
 
 #[tokio::test]
