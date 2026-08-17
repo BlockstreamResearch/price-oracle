@@ -18,7 +18,6 @@ pub(crate) struct ConnectionPlan {
     pub(crate) initializer_secret_key: [u8; 32],
     pub(crate) initializer_public_key: [u8; 33],
     pub(crate) listener_port: Option<u16>,
-    pub(crate) discovery_in_progress: bool,
     pub(crate) targets: Vec<ConnectionTarget>,
 }
 
@@ -36,9 +35,7 @@ impl ConnectionPlan {
             return false;
         }
 
-        !self.discovery_in_progress
-            || self.initializer_public_key <= target.public_key
-            || target.discovery
+        target.discovery || self.initializer_public_key < target.public_key
     }
 }
 
@@ -94,7 +91,6 @@ impl StormState {
             initializer_secret_key: self.initializer_secret_key.secret_bytes(),
             initializer_public_key: self.initializer_public_key,
             listener_port,
-            discovery_in_progress: self.peers.iter().any(|peer| peer.discovery),
             targets,
         }
     }

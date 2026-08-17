@@ -11,7 +11,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{Mutex, RwLock, Semaphore, mpsc},
-    time::timeout,
+    time::{Instant, interval_at, timeout},
 };
 
 use crate::{
@@ -250,8 +250,25 @@ impl Storm {
 
             let send_messages = async {
                 let mut buffer = vec![0u8; 65_535];
+                let mut heartbeat = interval_at(
+                    Instant::now() + constants::HEARTBEAT_INTERVAL,
+                    constants::HEARTBEAT_INTERVAL,
+                );
 
-                while let Some(message) = receiver.recv().await {
+                loop {
+                    let (message, is_heartbeat) = tokio::select! {
+                        message = receiver.recv() => {
+                            let Some(message) = message else {
+                                return Ok(());
+                            };
+                            (message, false)
+                        }
+                        _ = heartbeat.tick() => {
+                            let message = message_handlers::heartbeat::message().to_framed_bytes()?;
+                            (message, true)
+                        }
+                    };
+
                     for chunk in message.chunks(constants::NOISE_MAX_PLAINTEXT_SIZE) {
                         let ciphertext_length =
                             transport.lock().await.write_message(chunk, &mut buffer)?;
@@ -262,9 +279,14 @@ impl Storm {
                         .await
                         .map_err(|_| Error::ConnectionTimeout("writing to a peer"))??;
                     }
+                    if is_heartbeat {
+                        tracing::trace!(
+                            target: "storm::heartbeat",
+                            peer_public_key = %hex::encode(peer_public_key),
+                            "heartbeat sent"
+                        );
+                    }
                 }
-
-                Ok(())
             };
 
             tokio::select! {

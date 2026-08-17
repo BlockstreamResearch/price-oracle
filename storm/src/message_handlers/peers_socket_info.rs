@@ -215,7 +215,11 @@ fn replace_discovered_peers(
             let mut peer = existing
                 .remove(&info.compressed_public_key)
                 .unwrap_or_else(|| Peer::new(info.compressed_public_key));
-            peer.socket_address = Some(info.socket_address);
+            if peer.compressed_public_key != discovery_peer_public_key
+                || peer.socket_address.is_none()
+            {
+                peer.socket_address = Some(info.socket_address);
+            }
             if state.connections.contains_key(&peer.compressed_public_key)
                 && peer.compressed_public_key != local_public_key
                 && peer.status != PeerStatus::Banned
@@ -308,6 +312,7 @@ mod tests {
         let (_, mut discovery_peer) = generated_peer();
         discovery_peer.status = PeerStatus::Active;
         discovery_peer.discovery = true;
+        discovery_peer.socket_address = Some("127.0.0.1:2000".to_string());
         let (_, retained_peer) = generated_peer();
         let (_, omitted_peer) = generated_peer();
         let mut state = StormState::new(
@@ -334,7 +339,7 @@ mod tests {
             &mut state,
             vec![
                 socket_info(&local_peer, "127.0.0.1:1000"),
-                socket_info(&discovery_peer, "127.0.0.1:2000"),
+                socket_info(&discovery_peer, "0.0.0.0:2000"),
                 socket_info(&retained_peer, "127.0.0.1:3000"),
             ],
             discovery_peer.compressed_public_key,
@@ -350,6 +355,10 @@ mod tests {
             .unwrap();
         assert_eq!(preserved_discovery_peer.status, PeerStatus::Active);
         assert!(preserved_discovery_peer.discovery);
+        assert_eq!(
+            preserved_discovery_peer.socket_address.as_deref(),
+            Some("127.0.0.1:2000")
+        );
         let retained_peer = state
             .peers
             .iter()

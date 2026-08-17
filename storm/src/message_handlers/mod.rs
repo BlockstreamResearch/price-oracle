@@ -1,7 +1,7 @@
 pub(crate) mod ask_peers_socket_info;
 pub(crate) mod custom;
 pub(crate) mod error;
-mod heartbeat;
+pub(crate) mod heartbeat;
 pub(crate) mod peers_socket_info;
 
 use crate::{MessageContext, StormHandle, StormMessage, constants, message::StormErrorCode};
