@@ -53,6 +53,7 @@ jobs:
         id: review
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SECURITY_REVIEW_MODEL: gpt-5.6-sol
           PR_NUMBER: ${{ github.event.issue.number }}
           SECURITY_REVIEW_REPORT: security-review.md
         run: |

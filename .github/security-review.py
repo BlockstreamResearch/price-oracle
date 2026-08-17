@@ -14,6 +14,7 @@ import urllib.request
 API_BASE_URL = "https://api.openai.com/v1"
 VECTOR_STORE_NAME = "price-oracle-security-context"
 REPORT_PATH = os.environ.get("SECURITY_REVIEW_REPORT", "security-review.md")
+MODEL = os.environ.get("SECURITY_REVIEW_MODEL", "gpt-5-mini")
 ARCHITECTURE_PATH = pathlib.Path("specs/oracle-network-architecture.md")
 MAX_ARCHITECTURE_SIZE = 100_000
 MAX_CODEBASE_CONTEXT_SIZE = 500_000
@@ -366,7 +367,7 @@ PR diff:
 
 
 payload = {
-    "model": "gpt-5-mini",
+    "model": MODEL,
     "input": prompt,
     "store": False,
     "tools": [
