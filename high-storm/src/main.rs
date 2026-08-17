@@ -1,10 +1,10 @@
 use clap::Parser;
 use high_storm::{
+    HighStorm,
     cli::{Cli, Commands, InitializeCommands},
     config::Config,
     db::{Database, network::NetworkStore},
 };
-use storm::Storm;
 use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tracing_subscriber::EnvFilter;
 
@@ -78,7 +78,7 @@ impl Action {
 }
 
 async fn run_until_shutdown(
-    mut storm: Storm,
+    mut storm: HighStorm,
     store: &NetworkStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reconnect = tokio::time::interval(Duration::from_secs(3));
