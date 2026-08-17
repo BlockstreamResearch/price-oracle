@@ -1,0 +1,7 @@
+[package]
+name = "simplex_contracts"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+smplx-std = "0.0.9"

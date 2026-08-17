@@ -3,7 +3,8 @@ members = [
     "high-storm",
     "storm",
     "storm-operator",
-    "storm-tree"
+    "storm-tree",
+    "contracts"
 ]
 resolver = "2"
 
