@@ -5,9 +5,7 @@ use simplex::transaction::{
 };
 
 use oracle_contracts::artifacts::treasury::TreasuryProgram;
-use oracle_contracts::artifacts::treasury::derived_treasury::{
-    TreasuryArguments, TreasuryWitness,
-};
+use oracle_contracts::artifacts::treasury::derived_treasury::{TreasuryArguments, TreasuryWitness};
 
 const STORM_EYE_SUPPLY: u64 = 10_000;
 const TREASURY_AMOUNT: u64 = 1_000;
