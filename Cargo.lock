@@ -2034,6 +2034,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "oracle_contracts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "smplx-std",
+]
+
+[[package]]
 name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2854,14 +2862,6 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest",
  "rand_core 0.6.4",
-]
-
-[[package]]
-name = "simplex_contracts"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "smplx-std",
 ]
 
 [[package]]

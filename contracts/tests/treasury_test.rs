@@ -4,8 +4,8 @@ use simplex::transaction::{
     FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
 };
 
-use simplex_contracts::artifacts::treasury::TreasuryProgram;
-use simplex_contracts::artifacts::treasury::derived_treasury::{
+use oracle_contracts::artifacts::treasury::TreasuryProgram;
+use oracle_contracts::artifacts::treasury::derived_treasury::{
     TreasuryArguments, TreasuryWitness,
 };
 
