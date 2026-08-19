@@ -5,8 +5,8 @@ use simplex::transaction::{
     FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
 };
 
-use simplex_contracts::artifacts::account::AccountProgram;
-use simplex_contracts::artifacts::account::derived_account::{AccountArguments, AccountWitness};
+use oracle_contracts::artifacts::account::AccountProgram;
+use oracle_contracts::artifacts::account::derived_account::{AccountArguments, AccountWitness};
 
 const STORM_EYE_SUPPLY: u64 = 10_000;
 const ACCOUNT_BALANCE: u64 = 10_000;
