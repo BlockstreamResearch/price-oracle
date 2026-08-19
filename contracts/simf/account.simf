@@ -1,0 +1,64 @@
+use std::lib::asserts::{assert_eq_64, assert_eq_256};
+use std::lib::u64::{safe_add_64, safe_sub_64};
+
+type UserSpendingWit = (u64, u32, Signature);
+type NetworkSpendingWit = (u32, u64, u32);
+
+// TODO: Refactor this file later
+fn user_authorized_spending(
+    amount_to_deposit: u64,
+    account_utxo_output_ind: u32,
+    owner_sig: Signature
+) {
+    jet::bip_0340_verify((param::ACCOUNT_OWNER_PUBKEY, jet::sig_all_hash()), owner_sig);
+
+    let (output_asset, output_amount): (Asset1, Amount1) = unwrap(jet::output_amount(account_utxo_output_ind));
+    let output_asset: u256 = unwrap_right::<Point>(output_asset);
+    let (current_asset, current_amount): (Asset1, Amount1) = jet::current_amount();
+    let current_asset: u256 = unwrap_right::<Point>(current_asset);
+    assert_eq_256(output_asset, current_asset);
+
+    let output_amount: u64 = unwrap_right::<Point>(output_amount);
+    let current_amount: u64 = unwrap_right::<Point>(current_amount);
+    let new_account_amount: u64 = safe_add_64(current_amount, amount_to_deposit);
+    assert_eq_64(output_amount, new_account_amount);
+
+    let output_script_hash: u256 = unwrap(jet::output_script_hash(account_utxo_output_ind));
+    assert_eq_256(output_script_hash, jet::current_script_hash());
+}
+
+fn network_authorized_spending(
+    storm_eye_input_ind: u32,
+    amount_to_withdraw: u64,
+    account_utxo_output_ind: u32,
+) {
+    let input_asset: u256 = unwrap_right::<Point>(unwrap(jet::input_asset(storm_eye_input_ind)));
+    assert_eq_256(input_asset, param::STORM_EYE_ASSET_ID);
+
+    let (output_asset, output_amount): (Asset1, Amount1) = unwrap(jet::output_amount(account_utxo_output_ind));
+    let output_asset: u256 = unwrap_right::<Point>(output_asset);
+    let (current_asset, current_amount): (Asset1, Amount1) = jet::current_amount();
+    let current_asset: u256 = unwrap_right::<Point>(current_asset);
+    assert_eq_256(output_asset, current_asset);
+
+    let output_amount: u64 = unwrap_right::<Point>(output_amount);
+    let current_amount: u64 = unwrap_right::<Point>(current_amount);
+    let new_account_amount: u64 = safe_sub_64(current_amount, amount_to_withdraw);
+    assert_eq_64(output_amount, new_account_amount);
+
+    let output_script_hash: u256 = unwrap(jet::output_script_hash(account_utxo_output_ind));
+    assert_eq_256(output_script_hash, jet::current_script_hash());
+}
+
+fn main() {
+    match witness::Path {
+        Left(wit: UserSpendingWit) => {
+            let (amount_to_deposit, account_utxo_output_ind, owner_sig): UserSpendingWit = wit;
+            user_authorized_spending(amount_to_deposit, account_utxo_output_ind, owner_sig);
+        },
+        Right(wit: NetworkSpendingWit) => {
+            let (storm_eye_input_ind, amount_to_withdraw, account_utxo_output_ind): NetworkSpendingWit = wit;
+            network_authorized_spending(storm_eye_input_ind, amount_to_withdraw, account_utxo_output_ind);
+        }
+    }
+}

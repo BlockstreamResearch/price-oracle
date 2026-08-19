@@ -5,11 +5,14 @@ use simplex::transaction::{
 };
 
 use simplex_contracts::artifacts::treasury::TreasuryProgram;
-use simplex_contracts::artifacts::treasury::derived_treasury::{TreasuryArguments, TreasuryWitness};
+use simplex_contracts::artifacts::treasury::derived_treasury::{
+    TreasuryArguments, TreasuryWitness,
+};
 
 const STORM_EYE_SUPPLY: u64 = 10_000;
 const TREASURY_AMOUNT: u64 = 1_000;
 
+// TODO: Refactor code and add more tests.
 fn issue_asset(context: &simplex::TestContext, amount: u64) -> anyhow::Result<AssetId> {
     let signer = context.get_default_signer();
     let funding_utxo = signer.get_utxos_asset(context.get_network().policy_asset())?[0].clone();
