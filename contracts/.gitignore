@@ -1,1 +1,6 @@
+# Rust
 src/artifacts
+target/
+
+# SimplicityHL
+deps/

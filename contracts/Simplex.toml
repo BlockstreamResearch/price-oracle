@@ -5,6 +5,10 @@
 # simf_files = ["*.simf"]
 # out_dir = "./src/artifacts"
 
+[dependencies]
+# TODO: Change to the appropriate tag when it becomes available
+std = { git = "https://github.com/BlockstreamResearch/simplicityhl-std.git", rev = "53b06722830fd85150389976e6b28ea26cc037f7" } 
+
 # [regtest]
 # mnemonic = "exist carry drive collect lend cereal occur much tiger just involve mean"
 # bitcoins = 10_000_000
