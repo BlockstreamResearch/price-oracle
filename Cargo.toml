@@ -3,8 +3,11 @@ members = [
     "high-storm",
     "storm",
     "storm-tree",
-    "contracts"
+    "contracts",
 ]
+
+# Not to use inside docker compose process
+# exclude = ["contract"]
 resolver = "2"
 
 [workspace.package]

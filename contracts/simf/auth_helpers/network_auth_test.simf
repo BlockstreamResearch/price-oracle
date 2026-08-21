@@ -1,0 +1,9 @@
+// LSP want to add `auth` after `crate`, but it is not working that way now.
+use crate::network::{StormTreeBloom, assert_network_authorization};
+
+fn main() {
+    let merkle_root: u256 = witness::MERKLE_ROOT;
+    let bloom: StormTreeBloom = witness::STORM_TREE_BLOOM;
+
+    assert_network_authorization(merkle_root, bloom);
+}

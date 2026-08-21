@@ -22,3 +22,7 @@ url.workspace = true
 
 storm.workspace = true
 storm-tree = { path = "../storm-tree" }
+
+[dev-dependencies]
+# Used only to replay a Storm Tree inclusion proof step by step in the tests.
+monotree.workspace = true
