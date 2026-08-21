@@ -10,10 +10,15 @@ mod handler;
 mod message;
 mod signing;
 mod state;
+mod voting;
 
-pub use message::{NodeMessage, NodeMessageKind, TestNodeMessage};
+pub use message::{
+    ApproveVotingRequest, MergeStormEyes, NetworkVoteKind, NetworkVoteRequest, NodeMessage,
+    NodeMessageKind, SplitStormEye, StormEyeUtxo, TestNodeMessage, UpdateNetworkMembers,
+};
 pub use signing::{SigningError, SigningResult};
 use state::NetworkState;
+pub use voting::{VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError, VotingRequest, VotingStatus};
 
 /// A long-lived Oracle Network node and its higher-level protocol state.
 pub struct HighStorm {
@@ -26,8 +31,10 @@ impl HighStorm {
         storm: Storm,
         secret_key: [u8; 32],
         coordinator_public_key: [u8; 33],
+        voting_store: crate::db::voting::VotingStore,
     ) -> Self {
-        let state = NetworkState::new(&storm, secret_key, coordinator_public_key).await;
+        let state =
+            NetworkState::new(&storm, secret_key, coordinator_public_key, voting_store).await;
         let handler_state = state.clone();
         storm
             .register_custom_handler(move |message, context| {
@@ -92,6 +99,57 @@ impl HighStorm {
     /// Returns the signer subset HighStorm would currently choose.
     pub async fn selected_signers(&self) -> Result<Vec<NodePublicKey>, SigningError> {
         self.state.signing().selected_signers(&self.storm).await
+    }
+
+    pub async fn create_voting_request(
+        &self,
+        request: NetworkVoteRequest,
+        block_height: u64,
+    ) -> Result<[u8; 32], VotingError> {
+        self.state.set_block_height(block_height);
+        self.state
+            .voting()
+            .create(&self.storm, request, block_height)
+            .await
+    }
+
+    pub async fn approve_voting_request(
+        &self,
+        request_hash: [u8; 32],
+        block_height: u64,
+    ) -> Result<(), VotingError> {
+        self.state.set_block_height(block_height);
+        self.state
+            .voting()
+            .approve(&self.storm, request_hash, block_height)
+            .await
+    }
+
+    pub async fn voting_request(
+        &self,
+        request_hash: [u8; 32],
+    ) -> Result<Option<VotingRequest>, VotingError> {
+        self.state.voting().get(request_hash).await
+    }
+
+    pub async fn voting_requests(&self) -> Result<Vec<VotingRequest>, VotingError> {
+        self.state.voting().list().await
+    }
+
+    pub async fn synchronize_voting_requests(&self) -> Result<(), VotingError> {
+        self.state.voting().synchronize(&self.storm).await
+    }
+
+    pub async fn remove_expired_voting_requests(
+        &self,
+        block_height: u64,
+    ) -> Result<u64, VotingError> {
+        self.state.set_block_height(block_height);
+        self.state.voting().remove_expired(block_height).await
+    }
+
+    pub fn set_block_height(&self, block_height: u64) {
+        self.state.set_block_height(block_height);
     }
 }
 

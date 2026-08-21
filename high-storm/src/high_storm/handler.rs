@@ -4,13 +4,24 @@ use super::{
     message::{NodeMessage, NodeMessageKind},
     signing::SigningError,
     state::NetworkState,
+    voting::VotingError,
 };
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum HandlerError {
+    #[error(transparent)]
+    Signing(#[from] SigningError),
+    #[error(transparent)]
+    Voting(#[from] VotingError),
+    #[error(transparent)]
+    Encoding(#[from] postcard::Error),
+}
 
 pub(crate) async fn handle(
     state: NetworkState,
     custom: CustomMsg,
     context: StormContext,
-) -> Result<(), SigningError> {
+) -> Result<(), HandlerError> {
     let Some(message) = NodeMessage::from_custom(&custom)? else {
         return Ok(());
     };
@@ -18,7 +29,8 @@ pub(crate) async fn handle(
         return Err(SigningError::InvalidMessage(format!(
             "unknown NodeMessage kind {}",
             message.kind
-        )));
+        ))
+        .into());
     };
     authorize_sender(
         kind,
@@ -27,18 +39,44 @@ pub(crate) async fn handle(
     )?;
 
     match kind {
-        NodeMessageKind::Test => state.signing().handle_test(message, &context).await,
+        NodeMessageKind::NetworkVoteRequest => {
+            state
+                .voting()
+                .handle_request(message, &context, state.block_height())
+                .await?;
+            Ok(())
+        }
+        NodeMessageKind::ApproveVotingRequest => {
+            state
+                .voting()
+                .handle_approval(message, &context, state.block_height())
+                .await?;
+            Ok(())
+        }
+        NodeMessageKind::AskAboutVotings => {
+            state
+                .voting()
+                .handle_synchronization(message, &context)
+                .await?;
+            Ok(())
+        }
+        NodeMessageKind::Test => {
+            state.signing().handle_test(message, &context).await?;
+            Ok(())
+        }
         NodeMessageKind::SigningNonces => {
             state
                 .signing()
                 .handle_signing_nonces(message, &context)
-                .await
+                .await?;
+            Ok(())
         }
         NodeMessageKind::PartialSignatures => {
             state
                 .signing()
                 .handle_partial_signatures(message, &context)
-                .await
+                .await?;
+            Ok(())
         }
         _ => {
             tracing::debug!(?kind, "NodeMessage kind has no high-storm handler yet");

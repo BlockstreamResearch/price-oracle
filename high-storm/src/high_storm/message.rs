@@ -17,7 +17,7 @@ pub struct NodeMessage {
 }
 
 impl NodeMessage {
-    pub(crate) fn new<T: Serialize>(
+    pub fn new<T: Serialize>(
         kind: NodeMessageKind,
         linked_to: Option<[u8; 32]>,
         payload: &T,
@@ -36,19 +36,19 @@ impl NodeMessage {
         postcard::from_bytes(&custom.payload).map(Some)
     }
 
-    pub(crate) fn decoded_kind(&self) -> Option<NodeMessageKind> {
+    pub fn decoded_kind(&self) -> Option<NodeMessageKind> {
         NodeMessageKind::from_id(self.kind)
     }
 
-    pub(crate) fn decode_payload<T: DeserializeOwned>(&self) -> Result<T, postcard::Error> {
+    pub fn decode_payload<T: DeserializeOwned>(&self) -> Result<T, postcard::Error> {
         postcard::from_bytes(&self.payload)
     }
 
-    pub(crate) fn hash(&self) -> Result<[u8; 32], postcard::Error> {
+    pub fn hash(&self) -> Result<[u8; 32], postcard::Error> {
         Ok(Sha256::digest(postcard::to_stdvec(self)?).into())
     }
 
-    pub(crate) fn into_storm_message(self) -> Result<StormMessage, storm::MessageError> {
+    pub fn into_storm_message(self) -> Result<StormMessage, storm::MessageError> {
         CustomMsg {
             domain: DOMAIN.to_string(),
             payload: postcard::to_stdvec(&self)?,
@@ -75,6 +75,89 @@ pub enum NodeMessageKind {
     NetworkAssets = 11,
     RenewStormUtxos = 12,
     Test = 13,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u16)]
+pub enum NetworkVoteKind {
+    UpdateNetworkMembers = 0,
+    MergeStormEyes = 1,
+    SplitStormEye = 2,
+}
+
+impl NetworkVoteKind {
+    pub fn from_id(id: u16) -> Option<Self> {
+        Some(match id {
+            0 => Self::UpdateNetworkMembers,
+            1 => Self::MergeStormEyes,
+            2 => Self::SplitStormEye,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkVoteRequest {
+    pub kind: u16,
+    pub payload: Vec<u8>,
+}
+
+impl NetworkVoteRequest {
+    pub fn new<T: Serialize>(kind: NetworkVoteKind, payload: &T) -> Result<Self, postcard::Error> {
+        Ok(Self {
+            kind: kind as u16,
+            payload: postcard::to_stdvec(payload)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateNetworkMembers {
+    pub to_accept: Vec<NodePublicKey>,
+    pub to_remove: Vec<NodePublicKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StormEyeUtxo {
+    pub txid: [u8; 32],
+    pub output_index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeStormEyes {
+    pub utxos_to_merge: Vec<StormEyeUtxo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitStormEye {
+    pub utxo_to_split: StormEyeUtxo,
+    pub number_of_splits: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproveVotingRequest {
+    pub public_key: NodePublicKey,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct VotingSyncApproval {
+    pub(crate) message: Vec<u8>,
+    pub(crate) block_height: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct VotingSyncRequest {
+    pub(crate) message_hash: [u8; 32],
+    pub(crate) message: Vec<u8>,
+    pub(crate) block_height: u64,
+    pub(crate) approvals: Vec<VotingSyncApproval>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct VotingSyncMessage {
+    pub(crate) is_response: bool,
+    pub(crate) requests: Vec<VotingSyncRequest>,
 }
 
 impl NodeMessageKind {
