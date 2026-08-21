@@ -48,6 +48,8 @@ pub enum SigningError {
     SigningFailed,
     #[error("invalid signing message: {0}")]
     InvalidMessage(String),
+    #[error("unauthorized node message: {0}")]
+    UnauthorizedMessage(String),
     #[error("Storm Tree operation failed: {0}")]
     StormTree(#[from] storm_tree::StormTreeError),
     #[error("Storm transport failed: {0}")]

@@ -22,8 +22,12 @@ pub struct HighStorm {
 }
 
 impl HighStorm {
-    pub(crate) async fn new(storm: Storm, secret_key: [u8; 32]) -> Self {
-        let state = NetworkState::new(&storm, secret_key).await;
+    pub(crate) async fn new(
+        storm: Storm,
+        secret_key: [u8; 32],
+        coordinator_public_key: [u8; 33],
+    ) -> Self {
+        let state = NetworkState::new(&storm, secret_key, coordinator_public_key).await;
         let handler_state = state.clone();
         storm
             .register_custom_handler(move |message, context| {
@@ -36,6 +40,22 @@ impl HighStorm {
             })
             .await;
         Self { storm, state }
+    }
+
+    /// Returns the compressed public key of the node coordinating user requests.
+    pub fn coordinator_public_key(&self) -> [u8; 33] {
+        self.state.coordinator_public_key()
+    }
+
+    /// Returns whether this node is the coordinator for user requests.
+    pub async fn is_coordinator(&self) -> bool {
+        let local_public_key = self
+            .peers()
+            .await
+            .into_iter()
+            .find(|peer| peer.status == storm::PeerStatus::Controlled)
+            .map(|peer| peer.compressed_public_key);
+        local_public_key == Some(self.coordinator_public_key())
     }
 
     /// Signs one or more dummy message hashes using an active Storm Tree branch.

@@ -52,7 +52,7 @@ Network User Contract is a Simplicity contract that can only be spent by the net
 
 Only one node can expose a REST API for the users at a time. This node is called the coordinator node as it is responsible for handling user requests and ensuring their execution.
 
-The node operators decide who will be the coordinator node off-chain and configure their node accordingly to only accept node requests that handle user input from this specific node.
+When the network is created, the discovery node becomes the coordinator node by default. The coordinator public key is persisted as part of the network state. Only messages from this node may initiate user request handling.
 
 ## 7\. Network discovery node
 
