@@ -3,6 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::{AnyPool, Row};
 use storm::{Peer, PeerStatus};
 
+use super::voting::VotingStore;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("database operation failed: {0}")]
@@ -25,6 +27,10 @@ pub struct NetworkStore {
 impl NetworkStore {
     pub(crate) fn new(pool: AnyPool) -> Self {
         Self { pool }
+    }
+
+    pub(crate) fn voting(&self) -> VotingStore {
+        VotingStore::new(self.pool.clone())
     }
 
     pub async fn save(
