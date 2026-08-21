@@ -67,6 +67,14 @@ async fn initializes_persists_and_restores_a_network() {
         .unwrap()
         .unwrap();
 
+    assert!(host.is_coordinator().await);
+    assert!(!join.is_coordinator().await);
+    assert_eq!(
+        hex::encode(host.coordinator_public_key()),
+        host_node.public_key
+    );
+    assert_eq!(host.coordinator_public_key(), join.coordinator_public_key());
+
     for store in [&host_node.store, &join_node.store] {
         let peers = store.load().await.unwrap();
         assert_eq!(peers.len(), 2);
@@ -91,6 +99,13 @@ async fn initializes_persists_and_restores_a_network() {
     restored_host.start(None).await.unwrap();
     restored_join.start(None).await.unwrap();
     wait_until_connected(&[&restored_host, &restored_join]).await;
+
+    assert!(restored_host.is_coordinator().await);
+    assert!(!restored_join.is_coordinator().await);
+    assert_eq!(
+        restored_host.coordinator_public_key(),
+        restored_join.coordinator_public_key()
+    );
 
     restored_host.shutdown().await;
     restored_join.shutdown().await;

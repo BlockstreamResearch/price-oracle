@@ -27,7 +27,11 @@ impl NetworkStore {
         Self { pool }
     }
 
-    pub async fn save(&self, peers: &[Peer]) -> Result<(), Error> {
+    pub async fn save(
+        &self,
+        peers: &[Peer],
+        coordinator_public_key: [u8; 33],
+    ) -> Result<(), Error> {
         tracing::debug!(peer_count = peers.len(), "persisting network state");
         let mut transaction = self.pool.begin().await?;
         sqlx::query("DELETE FROM network_peers")
@@ -41,10 +45,14 @@ impl NetworkStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        sqlx::query("INSERT INTO network_state (id, initialized_at) VALUES (1, $1)")
-            .bind(i64::try_from(initialized_at).map_err(|_| Error::TimestampOutOfRange)?)
-            .execute(&mut *transaction)
-            .await?;
+        sqlx::query(
+            "INSERT INTO network_state (id, initialized_at, coordinator_public_key) \
+             VALUES (1, $1, $2)",
+        )
+        .bind(i64::try_from(initialized_at).map_err(|_| Error::TimestampOutOfRange)?)
+        .bind(hex::encode(coordinator_public_key))
+        .execute(&mut *transaction)
+        .await?;
 
         for (position, peer) in peers.iter().enumerate() {
             let last_seen = peer
@@ -133,6 +141,18 @@ impl NetworkStore {
                 })
             })
             .collect()
+    }
+
+    pub async fn load_coordinator_public_key(&self) -> Result<[u8; 33], Error> {
+        let row = sqlx::query("SELECT coordinator_public_key FROM network_state WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(Error::NotInitialized)?;
+        let encoded_key: String = row.try_get("coordinator_public_key")?;
+        hex::decode(&encoded_key)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(Error::InvalidPublicKey(encoded_key))
     }
 }
 

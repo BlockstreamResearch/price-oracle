@@ -55,7 +55,7 @@ pub async fn initialize_host(
         "initializing discovery host"
     );
     let storm = Storm::discovery(secret_key, peers);
-    initialize(config, store, storm, secret_key_bytes).await
+    initialize(config, store, storm, secret_key_bytes, host_public_key).await
 }
 
 pub async fn initialize_join(
@@ -67,7 +67,8 @@ pub async fn initialize_join(
     discovery_address
         .parse::<SocketAddr>()
         .map_err(|_| Error::DiscoveryAddress(discovery_address.to_string()))?;
-    let mut discovery_peer = Peer::new(parse_public_key(discovery_public_key)?);
+    let coordinator_public_key = parse_public_key(discovery_public_key)?;
+    let mut discovery_peer = Peer::new(coordinator_public_key);
     discovery_peer.socket_address = Some(discovery_address.to_string());
     let secret_key = secret_key(config)?;
     let secret_key_bytes = secret_key.secret_bytes();
@@ -79,11 +80,19 @@ pub async fn initialize_join(
         "initializing node through discovery host"
     );
     let storm = Storm::discoverable(secret_key, discovery_peer)?;
-    initialize(config, store, storm, secret_key_bytes).await
+    initialize(
+        config,
+        store,
+        storm,
+        secret_key_bytes,
+        coordinator_public_key,
+    )
+    .await
 }
 
 pub async fn start_initialized(config: &Config, store: &NetworkStore) -> Result<HighStorm, Error> {
     let peers = store.load().await?;
+    let coordinator_public_key = store.load_coordinator_public_key().await?;
     tracing::info!(peer_count = peers.len(), "loaded persisted network state");
     let secret_key = secret_key(config)?;
     let secret_key_bytes = secret_key.secret_bytes();
@@ -92,7 +101,7 @@ pub async fn start_initialized(config: &Config, store: &NetworkStore) -> Result<
     tracing::info!(%listen_address, "starting initialized node");
     storm.start(Some(listen_address)).await?;
     tracing::info!("initialized node is running");
-    Ok(HighStorm::new(storm, secret_key_bytes).await)
+    Ok(HighStorm::new(storm, secret_key_bytes, coordinator_public_key).await)
 }
 
 async fn initialize(
@@ -100,6 +109,7 @@ async fn initialize(
     store: &NetworkStore,
     mut storm: Storm,
     secret_key: [u8; 32],
+    coordinator_public_key: [u8; 33],
 ) -> Result<HighStorm, Error> {
     let listen_address = listen_address(config);
     tracing::info!(%listen_address, "starting Storm discovery listener");
@@ -113,12 +123,12 @@ async fn initialize(
         }
         if peers.iter().all(|peer| !peer.discovery) {
             tracing::info!(peer_count = peers.len(), "network discovery completed");
-            store.save(&peers).await?;
+            store.save(&peers, coordinator_public_key).await?;
             tracing::info!(
                 peer_count = peers.len(),
                 "initialized network state persisted"
             );
-            return Ok(HighStorm::new(storm, secret_key).await);
+            return Ok(HighStorm::new(storm, secret_key, coordinator_public_key).await);
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
         storm.start(None).await?;

@@ -115,7 +115,7 @@ async fn run_until_shutdown(
         peer_count = peers.len(),
         "saving network state before shutdown"
     );
-    store.save(&peers).await?;
+    store.save(&peers, storm.coordinator_public_key()).await?;
     storm.shutdown().await;
     tracing::info!("high-storm stopped");
     Ok(())

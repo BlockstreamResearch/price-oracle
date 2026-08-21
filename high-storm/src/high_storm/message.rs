@@ -97,6 +97,10 @@ impl NodeMessageKind {
             _ => return None,
         })
     }
+
+    pub(crate) fn requires_coordinator(self) -> bool {
+        matches!(self, Self::ExecuteUserRequests)
+    }
 }
 
 /// Temporary message used to exercise signing before transaction validation exists.
