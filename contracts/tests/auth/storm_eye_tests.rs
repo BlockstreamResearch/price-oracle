@@ -103,10 +103,71 @@ fn spends_storm_eye_without_updating_storage(context: simplex::TestContext) -> a
         ),
     );
 
-    // The Storm Eye UTXO goes back to the same covenant, untouched — same script, same
-    // asset, same amount, and storage unchanged.
     final_utxo.add_output(PartialOutput::new(
         storm_eye_script_pubkey,
+        storm_eye_utxo.explicit_amount(),
+        storm_eye_utxo.explicit_asset(),
+    ));
+
+    signer.broadcast(&final_utxo)?.wait()?;
+
+    Ok(())
+}
+
+#[allow(unused_must_use)]
+fn rotated_program(new_merkle_root: [u8; 32]) -> AuthProgram {
+    let mut program = AuthProgram::new(AuthArguments {}).with_storage_capacity(2);
+
+    program.set_storage_at(0, new_merkle_root);
+    program.set_storage_at(1, rescue_block_slot_value(RESCUE_BLOCK_NUMBER));
+
+    program
+}
+
+/// 2. Authorized inclusion in a transaction with an update to the Storm Tree root.
+#[simplex::test]
+fn spends_storm_eye_with_update_storm_tree_root(
+    context: simplex::TestContext,
+) -> anyhow::Result<()> {
+    let signer = context.get_default_signer();
+    let provider = context.get_default_provider();
+
+    let (program, mut storm_tree, signing_branch, _) = setup_storm_eye(&context)?;
+    let proof: [WitnessStep; WITNESS_DEPTH] = storm_tree.witness_proof(&signing_branch);
+
+    let rotated_tree = StormTree::new(&[signing_branch, [7u8; 32]]);
+    let rotated = rotated_program(rotated_tree.root());
+
+    let storm_eye_script_pubkey = program.get_script_pubkey(context.get_network());
+    let rotated_script_pubkey = rotated.get_script_pubkey(context.get_network());
+    let storm_eye_utxo = provider.fetch_scripthash_utxos(&storm_eye_script_pubkey)?[0].clone();
+
+    let mut final_utxo = FinalTransaction::new();
+
+    final_utxo.add_program_input(
+        PartialInput::new(storm_eye_utxo.clone()),
+        ProgramInput::new(
+            Box::new(program.as_ref().clone()),
+            Box::new(AuthWitness {
+                path: Either::Left((
+                    (storm_tree.root(), RESCUE_BLOCK_NUMBER),
+                    ([0u8; 64], signing_branch, proof),
+                    Either::Right(Either::Left(Either::Left((
+                        rotated_tree.root(),
+                        // output_index
+                        0u32,
+                    )))),
+                )),
+            }),
+        ),
+        RequiredSignature::WitnessWithPath(
+            "PATH".to_string(),
+            vec!["Left".to_string(), "1".to_string(), "0".to_string()],
+        ),
+    );
+
+    final_utxo.add_output(PartialOutput::new(
+        rotated_script_pubkey,
         storm_eye_utxo.explicit_amount(),
         storm_eye_utxo.explicit_asset(),
     ));

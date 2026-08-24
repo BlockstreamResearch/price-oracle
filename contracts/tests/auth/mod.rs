@@ -2,6 +2,6 @@
 mod common;
 
 mod covenant;
-mod inclusion_without_storage_update;
 mod network_auth_test;
+mod storm_eye_tests;
 mod storm_tree;

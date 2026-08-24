@@ -57,7 +57,15 @@ fn auth_with_update_storm_tree_root(
     new_merkle_root: u256,
     output_ind: u32
 ) {
-    panic!()
+    let (current_merkle_root, rescue_block_number): Storage = storage;
+    let expected_current_script_hash: u256 = get_script_hash_for_storage(current_merkle_root, rescue_block_number);
+    assert_eq_256(jet::current_script_hash(), expected_current_script_hash);
+
+    let expected_new_script_hash: u256 = get_script_hash_for_storage(new_merkle_root, rescue_block_number);
+    let output_script_hash: u256 = unwrap(jet::output_script_hash(output_ind));
+    assert_eq_256(output_script_hash, expected_new_script_hash);
+
+    assert_utxo_preserved(output_ind);
 }
 
 /// 3. Authorized inclusion in a transaction with an update
