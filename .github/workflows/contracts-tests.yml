@@ -15,7 +15,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  CONTRACTS_NAME: "oracle_contracts"
   SIMPLEX_VERSION: 0.0.9
 
 jobs:
@@ -62,12 +61,12 @@ jobs:
           test -f src/artifacts/mod.rs
 
       - name: Check formatting
-        run: cargo fmt -p "$CONTRACTS_NAME" --check
+        working-directory: contracts
+        run: cargo fmt --all --check
 
       - name: Run Clippy
-        run: >
-          cargo clippy -p "$CONTRACTS_NAME"
-          --all-targets --all-features -- -D warnings
+        working-directory: contracts
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run simplex tests
         shell: bash

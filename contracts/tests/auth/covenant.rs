@@ -110,7 +110,10 @@ pub fn pack_cut(cut: &[u8]) -> Result<(CutSlots, CutMask), CovenantError> {
             remainder -= size;
         }
     }
-    debug_assert_eq!(remainder, 0, "slot widths must decompose every length exactly");
+    debug_assert_eq!(
+        remainder, 0,
+        "slot widths must decompose every length exactly"
+    );
 
     let mut pieces: [&[u8]; SLOTS] = [&[]; SLOTS];
     let mut offset = 0;
@@ -120,7 +123,11 @@ pub fn pack_cut(cut: &[u8]) -> Result<(CutSlots, CutMask), CovenantError> {
             offset += size;
         }
     }
-    debug_assert_eq!(offset, cut.len(), "every byte of the cut must land in a slot");
+    debug_assert_eq!(
+        offset,
+        cut.len(),
+        "every byte of the cut must land in a slot"
+    );
 
     Ok((
         CutSlots {
@@ -146,10 +153,7 @@ pub fn pack_cut(cut: &[u8]) -> Result<(CutSlots, CutMask), CovenantError> {
 /// # Errors
 /// Returns [`CovenantError::ProofTooDeep`] if the proof needs more than `depth` levels, or
 /// [`CovenantError::CutTooLong`] if a cut does not fit the slots.
-pub fn pack_proof(
-    proof: &StormTreeProof,
-    depth: usize,
-) -> Result<Vec<PaddedStep>, CovenantError> {
+pub fn pack_proof(proof: &StormTreeProof, depth: usize) -> Result<Vec<PaddedStep>, CovenantError> {
     if proof.len() > depth {
         return Err(CovenantError::ProofTooDeep {
             actual: proof.len(),
@@ -159,7 +163,11 @@ pub fn pack_proof(
 
     let mut steps: Vec<PaddedStep> = Vec::with_capacity(depth);
     for (right, cut) in proof.iter().rev() {
-        let payload = if *right { &cut[..cut.len() - 1] } else { &cut[..] };
+        let payload = if *right {
+            &cut[..cut.len() - 1]
+        } else {
+            &cut[..]
+        };
         let (slots, mask) = pack_cut(payload)?;
         steps.push(Some(ProofStep {
             right: *right,

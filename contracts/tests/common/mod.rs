@@ -1,9 +1,7 @@
 #![allow(dead_code)]
 use simplex::simplicityhl::elements::AssetId;
 use simplex::transaction::partial_input::IssuanceInput;
-use simplex::transaction::{
-    FinalTransaction, PartialInput, PartialOutput, RequiredSignature,
-};
+use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, RequiredSignature};
 
 // TODO: Make general purpose
 pub fn issue_asset(context: &simplex::TestContext, amount: u64) -> anyhow::Result<AssetId> {

@@ -8,7 +8,7 @@ use simplex::transaction::{
 use oracle_contracts::artifacts::auth::AuthProgram;
 use oracle_contracts::artifacts::auth::derived_auth::{AuthArguments, AuthWitness};
 
-use super::storm_tree::{Branch, StormTree, WitnessStep, WITNESS_DEPTH};
+use super::storm_tree::{Branch, StormTree, WITNESS_DEPTH, WitnessStep};
 
 const STORM_EYE_SUPPLY: u64 = 10_000;
 const RESCUE_BLOCK_NUMBER: u32 = 1_576_800;
