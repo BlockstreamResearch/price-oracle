@@ -2518,6 +2518,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "storm-operator"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "high-storm",
+ "secp256k1-zkp",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "storm-tree"
 version = "0.1.0"
 dependencies = [

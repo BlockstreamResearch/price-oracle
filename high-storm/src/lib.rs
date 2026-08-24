@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod db;
 pub mod high_storm;
+pub mod ipc;
 
 use std::{collections::HashSet, net::SocketAddr, time::Duration};
 

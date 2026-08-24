@@ -1,0 +1,13 @@
+[package]
+name = "storm-operator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+hex.workspace = true
+secp256k1-zkp.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+
+high-storm = { path = "../high-storm" }

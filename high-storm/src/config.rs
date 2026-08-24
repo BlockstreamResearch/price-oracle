@@ -20,8 +20,14 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ServiceConfig {
     pub port: u16,
+    #[serde(default = "default_ipc_path")]
+    pub ipc_path: PathBuf,
     pub signer: SignerConfig,
     pub db: DbConfig,
+}
+
+fn default_ipc_path() -> PathBuf {
+    "/tmp/high-storm.sock".into()
 }
 
 #[derive(Clone, Debug, Deserialize)]

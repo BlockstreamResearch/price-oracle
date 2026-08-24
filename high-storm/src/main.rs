@@ -4,6 +4,7 @@ use high_storm::{
     cli::{Cli, Commands, InitializeCommands},
     config::Config,
     db::{Database, network::NetworkStore},
+    ipc::IpcServer,
 };
 use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tracing_subscriber::EnvFilter;
@@ -56,7 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             high_storm::initialize_join(&config, &store, &public_key, &address).await?
         }
     };
-    run_until_shutdown(storm, &store).await?;
+    let ipc = IpcServer::bind(&config.service.ipc_path, database.node_operators()).await?;
+    run_until_shutdown(storm, &store, ipc).await?;
 
     Ok(())
 }
@@ -80,6 +82,7 @@ impl Action {
 async fn run_until_shutdown(
     mut storm: HighStorm,
     store: &NetworkStore,
+    ipc: IpcServer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reconnect = tokio::time::interval(Duration::from_secs(3));
     reconnect.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -91,6 +94,8 @@ async fn run_until_shutdown(
     persist_runtime.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+    let ipc_task = tokio::spawn(ipc.run());
+    tokio::pin!(ipc_task);
     loop {
         tokio::select! {
             _ = &mut shutdown => {
@@ -108,8 +113,14 @@ async fn run_until_shutdown(
                     tracing::warn!(%error, "failed to persist current peer state");
                 }
             }
+            result = &mut ipc_task => {
+                result??;
+                return Err("operator IPC listener stopped unexpectedly".into());
+            }
         }
     }
+    ipc_task.abort();
+    let _ = ipc_task.await;
     let peers = storm.peers().await;
     tracing::info!(
         peer_count = peers.len(),

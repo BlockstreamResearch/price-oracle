@@ -14,7 +14,7 @@ serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 sqlx = { workspace = true, features = ["any", "macros", "migrate", "postgres", "sqlite", "runtime-tokio"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

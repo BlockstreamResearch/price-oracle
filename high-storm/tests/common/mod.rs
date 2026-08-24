@@ -20,6 +20,7 @@ impl TestNode {
         let config = Config {
             service: ServiceConfig {
                 port,
+                ipc_path: std::env::temp_dir().join(format!("high-storm-{port}.sock")),
                 signer: SignerConfig {
                     private_key: hex::encode(secret.secret_bytes()),
                 },

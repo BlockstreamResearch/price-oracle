@@ -2,6 +2,7 @@
 members = [
     "high-storm",
     "storm",
+    "storm-operator",
     "storm-tree"
 ]
 resolver = "2"
