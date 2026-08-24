@@ -7,7 +7,7 @@
 
 [dependencies]
 # TODO: Change to the appropriate tag when it becomes available
-std = { git = "https://github.com/BlockstreamResearch/simplicityhl-std.git", rev = "53b06722830fd85150389976e6b28ea26cc037f7" } 
+std = { git = "https://github.com/BlockstreamResearch/simplicityhl-std.git", rev = "3eafe6bde8c51e88a1f7a76cb297cc4179568bf0" } 
 
 # [regtest]
 # mnemonic = "exist carry drive collect lend cereal occur much tiger just involve mean"

@@ -1,0 +1,60 @@
+use std::lib::asserts::assert_eq_256;
+use std::lib::u64::convert::u64_to_u256;
+
+// Because Simplex accept only 32-bit values
+fn get_slot_leaf(slot_value: u256) -> u256 {
+    let slot_ctx: Ctx8 = jet::tapdata_init();
+    let slot_ctx: Ctx8 = jet::sha_256_ctx_8_add_32(slot_ctx, slot_value);
+    jet::sha_256_ctx_8_finalize(slot_ctx)
+}
+
+/// Slot 0. The Storm Tree root is already 32 bytes, so it goes in unchanged.
+fn get_merkle_root_slot_leaf(merkle_root: u256) -> u256 {
+    get_slot_leaf(merkle_root)
+}
+
+/// Slot 1. The rescue block number is widened to 32 bytes, so the Rust side must pass
+/// 28 zero bytes followed by the height in big-endian order.
+fn get_rescue_block_slot_leaf(rescue_block_number: Height) -> u256 {
+    let rescue_block_number: u64 = jet::left_pad_low_32_64(rescue_block_number);
+
+    get_slot_leaf(u64_to_u256(rescue_block_number))
+}
+
+/// Rebuilds the covenant's script hash from a candidate storage state.
+pub fn get_script_hash_for_storage(merkle_root: u256, rescue_block_number: u32) -> u256 {
+    let merkle_root_slot_leaf: u256 = get_merkle_root_slot_leaf(merkle_root);
+    let rescue_block_slot_leaf: u256 = get_rescue_block_slot_leaf(rescue_block_number);
+
+    let first_tap_node: u256 = jet::build_tapbranch(jet::tapleaf_hash(), merkle_root_slot_leaf);
+    let tap_node: u256 = jet::build_tapbranch(first_tap_node, rescue_block_slot_leaf);
+
+    let bip0341_key: u256 = 0x50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0;
+    let tweaked_key: u256 = jet::build_taptweak(bip0341_key, tap_node);
+
+    let hash_ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let hash_ctx: Ctx8 = jet::sha_256_ctx_8_add_2(hash_ctx, 0x5120); // Segwit v1, length 32
+    let hash_ctx: Ctx8 = jet::sha_256_ctx_8_add_32(hash_ctx, tweaked_key);
+
+    jet::sha_256_ctx_8_finalize(hash_ctx)
+}
+
+/*
+/// Load. Proves the given state is the one the spent UTXO's address commits to.
+pub fn assert_current_storage(merkle_root: u256, rescue_block_number: u32) {
+    let expected_script_hash: u256 = get_script_hash_for_storage(merkle_root, rescue_block_number);
+
+    assert_eq_256(jet::current_script_hash(), expected_script_hash);
+}
+
+pub fn assert_output_storage(
+    output_index: u32,
+    merkle_root: u256,
+    rescue_block_number: u32
+) {
+    let expected_script_hash: u256 = get_script_hash_for_storage(merkle_root, rescue_block_number);
+    let output_script_hash: u256 = unwrap(jet::output_script_hash(output_index));
+
+    assert_eq_256(output_script_hash, expected_script_hash);
+}
+*/

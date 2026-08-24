@@ -1,2 +1,3 @@
 /target
 /storm/config/*-peers.toml
+.vscode/

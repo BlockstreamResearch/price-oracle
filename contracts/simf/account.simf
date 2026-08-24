@@ -1,5 +1,5 @@
 use std::lib::asserts::{assert_eq_64, assert_eq_256};
-use std::lib::u64::{safe_add_64, safe_sub_64};
+use std::lib::u64::math::{safe_add_64, safe_sub_64};
 
 type UserSpendingWit = (u64, u32, Signature);
 type NetworkSpendingWit = (u32, u64, u32);

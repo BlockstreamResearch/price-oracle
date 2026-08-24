@@ -1,6 +1,7 @@
+mod common;
+
 use simplex::either::Either;
 use simplex::simplicityhl::elements::AssetId;
-use simplex::transaction::partial_input::IssuanceInput;
 use simplex::transaction::{
     FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
 };
@@ -8,32 +9,11 @@ use simplex::transaction::{
 use oracle_contracts::artifacts::account::AccountProgram;
 use oracle_contracts::artifacts::account::derived_account::{AccountArguments, AccountWitness};
 
+use crate::common::issue_asset;
+
 const STORM_EYE_SUPPLY: u64 = 10_000;
 const ACCOUNT_BALANCE: u64 = 10_000;
 const AMOUNT: u64 = 500;
-
-// TODO: Refactor this code. And add more tests.
-fn issue_asset(context: &simplex::TestContext, amount: u64) -> anyhow::Result<AssetId> {
-    let signer = context.get_default_signer();
-    let funding_utxo = signer.get_utxos_asset(context.get_network().policy_asset())?[0].clone();
-
-    let mut ft = FinalTransaction::new();
-
-    let issuance = ft.add_issuance_input(
-        PartialInput::new(funding_utxo),
-        IssuanceInput::new_issuance(amount, 0, [1u8; 32]),
-        RequiredSignature::NativeEcdsa,
-    );
-    ft.add_output(PartialOutput::new(
-        signer.get_address().script_pubkey(),
-        amount,
-        issuance.asset_id,
-    ));
-
-    signer.broadcast(&ft)?.wait()?;
-
-    Ok(issuance.asset_id)
-}
 
 /// Issues the stand-in Storm Eye asset, compiles the account for the default signer's key,
 /// and funds it with L-BTC.
