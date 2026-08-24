@@ -220,7 +220,11 @@ fn walkthrough(count: usize) {
             .join(",");
         let who = format!("{{{who}}}");
 
-        println!("   {who:<20} {}   bits {}", hex(&branch), bits_of(&branch, 8));
+        println!(
+            "   {who:<20} {}   bits {}",
+            hex(&branch),
+            bits_of(&branch, 8)
+        );
         leaves.insert(branch, who);
     }
 
@@ -285,7 +289,10 @@ fn walkthrough(count: usize) {
 
     assert_eq!(hash, tree.root());
     assert!(StormTree::verify_branch(&tree.root(), branch, proof));
-    println!("   result      {} == root, verify_branch agrees", short(&hash));
+    println!(
+        "   result      {} == root, verify_branch agrees",
+        short(&hash)
+    );
 }
 
 #[test]

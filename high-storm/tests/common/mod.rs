@@ -4,9 +4,10 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 use high_storm::{
-    HighStorm, initialize_host, initialize_join,
+    HighStorm,
     config::{Config, DbConfig, ServiceConfig, SignerConfig},
     db::{Database, network::NetworkStore},
+    initialize_host, initialize_join,
 };
 use secp256k1::PublicKey;
 use secp256k1_zkp::{Secp256k1, SecretKey};

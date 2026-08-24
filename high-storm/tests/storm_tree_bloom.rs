@@ -90,12 +90,25 @@ fn report((_signed_by, bloom): (String, BloomWitness)) {
     }
 
     println!("\n--- StormTreeBloom ---");
-    println!("merkle_root  (storage slot 0) : {}", hex::encode(bloom.root));
-    println!("signature    (Signature, 64B) : {}", hex::encode(bloom.signature));
-    println!("branch       (Pubkey,    32B) : {}", hex::encode(bloom.branch));
+    println!(
+        "merkle_root  (storage slot 0) : {}",
+        hex::encode(bloom.root)
+    );
+    println!(
+        "signature    (Signature, 64B) : {}",
+        hex::encode(bloom.signature)
+    );
+    println!(
+        "branch       (Pubkey,    32B) : {}",
+        hex::encode(bloom.branch)
+    );
     println!("proof        ({} steps, root-first)", bloom.proof.len());
     for (index, (right, cut)) in bloom.proof.iter().enumerate() {
-        println!("  [{index}] right={right:<5} cut={:>3}B  {}", cut.len(), hex::encode(cut));
+        println!(
+            "  [{index}] right={right:<5} cut={:>3}B  {}",
+            cut.len(),
+            hex::encode(cut)
+        );
     }
 
     assert!(
@@ -114,7 +127,10 @@ fn replay(bloom: &BloomWitness) {
         println!("    {}", hex::encode(signer));
     }
     println!("proof          : {} steps", bloom.proof.len());
-    println!("    start           {}  <- the branch itself", hex::encode(bloom.branch));
+    println!(
+        "    start           {}  <- the branch itself",
+        hex::encode(bloom.branch)
+    );
 
     let hasher = Sha2::new();
     let mut hash: Hash = bloom.branch;
