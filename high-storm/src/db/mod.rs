@@ -1,8 +1,10 @@
 pub mod network;
+pub mod voting;
 
 use sqlx::{AnyPool, any::AnyPoolOptions};
 
 use network::NetworkStore;
+use voting::VotingStore;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -34,5 +36,9 @@ impl Database {
 
     pub fn network(&self) -> NetworkStore {
         NetworkStore::new(self.pool.clone())
+    }
+
+    pub fn voting(&self) -> VotingStore {
+        VotingStore::new(self.pool.clone())
     }
 }

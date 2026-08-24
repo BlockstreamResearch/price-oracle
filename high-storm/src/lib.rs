@@ -11,7 +11,10 @@ use storm::{Peer, Storm};
 
 use crate::config::Config;
 pub use high_storm::{
-    HighStorm, NodeMessage, NodeMessageKind, SigningError, SigningResult, TestNodeMessage,
+    ApproveVotingRequest, HighStorm, MergeStormEyes, NetworkVoteKind, NetworkVoteRequest,
+    NodeMessage, NodeMessageKind, SigningError, SigningResult, SplitStormEye, StormEyeUtxo,
+    TestNodeMessage, UpdateNetworkMembers, VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError,
+    VotingRequest, VotingStatus,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -101,7 +104,13 @@ pub async fn start_initialized(config: &Config, store: &NetworkStore) -> Result<
     tracing::info!(%listen_address, "starting initialized node");
     storm.start(Some(listen_address)).await?;
     tracing::info!("initialized node is running");
-    Ok(HighStorm::new(storm, secret_key_bytes, coordinator_public_key).await)
+    Ok(HighStorm::new(
+        storm,
+        secret_key_bytes,
+        coordinator_public_key,
+        store.voting(),
+    )
+    .await)
 }
 
 async fn initialize(
@@ -128,7 +137,9 @@ async fn initialize(
                 peer_count = peers.len(),
                 "initialized network state persisted"
             );
-            return Ok(HighStorm::new(storm, secret_key, coordinator_public_key).await);
+            return Ok(
+                HighStorm::new(storm, secret_key, coordinator_public_key, store.voting()).await,
+            );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
         storm.start(None).await?;

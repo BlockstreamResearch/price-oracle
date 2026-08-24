@@ -74,7 +74,7 @@ def api_request(
         method=method,
     )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=300) as response:
             return json.loads(response.read())
     except urllib.error.HTTPError as error:
         details = error.read().decode("utf-8", errors="replace")
