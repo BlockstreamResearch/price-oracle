@@ -1,6 +1,7 @@
 
 [service]
 port = 9000
+ipc_path = "/tmp/high-storm.sock"
 
 [service.signer]
 # secpr256k1 32-byte hex-encoded private key, used for signing,

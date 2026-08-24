@@ -1,6 +1,8 @@
 pub mod network;
+pub mod node_operator;
 pub mod voting;
 
+use node_operator::NodeOperatorStore;
 use sqlx::{AnyPool, any::AnyPoolOptions};
 
 use network::NetworkStore;
@@ -36,6 +38,10 @@ impl Database {
 
     pub fn network(&self) -> NetworkStore {
         NetworkStore::new(self.pool.clone())
+    }
+
+    pub fn node_operators(&self) -> NodeOperatorStore {
+        NodeOperatorStore::new(self.pool.clone())
     }
 
     pub fn voting(&self) -> VotingStore {

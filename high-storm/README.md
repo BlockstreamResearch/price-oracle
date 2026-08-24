@@ -32,7 +32,8 @@ The checked-in identities and database password are for local development only.
 
 Copy `config.example.toml` to `config.toml`, then set the listener port, signer key,
 and PostgreSQL connection fields. The `service.db.url` value is the database host
-and optional port, for example `localhost:5432`.
+and optional port, for example `localhost:5432`. Set `service.ipc_path` to a unique
+Unix socket path for each high-storm process running on the same host.
 
 ## Initialize a network
 
@@ -62,6 +63,22 @@ Ctrl-C after all members report successful initialization.
 ```sh
 cargo run -p high-storm -- run --config config.toml
 ```
+
+## Manage node operators
+
+While high-storm is running, add and remove node operators by their compressed,
+hex-encoded secp256k1 public key:
+
+```sh
+cargo run -p storm-operator -- operator add <public-key>
+cargo run -p storm-operator -- operator remove <public-key>
+```
+
+High-storm verifies the Unix peer credentials before reading a command. Only the
+user that started the node and the root user are authorized to use the socket.
+
+When high-storm uses a non-default `service.ipc_path`, pass the same path to the
+client with `--socket <path>`.
 
 The integration harness in `tests/common` creates isolated in-memory SQLx stores,
 deterministic identities, and available listener ports for future node-level tests.
