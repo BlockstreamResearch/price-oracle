@@ -22,7 +22,7 @@ fn setup_account(context: &simplex::TestContext) -> anyhow::Result<(AccountProgr
 
     let storm_eye_asset = issue_asset(context, STORM_EYE_SUPPLY)?;
 
-    let account = AccountProgram::new(AccountArguments {
+    let account = AccountProgram::new(&AccountArguments {
         storm_eye_asset_id: storm_eye_asset.into_inner().to_byte_array(),
         account_owner_pubkey: signer.get_schnorr_public_key().serialize(),
     });

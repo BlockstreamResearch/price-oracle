@@ -60,7 +60,7 @@ fn setup_storm_eye(
 
     let storm_tree = StormTree::new(&branches);
 
-    let mut program = AuthProgram::new(AuthArguments {}).with_storage_capacity(2);
+    let mut program = AuthProgram::new(&AuthArguments {}).with_storage_capacity(2);
 
     program.set_storage_at(0, storm_tree.root());
     program.set_storage_at(1, rescue_block_slot_value(rescue_number));
@@ -117,7 +117,7 @@ fn spends_storm_eye_without_updating_storage(context: simplex::TestContext) -> a
 
 #[allow(unused_must_use)]
 fn rotated_program(new_merkle_root: [u8; 32], new_rescue_number: u32) -> AuthProgram {
-    let mut program = AuthProgram::new(AuthArguments {}).with_storage_capacity(2);
+    let mut program = AuthProgram::new(&AuthArguments {}).with_storage_capacity(2);
 
     program.set_storage_at(0, new_merkle_root);
     program.set_storage_at(1, rescue_block_slot_value(new_rescue_number));

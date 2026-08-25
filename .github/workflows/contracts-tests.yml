@@ -15,7 +15,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  SIMPLEX_VERSION: 0.0.9
+  SIMPLEX_VERSION: 0.0.10
 
 jobs:
   test:

@@ -51,7 +51,7 @@ fn accepts_a_valid_inclusion_proof(context: simplex::TestContext) -> anyhow::Res
     let mut storm_tree = StormTree::new(&branches);
     let proof: [WitnessStep; WITNESS_DEPTH] = storm_tree.witness_proof(&signing_branch);
 
-    let program = NetworkAuthTestProgram::new(NetworkAuthTestArguments {});
+    let program = NetworkAuthTestProgram::new(&NetworkAuthTestArguments {});
     let script_pubkey = program.get_script_pubkey(context.get_network());
     issue_asset_to(&context, &program)?;
 

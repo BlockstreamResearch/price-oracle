@@ -40,7 +40,7 @@ fn spends_treasury_when_storm_eye_is_present(context: simplex::TestContext) -> a
 
     let storm_eye_asset = issue_asset(&context, STORM_EYE_SUPPLY)?;
 
-    let treasury = TreasuryProgram::new(TreasuryArguments {
+    let treasury = TreasuryProgram::new(&TreasuryArguments {
         storm_eye_asset_id: storm_eye_asset.into_inner().to_byte_array(),
     });
     let treasury_script_pubkey = treasury.get_script_pubkey(context.get_network());
