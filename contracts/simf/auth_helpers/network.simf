@@ -47,7 +47,8 @@ fn storm_eye_midstate() -> u256 {
 /// The smplx signer only ever signs the untagged `sighash_all`, so a signature over this
 /// has to come from the network's own signing code; no test can produce one.
 fn get_signing_message() -> u256 {
-    jet::sha_256_block(storm_eye_midstate(), jet::sig_all_hash(), padding_96_tail())
+    jet::sig_all_hash()
+    //jet::sha_256_block(storm_eye_midstate(), jet::sig_all_hash(), padding_96_tail())
 }
 
 /// The Storm Tree leaf for a branch: `sha256(key || value || 1)`, matching

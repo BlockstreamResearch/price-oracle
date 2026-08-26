@@ -60,7 +60,10 @@ fn setup_storm_eye(
 
     let storm_tree = StormTree::new(&branches);
 
-    let mut program = AuthProgram::new(&AuthArguments {}).with_storage_capacity(2);
+    let mut program = AuthProgram::new(&AuthArguments {
+        // Unused by these tests; the split path is not exercised.
+        max_split_utxos_count: 4,
+    }).with_storage_capacity(2);
 
     program.set_storage_at(0, storm_tree.root());
     program.set_storage_at(1, rescue_block_slot_value(rescue_number));
@@ -77,7 +80,7 @@ fn spends_storm_eye_without_updating_storage(context: simplex::TestContext) -> a
     let provider = context.get_default_provider();
 
     let rescue_number = 1234;
-    let (program, mut storm_tree, signing_branch, _) = setup_storm_eye(&context, rescue_number)?;
+    let (program, storm_tree, signing_branch, _) = setup_storm_eye(&context, rescue_number)?;
     let proof: [WitnessStep; WITNESS_DEPTH] = storm_tree.witness_proof(&signing_branch);
 
     let storm_eye_script_pubkey = program.get_script_pubkey(context.get_network());
@@ -117,7 +120,10 @@ fn spends_storm_eye_without_updating_storage(context: simplex::TestContext) -> a
 
 #[allow(unused_must_use)]
 fn rotated_program(new_merkle_root: [u8; 32], new_rescue_number: u32) -> AuthProgram {
-    let mut program = AuthProgram::new(&AuthArguments {}).with_storage_capacity(2);
+    let mut program = AuthProgram::new(&AuthArguments {
+        // Unused by these tests; the split path is not exercised.
+        max_split_utxos_count: 4,
+    }).with_storage_capacity(2);
 
     program.set_storage_at(0, new_merkle_root);
     program.set_storage_at(1, rescue_block_slot_value(new_rescue_number));
@@ -135,7 +141,7 @@ fn spends_storm_eye_with_update_storm_tree_root(
     let provider = context.get_default_provider();
 
     let rescue_number = 1234;
-    let (program, mut storm_tree, signing_branch, _) = setup_storm_eye(&context, rescue_number)?;
+    let (program, storm_tree, signing_branch, _) = setup_storm_eye(&context, rescue_number)?;
     let proof: [WitnessStep; WITNESS_DEPTH] = storm_tree.witness_proof(&signing_branch);
 
     let rotated_tree = StormTree::new(&[signing_branch, [7u8; 32]]);
@@ -190,7 +196,7 @@ fn spends_storm_eye_with_update_rescue_block_number(
     let provider = context.get_default_provider();
 
     let rescue_number = 1234;
-    let (program, mut storm_tree, signing_branch, _) = setup_storm_eye(&context, rescue_number)?;
+    let (program, storm_tree, signing_branch, _) = setup_storm_eye(&context, rescue_number)?;
     let proof: [WitnessStep; WITNESS_DEPTH] = storm_tree.witness_proof(&signing_branch);
 
     let rotated_rescue_number = rescue_number + 1_576_800;

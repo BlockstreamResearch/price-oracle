@@ -17,7 +17,7 @@ const ZERO_IDX: u64 = 0;
 const ZERO_HASH: [u8; 32] = [0u8; 32];
 
 /// The 32-byte big-endian word `1`, hashed into every leaf as a domain separator.
-const LEAF_MARKER: [u8; 32] = {
+pub const LEAF_MARKER: [u8; 32] = {
     let mut marker = [0u8; 32];
     marker[31] = 1;
     marker
@@ -644,7 +644,7 @@ impl<H: Hasher> SparseMerkleTree<H> {
 /// # Panics
 /// Panics if `depth` is 256 or more, which no caller can reach: every walk is bounded by
 /// the tree's maximum depth, itself capped at [`MAX_DEPTH_HARD_CAP`].
-fn key_bit(key: &Key, depth: u32) -> bool {
+pub fn key_bit(key: &Key, depth: u32) -> bool {
     assert!(
         depth < MAX_DEPTH_HARD_CAP,
         "bit index {depth} is out of range"
