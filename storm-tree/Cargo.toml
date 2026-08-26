@@ -6,6 +6,6 @@ readme = "README.md"
 
 [dependencies]
 itertools.workspace = true
-monotree.workspace = true
 secp256k1.workspace = true
+sha2.workspace = true
 thiserror.workspace = true

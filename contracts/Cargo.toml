@@ -12,5 +12,4 @@ smplx-std = "0.0.10"
 anyhow = "1"
 # Storm Tree construction and witness packing, shared with the network side.
 storm-tree = { path = "../storm-tree" }
-monotree = "0.4.0"
 thiserror = "2"

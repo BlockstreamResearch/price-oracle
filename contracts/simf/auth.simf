@@ -1,5 +1,5 @@
 use std::lib::asserts::{assert_eq_1, assert_eq_32, assert_eq_64, assert_eq_256};
-use std::lib::u32::math::safe_add_32;
+use std::lib::u32::math::{safe_add_32, gt_32};
 
 use crate::helper::{get_explicit_current_amount, get_explicit_output_amount};
 use crate::storage::{get_script_hash_for_storage};
@@ -92,13 +92,22 @@ fn auth_with_update_rescue_block(
     assert_utxo_preserved(output_ind);
 }
 
+
+
 /// 4. Authorized splitting of a Storm Eye UTXO into
 /// multiple UTXOs with the same Storm Tree root.
 fn auth_split_storm_eye_utxo_into_multiple_utxos(
     storage: Storage,
     split_utxos_count: u32
 ) {
-    panic!()
+    assert_eq_32(jet::current_index(), 0);
+
+    let (merkle_root, rescue_block_number): Storage = storage;
+    let expected_current_script_hash: u256 = get_script_hash_for_storage(merkle_root, rescue_block_number);
+    assert_eq_256(jet::current_script_hash(), expected_current_script_hash);
+
+    assert!(gt_32(split_utxos_count, 1));
+    assert!(jet::le_32(split_utxos_count, param::MAX_SPLIT_UTXOS_COUNT));
 }
 
 /// Authorized merging of multiple Storm Eyes into
