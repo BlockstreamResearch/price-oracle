@@ -278,7 +278,7 @@ with open("pr.diff", "r", encoding="utf-8") as f:
     diff = f.read()
 
 # Avoid accidentally sending enormous PRs and spending lots of money.
-MAX_DIFF_SIZE = 100_000
+MAX_DIFF_SIZE = 1_000_000
 
 if len(diff) > MAX_DIFF_SIZE:
     fail(
