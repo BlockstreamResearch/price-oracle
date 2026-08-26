@@ -16,12 +16,12 @@ const ZERO_IDX: u64 = 0;
 /// The hash of an empty subtree.
 const ZERO_HASH: [u8; 32] = [0u8; 32];
 
-/// The 32-byte big-endian word `1`, hashed into every leaf as a domain separator.
-const LEAF_MARKER: [u8; 32] = {
-    let mut marker = [0u8; 32];
-    marker[31] = 1;
-    marker
-};
+/// BIP-340 tag: OracleNetworkV1/StormEye
+/// sha256(tag)
+const LEAF_MARKER: [u8; 32] = [
+    0xc1, 0x67, 0xb4, 0x50, 0xe8, 0x8f, 0x50, 0x02, 0x69, 0x27, 0x5c, 0x42, 0x24, 0x60, 0x37, 0x1c,
+    0xb2, 0xa5, 0x7a, 0x02, 0xc2, 0x2d, 0x39, 0xbc, 0xed, 0xe8, 0xbd, 0x01, 0x6a, 0xea, 0x2c, 0xd8
+];
 
 /// A 256-bit tree key.
 pub type Key = [u8; 32];
@@ -33,10 +33,10 @@ pub type NodeHash = [u8; 32];
 /// The two hash functions that define a tree's shape.
 pub trait Hasher {
     /// Hashes a middle node from its two child hashes.
-    fn hash2(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32];
+    fn hash_branch(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32];
 
     /// Hashes a leaf from its key, its value and the leaf marker.
-    fn hash3(a: &[u8; 32], b: &[u8; 32], c: &[u8; 32]) -> [u8; 32];
+    fn hash_leaf(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32];
 }
 
 /// SHA-256 over the concatenated arguments.
@@ -44,18 +44,19 @@ pub trait Hasher {
 pub struct Sha256;
 
 impl Hasher for Sha256 {
-    fn hash2(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    fn hash_branch(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
         let mut hasher = sha2::Sha256::new();
         hasher.update(a);
         hasher.update(b);
         hasher.finalize().into()
     }
 
-    fn hash3(a: &[u8; 32], b: &[u8; 32], c: &[u8; 32]) -> [u8; 32] {
+    fn hash_leaf(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
         let mut hasher = sha2::Sha256::new();
+        hasher.update(LEAF_MARKER);
+        hasher.update(LEAF_MARKER);
         hasher.update(a);
         hasher.update(b);
-        hasher.update(c);
         hasher.finalize().into()
     }
 }
@@ -77,7 +78,7 @@ pub enum Node {
         key: Key,
         /// The value stored under it.
         value: Value,
-        /// `hash3(key, value, 1)`.
+        /// `hash_leaf(key, value)`.
         hash: NodeHash,
     },
     /// An interior node with at least one non-empty child.
@@ -86,7 +87,7 @@ pub enum Node {
         left: u64,
         /// Arena index of the right child, or [`ZERO_IDX`] when absent.
         right: u64,
-        /// `hash2(left, right)`.
+        /// `hash_branch(left, right)`.
         hash: NodeHash,
     },
 }
@@ -377,9 +378,9 @@ impl<H: Hasher> SparseMerkleTree<H> {
     /// Recomputes the root a proof implies, without comparing it to anything.
     pub fn process_proof(proof: &Proof) -> NodeHash {
         let mut computed_hash = if proof.existence {
-            H::hash3(&proof.key, &proof.value, &LEAF_MARKER)
+            H::hash_leaf(&proof.key, &proof.value)
         } else if proof.aux_existence {
-            H::hash3(&proof.aux_key, &proof.aux_value, &LEAF_MARKER)
+            H::hash_leaf(&proof.aux_key, &proof.aux_value)
         } else {
             ZERO_HASH
         };
@@ -396,9 +397,9 @@ impl<H: Hasher> SparseMerkleTree<H> {
             let level = u32::try_from(level).expect("depth is bounded by MAX_DEPTH_HARD_CAP");
 
             computed_hash = if key_bit(&proof.key, level) {
-                H::hash2(sibling, &computed_hash)
+                H::hash_branch(sibling, &computed_hash)
             } else {
-                H::hash2(&computed_hash, sibling)
+                H::hash_branch(&computed_hash, sibling)
             };
         }
 
@@ -594,7 +595,7 @@ impl<H: Hasher> SparseMerkleTree<H> {
         Node::Leaf {
             key,
             value,
-            hash: H::hash3(&key, &value, &LEAF_MARKER),
+            hash: H::hash_leaf(&key, &value),
         }
     }
 
@@ -603,7 +604,7 @@ impl<H: Hasher> SparseMerkleTree<H> {
         Node::Middle {
             left,
             right,
-            hash: H::hash2(&self.node(left).hash(), &self.node(right).hash()),
+            hash: H::hash_branch(&self.node(left).hash(), &self.node(right).hash()),
         }
     }
 
@@ -673,7 +674,7 @@ mod tests {
     }
 
     fn leaf_hash(key: Key, value: Value) -> NodeHash {
-        Sha256::hash3(&key, &value, &LEAF_MARKER)
+        Sha256::hash_leaf(&key, &value)
     }
 
     #[test]
@@ -706,7 +707,7 @@ mod tests {
     }
 
     /// Pins the exact hash formula against roots computed by hand. Nothing else here
-    /// would notice a wrong leaf marker, a swapped `hash2` argument order, or an empty
+    /// would notice a wrong leaf marker, a swapped `hash_branch` argument order, or an empty
     /// subtree that hashes to something other than a flat zero.
     #[test]
     fn builds_known_roots_by_hand() {
@@ -723,25 +724,25 @@ mod tests {
         // A second key diverging at bit 2, so bits 0 and 1 are shared. Each shared bit
         // adds a middle node whose other child is empty.
         tree.add(key(0b100), value(0xbb)).unwrap();
-        let deepest = Sha256::hash2(
+        let deepest = Sha256::hash_branch(
             &leaf_hash(key(0b000), value(0xaa)),
             &leaf_hash(key(0b100), value(0xbb)),
         );
         assert_eq!(
             tree.root(),
-            Sha256::hash2(&Sha256::hash2(&deepest, &ZERO_HASH), &ZERO_HASH)
+            Sha256::hash_branch(&Sha256::hash_branch(&deepest, &ZERO_HASH), &ZERO_HASH)
         );
         // Two leaves plus three middle nodes.
         assert_eq!(tree.nodes_count(), 5);
 
         // Divergence at bit 0 instead, so the two leaves are siblings directly under the
-        // root and the argument order of `hash2` is what distinguishes them.
+        // root and the argument order of `hash_branch` is what distinguishes them.
         let mut flat = Tree::new(8).unwrap();
         flat.add(key(0), value(0xaa)).unwrap();
         flat.add(key(1), value(0xbb)).unwrap();
         assert_eq!(
             flat.root(),
-            Sha256::hash2(
+            Sha256::hash_branch(
                 &leaf_hash(key(0), value(0xaa)),
                 &leaf_hash(key(1), value(0xbb))
             )
@@ -984,5 +985,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn get_tag_for_leaf() {
+        let bytes = b"OracleNetworkV1/StormEye";
+
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(bytes);
+        let res: [u8; 32] = hasher.finalize().into();
+
+        // For debuging and updating SimplicityHL code
+        // println!("[{}]", res.map(|b| format!("0x{b:02x}")).join(", "));
+
+        assert_eq!(res, LEAF_MARKER);
     }
 }

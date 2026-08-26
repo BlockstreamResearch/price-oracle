@@ -2658,6 +2658,7 @@ version = "0.1.0"
 dependencies = [
  "itertools",
  "secp256k1 0.32.0-beta.2",
+ "serde_json",
  "sha2",
  "thiserror",
 ]
