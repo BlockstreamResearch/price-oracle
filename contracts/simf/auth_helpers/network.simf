@@ -24,18 +24,14 @@ fn padding_64_tail() -> u256 {
     0x0000000000000000000000000000000000000000000000000000000000000200
 }
 
-fn padding_128_tail() -> u256 {
-    0x0000000000000000000000000000000000000000000000000000000000000400
-}
-
 /// 96-byte message: 768 bits. Its padding fits beside the last 32 bytes of data, so this
 /// is a whole half-block and takes no [`padding_head`].
 fn padding_96_tail() -> u256 {
     0x8000000000000000000000000000000000000000000000000000000000000300
 }
 
-/// BIP-340 midstate for `OracleNetworkV1/StormEye`, shared by the signing message and the
-/// Storm Tree leaf. The tagged prefix is exactly one block, so it compresses offline:
+/// BIP-340 midstate for `OracleNetworkV1/StormEye`, used only by the signing message. The
+/// tagged prefix is exactly one block, so it compresses offline:
 ///
 ///     sha_256_block(sha_256_iv(), h, h)
 ///     with h = sha256("OracleNetworkV1/StormEye")
@@ -54,10 +50,12 @@ fn get_signing_message() -> u256 {
     jet::sha_256_block(storm_eye_midstate(), jet::sig_all_hash(), padding_96_tail())
 }
 
-/// Each branch is stored under itself, so a leaf's key and value are both the branch.
+/// The Storm Tree leaf for a branch: `sha256(key || value || 1)`, matching
+/// `SparseMerkleTree.sol`. Each branch is stored under itself, so key and value are both
+/// the branch, and the 96-byte preimage takes two compressions.
 fn get_storm_tree_leaf(branch: u256) -> u256 {
-    let data: u256 = jet::sha_256_block(storm_eye_midstate(), branch, branch);
-    jet::sha_256_block(data, padding_head(), padding_128_tail())
+    let data: u256 = jet::sha_256_block(jet::sha_256_iv(), branch, branch);
+    jet::sha_256_block(data, 1, padding_96_tail())
 }
 
 /// Folds one level: `sha256(left || right)`, untagged.
