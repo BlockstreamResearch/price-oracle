@@ -37,6 +37,15 @@ impl NodeOperatorStore {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn contains(&self, public_key: [u8; 33]) -> Result<bool, Error> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM node_operators WHERE public_key = $1")
+                .bind(public_key.to_vec())
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count > 0)
+    }
+
     pub async fn list(&self) -> Result<Vec<[u8; 33]>, Error> {
         sqlx::query("SELECT public_key FROM node_operators ORDER BY public_key")
             .fetch_all(&self.pool)

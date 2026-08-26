@@ -4,13 +4,18 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+axum.workspace = true
+bip322.workspace = true
+bitcoin.workspace = true
 clap = { workspace = true, features = ["derive"] }
+getrandom.workspace = true
 hex.workspace = true
 log.workspace = true
 postcard = { workspace = true, features = ["use-std"] }
 secp256k1 = { workspace = true, features = ["rand"] }
 secp256k1-zkp.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 sha2.workspace = true
 sqlx = { workspace = true, features = ["any", "macros", "migrate", "postgres", "sqlite", "runtime-tokio"] }
 thiserror.workspace = true
@@ -22,3 +27,7 @@ url.workspace = true
 
 storm.workspace = true
 storm-tree = { path = "../storm-tree" }
+
+[dev-dependencies]
+http-body-util.workspace = true
+tower = { workspace = true, features = ["util"] }

@@ -40,7 +40,7 @@ case "${1:-}" in
         compose up --detach
         ;;
     rebuild)
-        compose up --detach --build --force-recreate node-1 node-2 node-3
+        compose up --detach --build --force-recreate node-1 node-2 node-3 operator-1 operator-2 operator-3
         ;;
     down)
         compose down --remove-orphans

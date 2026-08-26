@@ -165,7 +165,8 @@ impl Storm {
             .await
     }
 
-    pub(crate) fn handle(&self) -> StormHandle {
+    /// Returns a cloneable handle for peer queries and message sending.
+    pub fn handle(&self) -> StormHandle {
         StormHandle {
             inner: Arc::clone(&self.inner),
         }

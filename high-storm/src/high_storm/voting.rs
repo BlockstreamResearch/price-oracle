@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use secp256k1::{Keypair, PublicKey, SecretKey, XOnlyPublicKey, schnorr};
 use secp256k1_zkp::PublicKey as TransportPublicKey;
-use storm::{Peer, PeerStatus, Storm, StormContext, StormHandle};
+use storm::{Peer, PeerStatus, StormContext, StormHandle};
 use tokio::sync::Mutex;
 
 use crate::db::voting::{StoredVotingRequest, VotingStore};
@@ -78,7 +78,7 @@ impl Voting {
 
     pub(crate) async fn create(
         &self,
-        storm: &Storm,
+        storm: &StormHandle,
         request: NetworkVoteRequest,
         block_height: u64,
     ) -> Result<[u8; 32], VotingError> {
@@ -101,7 +101,7 @@ impl Voting {
 
     pub(crate) async fn approve(
         &self,
-        storm: &Storm,
+        storm: &StormHandle,
         request_hash: [u8; 32],
         block_height: u64,
     ) -> Result<(), VotingError> {
@@ -129,7 +129,7 @@ impl Voting {
         send_from_storm(storm, message, &active_remote_peers(&peers)).await
     }
 
-    pub(crate) async fn synchronize(&self, storm: &Storm) -> Result<(), VotingError> {
+    pub(crate) async fn synchronize(&self, storm: &StormHandle) -> Result<(), VotingError> {
         let peers = storm.peers().await;
         let request = VotingSyncMessage {
             is_response: false,
@@ -490,7 +490,7 @@ fn decode_stored(stored: StoredVotingRequest) -> Result<VotingRequest, VotingErr
 }
 
 async fn send_from_storm(
-    storm: &Storm,
+    storm: &StormHandle,
     message: NodeMessage,
     recipients: &[[u8; 33]],
 ) -> Result<(), VotingError> {

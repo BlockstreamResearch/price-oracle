@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 use url::Url;
 
 #[derive(Debug, thiserror::Error)]
@@ -22,12 +22,20 @@ pub struct ServiceConfig {
     pub port: u16,
     #[serde(default = "default_ipc_path")]
     pub ipc_path: PathBuf,
+    #[serde(default = "default_rest_address")]
+    pub rest_address: SocketAddr,
     pub signer: SignerConfig,
     pub db: DbConfig,
 }
 
 fn default_ipc_path() -> PathBuf {
     "/tmp/high-storm.sock".into()
+}
+
+fn default_rest_address() -> SocketAddr {
+    "127.0.0.1:9001"
+        .parse()
+        .expect("the default REST address is valid")
 }
 
 #[derive(Clone, Debug, Deserialize)]
