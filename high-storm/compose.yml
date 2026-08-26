@@ -13,6 +13,19 @@ x-node: &node
   networks:
     storm:
 
+x-operator-platform: &operator-platform
+  build:
+    context: ..
+    dockerfile: web/operator/Dockerfile
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "wget --quiet --output-document=/dev/null http://127.0.0.1/"]
+    interval: 2s
+    timeout: 3s
+    retries: 20
+  networks:
+    storm:
+
 services:
   postgres:
     image: postgres:17-bookworm
@@ -37,23 +50,32 @@ services:
 
   node-1:
     <<: *node
+    environment:
+      RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=debug,sqlx=warn}
+      OPERATOR_PUBLIC_KEY: 031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f
     volumes:
       - ./docker/node-1.toml:/etc/high-storm/config.toml:ro
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >-
+        (while [ ! -S /tmp/high-storm.sock ]; do sleep 1; done;
+        until storm-operator operator add "$${OPERATOR_PUBLIC_KEY}"; do sleep 1; done) &
         high-storm run --config /etc/high-storm/config.toml ||
         exec high-storm initialize host --config /etc/high-storm/config.toml
         --public-key 024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766
         --public-key 02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337
     ports:
       - "9000:9000"
+      - "9100:9100"
     networks:
       storm:
         ipv4_address: 172.28.0.11
 
   node-2:
     <<: *node
+    environment:
+      RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=debug,sqlx=warn}
+      OPERATOR_PUBLIC_KEY: 024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766
     depends_on:
       postgres:
         condition: service_healthy
@@ -64,18 +86,24 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >-
+        (while [ ! -S /tmp/high-storm.sock ]; do sleep 1; done;
+        until storm-operator operator add "$${OPERATOR_PUBLIC_KEY}"; do sleep 1; done) &
         high-storm run --config /etc/high-storm/config.toml ||
         exec high-storm initialize join --config /etc/high-storm/config.toml
         --discovery-public-key 031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f
         --discovery-address 172.28.0.11:9000
     ports:
       - "9001:9000"
+      - "9101:9100"
     networks:
       storm:
         ipv4_address: 172.28.0.12
 
   node-3:
     <<: *node
+    environment:
+      RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=debug,sqlx=warn}
+      OPERATOR_PUBLIC_KEY: 02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337
     depends_on:
       postgres:
         condition: service_healthy
@@ -86,15 +114,48 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >-
+        (while [ ! -S /tmp/high-storm.sock ]; do sleep 1; done;
+        until storm-operator operator add "$${OPERATOR_PUBLIC_KEY}"; do sleep 1; done) &
         high-storm run --config /etc/high-storm/config.toml ||
         exec high-storm initialize join --config /etc/high-storm/config.toml
         --discovery-public-key 031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f
         --discovery-address 172.28.0.11:9000
     ports:
       - "9002:9000"
+      - "9102:9100"
     networks:
       storm:
         ipv4_address: 172.28.0.13
+
+  operator-1:
+    <<: *operator-platform
+    environment:
+      OPERATOR_API_UPSTREAM: http://node-1:9100
+    depends_on:
+      node-1:
+        condition: service_started
+    ports:
+      - "9200:80"
+
+  operator-2:
+    <<: *operator-platform
+    environment:
+      OPERATOR_API_UPSTREAM: http://node-2:9100
+    depends_on:
+      node-2:
+        condition: service_started
+    ports:
+      - "9201:80"
+
+  operator-3:
+    <<: *operator-platform
+    environment:
+      OPERATOR_API_UPSTREAM: http://node-3:9100
+    depends_on:
+      node-3:
+        condition: service_started
+    ports:
+      - "9202:80"
 
 volumes:
   postgres-data:

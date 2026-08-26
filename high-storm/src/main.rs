@@ -5,6 +5,7 @@ use high_storm::{
     config::Config,
     db::{Database, network::NetworkStore},
     ipc::IpcServer,
+    rest::RestServer,
 };
 use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tracing_subscriber::EnvFilter;
@@ -57,8 +58,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             high_storm::initialize_join(&config, &store, &public_key, &address).await?
         }
     };
+    let rest = RestServer::bind(
+        config.service.rest_address,
+        storm.handle(),
+        database.node_operators(),
+    )
+    .await?;
+    tracing::info!(address = %rest.local_addr()?, "REST API is listening");
     let ipc = IpcServer::bind(&config.service.ipc_path, database.node_operators()).await?;
-    run_until_shutdown(storm, &store, ipc).await?;
+    run_until_shutdown(storm, &store, ipc, rest).await?;
 
     Ok(())
 }
@@ -83,6 +91,7 @@ async fn run_until_shutdown(
     mut storm: HighStorm,
     store: &NetworkStore,
     ipc: IpcServer,
+    rest: RestServer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reconnect = tokio::time::interval(Duration::from_secs(3));
     reconnect.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -96,6 +105,8 @@ async fn run_until_shutdown(
     tokio::pin!(shutdown);
     let ipc_task = tokio::spawn(ipc.run());
     tokio::pin!(ipc_task);
+    let rest_task = tokio::spawn(rest.run());
+    tokio::pin!(rest_task);
     loop {
         tokio::select! {
             _ = &mut shutdown => {
@@ -117,10 +128,16 @@ async fn run_until_shutdown(
                 result??;
                 return Err("operator IPC listener stopped unexpectedly".into());
             }
+            result = &mut rest_task => {
+                result??;
+                return Err("REST API listener stopped unexpectedly".into());
+            }
         }
     }
     ipc_task.abort();
     let _ = ipc_task.await;
+    rest_task.abort();
+    let _ = rest_task.await;
     let peers = storm.peers().await;
     tracing::info!(
         peer_count = peers.len(),

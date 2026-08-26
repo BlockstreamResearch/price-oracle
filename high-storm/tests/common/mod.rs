@@ -21,6 +21,7 @@ impl TestNode {
             service: ServiceConfig {
                 port,
                 ipc_path: std::env::temp_dir().join(format!("high-storm-{port}.sock")),
+                rest_address: "127.0.0.1:0".parse().unwrap(),
                 signer: SignerConfig {
                     private_key: hex::encode(secret.secret_bytes()),
                 },

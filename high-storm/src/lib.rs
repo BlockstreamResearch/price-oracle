@@ -3,6 +3,7 @@ pub mod config;
 pub mod db;
 pub mod high_storm;
 pub mod ipc;
+pub mod rest;
 
 use std::{collections::HashSet, net::SocketAddr, time::Duration};
 
@@ -12,10 +13,10 @@ use storm::{Peer, Storm};
 
 use crate::config::Config;
 pub use high_storm::{
-    ApproveVotingRequest, HighStorm, MergeStormEyes, NetworkVoteKind, NetworkVoteRequest,
-    NodeMessage, NodeMessageKind, SigningError, SigningResult, SplitStormEye, StormEyeUtxo,
-    TestNodeMessage, UpdateNetworkMembers, VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError,
-    VotingRequest, VotingStatus,
+    ApproveVotingRequest, HighStorm, HighStormHandle, MergeStormEyes, NetworkVoteKind,
+    NetworkVoteRequest, NodeMessage, NodeMessageKind, SigningError, SigningResult, SplitStormEye,
+    StormEyeUtxo, TestNodeMessage, UpdateNetworkMembers, VOTING_TIMEOUT_BLOCKS, VotingApproval,
+    VotingError, VotingRequest, VotingStatus,
 };
 
 #[derive(Debug, thiserror::Error)]

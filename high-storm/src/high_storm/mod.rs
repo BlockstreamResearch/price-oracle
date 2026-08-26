@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use storm::Storm;
+use storm::{Storm, StormHandle};
 use storm_tree::NodePublicKey;
 
 mod handler;
@@ -23,6 +23,12 @@ pub use voting::{VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError, VotingReque
 /// A long-lived Oracle Network node and its higher-level protocol state.
 pub struct HighStorm {
     storm: Storm,
+    state: NetworkState,
+}
+
+#[derive(Clone)]
+pub struct HighStormHandle {
+    storm: StormHandle,
     state: NetworkState,
 }
 
@@ -52,6 +58,13 @@ impl HighStorm {
     /// Returns the compressed public key of the node coordinating user requests.
     pub fn coordinator_public_key(&self) -> [u8; 33] {
         self.state.coordinator_public_key()
+    }
+
+    pub fn handle(&self) -> HighStormHandle {
+        HighStormHandle {
+            storm: self.storm.handle(),
+            state: self.state.clone(),
+        }
     }
 
     /// Returns whether this node is the coordinator for user requests.
@@ -109,7 +122,7 @@ impl HighStorm {
         self.state.set_block_height(block_height);
         self.state
             .voting()
-            .create(&self.storm, request, block_height)
+            .create(&self.storm.handle(), request, block_height)
             .await
     }
 
@@ -121,7 +134,7 @@ impl HighStorm {
         self.state.set_block_height(block_height);
         self.state
             .voting()
-            .approve(&self.storm, request_hash, block_height)
+            .approve(&self.storm.handle(), request_hash, block_height)
             .await
     }
 
@@ -137,7 +150,7 @@ impl HighStorm {
     }
 
     pub async fn synchronize_voting_requests(&self) -> Result<(), VotingError> {
-        self.state.voting().synchronize(&self.storm).await
+        self.state.voting().synchronize(&self.storm.handle()).await
     }
 
     pub async fn remove_expired_voting_requests(
@@ -150,6 +163,58 @@ impl HighStorm {
 
     pub fn set_block_height(&self, block_height: u64) {
         self.state.set_block_height(block_height);
+    }
+}
+
+impl HighStormHandle {
+    pub fn coordinator_public_key(&self) -> [u8; 33] {
+        self.state.coordinator_public_key()
+    }
+
+    pub fn block_height(&self) -> u64 {
+        self.state.block_height()
+    }
+
+    pub async fn peers(&self) -> Vec<storm::Peer> {
+        self.storm.peers().await
+    }
+
+    pub async fn is_coordinator(&self) -> bool {
+        self.storm
+            .peers()
+            .await
+            .into_iter()
+            .find(|peer| peer.status == storm::PeerStatus::Controlled)
+            .map(|peer| peer.compressed_public_key)
+            == Some(self.coordinator_public_key())
+    }
+
+    pub async fn create_voting_request(
+        &self,
+        request: NetworkVoteRequest,
+    ) -> Result<[u8; 32], VotingError> {
+        self.state
+            .voting()
+            .create(&self.storm, request, self.state.block_height())
+            .await
+    }
+
+    pub async fn approve_voting_request(&self, request_hash: [u8; 32]) -> Result<(), VotingError> {
+        self.state
+            .voting()
+            .approve(&self.storm, request_hash, self.state.block_height())
+            .await
+    }
+
+    pub async fn voting_request(
+        &self,
+        request_hash: [u8; 32],
+    ) -> Result<Option<VotingRequest>, VotingError> {
+        self.state.voting().get(request_hash).await
+    }
+
+    pub async fn voting_requests(&self) -> Result<Vec<VotingRequest>, VotingError> {
+        self.state.voting().list().await
     }
 }
 
