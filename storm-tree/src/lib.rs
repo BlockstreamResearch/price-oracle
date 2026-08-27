@@ -10,7 +10,7 @@ use secp256k1::musig::KeyAggCache;
 use secp256k1::{Parity, PublicKey, XOnlyPublicKey};
 use thiserror::Error;
 
-use smt::SparseMerkleTree;
+use smt::MerkleTree;
 
 /// The serialized 32-byte X-only secp256k1 public key of a network node.
 pub type NodePublicKey = [u8; 32];
@@ -18,23 +18,20 @@ pub type NodePublicKey = [u8; 32];
 pub type StormTreeBranch = [u8; 32];
 /// The SHA-256 root of a Storm Tree.
 pub type StormTreeRoot = [u8; 32];
-/// A sparse Merkle inclusion proof for a [`StormTreeBranch`].
+/// A Merkle inclusion proof for a [`StormTreeBranch`].
 pub type StormTreeProof = smt::Proof;
 
-/// The sparse Merkle tree backing every Storm Tree.
-type BranchTree = SparseMerkleTree<smt::Sha256>;
-
-// TODO: Make performance tests to choose better param
-/// The depth every Storm Tree is built at.
+/// The deepest Storm Tree the covenant can verify, `ceil(log2(MAX_BRANCHES))`.
 ///
-/// The backing tree does not compress paths, so a branch sits one level below the longest
-/// prefix it shares with any other branch. Branch keys are MuSig2 aggregate keys and so
-/// are uniformly distributed: across the [`MAX_BRANCHES`] limit there are fewer than
-/// 2^33 pairs, and the chance that any pair shares 48 low bits is below 2^-15.
+/// A tree is built only as deep as its branch count needs, so a small network produces a
+/// shallow tree and a short proof. This is the ceiling the covenant's fold is compiled
+/// for, and the levels a shallower tree does not use are padding in the witness.
 ///
-/// This is a consensus parameter. The covenant's fold is compiled for exactly this depth,
-/// and lowering it would make some legitimate node sets unrepresentable.
-pub const TREE_DEPTH: u32 = 48;
+/// Because leaves sit at fixed positions rather than being addressed by their value, this
+/// is arithmetic rather than a probability: no branch set can fail to fit.
+///
+/// This is a consensus parameter.
+pub const TREE_DEPTH: u32 = 17;
 
 const MIN_NODES: usize = 3;
 /// Maximum number of signer combinations accepted by [`StormTree::new`].
@@ -79,24 +76,22 @@ pub enum StormTreeError {
     /// The requested aggregate key is not a branch in this tree.
     #[error("unknown Storm Tree branch: {0:02x?}")]
     UnknownBranch(StormTreeBranch),
-    /// The underlying sparse Merkle tree operation failed.
-    #[error("sparse Merkle tree operation failed: {0}")]
-    SparseMerkleTree(#[from] smt::Error),
+    /// The underlying Merkle tree operation failed.
+    #[error("Merkle tree operation failed: {0}")]
+    MerkleTree(#[from] smt::Error),
 }
 
-/// A deterministic sparse Merkle tree of minimum-threshold MuSig2 keys.
+/// A deterministic Merkle tree of minimum-threshold MuSig2 keys.
 ///
 /// Node keys are validated, sorted lexicographically, and treated as a set.
 /// Every size-`threshold` subset appears exactly once; permutations of a subset
-/// are never separate branches. Each branch is stored under itself, so a branch is both
-/// the sparse-tree key and its value, and its leaf hashes to
-/// `sha256(branch || branch || 1)`.
+/// are never separate branches. Branches occupy leaf slots in ascending order, and each
+/// leaf hashes to `sha256(branch || 0x01)`.
 pub struct StormTree {
     nodes: Vec<NodePublicKey>,
     threshold: usize,
     branches: BTreeMap<StormTreeBranch, Vec<NodePublicKey>>,
-    tree: BranchTree,
-    root: StormTreeRoot,
+    tree: MerkleTree,
 }
 
 impl StormTree {
@@ -149,18 +144,16 @@ impl StormTree {
         }
         debug_assert_eq!(branches.len(), branch_count);
 
-        let mut tree = BranchTree::new(TREE_DEPTH)?;
-        for branch in branches.keys() {
-            tree.add(*branch, *branch)?;
-        }
-        let root = tree.root();
+        // `from_leaves` is the single construction recipe, shared with every other caller
+        // that has to arrive at the same root for the same branch set.
+        let leaves: Vec<StormTreeBranch> = branches.keys().copied().collect();
+        let tree = MerkleTree::from_leaves(&leaves)?;
 
         Ok(Self {
             nodes,
             threshold,
             branches,
             tree,
-            root,
         })
     }
 
@@ -179,9 +172,9 @@ impl StormTree {
         self.threshold
     }
 
-    /// Returns the SHA-256 sparse Merkle root.
-    pub const fn root(&self) -> StormTreeRoot {
-        self.root
+    /// Returns the SHA-256 Merkle root.
+    pub fn root(&self) -> StormTreeRoot {
+        self.tree.root()
     }
 
     /// Iterates over aggregate branch keys in lexicographic order.
@@ -211,7 +204,7 @@ impl StormTree {
             return Err(StormTreeError::UnknownBranch(*branch));
         }
 
-        Ok(self.tree.proof(*branch))
+        Ok(self.tree.proof(branch)?)
     }
 
     /// Verifies that an aggregate key is included under a Storm Tree root.
@@ -223,13 +216,9 @@ impl StormTree {
         branch: &StormTreeBranch,
         proof: &StormTreeProof,
     ) -> bool {
-        // A Storm Tree stores each branch under itself, so a proof only speaks for this
-        // branch if it is an inclusion proof of that key holding that same value.
-        proof.existence
-            && proof.root == *root
-            && proof.key == *branch
-            && proof.value == *branch
-            && BranchTree::verify_proof(proof)
+        // A proof only speaks for this branch under this root, so both have to be checked
+        // alongside the fold itself.
+        proof.leaf == *branch && proof.root == *root && smt::verify_proof(proof)
     }
 }
 

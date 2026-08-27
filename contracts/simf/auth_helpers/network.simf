@@ -3,13 +3,12 @@ use std::lib::asserts::assert_eq_256;
 /// One level of the fold: path bit (is_right = true) with sibling node hash
 type StormTreeProofStep = Either<(), (bool, u256)>;
 
-// TODO: Try to optimize number of steps.
 /// The aggregate signature, the signing
 /// combination's MuSig2 key, and its inclusion proof under the stored root.
 pub type StormTreeBloom = (
     Signature,                 // MuSig2 signature
     Pubkey,                    // Signing storm tree branch (the MuSig2 aggregate key)
-    [StormTreeProofStep; 48],  // Signing storm tree branch merkle proof
+    [StormTreeProofStep; 17],  // Signing storm tree branch merkle proof
 );
 
 // SHA-256 padding blocks. Every message here has a length known at compile time, so its
@@ -20,6 +19,7 @@ fn padding_head() -> u256 {
     0x8000000000000000000000000000000000000000000000000000000000000000
 }
 
+/// 64-byte message: 512 bits.
 fn padding_64_tail() -> u256 {
     0x0000000000000000000000000000000000000000000000000000000000000200
 }
@@ -28,6 +28,13 @@ fn padding_64_tail() -> u256 {
 /// is a whole half-block and takes no [`padding_head`].
 fn padding_96_tail() -> u256 {
     0x8000000000000000000000000000000000000000000000000000000000000300
+}
+
+/// The second half of a leaf's only block: the `0x01` domain separator, then the padding
+/// for a 33-byte message (264 bits). Data and padding share one block, so a leaf costs a
+/// single compression.
+fn leaf_tail() -> u256 {
+    0x0180000000000000000000000000000000000000000000000000000000000108
 }
 
 /// BIP-340 midstate for `OracleNetworkV1/StormEye`, used only by the signing message. The
@@ -44,25 +51,22 @@ fn storm_eye_midstate() -> u256 {
 
 /// The message the network signs for any Storm Eye operation, per Network Spec Part III §3.
 ///
-/// The smplx signer only ever signs the untagged `sighash_all`, so a signature over this
-/// has to come from the network's own signing code; no test can produce one.
+/// TODO: this should be the tagged hash the spec calls for:
+///
+///     jet::sha_256_block(storm_eye_midstate(), jet::sig_all_hash(), padding_96_tail())
+///
+/// It is untagged only because no test can currently produce a tagged signature. Need
+/// to add this functionality in smplx.
 fn get_signing_message() -> u256 {
     jet::sig_all_hash()
-    //jet::sha_256_block(storm_eye_midstate(), jet::sig_all_hash(), padding_96_tail())
 }
 
-/// The Storm Tree leaf for a branch: `sha256(key || value || 1)`, matching
-/// `SparseMerkleTree.sol`. Each branch is stored under itself, so key and value are both
-/// the branch, and the 96-byte preimage takes two compressions.
+/// The Storm Tree leaf for a branch: `sha256(branch || 0x01)`.
 fn get_storm_tree_leaf(branch: u256) -> u256 {
-    let data: u256 = jet::sha_256_block(jet::sha_256_iv(), branch, branch);
-    jet::sha_256_block(data, 1, padding_96_tail())
+    jet::sha_256_block(jet::sha_256_iv(), branch, leaf_tail())
 }
 
-/// Folds one level: `sha256(left || right)`, untagged.
-///
-/// `Left` is a level past the leaf's depth. A zero sibling *within* the proof is a
-/// genuinely empty subtree and still has to be hashed, so the two are not interchangeable.
+/// Folds one level: `sha256(left || right)`.
 fn storm_tree_fold_step(step: StormTreeProofStep, node: u256) -> u256 {
     match step {
         Left(_: ()) => node,
@@ -85,8 +89,7 @@ fn storm_tree_fold_step(step: StormTreeProofStep, node: u256) -> u256 {
 pub fn assert_network_authorization(merkle_root: u256, bloom: StormTreeBloom) {
     let (signature, branch, merkle_proof): StormTreeBloom = bloom;
 
-    // Starts at the leaf, not the branch: `storm-tree` hashes every leaf.
-    let computed_root: u256 = array_fold::<storm_tree_fold_step, 48>(
+    let computed_root: u256 = array_fold::<storm_tree_fold_step, 17>(
         merkle_proof,
         get_storm_tree_leaf(branch)
     );

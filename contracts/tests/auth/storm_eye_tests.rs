@@ -8,7 +8,9 @@ use simplex::transaction::{
 use oracle_contracts::artifacts::auth::AuthProgram;
 use oracle_contracts::artifacts::auth::derived_auth::{AuthArguments, AuthWitness};
 
-use super::storm_tree::{Branch, StormTree, WITNESS_DEPTH, WitnessStep};
+use storm_tree::smt::MerkleTree;
+
+use super::covenant::{Branch, WITNESS_DEPTH, WitnessStep, build_tree, witness_proof};
 
 const STORM_EYE_SUPPLY: u64 = 10_000;
 
@@ -51,19 +53,20 @@ fn issue_storm_eye_asset(
 fn setup_storm_eye(
     context: &simplex::TestContext,
     rescue_number: u32,
-) -> anyhow::Result<(AuthProgram, StormTree, Branch, AssetId)> {
+) -> anyhow::Result<(AuthProgram, MerkleTree, Branch, AssetId)> {
     let signer = context.get_default_signer();
     let signing_branch: Branch = signer.get_schnorr_public_key().serialize();
 
     // The other combinations the network could have signed with.
     let branches = vec![signing_branch];
 
-    let storm_tree = StormTree::new(&branches);
+    let storm_tree = build_tree(&branches);
 
     let mut program = AuthProgram::new(&AuthArguments {
         // Unused by these tests; the split path is not exercised.
         max_split_utxos_count: 4,
-    }).with_storage_capacity(2);
+    })
+    .with_storage_capacity(2);
 
     program.set_storage_at(0, storm_tree.root());
     program.set_storage_at(1, rescue_block_slot_value(rescue_number));
@@ -81,7 +84,7 @@ fn spends_storm_eye_without_updating_storage(context: simplex::TestContext) -> a
 
     let rescue_number = 1234;
     let (program, storm_tree, signing_branch, _) = setup_storm_eye(&context, rescue_number)?;
-    let proof: [WitnessStep; WITNESS_DEPTH] = storm_tree.witness_proof(&signing_branch);
+    let proof: [WitnessStep; WITNESS_DEPTH] = witness_proof(&storm_tree, &signing_branch);
 
     let storm_eye_script_pubkey = program.get_script_pubkey(context.get_network());
     let storm_eye_utxo = provider.fetch_scripthash_utxos(&storm_eye_script_pubkey)?[0].clone();
@@ -123,7 +126,8 @@ fn rotated_program(new_merkle_root: [u8; 32], new_rescue_number: u32) -> AuthPro
     let mut program = AuthProgram::new(&AuthArguments {
         // Unused by these tests; the split path is not exercised.
         max_split_utxos_count: 4,
-    }).with_storage_capacity(2);
+    })
+    .with_storage_capacity(2);
 
     program.set_storage_at(0, new_merkle_root);
     program.set_storage_at(1, rescue_block_slot_value(new_rescue_number));
@@ -142,9 +146,9 @@ fn spends_storm_eye_with_update_storm_tree_root(
 
     let rescue_number = 1234;
     let (program, storm_tree, signing_branch, _) = setup_storm_eye(&context, rescue_number)?;
-    let proof: [WitnessStep; WITNESS_DEPTH] = storm_tree.witness_proof(&signing_branch);
+    let proof: [WitnessStep; WITNESS_DEPTH] = witness_proof(&storm_tree, &signing_branch);
 
-    let rotated_tree = StormTree::new(&[signing_branch, [7u8; 32]]);
+    let rotated_tree = build_tree(&[signing_branch, [7u8; 32]]);
     let rotated = rotated_program(rotated_tree.root(), rescue_number);
 
     let storm_eye_script_pubkey = program.get_script_pubkey(context.get_network());
@@ -197,7 +201,7 @@ fn spends_storm_eye_with_update_rescue_block_number(
 
     let rescue_number = 1234;
     let (program, storm_tree, signing_branch, _) = setup_storm_eye(&context, rescue_number)?;
-    let proof: [WitnessStep; WITNESS_DEPTH] = storm_tree.witness_proof(&signing_branch);
+    let proof: [WitnessStep; WITNESS_DEPTH] = witness_proof(&storm_tree, &signing_branch);
 
     let rotated_rescue_number = rescue_number + 1_576_800;
     let rotated = rotated_program(storm_tree.root(), rotated_rescue_number);

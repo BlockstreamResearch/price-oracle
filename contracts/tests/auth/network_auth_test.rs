@@ -1,11 +1,5 @@
 //! Exercises `assert_network_authorization` on its own, before the full flow.
 
-
-// Currently broken, because of the following error:
-// stderr ───
-//    Error: Broadcast failed with HTTP 400 for http://127.0.0.1:33145/tx: sendrawtransaction RPC error -26: non-mandatory-script-verify-flag (Program's execution cost could exceed budget)
-
-/*
 use simplex::simplicityhl::elements::AssetId;
 use simplex::transaction::partial_input::IssuanceInput;
 use simplex::transaction::{
@@ -17,7 +11,7 @@ use oracle_contracts::artifacts::auth_helpers::network_auth_test::derived_networ
     NetworkAuthTestArguments, NetworkAuthTestWitness,
 };
 
-use super::storm_tree::{Branch, StormTree, WITNESS_DEPTH, WitnessStep};
+use super::covenant::{Branch, WITNESS_DEPTH, WitnessStep, build_tree, witness_proof};
 
 const SUPPLY: u64 = 500_000;
 
@@ -54,8 +48,8 @@ fn accepts_a_valid_inclusion_proof(context: simplex::TestContext) -> anyhow::Res
 
     let signing_branch: Branch = signer.get_schnorr_public_key().serialize();
     let branches = vec![signing_branch, [1u8; 32], [2u8; 32]];
-    let storm_tree = StormTree::new(&branches);
-    let proof: [WitnessStep; WITNESS_DEPTH] = storm_tree.witness_proof(&signing_branch);
+    let storm_tree = build_tree(&branches);
+    let proof: [WitnessStep; WITNESS_DEPTH] = witness_proof(&storm_tree, &signing_branch);
 
     let program = NetworkAuthTestProgram::new(&NetworkAuthTestArguments {});
     let script_pubkey = program.get_script_pubkey(context.get_network());
@@ -87,4 +81,3 @@ fn accepts_a_valid_inclusion_proof(context: simplex::TestContext) -> anyhow::Res
 
     Ok(())
 }
-*/
