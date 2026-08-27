@@ -6,8 +6,7 @@
 # out_dir = "./src/artifacts"
 
 [dependencies]
-# TODO: Change to the appropriate tag when it becomes available
-std = { git = "https://github.com/BlockstreamResearch/simplicityhl-std.git", rev = "4d5c11d65d45be4bfafe8d1970462c69d511a9a3" } 
+std = { git = "https://github.com/BlockstreamResearch/simplicityhl-std.git", tag = "v0.1.0" } 
 
 # [regtest]
 # mnemonic = "exist carry drive collect lend cereal occur much tiger just involve mean"
