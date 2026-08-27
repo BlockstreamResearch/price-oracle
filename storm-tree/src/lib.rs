@@ -22,15 +22,6 @@ pub type StormTreeRoot = [u8; 32];
 pub type StormTreeProof = smt::Proof;
 
 /// The deepest Storm Tree the covenant can verify, `ceil(log2(MAX_BRANCHES))`.
-///
-/// A tree is built only as deep as its branch count needs, so a small network produces a
-/// shallow tree and a short proof. This is the ceiling the covenant's fold is compiled
-/// for, and the levels a shallower tree does not use are padding in the witness.
-///
-/// Because leaves sit at fixed positions rather than being addressed by their value, this
-/// is arithmetic rather than a probability: no branch set can fail to fit.
-///
-/// This is a consensus parameter.
 pub const TREE_DEPTH: u32 = 17;
 
 const MIN_NODES: usize = 3;
