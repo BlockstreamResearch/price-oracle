@@ -60,7 +60,6 @@ fn spends_treasury_when_storm_eye_is_present(context: simplex::TestContext) -> a
             Box::new(treasury.as_ref().clone()),
             Box::new(TreasuryWitness {
                 storm_eye_input_index: 1,
-                treasury_utxo_output_index: 0,
             }),
         ),
         RequiredSignature::None,

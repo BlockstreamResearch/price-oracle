@@ -1,17 +1,12 @@
 use std::lib::asserts::assert_eq_256;
 
-fn treasury(storm_eye_input_index: u32, treasury_utxo_output_index: u32) {
+fn treasury(storm_eye_input_index: u32) {
     let input_asset: u256 = unwrap_right::<Point>(unwrap(jet::input_asset(storm_eye_input_index)));
     assert_eq_256(input_asset, param::STORM_EYE_ASSET_ID);
-
-    let output_asset: u256 = unwrap_right::<Point>(unwrap(jet::output_asset(treasury_utxo_output_index)));
-    let current_asset: u256 = unwrap_right::<Point>(jet::current_asset());
-    assert_eq_256(output_asset, current_asset);
 }
 
 fn main() {
     let storm_eye_input_index: u32 = witness::STORM_EYE_INPUT_INDEX;
-    let treasury_utxo_output_index: u32 = witness::TREASURY_UTXO_OUTPUT_INDEX;
 
-    treasury(storm_eye_input_index, treasury_utxo_output_index);
+    treasury(storm_eye_input_index);
 }

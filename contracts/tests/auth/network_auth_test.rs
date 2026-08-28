@@ -67,7 +67,7 @@ fn accepts_a_valid_inclusion_proof(context: simplex::TestContext) -> anyhow::Res
                 storm_tree_bloom: ([0u8; 64], signing_branch, proof),
             }),
         ),
-        RequiredSignature::WitnessWithPath("STORM_TREE_BLOOM".to_string(), vec!["0".to_string()]),
+        RequiredSignature::tagged("STORM_TREE_BLOOM", vec!["0".to_string()], "OracleNetworkV1/StormEye"),
     );
 
     // The covenant inspects no outputs, so this one only has to carry the asset somewhere.
