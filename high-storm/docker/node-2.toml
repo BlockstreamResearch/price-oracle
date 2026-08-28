@@ -1,6 +1,6 @@
 [service]
 port = 9000
-rest_address = "0.0.0.0:9100"
+external_api_address = "0.0.0.0:9100"
 
 [service.signer]
 # Development-only deterministic key. Do not use in production.

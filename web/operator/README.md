@@ -11,7 +11,7 @@ bun install
 bun run dev
 ```
 
-Vite proxies `/operators/*` to Compose node 1 at `http://127.0.0.1:9100`. Set `OPERATOR_API_TARGET` to use another high-storm REST address.
+Vite proxies `/operators/*` to Compose node 1 at `http://127.0.0.1:9100`. Set `OPERATOR_API_TARGET` to use another high-storm external API address.
 
 ```sh
 OPERATOR_API_TARGET=http://127.0.0.1:9100 bun run dev

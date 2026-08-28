@@ -4,12 +4,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use axum::{Json, extract::State, http::HeaderMap};
 use bitcoin::{Address, CompressedPublicKey, address::KnownHrp};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use crate::db::node_operator::NodeOperatorStore;
+use crate::{
+    db::node_operator::NodeOperatorStore,
+    external_api::{ApiError, ExternalApiState},
+};
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(5 * 60);
 const TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
@@ -51,6 +55,18 @@ pub struct Challenge {
 pub struct AccessToken {
     pub token: String,
     pub expires_at: u64,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ChallengeRequest {
+    public_key: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TokenRequest {
+    public_key: String,
+    message: String,
+    signature: String,
 }
 
 #[derive(Deserialize)]
@@ -126,7 +142,8 @@ impl AuthService {
         .await
     }
 
-    pub fn write_message<T: Serialize>(
+    #[cfg(test)]
+    pub(crate) fn write_message<T: Serialize>(
         method: &str,
         path: &str,
         timestamp: u64,
@@ -262,6 +279,43 @@ impl AuthService {
             Err(AuthError::Unauthorized)
         }
     }
+}
+
+pub(super) async fn issue_challenge(
+    State(state): State<ExternalApiState>,
+    Json(request): Json<ChallengeRequest>,
+) -> Result<Json<Challenge>, ApiError> {
+    state
+        .auth
+        .issue_challenge(&request.public_key)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+pub(super) async fn exchange_token(
+    State(state): State<ExternalApiState>,
+    Json(request): Json<TokenRequest>,
+) -> Result<Json<AccessToken>, ApiError> {
+    state
+        .auth
+        .exchange_token(&request.public_key, &request.message, &request.signature)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+pub(super) async fn authenticate_bearer(
+    auth: &AuthService,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
+    auth.authenticate_token(token).await?;
+    Ok(())
 }
 
 impl AuthState {
