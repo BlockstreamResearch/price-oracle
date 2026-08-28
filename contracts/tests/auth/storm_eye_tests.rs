@@ -243,3 +243,59 @@ fn spends_storm_eye_with_update_rescue_block_number(
 
     Ok(())
 }
+
+/// 4. Authorized splitting of a Storm Eye UTXO into multiple UTXOs.
+#[simplex::test]
+fn splits_storm_eye_into_multiple_utxos(context: simplex::TestContext) -> anyhow::Result<()> {
+    let signer = context.get_default_signer();
+    let provider = context.get_default_provider();
+
+    let rescue_number = 1234;
+    let (program, storm_tree, signing_branch, _) = setup_storm_eye(&context, rescue_number)?;
+    let proof: [WitnessStep; WITNESS_DEPTH] = witness_proof(&storm_tree, &signing_branch);
+
+    let storm_eye_script_pubkey = program.get_script_pubkey(context.get_network());
+    let storm_eye_utxo = provider.fetch_scripthash_utxos(&storm_eye_script_pubkey)?[0].clone();
+
+    // Any distribution, as long as it sums to the input amount.
+    let amounts = [5_000u64, 3_000, 2_000];
+    assert_eq!(
+        amounts.iter().sum::<u64>(),
+        storm_eye_utxo.explicit_amount()
+    );
+
+    let mut final_utxo = FinalTransaction::new();
+
+    final_utxo.add_program_input(
+        PartialInput::new(storm_eye_utxo.clone()),
+        ProgramInput::new(
+            Box::new(program.as_ref().clone()),
+            Box::new(AuthWitness {
+                path: Either::Left((
+                    (storm_tree.root(), rescue_number),
+                    ([0u8; 64], signing_branch, proof),
+                    // split_utxos_count
+                    Either::Right(Either::Right(Either::Left(amounts.len() as u8))),
+                )),
+            }),
+        ),
+        RequiredSignature::tagged(
+            "PATH",
+            vec!["Left".to_string(), "1".to_string(), "0".to_string()],
+            "OracleNetworkV1/StormEye",
+        ),
+    );
+
+    // Outputs 0..N-1, same script and asset, so the covenant's loop sees them.
+    for amount in amounts {
+        final_utxo.add_output(PartialOutput::new(
+            storm_eye_script_pubkey.clone(),
+            amount,
+            storm_eye_utxo.explicit_asset(),
+        ));
+    }
+
+    signer.broadcast(&final_utxo)?.wait()?;
+
+    Ok(())
+}

@@ -1,5 +1,8 @@
 use std::lib::asserts::{assert_eq_1, assert_eq_32, assert_eq_64, assert_eq_256};
+use std::lib::u8::math::gt_8;
+use std::lib::u8::convert::u8_to_u32;
 use std::lib::u32::math::{safe_add_32, gt_32};
+use std::lib::u64::math::safe_add_64;
 
 use crate::helper::{get_explicit_current_amount, get_explicit_output_amount};
 use crate::storage::{get_script_hash_for_storage};
@@ -15,9 +18,9 @@ type RootUpdateWit = (u256, u32);
 /// 3. new_rescue_block_number, output_index
 type RescueBlockUpdateWit = (Height, u32);
 /// 4. split_utxos_count
-type SplitWit = u32;
+type SplitWit = u8;
 /// 5. utxos_to_merge
-type MergeWit = u32;
+type MergeWit = u8;
 
 type UpdateKind = Either<RootUpdateWit, RescueBlockUpdateWit>;
 type ReshapeKind = Either<SplitWit, MergeWit>;
@@ -92,13 +95,37 @@ fn auth_with_update_rescue_block(
     assert_utxo_preserved(output_ind);
 }
 
+/// Loop-invariant data for the split: how many outputs to visit, and what each must look like.
+type SplitCtx = (u8, u256, u256);
 
+/// One split output: check its shape, add its amount. `Left` ends the loop.
+fn step_collect_total_amount(
+    total_outputs_amount: u64,
+    ctx: SplitCtx,
+    counter: u8,
+) -> Either<u64, u64> {
+    let (split_utxos_count, expected_script_hash, current_asset): SplitCtx = ctx;
+
+    match jet::lt_8(counter, split_utxos_count) {
+        // Past the last split output: stop, carrying the total.
+        false => Left(total_outputs_amount),
+        true => {
+            let output_ind: u32 = u8_to_u32(counter);
+            let (output_asset, output_amount): (u256, u64) = get_explicit_output_amount(output_ind);
+            
+            assert_eq_256(unwrap(jet::output_script_hash(output_ind)), expected_script_hash);
+            assert_eq_256(output_asset, current_asset);
+
+            Right(safe_add_64(total_outputs_amount, output_amount))
+        },
+    }
+}
 
 /// 4. Authorized splitting of a Storm Eye UTXO into
 /// multiple UTXOs with the same Storm Tree root.
 fn auth_split_storm_eye_utxo_into_multiple_utxos(
     storage: Storage,
-    split_utxos_count: u32
+    split_utxos_count: u8
 ) {
     assert_eq_32(jet::current_index(), 0);
 
@@ -106,15 +133,21 @@ fn auth_split_storm_eye_utxo_into_multiple_utxos(
     let expected_current_script_hash: u256 = get_script_hash_for_storage(merkle_root, rescue_block_number);
     assert_eq_256(jet::current_script_hash(), expected_current_script_hash);
 
-    assert!(gt_32(split_utxos_count, 1));
-    assert!(jet::le_32(split_utxos_count, param::MAX_SPLIT_UTXOS_COUNT));
+    assert!(gt_8(split_utxos_count, 1));
+    assert!(jet::le_8(split_utxos_count, param::MAX_SPLIT_UTXOS_COUNT));
+
+    let (current_asset, current_amount): (u256, u64) = get_explicit_current_amount();
+    let ctx: SplitCtx = (split_utxos_count, expected_current_script_hash, current_asset);
+
+    let out: Either<u64, u64> = for_while::<step_collect_total_amount>(0, ctx);
+    assert_eq_64(current_amount, unwrap_left::<u64>(out));
 }
 
 /// Authorized merging of multiple Storm Eyes into
 /// a single Storm Eye UTXO with the same Storm Tree root.
 fn auth_merge_multiple_storm_eyes_into_single_utxo(
     storage: Storage,
-    utxos_to_merge: u32
+    utxos_to_merge: u8
 ) {
     panic!()
 }
