@@ -134,7 +134,7 @@ fn auth_split_storm_eye_utxo_into_multiple_utxos(
     assert_eq_256(jet::current_script_hash(), expected_current_script_hash);
 
     assert!(gt_8(split_utxos_count, 1));
-    assert!(jet::le_8(split_utxos_count, param::MAX_SPLIT_UTXOS_COUNT));
+    assert!(jet::lt_8(split_utxos_count, param::MAX_SPLIT_UTXOS_COUNT));
 
     let (current_asset, current_amount): (u256, u64) = get_explicit_current_amount();
     let ctx: SplitCtx = (split_utxos_count, expected_current_script_hash, current_asset);

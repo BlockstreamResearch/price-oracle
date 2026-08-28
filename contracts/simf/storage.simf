@@ -38,23 +38,3 @@ pub fn get_script_hash_for_storage(merkle_root: u256, rescue_block_number: u32) 
 
     jet::sha_256_ctx_8_finalize(hash_ctx)
 }
-
-/*
-/// Load. Proves the given state is the one the spent UTXO's address commits to.
-pub fn assert_current_storage(merkle_root: u256, rescue_block_number: u32) {
-    let expected_script_hash: u256 = get_script_hash_for_storage(merkle_root, rescue_block_number);
-
-    assert_eq_256(jet::current_script_hash(), expected_script_hash);
-}
-
-pub fn assert_output_storage(
-    output_index: u32,
-    merkle_root: u256,
-    rescue_block_number: u32
-) {
-    let expected_script_hash: u256 = get_script_hash_for_storage(merkle_root, rescue_block_number);
-    let output_script_hash: u256 = unwrap(jet::output_script_hash(output_index));
-
-    assert_eq_256(output_script_hash, expected_script_hash);
-}
-*/
