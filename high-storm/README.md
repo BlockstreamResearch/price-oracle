@@ -17,7 +17,7 @@ high-storm/docker.sh connections 1 # List node 1's active connections.
 ```
 
 The Storm listeners are exposed on host ports `9000`, `9001`, and `9002`; their
-REST APIs are exposed on `9100`, `9101`, and `9102`.
+external APIs are exposed on `9100`, `9101`, and `9102`.
 Each node has its own operator platform at `http://127.0.0.1:9200`,
 `http://127.0.0.1:9201`, and `http://127.0.0.1:9202`, respectively. For local
 development, log in with the matching deterministic secret from
@@ -39,8 +39,8 @@ The checked-in identities and database password are for local development only.
 Copy `config.example.toml` to `config.toml`, then set the listener port, signer key,
 and PostgreSQL connection fields. The `service.db.url` value is the database host
 and optional port, for example `localhost:5432`. Set `service.ipc_path` to a unique
-Unix socket path for each high-storm process running on the same host. The REST API
-binds to `service.rest_address`, which defaults to `127.0.0.1:9001`.
+Unix socket path for each high-storm process running on the same host. The external API
+binds to `service.external_api_address`, which defaults to `127.0.0.1:9001`.
 
 ## Initialize a network
 
@@ -87,7 +87,7 @@ user that started the node and the root user are authorized to use the socket.
 When high-storm uses a non-default `service.ipc_path`, pass the same path to the
 client with `--socket <path>`.
 
-## REST API
+## External API
 
 Operator identities are compressed secp256k1 public keys. High-storm derives each
 key's mainnet P2WPKH address and verifies BIP322-simple signatures against it.

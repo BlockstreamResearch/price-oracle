@@ -1,10 +1,100 @@
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+};
 use secp256k1::XOnlyPublicKey;
 use serde::{Deserialize, Serialize};
 
+use super::auth::{SignedRequest, authenticate_bearer};
 use crate::{
     MergeStormEyes, NetworkVoteKind, NetworkVoteRequest, SplitStormEye, StormEyeUtxo,
     UpdateNetworkMembers, VotingRequest, VotingStatus,
+    external_api::{ApiError, ExternalApiState},
 };
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(super) struct EmptyPayload {}
+
+#[derive(Serialize)]
+pub(super) struct CreatedVoting {
+    message_hash: String,
+}
+
+pub(super) async fn list_votings(
+    State(state): State<ExternalApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<VotingResponse>>, ApiError> {
+    authenticate_bearer(&state.auth, &headers).await?;
+    state
+        .node
+        .voting_requests()
+        .await?
+        .into_iter()
+        .map(VotingResponse::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
+pub(super) async fn get_voting(
+    State(state): State<ExternalApiState>,
+    headers: HeaderMap,
+    Path(hash): Path<String>,
+) -> Result<Json<VotingResponse>, ApiError> {
+    authenticate_bearer(&state.auth, &headers).await?;
+    let hash = parse_hash(&hash)?;
+    let voting = state
+        .node
+        .voting_request(hash)
+        .await?
+        .ok_or_else(|| ApiError::not_found("voting request does not exist"))?;
+    VotingResponse::try_from(voting)
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
+pub(super) async fn create_voting(
+    State(state): State<ExternalApiState>,
+    Json(request): Json<SignedRequest<VotingProposal>>,
+) -> Result<(StatusCode, Json<CreatedVoting>), ApiError> {
+    state
+        .auth
+        .verify_write(&request, "POST", "/operators/voting")
+        .await?;
+    let voting = request
+        .payload
+        .into_request()
+        .map_err(ApiError::bad_request)?;
+    let message_hash = state.node.create_voting_request(voting).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedVoting {
+            message_hash: hex::encode(message_hash),
+        }),
+    ))
+}
+
+pub(super) async fn approve_voting(
+    State(state): State<ExternalApiState>,
+    Path(hash): Path<String>,
+    Json(request): Json<SignedRequest<EmptyPayload>>,
+) -> Result<StatusCode, ApiError> {
+    let path = format!("/operators/voting/{hash}/approve");
+    state.auth.verify_write(&request, "POST", &path).await?;
+    state
+        .node
+        .approve_voting_request(parse_hash(&hash)?)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn parse_hash(encoded: &str) -> Result<[u8; 32], ApiError> {
+    hex::decode(encoded)
+        .map_err(|_| ApiError::bad_request("invalid voting request hash"))?
+        .try_into()
+        .map_err(|_| ApiError::bad_request("invalid voting request hash"))
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

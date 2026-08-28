@@ -22,8 +22,8 @@ pub struct ServiceConfig {
     pub port: u16,
     #[serde(default = "default_ipc_path")]
     pub ipc_path: PathBuf,
-    #[serde(default = "default_rest_address")]
-    pub rest_address: SocketAddr,
+    #[serde(default = "default_external_api_address")]
+    pub external_api_address: SocketAddr,
     pub signer: SignerConfig,
     pub db: DbConfig,
 }
@@ -32,10 +32,10 @@ fn default_ipc_path() -> PathBuf {
     "/tmp/high-storm.sock".into()
 }
 
-fn default_rest_address() -> SocketAddr {
+fn default_external_api_address() -> SocketAddr {
     "127.0.0.1:9001"
         .parse()
-        .expect("the default REST address is valid")
+        .expect("the default external API address is valid")
 }
 
 #[derive(Clone, Debug, Deserialize)]
