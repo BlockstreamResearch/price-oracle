@@ -480,7 +480,7 @@ Outputs:
 
 ## 5.1. Description
 
-This contract is designed to store users' LBTC, which will be used by the network to issue Tick and Verifier UTXOs.
+This contract is designed to store users' LBTC, which will be used by the network to issue and burn Tick and Verifier UTXOs.
 
 ## 5.2. Compilation parameters
 
@@ -491,44 +491,19 @@ This contract is designed to store users' LBTC, which will be used by the networ
 
 The Verifier asset contract has next spending paths:
 
-1. User authorized spending  
-2. Network authorized spending
+1. Network authorized spending
 
-### 5.3.1. User authorized spending
-
-In this scenario, the user can spend an Account UTXO to top up their account with LBTC assets. To spend it, the user must include the *jet::sig\_all\_hash* signature
-
-The following witness parameters are accepted for spending:
-
-1. *amount\_to\_deposit* \- the amount of the asset to deposit to the user Account UTXO  
-2. *account\_utxo\_output\_index* \- the output index of the user Account UTXO  
-3. *owner\_signature* \- the account owner *jet::sig\_all\_hash* signature
-
-This spending path will include the following checks:
-
-1. jet::bip\_0340\_verify((param::ACCOUNT\_OWNER\_PUBKEY, jet::sig\_all\_hash()), *owner\_signature*)  
-2. assert(jet::output\_asset(*account\_utxo\_output\_index*) \== jet::current\_asset())  
-3. new\_account\_amount \= safe\_add(jet::current\_amount(), *amount\_to\_deposit*)  
-4. assert(jet::output\_amount(*account\_utxo\_output\_index*) \== new\_account\_amount)  
-5. assert(jet::output\_script\_hash(*account\_utxo\_output\_index*) \== jet::current\_script\_hash())
-
-### 5.3.2. Network authorized spending
+### 5.3.1. Network authorized spending
 
 In this scenario, the network can spend a user Account UTXO. To spend it, the network must include the Storm Eye UTXO in the transaction.
 
 The following witness parameters are accepted for spending:
 
 1. *storm\_eye\_input\_index* \- the Storm Eye UTXO input index  
-2. *amount\_to\_withdraw* \- the amount of the asset to withdraw from the user Account UTXO  
-3. *account\_utxo\_output\_index* \- the output index of the user Account UTXO
 
 This spending path will include the following checks:
 
 1. assert(jet::input\_asset(*storm\_eye\_input\_index*) \== param::STORM\_EYE\_ASSET\_ID)  
-2. assert(jet::output\_asset(*account\_utxo\_output\_index*) \== jet::current\_asset())  
-3. new\_account\_amount \= safe\_sub(jet::current\_amount(), *amount\_to\_withdraw*)  
-4. assert(jet::output\_amount(*account\_utxo\_output\_index*) \== new\_account\_amount)  
-5. assert(jet::output\_script\_hash(*account\_utxo\_output\_index*) \== jet::current\_script\_hash())
 
 # 6\. Treasury contract
 
@@ -553,10 +528,7 @@ In this scenario, the network can spend a user Treasury UTXO. To spend it, the n
 The following witness parameters are accepted for spending:
 
 1. *storm\_eye\_input\_index* \- the Storm Eye UTXO input index  
-2. *treasury\_utxo\_output\_index* \- the output index of the user Account UTXO
 
 This spending path will include the following checks:
 
 1. assert(jet::input\_asset(*storm\_eye\_input\_index*) \== param::STORM\_EYE\_ASSET\_ID)  
-2. assert(jet::output\_asset(*treasury\_utxo\_output\_index*) \== jet::current\_asset())  
-3. assert(jet::output\_script\_hash(*treasury\_utxo\_output\_index*) \== jet::current\_script\_hash())
