@@ -143,7 +143,7 @@ fn auth_split_storm_eye_utxo_into_multiple_utxos(
     assert_eq_64(current_amount, unwrap_left::<u64>(out));
 }
 
-/// Authorized merging of multiple Storm Eyes into
+/// 5. Authorized merging of multiple Storm Eyes into
 /// a single Storm Eye UTXO with the same Storm Tree root.
 fn auth_merge_multiple_storm_eyes_into_single_utxo(
     storage: Storage,
@@ -152,7 +152,7 @@ fn auth_merge_multiple_storm_eyes_into_single_utxo(
     panic!()
 }
 
-/// Inclusion in a transaction upon reaching the rescue block number,
+/// 6. Inclusion in a transaction upon reaching the rescue block number,
 /// with the option to spend to output with the RESCUE_OUTPUT_SCRIPT_HASH script hash
 fn transaction_inclusion(
     storage: Storage,
