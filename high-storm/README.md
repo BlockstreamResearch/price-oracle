@@ -2,18 +2,20 @@
 
 `high-storm` persists Storm discovery state in PostgreSQL and restores it on later runs.
 
-## Three-node Docker deployment
+## Local Docker deployment
 
-The included Compose stack starts PostgreSQL and three preconfigured development
-nodes. On the first start, node 1 hosts discovery and nodes 2 and 3 join it. Later
-starts restore each node from its own database. Manage it from any directory with:
+The included Compose stack starts PostgreSQL, three preconfigured High Storm nodes,
+three operator platforms, and three interconnected Elements nodes. On the first
+start, High Storm node 1 hosts discovery and nodes 2 and 3 join it. Later starts
+restore each node from its own database. Manage it from any directory with:
 
 ```sh
-high-storm/docker.sh create # Reset data, rebuild, and start everything.
-high-storm/docker.sh up     # Start while preserving initialized state.
-high-storm/docker.sh rebuild # Rebuild Rust and restart nodes, preserving state.
-high-storm/docker.sh down   # Stop while preserving initialized state.
-high-storm/docker.sh connections 1 # List node 1's active connections.
+high-storm/devenv.sh create # Reset data, rebuild, and start everything.
+high-storm/devenv.sh up     # Start while preserving initialized state.
+high-storm/devenv.sh rebuild # Rebuild Rust and restart nodes, preserving state.
+high-storm/devenv.sh down   # Stop while preserving initialized state.
+high-storm/devenv.sh connections 1 # List node 1's active connections.
+high-storm/devenv.sh elements 1 getblockchaininfo # Call node 1's Elements RPC.
 ```
 
 The Storm listeners are exposed on host ports `9000`, `9001`, and `9002`; their
@@ -29,6 +31,27 @@ PostgreSQL is exposed on `5432`. Follow the node logs with:
 docker compose -f high-storm/compose.yml logs -f node-1 node-2 node-3
 ```
 
+Elements RPC is exposed on host ports `18884`, `18885`, and `18886`. Every High
+Storm node uses its matching Elements daemon through `service.elements_rpc`.
+Elements `29.4.1rc1` is built from its release tag and verified against commit
+`a4d4c96ac7a7a9171b6f777e287ee4df18d779e1` and the checked-in source archive
+checksum.
+
+The bootstrap service claims the development chain's initial free coins and sends
+exactly 50 LBTC to the private key in `docker/funded-private-key.txt`. It then mines
+one block immediately and one block every 60 seconds. The bootstrap is idempotent,
+so restarting it does not fund the key again. Inspect the funded wallet with:
+
+```sh
+docker compose -f high-storm/compose.yml exec -T elements-1 \
+  elements-cli -chain=elementsregtest -rpcport=18884 \
+  -rpcuser=high-storm -rpcpassword=high-storm \
+  -rpcwallet=funded-key getbalance
+```
+
+The chain, RPC credentials, signer keys, and funded private key are for local
+development only.
+
 Heartbeat send and receive events are emitted at trace level. Enable them with
 `RUST_LOG=info,high_storm=debug,storm=debug,storm::heartbeat=trace`.
 
@@ -37,10 +60,12 @@ The checked-in identities and database password are for local development only.
 ## Configuration
 
 Copy `config.example.toml` to `config.toml`, then set the listener port, signer key,
-and PostgreSQL connection fields. The `service.db.url` value is the database host
-and optional port, for example `localhost:5432`. Set `service.ipc_path` to a unique
-Unix socket path for each high-storm process running on the same host. The external API
-binds to `service.external_api_address`, which defaults to `127.0.0.1:9001`.
+Elements RPC endpoint, and PostgreSQL connection fields. The
+`service.elements_rpc.url` value is the full HTTP endpoint for that node's Elements
+daemon. The `service.db.url` value is the database host and optional port, for
+example `localhost:5432`. Set `service.ipc_path` to a unique Unix socket path for
+each high-storm process running on the same host. The external API binds to
+`service.external_api_address`, which defaults to `127.0.0.1:9001`.
 
 ## Initialize a network
 

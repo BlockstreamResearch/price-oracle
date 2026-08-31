@@ -9,6 +9,11 @@ external_api_address = "127.0.0.1:9001"
 # this is a example key, do not use it anywhere else
 private_key = "804622cda0d8e634317a12651d91751ceff5c081f2b5f63ef7912725c7275e5d"
 
+[service.elements_rpc]
+url = "http://127.0.0.1:18884"
+username = "high-storm"
+password = "high-storm"
+
 [service.db]
 url = "localhost:5432"
 username = "high-storm"
