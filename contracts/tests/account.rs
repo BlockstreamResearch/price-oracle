@@ -1,9 +1,3 @@
-//! 5. Account contract (spec §5.3.2): network-authorized spending.
-//!
-//! §5.3.1, the user deposit path, is not implemented yet — the covenant binds
-//! `ACCOUNT_OWNER_PUBKEY` as a parameter but nothing verifies against it, so the tests
-//! compile the account with an empty key.
-
 #[path = "common/mod.rs"]
 mod common;
 
