@@ -10,8 +10,9 @@ use contracts::artifacts::auth::derived_auth::AuthWitness;
 
 use storm_tree::smt::MerkleTree;
 
+use super::common::assert_covenant_rejects;
 use super::covenant::{Branch, WITNESS_DEPTH, WitnessStep, witness_proof};
-use super::fixtures::{MAX_SPLIT_UTXOS_COUNT, assert_covenant_rejects, setup_storm_eye};
+use super::fixtures::{MAX_SPLIT_UTXOS_COUNT, setup_storm_eye};
 
 /// Everything a split transaction needs that does not vary between these tests.
 struct SplitFixture {

@@ -1,3 +1,6 @@
+#[path = "../common/mod.rs"]
+mod common;
+
 mod covenant;
 mod fixtures;
 mod network_auth_test;

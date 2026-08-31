@@ -1,6 +1,5 @@
 //! Shared setup for the Storm Eye covenant tests.
 
-use simplex::signer::SignerError;
 use simplex::simplicityhl::elements::AssetId;
 use simplex::transaction::partial_input::IssuanceInput;
 use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, RequiredSignature};
@@ -83,16 +82,4 @@ pub fn setup_storm_eye(
     let storm_eye_asset = issue_storm_eye_asset(context, &program)?;
 
     Ok((program, storm_tree, signing_branch, storm_eye_asset))
-}
-
-/// Asserts the transaction is rejected by the covenant
-#[track_caller]
-pub fn assert_covenant_rejects(context: &simplex::TestContext, tx: &FinalTransaction) {
-    match context.get_default_signer().broadcast(tx) {
-        Err(SignerError::CovenantExecution { index, source, .. }) => {
-            println!("covenant rejected input {index} as expected: {source}");
-        }
-        Err(other) => panic!("expected the covenant to reject the transaction, got: {other}"),
-        Ok(_) => panic!("expected the covenant to reject the transaction, but it was accepted"),
-    }
 }

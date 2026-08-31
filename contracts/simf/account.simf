@@ -1,0 +1,14 @@
+use std::lib::asserts::assert_eq_256;
+
+fn network_asset_auth(storm_eye_input_index: u32) {
+    let input_asset: u256 = unwrap_right::<Point>(unwrap(jet::input_asset(storm_eye_input_index)));
+    assert_eq_256(input_asset, param::STORM_EYE_ASSET_ID);
+}
+
+fn main() {
+    let _: Pubkey = param::ACCOUNT_OWNER_PUBKEY;
+
+    let storm_eye_input_index: u32 = witness::STORM_EYE_INPUT_INDEX;
+
+    network_asset_auth(storm_eye_input_index);
+}
