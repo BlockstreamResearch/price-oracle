@@ -47,11 +47,6 @@ fn storm_eye_midstate() -> u256 {
     0xb144605cf5f45223882ae168403987ae38744e847ae307aa36d03152d250c3a6
 }
 
-/// BIP-340 midstate for `OracleNetworkV1/Price`.
-fn price_midstate() -> u256 {
-    0x8af552810209fa371d86431baca6eba01583cc76358485deccea9f5dc6a63190
-}
-
 // Network authorization
 
 /// The message the network signs for any Storm Eye operation, per Network Spec Part III §3.
