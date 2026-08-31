@@ -42,6 +42,7 @@ impl HighStorm {
         let state =
             NetworkState::new(&storm, secret_key, coordinator_public_key, voting_store).await;
         let handler_state = state.clone();
+
         storm
             .register_custom_handler(move |message, context| {
                 let state = handler_state.clone();
@@ -52,6 +53,7 @@ impl HighStorm {
                 }
             })
             .await;
+
         Self { storm, state }
     }
 
@@ -75,6 +77,7 @@ impl HighStorm {
             .into_iter()
             .find(|peer| peer.status == storm::PeerStatus::Controlled)
             .map(|peer| peer.compressed_public_key);
+
         local_public_key == Some(self.coordinator_public_key())
     }
 

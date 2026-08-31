@@ -127,6 +127,8 @@ key's mainnet P2WPKH address and verifies BIP322-simple signatures against it.
 | `GET` | `/operators/voting/{hash}` | `Authorization: Bearer <token>` |
 | `POST` | `/operators/voting` | Signed request envelope |
 | `POST` | `/operators/voting/{hash}/approve` | Signed request envelope |
+| `POST` | `/users/requests` | User Schnorr signature in JSON |
+| `GET` | `/users/requests/{request_hash}` | None; coordinator node only |
 
 Challenge and token requests use these shapes:
 
@@ -154,7 +156,30 @@ Canonical payload JSON is compact JSON with object keys sorted recursively; arra
 order is preserved. Timestamps must be within five minutes of the server clock and
 nonces may only be used once during that window. Vote payloads use the tagged kinds
 `update_network_members`, `merge_storm_eyes`, and `split_storm_eye`. Approval uses
-an empty object as its payload. `/users/*` currently returns `501 Not Implemented`.
+an empty object as its payload.
+
+User submissions contain a `header` and a non-empty `requests` array. Each fee
+UTXO is encoded as `<64-character txid>:<u32 output index>`. The coordinator
+currently validates only this format; it does not query Elements to verify the
+UTXO, its value, or its ownership. Only `tick-utxo` requests are accepted at this
+stage. Its `payload` is a JSON-encoded string with this shape:
+
+```json
+{"utxo_auth_method":{"kind":"signature-auth","auth_data":"<64-character x-only public key>"}}
+```
+
+The supported UTXO authentication kinds are `asset-id-auth`,
+`scriptPubKey-auth`, and `signature-auth`. Sign the BIP-340 tagged hash named
+`OracleNetworkV1/NetworkUserRequests` with the x-only key in
+`header.public_key`. The tagged-hash message is the byte concatenation of each
+request's payload, in array order, followed by each fee UTXO string, in array
+order. Encode the 64-byte Schnorr signature as hex in `header.signature`.
+
+Accepted submissions return `201` and a `request_hash`; submitting the same
+request again returns `409`. `GET /users/requests/{request_hash}` initially
+returns `{"status":"pending","payload":null}`. A node that is not the current
+coordinator returns `503` for both user routes. `signed-price-data` returns `422`
+until price request processing is implemented.
 
 The API has no TLS termination. Keep the default loopback bind or place it behind
 an authenticated TLS reverse proxy before exposing it beyond a trusted network.

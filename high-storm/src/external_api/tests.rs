@@ -1,3 +1,4 @@
+use ::secp256k1::{Keypair as SchnorrKeypair, SecretKey as SchnorrSecretKey, schnorr};
 use axum::{
     Router,
     body::Body,
@@ -12,7 +13,11 @@ use tower::ServiceExt;
 
 use crate::{HighStorm, db::Database};
 
-use super::{operators::AuthService, router};
+use super::{
+    operators::AuthService,
+    router,
+    users::{NetworkUserRequests, UserRequest, UserRequestHeader, signing_hash},
+};
 
 #[tokio::test]
 async fn authenticates_operator_reads_with_a_real_bip322_signature() {
@@ -119,7 +124,7 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
         )
         .await
         .unwrap();
-    assert_eq!(users.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(users.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -168,9 +173,78 @@ async fn creates_and_approves_voting_with_signed_requests() {
     assert_eq!(approve.status(), StatusCode::NO_CONTENT);
 }
 
+#[tokio::test]
+async fn registers_tick_requests_and_returns_pending_status() {
+    let (app, _, _) = setup().await;
+    let request = signed_user_request("tick-utxo", "signature-auth");
+
+    let created = app.clone().oneshot(user_request(&request)).await.unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = response_json(created).await;
+    let request_hash = created["request_hash"].as_str().unwrap();
+    assert_eq!(request_hash.len(), 64);
+
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/users/requests/{request_hash}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(status).await,
+        serde_json::json!({"status": "pending", "payload": null})
+    );
+
+    let duplicate = app.oneshot(user_request(&request)).await.unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn rejects_unsupported_or_invalid_user_requests() {
+    let (app, _, _) = setup().await;
+
+    let price = signed_user_request("signed-price-data", "signature-auth");
+    let response = app.clone().oneshot(user_request(&price)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let invalid_auth = signed_user_request("tick-utxo", "unknown-auth");
+    let response = app
+        .clone()
+        .oneshot(user_request(&invalid_auth))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let mut invalid_signature = signed_user_request("tick-utxo", "signature-auth");
+    invalid_signature.header.signature = hex::encode([0; 64]);
+    let response = app
+        .clone()
+        .oneshot(user_request(&invalid_signature))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/users/requests/{}", hex::encode([9; 32])))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 async fn setup() -> (Router, PrivateKey, String) {
     let database = Database::connect("sqlite::memory:", 1).await.unwrap();
     let operators = database.node_operators();
+
     let operator_secret = secp256k1::SecretKey::from_slice(&[42; 32]).unwrap();
     let operator_private_key = PrivateKey::new(operator_secret, Network::Bitcoin);
     let operator_public_key = operator_private_key
@@ -189,8 +263,9 @@ async fn setup() -> (Router, PrivateKey, String) {
         database.voting(),
     )
     .await;
+
     (
-        router(node.handle(), operators),
+        router(node.handle(), operators, database.user_requests()),
         operator_private_key,
         hex::encode(operator_public_key),
     )
@@ -224,6 +299,37 @@ fn signed_request(
             "payload": payload,
         }),
     )
+}
+
+fn signed_user_request(kind: &str, auth_kind: &str) -> NetworkUserRequests {
+    let secret_key = SchnorrSecretKey::from_secret_bytes([31; 32]).unwrap();
+    let keypair = SchnorrKeypair::from_secret_key(&secret_key);
+    let public_key = keypair.x_only_public_key().0.serialize();
+    let payload = serde_json::json!({
+        "utxo_auth_method": {
+            "kind": auth_kind,
+            "auth_data": hex::encode(public_key),
+        }
+    })
+    .to_string();
+    let mut request = NetworkUserRequests {
+        header: UserRequestHeader {
+            signature: String::new(),
+            public_key: hex::encode(public_key),
+            fee_utxos: vec![format!("{}:3", hex::encode([8; 32]))],
+        },
+        requests: vec![UserRequest {
+            kind: kind.to_string(),
+            payload,
+        }],
+    };
+    request.header.signature =
+        hex::encode(schnorr::sign(&signing_hash(&request), &keypair).to_byte_array());
+    request
+}
+
+fn user_request(request: &NetworkUserRequests) -> Request<Body> {
+    json_request("/users/requests", serde_json::to_value(request).unwrap())
 }
 
 async fn response_json(response: Response) -> serde_json::Value {

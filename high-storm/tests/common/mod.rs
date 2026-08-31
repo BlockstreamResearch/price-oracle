@@ -17,6 +17,7 @@ impl TestNode {
         let secret = SecretKey::from_slice(&[key_byte; 32]).unwrap();
         let public_key = secret.public_key(&Secp256k1::new()).serialize();
         let port = available_port();
+
         let config = Config {
             service: ServiceConfig {
                 port,

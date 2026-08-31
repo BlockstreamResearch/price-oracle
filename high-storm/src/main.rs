@@ -33,11 +33,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Action::Join(args.discovery_public_key, args.discovery_address),
         ),
     };
+
     tracing::info!(
         command = action.name(),
         config = %config_path.display(),
         "starting high-storm"
     );
+
     let config = Config::from_file(config_path)?;
     tracing::debug!(
         listen_port = config.service.port,
@@ -50,6 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Database::connect(&config.database_url()?, config.service.db.max_connections).await?;
     let store = database.network();
     tracing::info!("database is ready");
+
     let storm = match action {
         Action::Run => high_storm::start_initialized(&config, &store).await?,
         Action::Host(public_keys) => {
@@ -59,13 +62,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             high_storm::initialize_join(&config, &store, &public_key, &address).await?
         }
     };
+
     let external_api = ExternalApiServer::bind(
         config.service.external_api_address,
         storm.handle(),
         database.node_operators(),
+        database.user_requests(),
     )
     .await?;
     tracing::info!(address = %external_api.local_addr()?, "external API is listening");
+
     let ipc = IpcServer::bind(&config.service.ipc_path, database.node_operators()).await?;
     run_until_shutdown(storm, &store, ipc, external_api).await?;
 
@@ -97,17 +103,21 @@ async fn run_until_shutdown(
     let mut reconnect = tokio::time::interval(Duration::from_secs(3));
     reconnect.set_missed_tick_behavior(MissedTickBehavior::Skip);
     reconnect.tick().await;
+
     let mut persist_runtime = tokio::time::interval_at(
         Instant::now() + Duration::from_secs(10),
         Duration::from_secs(10),
     );
     persist_runtime.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+
     let ipc_task = tokio::spawn(ipc.run());
     tokio::pin!(ipc_task);
     let external_api_task = tokio::spawn(external_api.run());
     tokio::pin!(external_api_task);
+
     loop {
         tokio::select! {
             _ = &mut shutdown => {
@@ -135,10 +145,12 @@ async fn run_until_shutdown(
             }
         }
     }
+
     ipc_task.abort();
     let _ = ipc_task.await;
     external_api_task.abort();
     let _ = external_api_task.await;
+
     let peers = storm.peers().await;
     tracing::info!(
         peer_count = peers.len(),
@@ -147,6 +159,7 @@ async fn run_until_shutdown(
     store.save(&peers, storm.coordinator_public_key()).await?;
     storm.shutdown().await;
     tracing::info!("high-storm stopped");
+
     Ok(())
 }
 
