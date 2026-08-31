@@ -37,7 +37,7 @@ fn spends_storm_eye_without_updating_storage(context: simplex::TestContext) -> a
                 )),
             }),
         ),
-        RequiredSignature::tagged(
+        RequiredSignature::witness_tagged(
             "PATH",
             vec!["Left".to_string(), "1".to_string(), "0".to_string()],
             "OracleNetworkV1/StormEye",
@@ -97,7 +97,7 @@ fn spends_storm_eye_with_update_storm_tree_root(
                 )),
             }),
         ),
-        RequiredSignature::tagged(
+        RequiredSignature::witness_tagged(
             "PATH",
             vec!["Left".to_string(), "1".to_string(), "0".to_string()],
             "OracleNetworkV1/StormEye",
@@ -149,7 +149,7 @@ fn spends_storm_eye_with_update_rescue_block_number(
                 )),
             }),
         ),
-        RequiredSignature::tagged(
+        RequiredSignature::witness_tagged(
             "PATH",
             vec!["Left".to_string(), "1".to_string(), "0".to_string()],
             "OracleNetworkV1/StormEye",

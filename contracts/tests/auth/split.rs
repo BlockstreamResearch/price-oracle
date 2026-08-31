@@ -66,7 +66,7 @@ impl SplitFixture {
                     )),
                 }),
             ),
-            RequiredSignature::tagged(
+            RequiredSignature::witness_tagged(
                 "PATH",
                 vec!["Left".to_string(), "1".to_string(), "0".to_string()],
                 "OracleNetworkV1/StormEye",

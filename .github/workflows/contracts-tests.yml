@@ -15,7 +15,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  SIMPLEX_COMMIT: 826cd1f97d0e35fa74e0ab669a74ddb9f794f536
+  SIMPLEX_COMMIT: 53087018cd1a8e12c710a44bafc5e32c077edc5a
   # Set up after release version and fixed bug with RequiredSignature
   # SIMPLEX_VERSION: 0.0.11
 

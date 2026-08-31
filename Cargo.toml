@@ -4,10 +4,9 @@ members = [
     "storm",
     "storm-operator",
     "storm-tree",
+    "contracts",
 ]
 
-# To successfully build high-storm via docker
-exclude = ["contracts"]
 resolver = "2"
 
 [workspace.package]

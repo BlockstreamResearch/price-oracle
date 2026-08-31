@@ -67,7 +67,7 @@ fn accepts_a_valid_inclusion_proof(context: simplex::TestContext) -> anyhow::Res
                 storm_tree_bloom: ([0u8; 64], signing_branch, proof),
             }),
         ),
-        RequiredSignature::tagged(
+        RequiredSignature::witness_tagged(
             "STORM_TREE_BLOOM",
             vec!["0".to_string()],
             "OracleNetworkV1/StormEye",

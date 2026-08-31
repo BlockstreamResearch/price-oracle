@@ -1,12 +1,10 @@
-[workspace]
-
 [package]
 name = "oracle_contracts"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-smplx-std = { git = "https://github.com/BlockstreamResearch/smplx", branch = "feat/add-custom-signer" } # "0.0.10"
+smplx-std = { git = "https://github.com/BlockstreamResearch/smplx", rev = "53087018cd1a8e12c710a44bafc5e32c077edc5a" } # "0.0.10"
 
 [dev-dependencies]
 anyhow = "1"
