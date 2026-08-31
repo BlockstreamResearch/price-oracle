@@ -6,8 +6,8 @@ use simplex::transaction::{
     FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
 };
 
-use oracle_contracts::artifacts::auth_helpers::network_auth_test::NetworkAuthTestProgram;
-use oracle_contracts::artifacts::auth_helpers::network_auth_test::derived_network_auth_test::{
+use contracts::artifacts::auth_helpers::network_auth_test::NetworkAuthTestProgram;
+use contracts::artifacts::auth_helpers::network_auth_test::derived_network_auth_test::{
     NetworkAuthTestArguments, NetworkAuthTestWitness,
 };
 

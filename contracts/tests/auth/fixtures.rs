@@ -5,8 +5,8 @@ use simplex::simplicityhl::elements::AssetId;
 use simplex::transaction::partial_input::IssuanceInput;
 use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, RequiredSignature};
 
-use oracle_contracts::artifacts::auth::AuthProgram;
-use oracle_contracts::artifacts::auth::derived_auth::AuthArguments;
+use contracts::artifacts::auth::AuthProgram;
+use contracts::artifacts::auth::derived_auth::AuthArguments;
 
 use storm_tree::smt::MerkleTree;
 

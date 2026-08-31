@@ -1,5 +1,5 @@
 [package]
-name = "oracle_contracts"
+name = "contracts"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,7 +7,8 @@ edition = "2024"
 smplx-std = { git = "https://github.com/BlockstreamResearch/smplx", rev = "53087018cd1a8e12c710a44bafc5e32c077edc5a" } # "0.0.10"
 
 [dev-dependencies]
-anyhow = "1"
-# Storm Tree construction and witness packing, shared with the network side.
+thiserror.workspace = true
+
 storm-tree = { path = "../storm-tree" }
-thiserror = "2"
+
+anyhow = "1"

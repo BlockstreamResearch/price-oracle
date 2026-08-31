@@ -1,5 +1,8 @@
 .git
-target
+**/target
 **/dist
 **/node_modules
 **/*.tmp
+
+contracts/src/artifacts
+contracts/deps

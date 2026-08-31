@@ -5,8 +5,8 @@ use simplex::transaction::{
     FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
 };
 
-use oracle_contracts::artifacts::auth::AuthProgram;
-use oracle_contracts::artifacts::auth::derived_auth::AuthWitness;
+use contracts::artifacts::auth::AuthProgram;
+use contracts::artifacts::auth::derived_auth::AuthWitness;
 
 use storm_tree::smt::MerkleTree;
 

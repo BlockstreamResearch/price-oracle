@@ -3,8 +3,8 @@ use simplex::transaction::{
     FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
 };
 
-use oracle_contracts::artifacts::auth::AuthProgram;
-use oracle_contracts::artifacts::auth::derived_auth::AuthWitness;
+use contracts::artifacts::auth::AuthProgram;
+use contracts::artifacts::auth::derived_auth::AuthWitness;
 
 use super::covenant::{WITNESS_DEPTH, WitnessStep, build_tree, witness_proof};
 use super::fixtures::{program_with_storage, setup_storm_eye};

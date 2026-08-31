@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CONTRACTS_NAME: "oracle_contracts"
+  CONTRACTS_NAME: "contracts"
 
 jobs:
   ci:
