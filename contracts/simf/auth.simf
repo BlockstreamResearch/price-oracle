@@ -200,7 +200,14 @@ fn transaction_inclusion(
     storage: Storage,
     output_ind: u32
 ) {
-    panic!()
+    let (merkle_root, rescue_block_number): Storage = storage;
+    let expected_script_hash: u256 = get_script_hash_for_storage(merkle_root, rescue_block_number);
+
+    assert_eq_256(jet::current_script_hash(), expected_script_hash);
+    jet::check_lock_height(rescue_block_number);
+
+    assert_eq_256(unwrap(jet::output_script_hash(output_ind)), param::RESCUE_OUTPUT_SCRIPT_HASH);
+    assert_utxo_preserved(output_ind);
 }
 
 fn main() {

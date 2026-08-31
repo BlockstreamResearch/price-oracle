@@ -2,7 +2,7 @@
 
 use simplex::either::Either;
 use simplex::signer::SignerError;
-use simplex::simplicityhl::elements::{AssetId, Script};
+use simplex::simplicityhl::elements::{AssetId, Script, Sequence};
 use simplex::transaction::partial_input::IssuanceInput;
 use simplex::transaction::utxo::UTXO;
 use simplex::transaction::{
@@ -62,12 +62,31 @@ pub fn rescue_block_slot_value(rescue_block_number: u32) -> [u8; 32] {
     slot
 }
 
+/// Only for point 6. 1-5 tests never used it
+pub const UNUSED_RESCUE_OUTPUT_SCRIPT_HASH: [u8; 32] = [0u8; 32];
+
+pub const DEFAULT_RESCUE_NUMBER: u32 = 1234;
+
 /// Compiles the covenant with the given storage state, without funding it.
-#[allow(unused_must_use)]
 pub fn program_with_storage(merkle_root: [u8; 32], rescue_block_number: u32) -> AuthProgram {
+    program_with_rescue_output(
+        merkle_root,
+        rescue_block_number,
+        UNUSED_RESCUE_OUTPUT_SCRIPT_HASH,
+    )
+}
+
+/// As [`program_with_storage`], but naming where §1.4.6 is allowed to send the funds.
+#[allow(unused_must_use)]
+pub fn program_with_rescue_output(
+    merkle_root: [u8; 32],
+    rescue_block_number: u32,
+    rescue_output_script_hash: [u8; 32],
+) -> AuthProgram {
     let mut program = AuthProgram::new(&AuthArguments {
         max_merge_utxos_count: MAX_MERGE_UTXOS_COUNT,
         max_split_utxos_count: MAX_SPLIT_UTXOS_COUNT,
+        rescue_output_script_hash,
     })
     .with_storage_capacity(2);
 
@@ -116,7 +135,20 @@ impl StormEyeFixture {
     /// Builds the Storm Tree, compiles the covenant with the tree root and rescue height
     /// in storage, and funds it with a single Storm Eye UTXO of [`STORM_EYE_SUPPLY`].
     pub fn new(context: &simplex::TestContext) -> anyhow::Result<Self> {
-        let rescue_number = 1234;
+        Self::with_rescue(
+            context,
+            DEFAULT_RESCUE_NUMBER,
+            UNUSED_RESCUE_OUTPUT_SCRIPT_HASH,
+        )
+    }
+
+    /// As [`StormEyeFixture::new`], but fixing the rescue height and destination that
+    /// §1.4.6 will check against.
+    pub fn with_rescue(
+        context: &simplex::TestContext,
+        rescue_number: u32,
+        rescue_output_script_hash: [u8; 32],
+    ) -> anyhow::Result<Self> {
         let signing_branch: Branch = context
             .get_default_signer()
             .get_schnorr_public_key()
@@ -126,7 +158,8 @@ impl StormEyeFixture {
         let storm_tree = build_tree(&[signing_branch]);
         let proof = witness_proof(&storm_tree, &signing_branch);
 
-        let program = program_with_storage(storm_tree.root(), rescue_number);
+        let program =
+            program_with_rescue_output(storm_tree.root(), rescue_number, rescue_output_script_hash);
         let asset = issue_storm_eye_asset(context, &program)?;
 
         Ok(Self {
@@ -170,6 +203,29 @@ impl StormEyeFixture {
                 vec!["Left".to_string(), "1".to_string(), "0".to_string()],
                 "OracleNetworkV1/StormEye",
             ),
+        );
+    }
+
+    /// Spends `utxo` through §1.4.6, the rescue path — the `Either::Right` witness arm,
+    /// with no signature and no Merkle proof.
+    ///
+    /// The sequence matters: at the default `Sequence::MAX` the transaction is *final*,
+    /// which switches off nLockTime enforcement entirely, and `jet::check_lock_height`
+    /// then fails no matter how the locktime is set. The caller still has to call
+    /// `set_locktime` on the transaction.
+    pub fn add_rescue_input(&self, tx: &mut FinalTransaction, utxo: &UTXO, output_index: u32) {
+        tx.add_program_input(
+            PartialInput::new(utxo.clone()).with_sequence(Sequence::ENABLE_LOCKTIME_NO_RBF),
+            ProgramInput::new(
+                Box::new(self.program.as_ref().clone()),
+                Box::new(AuthWitness {
+                    path: Either::Right((
+                        (self.storm_tree.root(), self.rescue_number),
+                        output_index,
+                    )),
+                }),
+            ),
+            RequiredSignature::None,
         );
     }
 
