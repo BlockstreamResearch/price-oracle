@@ -129,6 +129,7 @@ impl AuthService {
         path: &str,
     ) -> Result<String, AuthError> {
         let payload = canonical_json(&request.payload).map_err(|_| AuthError::InvalidSignature)?;
+
         self.verify_write_at(
             &request.public_key,
             request.timestamp,
@@ -157,11 +158,13 @@ impl AuthService {
     async fn issue_challenge_at(&self, public_key: &str, now: u64) -> Result<Challenge, AuthError> {
         let (public_key, bytes) = parse_public_key(public_key)?;
         self.require_operator(bytes).await?;
+
         let message = format!(
             "high-storm:operator-auth:v1\n{public_key}\n{}",
             random_hex()?
         );
         let expires_at = now + CHALLENGE_TTL.as_secs();
+
         let mut state = self.state.lock().await;
         state.cleanup(now);
         state.challenges.insert(
@@ -171,6 +174,7 @@ impl AuthService {
                 expires_at,
             },
         );
+
         Ok(Challenge {
             message,
             expires_at,
@@ -186,6 +190,7 @@ impl AuthService {
     ) -> Result<AccessToken, AuthError> {
         let (public_key, bytes) = parse_public_key(public_key)?;
         self.require_operator(bytes).await?;
+
         {
             let mut state = self.state.lock().await;
             state.cleanup(now);
@@ -197,6 +202,7 @@ impl AuthService {
                 return Err(AuthError::InvalidChallenge);
             }
         }
+
         verify_signature(bytes, message, signature)?;
 
         let mut state = self.state.lock().await;
@@ -207,6 +213,7 @@ impl AuthService {
         if challenge.public_key != public_key || challenge.expires_at <= now {
             return Err(AuthError::InvalidChallenge);
         }
+
         let token = random_hex()?;
         let expires_at = now + TOKEN_TTL.as_secs();
         state.tokens.insert(
@@ -216,6 +223,7 @@ impl AuthService {
                 expires_at,
             },
         );
+
         Ok(AccessToken { token, expires_at })
     }
 
@@ -229,8 +237,10 @@ impl AuthService {
                 .map(|token| token.public_key.clone())
                 .ok_or(AuthError::InvalidToken)?
         };
+
         let (_, bytes) = parse_public_key(&public_key)?;
         self.require_operator(bytes).await?;
+
         Ok(public_key)
     }
 
@@ -252,8 +262,10 @@ impl AuthService {
         if nonce.is_empty() || nonce.len() > 128 {
             return Err(AuthError::InvalidNonce);
         }
+
         let (public_key, bytes) = parse_public_key(public_key)?;
         self.require_operator(bytes).await?;
+
         let message = write_message(method, path, timestamp, nonce, payload);
         verify_signature(bytes, &message, signature)?;
 
@@ -269,6 +281,7 @@ impl AuthService {
         {
             return Err(AuthError::ReplayedNonce);
         }
+
         Ok(public_key)
     }
 
@@ -447,6 +460,7 @@ mod tests {
     async fn setup() -> (AuthService, PrivateKey, String) {
         let database = Database::connect("sqlite::memory:", 1).await.unwrap();
         let operators = database.node_operators();
+
         let secret_key = secp256k1::SecretKey::from_slice(&[42; 32]).unwrap();
         let private_key = PrivateKey::new(secret_key, Network::Bitcoin);
         let public_key = private_key
@@ -454,6 +468,7 @@ mod tests {
             .inner
             .serialize();
         operators.add(public_key).await.unwrap();
+
         (
             AuthService::new(operators),
             private_key,

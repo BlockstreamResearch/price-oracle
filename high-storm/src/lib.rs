@@ -43,6 +43,7 @@ pub async fn initialize_host(
     let secret_key = secret_key(config)?;
     let secret_key_bytes = secret_key.secret_bytes();
     let host_public_key = secret_key.public_key(&Secp256k1::new()).serialize();
+
     let mut seen = HashSet::from([host_public_key]);
     let mut peers = vec![Peer::new(host_public_key)];
     peers.extend(
@@ -54,11 +55,13 @@ pub async fn initialize_host(
             .filter(|key| seen.insert(*key))
             .map(Peer::new),
     );
+
     tracing::info!(
         public_key = %hex::encode(host_public_key),
         member_count = peers.len(),
         "initializing discovery host"
     );
+
     let storm = Storm::discovery(secret_key, peers);
     initialize(config, store, storm, secret_key_bytes, host_public_key).await
 }
@@ -73,17 +76,21 @@ pub async fn initialize_join(
         .parse::<SocketAddr>()
         .map_err(|_| Error::DiscoveryAddress(discovery_address.to_string()))?;
     let coordinator_public_key = parse_public_key(discovery_public_key)?;
+
     let mut discovery_peer = Peer::new(coordinator_public_key);
     discovery_peer.socket_address = Some(discovery_address.to_string());
+
     let secret_key = secret_key(config)?;
     let secret_key_bytes = secret_key.secret_bytes();
     let local_public_key = secret_key.public_key(&Secp256k1::new()).serialize();
+
     tracing::info!(
         public_key = %hex::encode(local_public_key),
         discovery_public_key,
         discovery_address,
         "initializing node through discovery host"
     );
+
     let storm = Storm::discoverable(secret_key, discovery_peer)?;
     initialize(
         config,
@@ -99,13 +106,16 @@ pub async fn start_initialized(config: &Config, store: &NetworkStore) -> Result<
     let peers = store.load().await?;
     let coordinator_public_key = store.load_coordinator_public_key().await?;
     tracing::info!(peer_count = peers.len(), "loaded persisted network state");
+
     let secret_key = secret_key(config)?;
     let secret_key_bytes = secret_key.secret_bytes();
     let mut storm = Storm::from_peers(secret_key, peers);
+
     let listen_address = listen_address(config);
     tracing::info!(%listen_address, "starting initialized node");
     storm.start(Some(listen_address)).await?;
     tracing::info!("initialized node is running");
+
     Ok(HighStorm::new(
         storm,
         secret_key_bytes,
@@ -125,13 +135,16 @@ async fn initialize(
     let listen_address = listen_address(config);
     tracing::info!(%listen_address, "starting Storm discovery listener");
     storm.start(Some(listen_address)).await?;
+
     let mut previous_peers = None;
     loop {
         let peers = storm.peers().await;
+
         if previous_peers.as_ref() != Some(&peers) {
             log_discovery_state(&peers);
             previous_peers = Some(peers.clone());
         }
+
         if peers.iter().all(|peer| !peer.discovery) {
             tracing::info!(peer_count = peers.len(), "network discovery completed");
             store.save(&peers, coordinator_public_key).await?;
@@ -143,6 +156,7 @@ async fn initialize(
                 HighStorm::new(storm, secret_key, coordinator_public_key, store.voting()).await,
             );
         }
+
         tokio::time::sleep(Duration::from_millis(250)).await;
         storm.start(None).await?;
     }
@@ -154,6 +168,7 @@ fn log_discovery_state(peers: &[Peer]) {
         .iter()
         .filter(|peer| peer.status == storm::PeerStatus::Active)
         .count();
+
     tracing::info!(
         peer_count = peers.len(),
         active_peers = active,
@@ -169,6 +184,7 @@ fn log_discovery_state(peers: &[Peer]) {
             "peer state"
         );
     }
+
     if pending > 0 {
         tracing::info!("waiting for all configured members to join the discovery host");
     }

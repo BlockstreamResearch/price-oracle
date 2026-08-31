@@ -48,6 +48,7 @@ async fn initializes_persists_and_restores_a_network() {
     let members = vec![join_node.public_key.clone()];
     let host_task =
         tokio::spawn(async move { initialize_host(&host_config, &host_store, &members).await });
+
     tokio::time::sleep(Duration::from_millis(50)).await;
     let mut join = timeout(
         Duration::from_secs(5),
@@ -61,6 +62,7 @@ async fn initializes_persists_and_restores_a_network() {
     .await
     .expect("join initialization timed out")
     .unwrap();
+
     let mut host = timeout(Duration::from_secs(5), host_task)
         .await
         .expect("host initialization timed out")
@@ -96,6 +98,7 @@ async fn initializes_persists_and_restores_a_network() {
     let mut restored_join = start_initialized(&join_node.config, &join_node.store)
         .await
         .unwrap();
+
     restored_host.start(None).await.unwrap();
     restored_join.start(None).await.unwrap();
     wait_until_connected(&[&restored_host, &restored_join]).await;

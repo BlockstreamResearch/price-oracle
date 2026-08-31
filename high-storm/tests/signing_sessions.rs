@@ -20,6 +20,7 @@ impl TestNetwork {
         let first = TestNode::new(11).await;
         let second = TestNode::new(12).await;
         let third = TestNode::new(13).await;
+
         let host_config = first.config.clone();
         let host_store = first.store.clone();
         let members = vec![second.public_key.clone(), third.public_key.clone()];
@@ -42,6 +43,7 @@ impl TestNetwork {
                 &host_address,
             ),
         );
+
         let first_node = timeout(Duration::from_secs(5), host)
             .await
             .expect("host initialization timed out")
@@ -52,6 +54,7 @@ impl TestNetwork {
             second_node.expect("second node initialization failed"),
             third_node.expect("third node initialization failed"),
         ];
+
         wait_for_all_connections(&nodes).await;
 
         Self {

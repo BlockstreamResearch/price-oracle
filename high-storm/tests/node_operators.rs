@@ -25,6 +25,7 @@ async fn adds_lists_and_removes_node_operators() {
 async fn handles_node_operator_commands_over_ipc() {
     let database = Database::connect("sqlite::memory:", 1).await.unwrap();
     let operators = database.node_operators();
+
     let socket_path = std::env::temp_dir().join(format!(
         "high-storm-operator-test-{}.sock",
         std::process::id()
@@ -33,6 +34,7 @@ async fn handles_node_operator_commands_over_ipc() {
         .await
         .unwrap();
     let server_task = tokio::spawn(server.run());
+
     let public_key = SecretKey::from_slice(&[43; 32])
         .unwrap()
         .public_key(&Secp256k1::new())

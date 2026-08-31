@@ -127,7 +127,7 @@ struct Header {
 }
 
 struct UserRequest {
-    kind: u64,
+    kind: String,
     payload: String,
 }
 
@@ -139,7 +139,7 @@ struct NetworkUserRequests {
 
 | Field | Description |
 | :---- | :---- |
-| `Header::signature` | A user signature that identifies the user. User signs a byte concatenation of the following: 1\. **Payload** – raw bytes payload stored inside the network user requests. 2\. **Fee UTXOs** – raw bytes of a concatenated array of fee UTXOs. The concatenation is then hashed with the `OracleNetowk/NetworkUserRequests` tag for a BIP-340 tagged hash. |
+| `Header::signature` | A user signature that identifies the user. User signs a byte concatenation of the following: 1\. **Payload** – raw bytes payload stored inside the network user requests. 2\. **Fee UTXOs** – raw bytes of a concatenated array of fee UTXOs. The concatenation is then hashed with the `OracleNetworkV1/NetworkUserRequests` tag for a BIP-340 tagged hash. |
 | `Header::public_key` | A user public key of the keypair that signed this request. |
 | `Header::fee_utxos` | A list of UTXOs to be used to pay request fees. Each such UTXO is encoded as **txid:output\_index**. Example: e36c0606c2bfd608deab15ba9572c608136e6d499fefc00d5b239ce0fbb5fa04:3 |
 | `UserRequest::kind` | Information about the request type. |
@@ -934,7 +934,7 @@ A user specifies authentication methods in the request details, which are writte
 
 ```rust
 struct UTXOAuthMethod {
-    kind: u64,
+    kind: String,
     auth_data: String 
 }
 ```

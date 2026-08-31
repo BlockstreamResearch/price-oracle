@@ -1,11 +1,13 @@
 pub mod network;
 pub mod node_operator;
+pub mod user_request;
 pub mod voting;
 
 use node_operator::NodeOperatorStore;
 use sqlx::{AnyPool, any::AnyPoolOptions};
 
 use network::NetworkStore;
+use user_request::UserRequestStore;
 use voting::VotingStore;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -42,6 +44,10 @@ impl Database {
 
     pub fn node_operators(&self) -> NodeOperatorStore {
         NodeOperatorStore::new(self.pool.clone())
+    }
+
+    pub fn user_requests(&self) -> UserRequestStore {
+        UserRequestStore::new(self.pool.clone())
     }
 
     pub fn voting(&self) -> VotingStore {

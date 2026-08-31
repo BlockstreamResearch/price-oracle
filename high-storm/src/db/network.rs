@@ -39,6 +39,7 @@ impl NetworkStore {
         coordinator_public_key: [u8; 33],
     ) -> Result<(), Error> {
         tracing::debug!(peer_count = peers.len(), "persisting network state");
+
         let mut transaction = self.pool.begin().await?;
         sqlx::query("DELETE FROM network_peers")
             .execute(&mut *transaction)
@@ -66,6 +67,7 @@ impl NetworkStore {
                 .map(i64::try_from)
                 .transpose()
                 .map_err(|_| Error::TimestampOutOfRange)?;
+
             sqlx::query(
                 "INSERT INTO network_peers (\
 					peer_order, public_key, socket_address, last_seen, status, discovery\
@@ -88,12 +90,14 @@ impl NetworkStore {
 
     pub async fn update_runtime(&self, peers: &[Peer]) -> Result<(), Error> {
         let mut transaction = self.pool.begin().await?;
+
         for peer in peers {
             let last_seen = peer
                 .last_seen
                 .map(i64::try_from)
                 .transpose()
                 .map_err(|_| Error::TimestampOutOfRange)?;
+
             sqlx::query(
                 "UPDATE network_peers SET \
 					socket_address = $1, last_seen = $2, status = $3, discovery = $4 \
@@ -107,8 +111,10 @@ impl NetworkStore {
             .execute(&mut *transaction)
             .await?;
         }
+
         transaction.commit().await?;
         tracing::trace!(peer_count = peers.len(), "runtime network state updated");
+
         Ok(())
     }
 
@@ -155,6 +161,7 @@ impl NetworkStore {
             .await?
             .ok_or(Error::NotInitialized)?;
         let encoded_key: String = row.try_get("coordinator_public_key")?;
+
         hex::decode(&encoded_key)
             .ok()
             .and_then(|bytes| bytes.try_into().ok())

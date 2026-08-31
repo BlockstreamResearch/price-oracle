@@ -1,6 +1,7 @@
 mod operators;
 #[cfg(test)]
 mod tests;
+mod users;
 
 use std::net::SocketAddr;
 
@@ -8,17 +9,20 @@ use axum::{
     Json, Router,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::any,
 };
 use serde::Serialize;
 
-use crate::{HighStormHandle, VotingError, db::node_operator::NodeOperatorStore};
+use crate::{
+    HighStormHandle, VotingError,
+    db::{node_operator::NodeOperatorStore, user_request::UserRequestStore},
+};
 use operators::{AuthError, AuthService};
 
 #[derive(Clone)]
 pub(super) struct ExternalApiState {
     pub(super) node: HighStormHandle,
     pub(super) auth: AuthService,
+    pub(super) user_requests: UserRequestStore,
 }
 
 pub struct ExternalApiServer {
@@ -31,11 +35,12 @@ impl ExternalApiServer {
         address: SocketAddr,
         node: HighStormHandle,
         operators: NodeOperatorStore,
+        user_requests: UserRequestStore,
     ) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(address).await?;
         Ok(Self {
             listener,
-            router: router(node, operators),
+            router: router(node, operators, user_requests),
         })
     }
 
@@ -48,18 +53,18 @@ impl ExternalApiServer {
     }
 }
 
-pub fn router(node: HighStormHandle, operators: NodeOperatorStore) -> Router {
+pub fn router(
+    node: HighStormHandle,
+    operators: NodeOperatorStore,
+    user_requests: UserRequestStore,
+) -> Router {
     let state = ExternalApiState {
         node,
         auth: AuthService::new(operators),
+        user_requests,
     };
     Router::new()
-        .nest(
-            "/users",
-            Router::new()
-                .route("/", any(not_implemented))
-                .route("/{*path}", any(not_implemented)),
-        )
+        .nest("/users", users::router())
         .nest("/operators", operators::router())
         .with_state(state)
 }
@@ -72,13 +77,6 @@ struct ErrorBody {
 pub(super) struct ApiError {
     status: StatusCode,
     message: String,
-}
-
-async fn not_implemented() -> ApiError {
-    ApiError {
-        status: StatusCode::NOT_IMPLEMENTED,
-        message: "user API is not implemented".to_string(),
-    }
 }
 
 impl ApiError {
@@ -99,6 +97,27 @@ impl ApiError {
     pub(super) fn not_found(message: impl ToString) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.to_string(),
+        }
+    }
+
+    pub(super) fn conflict(message: impl ToString) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.to_string(),
+        }
+    }
+
+    pub(super) fn unprocessable(message: impl ToString) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: message.to_string(),
+        }
+    }
+
+    pub(super) fn unavailable(message: impl ToString) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.to_string(),
         }
     }
