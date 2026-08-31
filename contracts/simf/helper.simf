@@ -1,3 +1,12 @@
+/// Return explicit input asset and amount
+pub fn get_explicit_input_amount(output_ind: u32) -> (u256, u64) {
+    let (output_asset, output_amount): (Asset1, Amount1) = unwrap(jet::input_amount(output_ind));
+    let output_asset: u256 = unwrap_right::<Point>(output_asset);
+    let output_amount: u64 = unwrap_right::<Point>(output_amount);
+
+    (output_asset, output_amount)
+}
+
 /// Return explicit output asset and amount
 pub fn get_explicit_output_amount(output_ind: u32) -> (u256, u64) {
     let (output_asset, output_amount): (Asset1, Amount1) = unwrap(jet::output_amount(output_ind));

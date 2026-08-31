@@ -4,7 +4,7 @@ use std::lib::u8::convert::u8_to_u32;
 use std::lib::u32::math::{safe_add_32, gt_32};
 use std::lib::u64::math::safe_add_64;
 
-use crate::helper::{get_explicit_current_amount, get_explicit_output_amount};
+use crate::helper::{get_explicit_current_amount, get_explicit_output_amount, get_explicit_input_amount};
 use crate::storage::{get_script_hash_for_storage};
 use crate::auth_helpers::network::{StormTreeBloom, assert_network_authorization};
 
@@ -96,15 +96,15 @@ fn auth_with_update_rescue_block(
 }
 
 /// Loop-invariant data for the split: how many outputs to visit, and what each must look like.
-type SplitCtx = (u8, u256, u256);
+type StepUtxosCtx = (u8, u256, u256);
 
 /// One split output: check its shape, add its amount. `Left` ends the loop.
 fn step_collect_total_amount(
     total_outputs_amount: u64,
-    ctx: SplitCtx,
+    ctx: StepUtxosCtx,
     counter: u8,
 ) -> Either<u64, u64> {
-    let (split_utxos_count, expected_script_hash, current_asset): SplitCtx = ctx;
+    let (split_utxos_count, expected_script_hash, current_asset): StepUtxosCtx = ctx;
 
     match jet::lt_8(counter, split_utxos_count) {
         // Past the last split output: stop, carrying the total.
@@ -137,10 +137,33 @@ fn auth_split_storm_eye_utxo_into_multiple_utxos(
     assert!(jet::lt_8(split_utxos_count, param::MAX_SPLIT_UTXOS_COUNT));
 
     let (current_asset, current_amount): (u256, u64) = get_explicit_current_amount();
-    let ctx: SplitCtx = (split_utxos_count, expected_current_script_hash, current_asset);
+    let ctx: StepUtxosCtx = (split_utxos_count, expected_current_script_hash, current_asset);
 
     let out: Either<u64, u64> = for_while::<step_collect_total_amount>(0, ctx);
     assert_eq_64(current_amount, unwrap_left::<u64>(out));
+}
+
+/// One split output: check its shape, add its amount. `Left` ends the loop.
+fn step_collect_input_total_amount(
+    total_inputs_amount: u64,
+    ctx: StepUtxosCtx,
+    counter: u8,
+) -> Either<u64, u64> {
+    let (utxos_to_merge, expected_script_hash, current_asset): StepUtxosCtx = ctx;
+
+    match jet::lt_8(counter, utxos_to_merge) {
+        // Past the last merge: stop, carrying the total.
+        false => Left(total_inputs_amount),
+        true => {
+            let input_ind: u32 = u8_to_u32(counter);
+            let (input_asset, input_amount): (u256, u64) = get_explicit_input_amount(input_ind);
+            
+            assert_eq_256(unwrap(jet::input_script_hash(input_ind)), expected_script_hash);
+            assert_eq_256(input_asset, current_asset);
+
+            Right(safe_add_64(total_inputs_amount, input_amount))
+        },
+    }
 }
 
 /// 5. Authorized merging of multiple Storm Eyes into
@@ -149,7 +172,26 @@ fn auth_merge_multiple_storm_eyes_into_single_utxo(
     storage: Storage,
     utxos_to_merge: u8
 ) {
-    panic!()
+    let (merkle_root, rescue_block_number): Storage = storage;
+    let expected_current_script_hash: u256 = get_script_hash_for_storage(merkle_root, rescue_block_number);
+    assert_eq_256(jet::current_script_hash(), expected_current_script_hash);
+    assert_eq_256(unwrap(jet::output_script_hash(0)), expected_current_script_hash);
+
+    assert!(gt_8(utxos_to_merge, 1));
+    assert!(jet::lt_8(utxos_to_merge, param::MAX_MERGE_UTXOS_COUNT));
+
+    // TODO: Do we need this?
+    assert!(jet::lt_32(jet::current_index(), u8_to_u32(utxos_to_merge)));
+
+    let current_asset: u256 = unwrap_right::<Point>(jet::current_asset());
+    let ctx: StepUtxosCtx = (utxos_to_merge, expected_current_script_hash, current_asset);
+
+    let total_inputs_amount: u64 = unwrap_left::<u64>(for_while::<step_collect_input_total_amount>(0, ctx));
+    let (output_asset, output_amount): (u256, u64) = get_explicit_output_amount(0);
+    assert_eq_64(output_amount, total_inputs_amount);
+
+    let current_asset: u256 = unwrap_right::<Point>(jet::current_asset());
+    assert_eq_256(output_asset, current_asset);
 }
 
 /// 6. Inclusion in a transaction upon reaching the rescue block number,
