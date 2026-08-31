@@ -25,6 +25,7 @@ pub struct ServiceConfig {
     #[serde(default = "default_external_api_address")]
     pub external_api_address: SocketAddr,
     pub signer: SignerConfig,
+    pub elements_rpc: ElementsRpcConfig,
     pub db: DbConfig,
 }
 
@@ -41,6 +42,13 @@ fn default_external_api_address() -> SocketAddr {
 #[derive(Clone, Debug, Deserialize)]
 pub struct SignerConfig {
     pub private_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ElementsRpcConfig {
+    pub url: String,
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

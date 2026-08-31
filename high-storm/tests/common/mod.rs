@@ -1,7 +1,7 @@
 use std::net::TcpListener;
 
 use high_storm::{
-    config::{Config, DbConfig, ServiceConfig, SignerConfig},
+    config::{Config, DbConfig, ElementsRpcConfig, ServiceConfig, SignerConfig},
     db::{Database, network::NetworkStore},
 };
 use secp256k1_zkp::{Secp256k1, SecretKey};
@@ -24,6 +24,11 @@ impl TestNode {
                 external_api_address: "127.0.0.1:0".parse().unwrap(),
                 signer: SignerConfig {
                     private_key: hex::encode(secret.secret_bytes()),
+                },
+                elements_rpc: ElementsRpcConfig {
+                    url: "http://127.0.0.1:18884".to_string(),
+                    username: "unused".to_string(),
+                    password: "unused".to_string(),
                 },
                 db: DbConfig {
                     url: "unused".to_string(),

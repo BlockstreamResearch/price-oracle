@@ -13,6 +13,19 @@ x-node: &node
   networks:
     storm:
 
+x-elements-node: &elements-node
+  build:
+    context: ./docker/elements
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "elements-cli", "-chain=elementsregtest", "-rpcconnect=127.0.0.1", "-rpcport=18884", "-rpcuser=high-storm", "-rpcpassword=high-storm", "getblockchaininfo"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+  networks:
+    storm:
+
 x-operator-platform: &operator-platform
   build:
     context: ..
@@ -27,6 +40,125 @@ x-operator-platform: &operator-platform
     storm:
 
 services:
+  elements-1:
+    <<: *elements-node
+    command:
+      - -chain=elementsregtest
+      - -server=1
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=172.28.0.0/24
+      - -rpcport=18884
+      - -rpcuser=high-storm
+      - -rpcpassword=high-storm
+      - -port=18888
+      - -bind=0.0.0.0:18888
+      - -addnode=elements-2:18888
+      - -addnode=elements-3:18888
+      - -dnsseed=0
+      - -fixedseeds=0
+      - -validatepegin=0
+      - -initialfreecoins=2100000000000000
+      - -con_connect_genesis_outputs=1
+      - -con_blocksubsidy=0
+      - -anyonecanspendaremine=1
+      - -blindedaddresses=0
+      - -fallbackfee=0.0001
+    volumes:
+      - elements-1-data:/home/elements/.elements
+    ports:
+      - "18884:18884"
+    networks:
+      storm:
+        ipv4_address: 172.28.0.21
+
+  elements-2:
+    <<: *elements-node
+    command:
+      - -chain=elementsregtest
+      - -server=1
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=172.28.0.0/24
+      - -rpcport=18884
+      - -rpcuser=high-storm
+      - -rpcpassword=high-storm
+      - -port=18888
+      - -bind=0.0.0.0:18888
+      - -addnode=elements-1:18888
+      - -addnode=elements-3:18888
+      - -dnsseed=0
+      - -fixedseeds=0
+      - -validatepegin=0
+      - -initialfreecoins=2100000000000000
+      - -con_connect_genesis_outputs=1
+      - -con_blocksubsidy=0
+      - -anyonecanspendaremine=0
+      - -blindedaddresses=0
+      - -fallbackfee=0.0001
+    volumes:
+      - elements-2-data:/home/elements/.elements
+    ports:
+      - "18885:18884"
+    networks:
+      storm:
+        ipv4_address: 172.28.0.22
+
+  elements-3:
+    <<: *elements-node
+    command:
+      - -chain=elementsregtest
+      - -server=1
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=172.28.0.0/24
+      - -rpcport=18884
+      - -rpcuser=high-storm
+      - -rpcpassword=high-storm
+      - -port=18888
+      - -bind=0.0.0.0:18888
+      - -addnode=elements-1:18888
+      - -addnode=elements-2:18888
+      - -dnsseed=0
+      - -fixedseeds=0
+      - -validatepegin=0
+      - -initialfreecoins=2100000000000000
+      - -con_connect_genesis_outputs=1
+      - -con_blocksubsidy=0
+      - -anyonecanspendaremine=0
+      - -blindedaddresses=0
+      - -fallbackfee=0.0001
+    volumes:
+      - elements-3-data:/home/elements/.elements
+    ports:
+      - "18886:18884"
+    networks:
+      storm:
+        ipv4_address: 172.28.0.23
+
+  elements-bootstrap:
+    build:
+      context: ./docker/elements
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      elements-1:
+        condition: service_healthy
+      elements-2:
+        condition: service_healthy
+      elements-3:
+        condition: service_healthy
+    environment:
+      ELEMENTS_RPC_HOST: elements-1
+      ELEMENTS_RPC_PORT: 18884
+      ELEMENTS_RPC_USER: high-storm
+      ELEMENTS_RPC_PASSWORD: high-storm
+      BLOCK_INTERVAL_SECONDS: 60
+    entrypoint: ["/bin/bash", "/opt/elements/bootstrap.sh"]
+    volumes:
+      - ./docker/elements/bootstrap.sh:/opt/elements/bootstrap.sh:ro
+      - ./assets:/assets:ro
+    networks:
+      storm:
+        ipv4_address: 172.28.0.24
+
   postgres:
     image: postgres:17-bookworm
     restart: unless-stopped
@@ -53,6 +185,11 @@ services:
     environment:
       RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=debug,sqlx=warn}
       OPERATOR_PUBLIC_KEY: 031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elements-1:
+        condition: service_healthy
     volumes:
       - ./docker/node-1.toml:/etc/high-storm/config.toml:ro
     entrypoint: ["/bin/sh", "-c"]
@@ -81,6 +218,8 @@ services:
         condition: service_healthy
       node-1:
         condition: service_started
+      elements-2:
+        condition: service_healthy
     volumes:
       - ./docker/node-2.toml:/etc/high-storm/config.toml:ro
     entrypoint: ["/bin/sh", "-c"]
@@ -109,6 +248,8 @@ services:
         condition: service_healthy
       node-1:
         condition: service_started
+      elements-3:
+        condition: service_healthy
     volumes:
       - ./docker/node-3.toml:/etc/high-storm/config.toml:ro
     entrypoint: ["/bin/sh", "-c"]
@@ -159,6 +300,9 @@ services:
 
 volumes:
   postgres-data:
+  elements-1-data:
+  elements-2-data:
+  elements-3-data:
 
 networks:
   storm:

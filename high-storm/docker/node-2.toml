@@ -6,6 +6,11 @@ external_api_address = "0.0.0.0:9100"
 # Development-only deterministic key. Do not use in production.
 private_key = "0202020202020202020202020202020202020202020202020202020202020202"
 
+[service.elements_rpc]
+url = "http://elements-2:18884"
+username = "high-storm"
+password = "high-storm"
+
 [service.db]
 url = "postgres:5432"
 username = "high-storm"

@@ -41,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_file(config_path)?;
     tracing::debug!(
         listen_port = config.service.port,
+        elements_rpc = %config.service.elements_rpc.url,
         database_host = %config.service.db.url,
         database = %config.service.db.database,
         "configuration loaded"
