@@ -1,15 +1,16 @@
 #![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
 
+pub mod smt;
+
 use std::collections::BTreeMap;
 
 use itertools::Itertools;
-use monotree::database::MemoryDB;
-use monotree::hasher::Sha2;
-use monotree::{Hash, Hasher, Monotree, Proof, verify_proof};
 use secp256k1::musig::KeyAggCache;
 use secp256k1::{Parity, PublicKey, XOnlyPublicKey};
 use thiserror::Error;
+
+use smt::MerkleTree;
 
 /// The serialized 32-byte X-only secp256k1 public key of a network node.
 pub type NodePublicKey = [u8; 32];
@@ -17,8 +18,11 @@ pub type NodePublicKey = [u8; 32];
 pub type StormTreeBranch = [u8; 32];
 /// The SHA-256 root of a Storm Tree.
 pub type StormTreeRoot = [u8; 32];
-/// A sparse Merkle inclusion proof for a [`StormTreeBranch`].
-pub type StormTreeProof = Proof;
+/// A Merkle inclusion proof for a [`StormTreeBranch`].
+pub type StormTreeProof = smt::Proof;
+
+/// The deepest Storm Tree the covenant can verify, `ceil(log2(MAX_BRANCHES))`.
+pub const TREE_DEPTH: u32 = 17;
 
 const MIN_NODES: usize = 3;
 /// Maximum number of signer combinations accepted by [`StormTree::new`].
@@ -63,22 +67,22 @@ pub enum StormTreeError {
     /// The requested aggregate key is not a branch in this tree.
     #[error("unknown Storm Tree branch: {0:02x?}")]
     UnknownBranch(StormTreeBranch),
-    /// The underlying sparse Merkle tree operation failed.
-    #[error("sparse Merkle tree operation failed: {0}")]
-    SparseMerkleTree(#[from] monotree::Errors),
+    /// The underlying Merkle tree operation failed.
+    #[error("Merkle tree operation failed: {0}")]
+    MerkleTree(#[from] smt::Error),
 }
 
-/// A deterministic sparse Merkle tree of minimum-threshold MuSig2 keys.
+/// A deterministic Merkle tree of minimum-threshold MuSig2 keys.
 ///
 /// Node keys are validated, sorted lexicographically, and treated as a set.
 /// Every size-`threshold` subset appears exactly once; permutations of a subset
-/// are never separate branches. Each branch is both the sparse-tree key and leaf.
+/// are never separate branches. Branches occupy leaf slots in ascending order, and each
+/// leaf hashes to `sha256(branch || 0x01)`.
 pub struct StormTree {
     nodes: Vec<NodePublicKey>,
     threshold: usize,
     branches: BTreeMap<StormTreeBranch, Vec<NodePublicKey>>,
-    tree: Monotree<MemoryDB, Sha2>,
-    root: StormTreeRoot,
+    tree: MerkleTree,
 }
 
 impl StormTree {
@@ -131,18 +135,16 @@ impl StormTree {
         }
         debug_assert_eq!(branches.len(), branch_count);
 
-        let branch_keys: Vec<Hash> = branches.keys().copied().collect();
-        let mut tree = Monotree::<MemoryDB, Sha2>::new("storm-tree");
-        let root = tree
-            .inserts(None, &branch_keys, &branch_keys)?
-            .expect("a valid Storm Tree has at least one branch");
+        // `from_leaves` is the single construction recipe, shared with every other caller
+        // that has to arrive at the same root for the same branch set.
+        let leaves: Vec<StormTreeBranch> = branches.keys().copied().collect();
+        let tree = MerkleTree::from_leaves(&leaves)?;
 
         Ok(Self {
             nodes,
             threshold,
             branches,
             tree,
-            root,
         })
     }
 
@@ -161,9 +163,9 @@ impl StormTree {
         self.threshold
     }
 
-    /// Returns the SHA-256 sparse Merkle root.
-    pub const fn root(&self) -> StormTreeRoot {
-        self.root
+    /// Returns the SHA-256 Merkle root.
+    pub fn root(&self) -> StormTreeRoot {
+        self.tree.root()
     }
 
     /// Iterates over aggregate branch keys in lexicographic order.
@@ -186,16 +188,14 @@ impl StormTree {
 
     /// Returns an inclusion proof for an aggregate MuSig2 branch key.
     ///
-    /// The tree is borrowed mutably because `monotree`'s in-memory database API
-    /// uses mutable access for reads.
-    pub fn proof(&mut self, branch: &StormTreeBranch) -> Result<StormTreeProof, StormTreeError> {
+    /// # Errors
+    /// Returns [`StormTreeError::UnknownBranch`] if the key is not a branch of this tree.
+    pub fn proof(&self, branch: &StormTreeBranch) -> Result<StormTreeProof, StormTreeError> {
         if !self.branches.contains_key(branch) {
             return Err(StormTreeError::UnknownBranch(*branch));
         }
 
-        self.tree
-            .get_merkle_proof(Some(&self.root), branch)?
-            .ok_or(StormTreeError::UnknownBranch(*branch))
+        Ok(self.tree.proof(branch)?)
     }
 
     /// Verifies that an aggregate key is included under a Storm Tree root.
@@ -207,7 +207,9 @@ impl StormTree {
         branch: &StormTreeBranch,
         proof: &StormTreeProof,
     ) -> bool {
-        verify_proof(&Sha2::new(), Some(root), branch, Some(proof))
+        // A proof only speaks for this branch under this root, so both have to be checked
+        // alongside the fold itself.
+        proof.leaf == *branch && proof.root == *root && smt::verify_proof(proof)
     }
 }
 
@@ -290,7 +292,7 @@ mod tests {
 
     #[test]
     fn creates_verifiable_sha256_inclusion_proofs() {
-        let mut tree = StormTree::new(node_keys(5)).unwrap();
+        let tree = StormTree::new(node_keys(5)).unwrap();
         let branch = tree.branches().next().unwrap();
         let proof = tree.proof(&branch).unwrap();
 

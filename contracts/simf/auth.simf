@@ -1,0 +1,221 @@
+use std::lib::asserts::{assert_eq_1, assert_eq_32, assert_eq_64, assert_eq_256};
+use std::lib::u8::math::gt_8;
+use std::lib::u8::convert::u8_to_u32;
+use std::lib::u32::math::{safe_add_32, gt_32};
+use std::lib::u64::math::safe_add_64;
+
+use crate::helper::{get_explicit_current_amount, get_explicit_output_amount};
+use crate::storage::{get_script_hash_for_storage};
+use crate::auth_helpers::network::{StormTreeBloom, assert_network_authorization};
+
+/// Taproot storage: Storm Tree root, rescue block number.
+type Storage = (u256, Height);
+
+/// 1. output_index
+type InclusionWit = u32;
+/// 2. new_merkle_root, output_index
+type RootUpdateWit = (u256, u32);
+/// 3. new_rescue_block_number, output_index
+type RescueBlockUpdateWit = (Height, u32);
+/// 4. split_utxos_count
+type SplitWit = u8;
+/// 5. utxos_to_merge
+type MergeWit = u8;
+
+type UpdateKind = Either<RootUpdateWit, RescueBlockUpdateWit>;
+type ReshapeKind = Either<SplitWit, MergeWit>;
+type AuthKind = Either<InclusionWit, Either<UpdateKind, ReshapeKind>>;
+
+/// 1-5. Every network-authorised path carries the same storage and bloom.
+type AuthorizedWit = (Storage, StormTreeBloom, AuthKind);
+/// 6. The rescue path is the only one with no signature and no proof.
+type RescueWit = (Storage, u32);
+
+/// The Storm Eye UTXO must be spent in its entirety: same asset, same amount.
+fn assert_utxo_preserved(output_ind: u32) {
+    let (output_asset, output_amount): (u256, u64) = get_explicit_output_amount(output_ind);
+    let (current_asset, current_amount): (u256, u64) = get_explicit_current_amount();
+
+    assert_eq_256(output_asset, current_asset);
+    assert_eq_64(output_amount, current_amount);
+}
+
+// Auth main functions
+
+/// 1. Authorized inclusion in a transaction without storage updating.
+fn auth_without_storage_updating(storage: Storage, output_ind: u32) {
+    let (merkle_root, rescue_block_number): Storage = storage;
+    let expected_script_hash: u256 = get_script_hash_for_storage(merkle_root, rescue_block_number);
+    assert_eq_256(jet::current_script_hash(), expected_script_hash);
+
+    let output_script_hash: u256 = unwrap(jet::output_script_hash(output_ind));
+    assert_eq_256(output_script_hash, expected_script_hash);
+    
+    assert_utxo_preserved(output_ind);
+}
+
+/// 2. Authorized inclusion in a transaction with an update
+/// to the Storm Tree root using the network signature.
+fn auth_with_update_storm_tree_root(
+    storage: Storage,
+    new_merkle_root: u256,
+    output_ind: u32
+) {
+    let (current_merkle_root, rescue_block_number): Storage = storage;
+    let expected_current_script_hash: u256 = get_script_hash_for_storage(current_merkle_root, rescue_block_number);
+    assert_eq_256(jet::current_script_hash(), expected_current_script_hash);
+
+    let expected_new_script_hash: u256 = get_script_hash_for_storage(new_merkle_root, rescue_block_number);
+    let output_script_hash: u256 = unwrap(jet::output_script_hash(output_ind));
+    assert_eq_256(output_script_hash, expected_new_script_hash);
+
+    assert_utxo_preserved(output_ind);
+}
+
+/// 3. Authorized inclusion in a transaction with an update
+/// to the rescue block number using a network signature.
+fn auth_with_update_rescue_block(
+    storage: Storage,
+    new_rescue_block_number: Height,
+    output_ind: u32
+) {
+    let (merkle_root, current_rescue_block_number): Storage = storage;
+
+    // Minuted in 3 years
+    let expected_new_rescue_block_number: Height = safe_add_32(current_rescue_block_number, 1_576_800);
+    assert_eq_32(new_rescue_block_number, expected_new_rescue_block_number);
+    
+    let expected_current_script_hash: u256 = get_script_hash_for_storage(merkle_root, current_rescue_block_number);
+    assert_eq_256(jet::current_script_hash(), expected_current_script_hash);
+
+    let expected_new_script_hash: u256 = get_script_hash_for_storage(merkle_root, new_rescue_block_number);
+    let output_script_hash: u256 = unwrap(jet::output_script_hash(output_ind));
+    assert_eq_256(output_script_hash, expected_new_script_hash);
+
+    assert_utxo_preserved(output_ind);
+}
+
+/// Loop-invariant data for the split: how many outputs to visit, and what each must look like.
+type SplitCtx = (u8, u256, u256);
+
+/// One split output: check its shape, add its amount. `Left` ends the loop.
+fn step_collect_total_amount(
+    total_outputs_amount: u64,
+    ctx: SplitCtx,
+    counter: u8,
+) -> Either<u64, u64> {
+    let (split_utxos_count, expected_script_hash, current_asset): SplitCtx = ctx;
+
+    match jet::lt_8(counter, split_utxos_count) {
+        // Past the last split output: stop, carrying the total.
+        false => Left(total_outputs_amount),
+        true => {
+            let output_ind: u32 = u8_to_u32(counter);
+            let (output_asset, output_amount): (u256, u64) = get_explicit_output_amount(output_ind);
+            
+            assert_eq_256(unwrap(jet::output_script_hash(output_ind)), expected_script_hash);
+            assert_eq_256(output_asset, current_asset);
+
+            Right(safe_add_64(total_outputs_amount, output_amount))
+        },
+    }
+}
+
+/// 4. Authorized splitting of a Storm Eye UTXO into
+/// multiple UTXOs with the same Storm Tree root.
+fn auth_split_storm_eye_utxo_into_multiple_utxos(
+    storage: Storage,
+    split_utxos_count: u8
+) {
+    assert_eq_32(jet::current_index(), 0);
+
+    let (merkle_root, rescue_block_number): Storage = storage;
+    let expected_current_script_hash: u256 = get_script_hash_for_storage(merkle_root, rescue_block_number);
+    assert_eq_256(jet::current_script_hash(), expected_current_script_hash);
+
+    assert!(gt_8(split_utxos_count, 1));
+    assert!(jet::lt_8(split_utxos_count, param::MAX_SPLIT_UTXOS_COUNT));
+
+    let (current_asset, current_amount): (u256, u64) = get_explicit_current_amount();
+    let ctx: SplitCtx = (split_utxos_count, expected_current_script_hash, current_asset);
+
+    let out: Either<u64, u64> = for_while::<step_collect_total_amount>(0, ctx);
+    assert_eq_64(current_amount, unwrap_left::<u64>(out));
+}
+
+/// 5. Authorized merging of multiple Storm Eyes into
+/// a single Storm Eye UTXO with the same Storm Tree root.
+fn auth_merge_multiple_storm_eyes_into_single_utxo(
+    storage: Storage,
+    utxos_to_merge: u8
+) {
+    panic!()
+}
+
+/// 6. Inclusion in a transaction upon reaching the rescue block number,
+/// with the option to spend to output with the RESCUE_OUTPUT_SCRIPT_HASH script hash
+fn transaction_inclusion(
+    storage: Storage,
+    output_ind: u32
+) {
+    panic!()
+}
+
+fn main() {
+    match witness::PATH {
+        Left(authorized: AuthorizedWit) => {
+            let (storage, bloom, kind): AuthorizedWit = authorized;
+            let (merkle_root, _): Storage = storage;
+
+            // Every path below this point is network-authorised, so the proof and the
+            // signature are checked once, before the paths diverge.
+            assert_network_authorization(merkle_root, bloom);
+
+            match kind {
+                Left(output_ind: InclusionWit) => {
+                    auth_without_storage_updating(storage, output_ind);
+                },
+                Right(update_or_reshape: Either<UpdateKind, ReshapeKind>) => {
+                    match update_or_reshape {
+                        Left(update: UpdateKind) => match update {
+                            Left(wit: RootUpdateWit) => {
+                                let (new_merkle_root, output_ind): RootUpdateWit = wit;
+                                auth_with_update_storm_tree_root(
+                                    storage,
+                                    new_merkle_root,
+                                    output_ind
+                                );
+                            },
+                            Right(wit: RescueBlockUpdateWit) => {
+                                let (new_rescue_block_number, output_ind): RescueBlockUpdateWit = wit;
+                                auth_with_update_rescue_block(
+                                    storage,
+                                    new_rescue_block_number,
+                                    output_ind
+                                );
+                            },
+                        },
+                        Right(reshape: ReshapeKind) => match reshape {
+                            Left(split_utxos_count: SplitWit) => {
+                                auth_split_storm_eye_utxo_into_multiple_utxos(
+                                    storage,
+                                    split_utxos_count
+                                );
+                            },
+                            Right(utxos_to_merge: MergeWit) => {
+                                auth_merge_multiple_storm_eyes_into_single_utxo(
+                                    storage,
+                                    utxos_to_merge
+                                );
+                            },
+                        },
+                    }
+                },
+            }
+        },
+        Right(rescue: RescueWit) => {
+            let (storage, output_ind): RescueWit = rescue;
+            transaction_inclusion(storage, output_ind);
+        },
+    }
+}

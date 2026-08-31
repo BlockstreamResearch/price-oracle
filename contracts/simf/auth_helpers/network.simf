@@ -1,0 +1,92 @@
+use std::lib::asserts::assert_eq_256;
+
+/// One level of the fold: path bit (is_right = true) with sibling node hash
+type StormTreeProofStep = Either<(), (bool, u256)>;
+
+/// The aggregate signature, the signing
+/// combination's MuSig2 key, and its inclusion proof under the stored root.
+pub type StormTreeBloom = (
+    Signature,                 // MuSig2 signature
+    Pubkey,                    // Signing storm tree branch (the MuSig2 aggregate key)
+    [StormTreeProofStep; 17],  // Signing storm tree branch merkle proof
+);
+
+// SHA-256 padding blocks. Every message here has a length known at compile time, so its
+// padding is constant and `sha_256_block` can replace a `Ctx8`. Only the trailing bit
+// count varies.
+
+fn padding_head() -> u256 {
+    0x8000000000000000000000000000000000000000000000000000000000000000
+}
+
+/// 64-byte message: 512 bits.
+fn padding_64_tail() -> u256 {
+    0x0000000000000000000000000000000000000000000000000000000000000200
+}
+
+/// 96-byte message: 768 bits. Its padding fits beside the last 32 bytes of data, so this
+/// is a whole half-block and takes no [`padding_head`].
+fn padding_96_tail() -> u256 {
+    0x8000000000000000000000000000000000000000000000000000000000000300
+}
+
+/// The second half of a leaf's only block: the `0x01` domain separator, then the padding
+/// for a 33-byte message (264 bits). Data and padding share one block, so a leaf costs a
+/// single compression.
+fn leaf_tail() -> u256 {
+    0x0180000000000000000000000000000000000000000000000000000000000108
+}
+
+/// BIP-340 midstate for `OracleNetworkV1/StormEye`, used only by the signing message. The
+/// tagged prefix is exactly one block, so it compresses offline:
+///
+///     sha_256_block(sha_256_iv(), h, h)
+///     with h = sha256("OracleNetworkV1/StormEye")
+///            = 0xc167b450e88f500269275c422460371cb2a57a02c22d39bcede8bd016aea2cd8
+fn storm_eye_midstate() -> u256 {
+    0xb144605cf5f45223882ae168403987ae38744e847ae307aa36d03152d250c3a6
+}
+
+// Network authorization
+
+/// The message the network signs for any Storm Eye operation, per Network Spec Part III §3.
+fn get_signing_message() -> u256 {
+    jet::sha_256_block(storm_eye_midstate(), jet::sig_all_hash(), padding_96_tail())
+}
+
+/// The Storm Tree leaf for a branch: `sha256(branch || 0x01)`.
+fn get_storm_tree_leaf(branch: u256) -> u256 {
+    jet::sha_256_block(jet::sha_256_iv(), branch, leaf_tail())
+}
+
+/// Folds one level: `sha256(left || right)`.
+fn storm_tree_fold_step(step: StormTreeProofStep, node: u256) -> u256 {
+    match step {
+        Left(_: ()) => node,
+        Right(level: (bool, u256)) => {
+            let (is_right, sibling): (bool, u256) = level;
+
+            let (left, right): (u256, u256) = match is_right {
+                true => (sibling, node),
+                false => (node, sibling),
+            };
+
+            let data: u256 = jet::sha_256_block(jet::sha_256_iv(), left, right);
+            jet::sha_256_block(data, padding_head(), padding_64_tail())
+        }
+    }
+}
+
+/// Proves the signing combination is in the Storm Tree committed
+/// to by storage, and that it signed this transaction.
+pub fn assert_network_authorization(merkle_root: u256, bloom: StormTreeBloom) {
+    let (signature, branch, merkle_proof): StormTreeBloom = bloom;
+
+    let computed_root: u256 = array_fold::<storm_tree_fold_step, 17>(
+        merkle_proof,
+        get_storm_tree_leaf(branch)
+    );
+    assert_eq_256(computed_root, merkle_root);
+
+    jet::bip_0340_verify((branch, get_signing_message()), signature);
+}

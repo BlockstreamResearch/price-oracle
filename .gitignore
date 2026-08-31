@@ -1,2 +1,7 @@
-/target
+**/target
 /storm/config/*-peers.toml
+.vscode/
+
+# SimplicityHL
+contracts/deps
+contracts/src/artifacts
