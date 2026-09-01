@@ -5,11 +5,7 @@ type StormTreeProofStep = Either<(), (bool, u256)>;
 
 /// The aggregate signature, the signing
 /// combination's MuSig2 key, and its inclusion proof under the stored root.
-pub type StormTreeBloom = (
-    Signature,                 // MuSig2 signature
-    Pubkey,                    // Signing storm tree branch (the MuSig2 aggregate key)
-    [StormTreeProofStep; 17],  // Signing storm tree branch merkle proof
-);
+pub type StormTreeBloom = (Signature, Pubkey, [StormTreeProofStep; 17]);
 
 // SHA-256 padding blocks. Every message here has a length known at compile time, so its
 // padding is constant and `sha_256_block` can replace a `Ctx8`. Only the trailing bit
@@ -66,14 +62,17 @@ fn storm_tree_fold_step(step: StormTreeProofStep, node: u256) -> u256 {
         Right(level: (bool, u256)) => {
             let (is_right, sibling): (bool, u256) = level;
 
-            let (left, right): (u256, u256) = match is_right {
+            let (
+                left,
+                right
+            ): (u256, u256) = match is_right {
                 true => (sibling, node),
                 false => (node, sibling),
             };
 
             let data: u256 = jet::sha_256_block(jet::sha_256_iv(), left, right);
             jet::sha_256_block(data, padding_head(), padding_64_tail())
-        }
+        },
     }
 }
 
