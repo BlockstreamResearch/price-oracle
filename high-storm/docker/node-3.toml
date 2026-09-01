@@ -10,6 +10,7 @@ private_key = "0303030303030303030303030303030303030303030303030303030303030303"
 url = "http://elements-3:18884"
 username = "high-storm"
 password = "high-storm"
+wallet = "funded-key"
 
 [service.db]
 url = "postgres:5432"

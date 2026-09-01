@@ -106,6 +106,16 @@ impl Signing {
         Self { state }
     }
 
+    pub(crate) async fn storm_tree_root(&self) -> Result<[u8; 32], SigningError> {
+        self.state
+            .lock()
+            .await
+            .tree
+            .as_ref()
+            .map(StormTree::root)
+            .ok_or(SigningError::TooFewMembers)
+    }
+
     pub(crate) async fn sign_test(
         &self,
         storm: &Storm,

@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::{AnyPool, Row};
 use storm::{Peer, PeerStatus};
 
-use super::voting::VotingStore;
+use super::{network_asset::NetworkAssetStore, voting::VotingStore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -31,6 +31,10 @@ impl NetworkStore {
 
     pub(crate) fn voting(&self) -> VotingStore {
         VotingStore::new(self.pool.clone())
+    }
+
+    pub(crate) fn network_assets(&self) -> NetworkAssetStore {
+        NetworkAssetStore::new(self.pool.clone())
     }
 
     pub async fn save(

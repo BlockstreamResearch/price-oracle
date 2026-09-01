@@ -151,10 +151,15 @@ services:
       ELEMENTS_RPC_USER: high-storm
       ELEMENTS_RPC_PASSWORD: high-storm
       BLOCK_INTERVAL_SECONDS: 60
+      FUNDED_PRIVATE_KEY: "0101010101010101010101010101010101010101010101010101010101010101"
     entrypoint: ["/bin/bash", "/opt/elements/bootstrap.sh"]
     volumes:
       - ./docker/elements/bootstrap.sh:/opt/elements/bootstrap.sh:ro
-      - ./assets:/assets:ro
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/bootstrap-ready"]
+      interval: 1s
+      timeout: 1s
+      retries: 60
     networks:
       storm:
         ipv4_address: 172.28.0.24
@@ -189,6 +194,8 @@ services:
       postgres:
         condition: service_healthy
       elements-1:
+        condition: service_healthy
+      elements-bootstrap:
         condition: service_healthy
     volumes:
       - ./docker/node-1.toml:/etc/high-storm/config.toml:ro

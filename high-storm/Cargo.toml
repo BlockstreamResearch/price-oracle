@@ -7,6 +7,7 @@ edition.workspace = true
 axum.workspace = true
 bip322.workspace = true
 bitcoin.workspace = true
+bitcoincore-rpc.workspace = true
 clap = { workspace = true, features = ["derive"] }
 getrandom.workspace = true
 hex.workspace = true
@@ -25,6 +26,8 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 url.workspace = true
 
+contracts.workspace = true
+simplex = { package = "smplx-std", git = "https://github.com/BlockstreamResearch/smplx", rev = "53087018cd1a8e12c710a44bafc5e32c077edc5a" }
 storm.workspace = true
 storm-tree = { path = "../storm-tree" }
 

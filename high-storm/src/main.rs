@@ -63,6 +63,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    if let Some(storm_eye) = storm
+        .initialize_storm_eye(&config.service.elements_rpc)
+        .await?
+    {
+        tracing::info!(
+            asset_id = %hex::encode(storm_eye.asset_id),
+            issuance_txid = %hex::encode(storm_eye.issuance_txid),
+            "Storm Eye asset is initialized"
+        );
+    }
+
     let external_api = ExternalApiServer::bind(
         config.service.external_api_address,
         storm.handle(),
@@ -127,6 +138,11 @@ async fn run_until_shutdown(
             _ = reconnect.tick() => {
                 if let Err(error) = storm.start(None).await {
                     tracing::warn!(%error, "peer reconnection pass failed");
+                }
+
+                if storm.is_coordinator().await
+                    && let Err(error) = storm.announce_network_assets().await {
+                        tracing::warn!(%error, "network asset announcement pass failed");
                 }
             }
             _ = persist_runtime.tick() => {
