@@ -3,6 +3,8 @@ use std::lib::asserts::{assert_eq_64, assert_eq_256};
 // TODO: Maybe it would be better to separate asset/amount getters into separate file.
 // Add them into std library for future.
 
+// Amount with asset getters
+
 /// Return explicit input asset and amount
 pub fn get_explicit_input_amount(output_index: u32) -> (u256, u64) {
     let (output_asset, output_amount): (Asset1, Amount1) = unwrap(jet::input_amount(output_index));
@@ -39,6 +41,12 @@ pub fn assert_output_preserves_utxo(output_index: u32) {
     assert_eq_64(output_amount, current_amount);
 }
 
+// Asset getters
+
+pub fn get_input_asset(input_index: u32) -> u256 {
+    unwrap_right::<Point>(unwrap(jet::input_asset(input_index)))
+}
+
 pub fn get_output_asset(output_index: u32) -> u256 {
     unwrap_right::<Point>(unwrap(jet::output_asset(output_index)))
 }
@@ -46,6 +54,8 @@ pub fn get_output_asset(output_index: u32) -> u256 {
 pub fn get_current_asset() -> u256 {
     unwrap_right::<Point>(jet::current_asset())
 }
+
+// Script hash getters
 
 pub fn get_input_script_hash(input_index: u32) -> u256 {
     unwrap(jet::input_script_hash(input_index))

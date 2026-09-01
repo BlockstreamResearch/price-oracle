@@ -1,28 +1,77 @@
-use std::lib::asserts::{assert_eq_32, assert_eq_64, assert_eq_256};
+use std::lib::asserts::{assert_eq_32, assert_eq_256};
 use std::lib::op_return::assert_output_is_op_return;
 
-use crate::helper::{get_explicit_current_amount, get_explicit_output_amount};
+use crate::helper::{get_input_asset, get_input_script_hash, assert_output_preserves_utxo};
 
-// TODO: Use it after merging full auth contracts (PR #23).
-fn assert_utxo_preserved(output_ind: u32) {
-    let (output_asset, output_amount): (u256, u64) = get_explicit_output_amount(output_ind);
-    let (current_asset, current_amount): (u256, u64) = get_explicit_current_amount();
+/// 1. asset_auth_utxo_input_index, tick_utxo_output_index
+type AssetAuthWit = (u32, u32);
+/// 2. script_auth_utxo_input_index, tick_utxo_output_index
+type ScriptAuthWit = (u32, u32);
+/// 3. auth_signature, tick_utxo_output_index
+type SignAuthWit = (Signature, u32);
+/// 4. storm_eye_input_index, tick_utxo_output_index
+type NetworkAuthWit = (u32, u32);
 
-    assert_eq_256(output_asset, current_asset);
-    assert_eq_64(output_amount, current_amount);
+type AuthKindLeft = Either<AssetAuthWit, ScriptAuthWit>;
+type AuthKindRight = Either<SignAuthWit, NetworkAuthWit>;
+
+fn assert_tick_utxo_burned(tick_utxo_output_index: u32) {
+    assert_output_preserves_utxo(tick_utxo_output_index);
+    assert_output_is_op_return(tick_utxo_output_index);
 }
 
 /// 1. User spending via the Asset authorization method.
 fn user_spend_via_asset_auth(asset_auth_utxo_input_index: u32, tick_utxo_output_index: u32) {
     assert_eq_32(param::AUTH_METHOD, 0);
+    assert_eq_256(get_input_asset(asset_auth_utxo_input_index), param::AUTH_ASSET_ID);
 
-    let input_asset: u256 = unwrap_right::<Point>(
-        unwrap(jet::input_asset(asset_auth_utxo_input_index))
-    );
-    assert_eq_256(input_asset, param::AUTH_ASSET_ID);
-
-    assert_utxo_preserved(tick_utxo_output_index);
-    assert_output_is_op_return(tick_utxo_output_index);
+    assert_tick_utxo_burned(tick_utxo_output_index);
 }
 
-fn main() {}
+/// 2. User spending via the Script authorization method.
+fn user_spend_via_script_auth(script_auth_utxo_input_index: u32, tick_utxo_output_index: u32) {
+    assert_eq_32(param::AUTH_METHOD, 1);
+    assert_eq_256(get_input_script_hash(script_auth_utxo_input_index), param::AUTH_SCRIPT_HASH);
+
+    assert_tick_utxo_burned(tick_utxo_output_index);
+}
+
+/// 3. User spending via the Signature authorization method.
+fn user_spend_via_sign_auth(auth_signature: Signature, tick_utxo_output_index: u32) {
+    assert_eq_32(param::AUTH_METHOD, 2);
+    jet::bip_0340_verify((param::AUTH_PUBKEY, jet::sig_all_hash()), auth_signature);
+
+    assert_tick_utxo_burned(tick_utxo_output_index);
+}
+
+/// 4. Network authorized spending.
+fn network_auth_spend(storm_eye_input_index: u32, tick_utxo_output_index: u32) {
+    assert_eq_256(get_input_asset(storm_eye_input_index), param::STORM_EYE_ASSET_ID);
+
+    assert_tick_utxo_burned(tick_utxo_output_index);
+}
+
+fn main() {
+    match witness::PATH {
+        Left(index_auth: AuthKindLeft) => match index_auth {
+            Left(wit: AssetAuthWit) => {
+                let (input_index, output_index): AssetAuthWit = wit;
+                user_spend_via_asset_auth(input_index, output_index);
+            },
+            Right(wit: ScriptAuthWit) => {
+                let (input_index, output_index): ScriptAuthWit = wit;
+                user_spend_via_script_auth(input_index, output_index);
+            },
+        },
+        Right(sign_or_network: AuthKindRight) => match sign_or_network {
+            Left(wit: SignAuthWit) => {
+                let (signature, output_index): SignAuthWit = wit;
+                user_spend_via_sign_auth(signature, output_index);
+            },
+            Right(wit: NetworkAuthWit) => {
+                let (input_index, output_index): NetworkAuthWit = wit;
+                network_auth_spend(input_index, output_index);
+            },
+        },
+    }
+}
