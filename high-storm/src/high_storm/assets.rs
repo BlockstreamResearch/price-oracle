@@ -5,6 +5,8 @@ use secp256k1_zkp::PublicKey;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use simplex::provider::SimplicityNetwork;
+use simplex::simplicityhl::elements::Script;
+use simplex::utils::hash_script;
 use storm::{PeerStatus, StormContext, StormHandle};
 use url::Url;
 
@@ -18,6 +20,7 @@ use super::{NodeMessage, NodeMessageKind, SigningError};
 
 const STORM_EYE_NAME: &str = "Storm Eye";
 const STORM_EYE_SUPPLY: u64 = 10_000;
+const MAX_MERGE_UTXOS_COUNT: u8 = 4;
 const MAX_SPLIT_UTXOS_COUNT: u8 = 4;
 const RESCUE_BLOCKS: u64 = 1_576_800;
 const STORM_EYE_RPC_AMOUNT: f64 = 0.000_100_00;
@@ -236,8 +239,20 @@ impl ElementsAssetIssuer {
         let rescue_height =
             u32::try_from(block_height + RESCUE_BLOCKS).map_err(|_| AssetError::RescueHeight)?;
 
+        let funding = client
+            .call::<Vec<WalletUtxo>>("listunspent", &[0.into(), 9_999_999.into()])?
+            .into_iter()
+            .find(|utxo| utxo.spendable && utxo.asset == sidechain.pegged_asset)
+            .ok_or(AssetError::MissingFundingUtxo)?;
+        let rescue_script = Script::from(
+            hex::decode(&funding.script_pub_key)
+                .map_err(|_| AssetError::InvalidRpcResponse("funding UTXO script"))?,
+        );
+
         let mut program = AuthProgram::new(&AuthArguments {
+            max_merge_utxos_count: MAX_MERGE_UTXOS_COUNT,
             max_split_utxos_count: MAX_SPLIT_UTXOS_COUNT,
+            rescue_output_script_hash: hash_script(&rescue_script),
         })
         .with_storage_capacity(2);
         program.set_storage_at(0, storm_tree_root);
@@ -245,11 +260,6 @@ impl ElementsAssetIssuer {
         let contract_address = program.as_ref().get_tr_address(&network).to_string();
         let contract_script = program.get_script_pubkey(&network).into_bytes();
 
-        let funding = client
-            .call::<Vec<WalletUtxo>>("listunspent", &[0.into(), 9_999_999.into()])?
-            .into_iter()
-            .find(|utxo| utxo.spendable && utxo.asset == sidechain.pegged_asset)
-            .ok_or(AssetError::MissingFundingUtxo)?;
         let funding_amount = Amount::from_btc(funding.amount)
             .map_err(|_| AssetError::InvalidRpcResponse("funding UTXO amount"))?;
         let change_sats = funding_amount
@@ -369,6 +379,8 @@ struct WalletUtxo {
     txid: String,
     vout: u32,
     address: String,
+    #[serde(rename = "scriptPubKey")]
+    script_pub_key: String,
     asset: String,
     amount: f64,
     spendable: bool,
