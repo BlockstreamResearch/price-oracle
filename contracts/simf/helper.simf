@@ -1,3 +1,5 @@
+use std::lib::asserts::{assert_eq_64, assert_eq_256};
+
 /// Return explicit input asset and amount
 pub fn get_explicit_input_amount(output_ind: u32) -> (u256, u64) {
     let (output_asset, output_amount): (Asset1, Amount1) = unwrap(jet::input_amount(output_ind));
@@ -23,4 +25,13 @@ pub fn get_explicit_current_amount() -> (u256, u64) {
     let output_amount: u64 = unwrap_right::<Point>(output_amount);
 
     (output_asset, output_amount)
+}
+
+/// The Storm Eye UTXO must be spent in its entirety: same asset, same amount.
+pub fn assert_output_preserves_utxo(output_ind: u32) {
+    let (output_asset, output_amount): (u256, u64) = get_explicit_output_amount(output_ind);
+    let (current_asset, current_amount): (u256, u64) = get_explicit_current_amount();
+
+    assert_eq_256(output_asset, current_asset);
+    assert_eq_64(output_amount, current_amount);
 }
