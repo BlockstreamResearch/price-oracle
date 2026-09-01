@@ -13,6 +13,7 @@ private_key = "804622cda0d8e634317a12651d91751ceff5c081f2b5f63ef7912725c7275e5d"
 url = "http://127.0.0.1:18884"
 username = "high-storm"
 password = "high-storm"
+wallet = "funded-key"
 
 [service.db]
 url = "localhost:5432"

@@ -124,6 +124,24 @@ pub struct StormEyeUtxo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkAsset {
+    pub kind: String,
+    pub name: String,
+    pub asset_id: [u8; 32],
+    pub reissuance_token_id: Option<[u8; 32]>,
+    pub entropy: Option<[u8; 32]>,
+    pub issuance_txid: [u8; 32],
+    pub contract_script: Vec<u8>,
+    pub supply: u64,
+    pub created_at_block: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkAssets {
+    pub assets: Vec<NetworkAsset>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeStormEyes {
     pub utxos_to_merge: Vec<StormEyeUtxo>,
 }
@@ -182,7 +200,7 @@ impl NodeMessageKind {
     }
 
     pub(crate) fn requires_coordinator(self) -> bool {
-        matches!(self, Self::ExecuteUserRequests)
+        matches!(self, Self::ExecuteUserRequests | Self::NetworkAssets)
     }
 }
 

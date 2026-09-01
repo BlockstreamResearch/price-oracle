@@ -2,7 +2,7 @@ use std::net::TcpListener;
 
 use high_storm::{
     config::{Config, DbConfig, ElementsRpcConfig, ServiceConfig, SignerConfig},
-    db::{Database, network::NetworkStore},
+    db::{Database, network::NetworkStore, network_asset::NetworkAssetStore},
 };
 use secp256k1_zkp::{Secp256k1, SecretKey};
 
@@ -10,6 +10,8 @@ pub struct TestNode {
     pub config: Config,
     pub public_key: String,
     pub store: NetworkStore,
+    #[allow(dead_code)]
+    pub assets: NetworkAssetStore,
 }
 
 impl TestNode {
@@ -30,6 +32,7 @@ impl TestNode {
                     url: "http://127.0.0.1:18884".to_string(),
                     username: "unused".to_string(),
                     password: "unused".to_string(),
+                    wallet: "unused".to_string(),
                 },
                 db: DbConfig {
                     url: "unused".to_string(),
@@ -43,11 +46,13 @@ impl TestNode {
 
         let database = Database::connect("sqlite::memory:", 1).await.unwrap();
         let store = database.network();
+        let assets = database.network_assets();
 
         Self {
             config,
             public_key: hex::encode(public_key),
             store,
+            assets,
         }
     }
 

@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-  pull_request:
 
 permissions:
   contents: read
@@ -13,6 +12,7 @@ concurrency:
 
 env:
   CONTRACTS_NAME: "contracts"
+  SIMPLEX_COMMIT: 53087018cd1a8e12c710a44bafc5e32c077edc5a
 
 jobs:
   ci:
@@ -27,6 +27,23 @@ jobs:
         run: |
           rustup show active-toolchain
           rustup component add rustfmt clippy
+
+      - name: Install pinned Simplex CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 https://smplx.simplicity-lang.org | bash
+          SIMPLEX_DIR="${SIMPLEX_DIR:-${XDG_CONFIG_HOME:-$HOME}/.simplex}"
+          echo "$SIMPLEX_DIR/bin" >> "$GITHUB_PATH"
+          "$SIMPLEX_DIR/bin/simplexup" -C "$SIMPLEX_COMMIT"
+          "$SIMPLEX_DIR/bin/simplex" --version
+
+      - name: Generate contract artifacts
+        working-directory: contracts
+        run: |
+          simplex install
+          simplex build
+          test -f src/artifacts/mod.rs
 
       - name: Check formatting
         run: cargo fmt -p high-storm -p storm -p storm-operator -p storm-tree --check

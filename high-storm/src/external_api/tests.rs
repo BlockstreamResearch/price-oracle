@@ -261,6 +261,7 @@ async fn setup() -> (Router, PrivateKey, String) {
         node_secret.secret_bytes(),
         node_public_key,
         database.voting(),
+        database.network_assets(),
     )
     .await;
 

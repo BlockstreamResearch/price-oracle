@@ -46,9 +46,13 @@ ensure_wallet bootstrap false
 ensure_wallet funded-key true
 wallet_rpc bootstrap rescanblockchain >/dev/null
 
-private_key="$(tr -d '[:space:]' < "${private_key_file}")"
+if [[ -n "${FUNDED_PRIVATE_KEY:-}" ]]; then
+	private_key="${FUNDED_PRIVATE_KEY}"
+else
+	private_key="$(tr -d '[:space:]' < "${private_key_file}")"
+fi
 if [[ ! "${private_key}" =~ ^[[:xdigit:]]{64}$ ]]; then
-	echo "${private_key_file} must contain one 32-byte hexadecimal private key." >&2
+	echo "FUNDED_PRIVATE_KEY or ${private_key_file} must provide one 32-byte hexadecimal private key." >&2
 	exit 1
 fi
 
@@ -99,6 +103,7 @@ PY
 esac
 
 echo "Funded development address: ${funded_address}"
+touch /tmp/bootstrap-ready
 while true; do
 	mining_address="$(wallet_rpc bootstrap getnewaddress "" bech32)"
 	rpc generatetoaddress 1 "${mining_address}" >/dev/null

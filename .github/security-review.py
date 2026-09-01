@@ -4,6 +4,7 @@ import os
 import pathlib
 import re
 import secrets
+import subprocess
 import sys
 import time
 import typing
@@ -17,7 +18,7 @@ REPORT_PATH = os.environ.get("SECURITY_REVIEW_REPORT", "security-review.md")
 MODEL = os.environ.get("SECURITY_REVIEW_MODEL", "gpt-5-mini")
 ARCHITECTURE_PATH = pathlib.Path("specs/oracle-network-architecture.md")
 MAX_ARCHITECTURE_SIZE = 100_000
-MAX_CODEBASE_CONTEXT_SIZE = 500_000
+MAX_CODEBASE_CONTEXT_SIZE = 1_000_000
 TEXT_SUFFIXES = {".json", ".md", ".py", ".rs", ".toml", ".yaml", ".yml"}
 TEXT_FILENAMES = {".gitignore", "Cargo.lock", "LICENSE", "rust-toolchain.toml"}
 EXCLUDED_DIRECTORIES = {".git", "target"}
@@ -130,9 +131,10 @@ def redact_config_secrets(path: pathlib.Path, contents: str) -> str:
     if path.suffix == ".json":
         try:
             parsed = json.loads(contents)
-        except json.JSONDecodeError as error:
-            fail(f"Could not parse JSON review context file {path}: {error}")
-        return json.dumps(redact_json_secrets(parsed), indent=2)
+        except json.JSONDecodeError:
+            pass
+        else:
+            return json.dumps(redact_json_secrets(parsed), indent=2)
     return SECRET_ASSIGNMENT.sub(r'\1"<redacted>"\2', contents)
 
 
@@ -140,7 +142,19 @@ def build_codebase_context() -> str:
     sections = []
     total_size = 0
 
-    for path in sorted(pathlib.Path(".").rglob("*")):
+    try:
+        tracked_files = subprocess.run(
+            ["git", "ls-files", "-z"],
+            check=True,
+            capture_output=True,
+        ).stdout.decode("utf-8").split("\0")
+    except (OSError, subprocess.CalledProcessError, UnicodeDecodeError) as error:
+        fail(f"Could not list tracked review context files: {error}")
+
+    for filename in tracked_files:
+        if not filename:
+            continue
+        path = pathlib.Path(filename)
         if not include_in_codebase_context(path):
             continue
 
@@ -265,6 +279,10 @@ def latest_context_store_id() -> str:
             "context sync workflow first."
         )
     return max(stores, key=lambda store: store.get("created_at", 0))["id"]
+
+if sys.argv[1:] == ["--check-context"]:
+    build_context_snapshot()
+    sys.exit(0)
 
 api_key = os.environ["OPENAI_API_KEY"]
 

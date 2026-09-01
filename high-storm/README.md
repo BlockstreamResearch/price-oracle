@@ -38,9 +38,10 @@ Elements `29.4.1rc1` is built from its release tag and verified against commit
 checksum.
 
 The bootstrap service claims the development chain's initial free coins and sends
-exactly 50 LBTC to the private key in `docker/funded-private-key.txt`. It then mines
-one block immediately and one block every 60 seconds. The bootstrap is idempotent,
-so restarting it does not fund the key again. Inspect the funded wallet with:
+exactly 50 LBTC to node 1's development key. It then mines one block immediately
+and one block every 60 seconds. The coordinator waits for this funding to complete.
+The bootstrap is idempotent, so restarting it does not fund the key again. Inspect
+the funded wallet with:
 
 ```sh
 docker compose -f high-storm/compose.yml exec -T elements-1 \
@@ -52,6 +53,14 @@ docker compose -f high-storm/compose.yml exec -T elements-1 \
 The chain, RPC credentials, signer keys, and funded private key are for local
 development only.
 
+On its first successful startup, the coordinator compiles the Storm Eye covenant
+with the current Storm Tree root and a three-year rescue height, issues the fixed
+10,000-unit asset from its configured Elements wallet, and persists the signed
+transaction before broadcasting it. A restart rebroadcasts the same pending
+transaction or reuses the active asset; it never prepares a second issuance.
+Active asset metadata is delivered idempotently to every network member and is
+retried for peers that were offline.
+
 Heartbeat send and receive events are emitted at trace level. Enable them with
 `RUST_LOG=info,high_storm=debug,storm=debug,storm::heartbeat=trace`.
 
@@ -62,10 +71,12 @@ The checked-in identities and database password are for local development only.
 Copy `config.example.toml` to `config.toml`, then set the listener port, signer key,
 Elements RPC endpoint, and PostgreSQL connection fields. The
 `service.elements_rpc.url` value is the full HTTP endpoint for that node's Elements
-daemon. The `service.db.url` value is the database host and optional port, for
-example `localhost:5432`. Set `service.ipc_path` to a unique Unix socket path for
-each high-storm process running on the same host. The external API binds to
-`service.external_api_address`, which defaults to `127.0.0.1:9001`.
+daemon. `service.elements_rpc.wallet` selects the coordinator wallet that funds
+the one-time Storm Eye issuance and defaults to `funded-key`. The `service.db.url`
+value is the database host and optional port, for example `localhost:5432`. Set
+`service.ipc_path` to a unique Unix socket path for each high-storm process running
+on the same host. The external API binds to `service.external_api_address`, which
+defaults to `127.0.0.1:9001`.
 
 ## Initialize a network
 

@@ -2,7 +2,11 @@ mod common;
 
 use std::time::Duration;
 
-use high_storm::{initialize_host, initialize_join, start_initialized};
+use high_storm::{
+    NetworkAsset,
+    db::network_asset::{PendingNetworkAsset, STORM_EYE_KIND},
+    initialize_host, initialize_join, start_initialized,
+};
 use storm::{PeerStatus, Storm};
 use tokio::time::timeout;
 
@@ -76,6 +80,62 @@ async fn initializes_persists_and_restores_a_network() {
         host_node.public_key
     );
     assert_eq!(host.coordinator_public_key(), join.coordinator_public_key());
+
+    let pending_asset = PendingNetworkAsset {
+        asset: NetworkAsset {
+            kind: STORM_EYE_KIND.to_string(),
+            name: "Storm Eye".to_string(),
+            asset_id: [3; 32],
+            reissuance_token_id: None,
+            entropy: None,
+            issuance_txid: [4; 32],
+            contract_script: vec![0x51],
+            supply: 10_000,
+            created_at_block: 1,
+        },
+        issuance_tx: vec![5; 64],
+    };
+    host_node
+        .assets
+        .insert_pending(&pending_asset)
+        .await
+        .unwrap();
+    host_node.assets.activate(STORM_EYE_KIND).await.unwrap();
+    host.announce_network_assets().await.unwrap();
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if join_node
+                .assets
+                .get(STORM_EYE_KIND)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("joiner did not persist announced network assets");
+    assert_eq!(
+        join_node.assets.get(STORM_EYE_KIND).await.unwrap(),
+        Some(pending_asset.asset)
+    );
+    let join_public_key = hex::decode(&join_node.public_key)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert!(
+        host_node
+            .assets
+            .pending_for_peer(&join_public_key)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    host.announce_network_assets().await.unwrap();
 
     for store in [&host_node.store, &join_node.store] {
         let peers = store.load().await.unwrap();

@@ -49,6 +49,12 @@ pub struct ElementsRpcConfig {
     pub url: String,
     pub username: String,
     pub password: String,
+    #[serde(default = "default_elements_wallet")]
+    pub wallet: String,
+}
+
+fn default_elements_wallet() -> String {
+    "funded-key".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize)]

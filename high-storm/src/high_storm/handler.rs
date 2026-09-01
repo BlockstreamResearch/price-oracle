@@ -1,6 +1,7 @@
 use storm::{CustomMsg, StormContext};
 
 use super::{
+    assets::AssetError,
     message::{NodeMessage, NodeMessageKind},
     signing::SigningError,
     state::NetworkState,
@@ -13,6 +14,8 @@ pub(crate) enum HandlerError {
     Signing(#[from] SigningError),
     #[error(transparent)]
     Voting(#[from] VotingError),
+    #[error(transparent)]
+    Asset(#[from] AssetError),
     #[error(transparent)]
     Encoding(#[from] postcard::Error),
 }
@@ -39,6 +42,13 @@ pub(crate) async fn handle(
     )?;
 
     match kind {
+        NodeMessageKind::NetworkAssets => {
+            state
+                .assets()
+                .handle_announcement(message, &context)
+                .await?;
+            Ok(())
+        }
         NodeMessageKind::NetworkVoteRequest => {
             state
                 .voting()
@@ -127,5 +137,13 @@ mod tests {
     #[test]
     fn member_can_send_messages_without_coordinator_restriction() {
         authorize_sender(NodeMessageKind::AttestPrice, COORDINATOR, MEMBER).unwrap();
+    }
+
+    #[test]
+    fn only_coordinator_can_announce_network_assets() {
+        let error =
+            authorize_sender(NodeMessageKind::NetworkAssets, COORDINATOR, MEMBER).unwrap_err();
+
+        assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
     }
 }

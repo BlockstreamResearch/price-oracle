@@ -13,10 +13,10 @@ use storm::{Peer, Storm};
 
 use crate::config::Config;
 pub use high_storm::{
-    ApproveVotingRequest, HighStorm, HighStormHandle, MergeStormEyes, NetworkVoteKind,
-    NetworkVoteRequest, NodeMessage, NodeMessageKind, SigningError, SigningResult, SplitStormEye,
-    StormEyeUtxo, TestNodeMessage, UpdateNetworkMembers, VOTING_TIMEOUT_BLOCKS, VotingApproval,
-    VotingError, VotingRequest, VotingStatus,
+    ApproveVotingRequest, AssetError, HighStorm, HighStormHandle, MergeStormEyes, NetworkAsset,
+    NetworkAssets, NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind, SigningError,
+    SigningResult, SplitStormEye, StormEyeUtxo, TestNodeMessage, UpdateNetworkMembers,
+    VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError, VotingRequest, VotingStatus,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -121,6 +121,7 @@ pub async fn start_initialized(config: &Config, store: &NetworkStore) -> Result<
         secret_key_bytes,
         coordinator_public_key,
         store.voting(),
+        store.network_assets(),
     )
     .await)
 }
@@ -152,9 +153,14 @@ async fn initialize(
                 peer_count = peers.len(),
                 "initialized network state persisted"
             );
-            return Ok(
-                HighStorm::new(storm, secret_key, coordinator_public_key, store.voting()).await,
-            );
+            return Ok(HighStorm::new(
+                storm,
+                secret_key,
+                coordinator_public_key,
+                store.voting(),
+                store.network_assets(),
+            )
+            .await);
         }
 
         tokio::time::sleep(Duration::from_millis(250)).await;

@@ -6,15 +6,18 @@ use std::{
 use storm::{Storm, StormHandle};
 use storm_tree::NodePublicKey;
 
+mod assets;
 mod handler;
 mod message;
 mod signing;
 mod state;
 mod voting;
 
+pub use assets::AssetError;
 pub use message::{
-    ApproveVotingRequest, MergeStormEyes, NetworkVoteKind, NetworkVoteRequest, NodeMessage,
-    NodeMessageKind, SplitStormEye, StormEyeUtxo, TestNodeMessage, UpdateNetworkMembers,
+    ApproveVotingRequest, MergeStormEyes, NetworkAsset, NetworkAssets, NetworkVoteKind,
+    NetworkVoteRequest, NodeMessage, NodeMessageKind, SplitStormEye, StormEyeUtxo, TestNodeMessage,
+    UpdateNetworkMembers,
 };
 pub use signing::{SigningError, SigningResult};
 use state::NetworkState;
@@ -38,9 +41,16 @@ impl HighStorm {
         secret_key: [u8; 32],
         coordinator_public_key: [u8; 33],
         voting_store: crate::db::voting::VotingStore,
+        network_assets: crate::db::network_asset::NetworkAssetStore,
     ) -> Self {
-        let state =
-            NetworkState::new(&storm, secret_key, coordinator_public_key, voting_store).await;
+        let state = NetworkState::new(
+            &storm,
+            secret_key,
+            coordinator_public_key,
+            voting_store,
+            network_assets,
+        )
+        .await;
         let handler_state = state.clone();
 
         storm
@@ -167,6 +177,37 @@ impl HighStorm {
     pub fn set_block_height(&self, block_height: u64) {
         self.state.set_block_height(block_height);
     }
+
+    pub async fn announce_network_assets(&self) -> Result<(), AssetError> {
+        self.state
+            .assets()
+            .announce_pending(&self.storm.handle())
+            .await
+    }
+
+    pub async fn initialize_storm_eye(
+        &self,
+        config: &crate::config::ElementsRpcConfig,
+    ) -> Result<Option<NetworkAsset>, AssetError> {
+        if !self.is_coordinator().await {
+            return Ok(None);
+        }
+
+        let storm_tree_root = self.state.signing().storm_tree_root().await?;
+        self.state
+            .assets()
+            .initialize_storm_eye(&self.storm.handle(), config, storm_tree_root)
+            .await
+            .map(Some)
+    }
+
+    pub async fn network_asset(&self, kind: &str) -> Result<Option<NetworkAsset>, AssetError> {
+        self.state.assets().get(kind).await
+    }
+
+    pub async fn storm_eye_asset(&self) -> Result<Option<NetworkAsset>, AssetError> {
+        self.state.assets().storm_eye().await
+    }
 }
 
 impl HighStormHandle {
@@ -218,6 +259,10 @@ impl HighStormHandle {
 
     pub async fn voting_requests(&self) -> Result<Vec<VotingRequest>, VotingError> {
         self.state.voting().list().await
+    }
+
+    pub async fn network_asset(&self, kind: &str) -> Result<Option<NetworkAsset>, AssetError> {
+        self.state.assets().get(kind).await
     }
 }
 
