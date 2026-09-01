@@ -1,0 +1,28 @@
+use std::lib::asserts::{assert_eq_32, assert_eq_64, assert_eq_256};
+use std::lib::op_return::assert_output_is_op_return;
+
+use crate::helper::{get_explicit_current_amount, get_explicit_output_amount};
+
+// TODO: Use it after merging full auth contracts (PR #23).
+fn assert_utxo_preserved(output_ind: u32) {
+    let (output_asset, output_amount): (u256, u64) = get_explicit_output_amount(output_ind);
+    let (current_asset, current_amount): (u256, u64) = get_explicit_current_amount();
+
+    assert_eq_256(output_asset, current_asset);
+    assert_eq_64(output_amount, current_amount);
+}
+
+/// 1. User spending via the Asset authorization method.
+fn user_spend_via_asset_auth(asset_auth_utxo_input_index: u32, tick_utxo_output_index: u32) {
+    assert_eq_32(param::AUTH_METHOD, 0);
+
+    let input_asset: u256 = unwrap_right::<Point>(
+        unwrap(jet::input_asset(asset_auth_utxo_input_index))
+    );
+    assert_eq_256(input_asset, param::AUTH_ASSET_ID);
+
+    assert_utxo_preserved(tick_utxo_output_index);
+    assert_output_is_op_return(tick_utxo_output_index);
+}
+
+fn main() {}
