@@ -8,6 +8,9 @@ use crate::helper::{
     get_explicit_current_amount,
     get_explicit_output_amount,
     get_explicit_input_amount,
+    get_output_script_hash,
+    get_input_script_hash,
+    get_current_asset,
     assert_output_preserves_utxo
 };
 use crate::storage::{get_script_hash_for_storage};
@@ -45,30 +48,30 @@ fn assert_storage_with_current(storage: Storage) {
     assert_eq_256(jet::current_script_hash(), script_hash_for(storage));
 }
 
-fn assert_storage_with_output(storage: Storage, output_ind: u32) {
-    assert_eq_256(unwrap(jet::output_script_hash(output_ind)), script_hash_for(storage));
+fn assert_storage_with_output(storage: Storage, output_index: u32) {
+    assert_eq_256(get_output_script_hash(output_index), script_hash_for(storage));
 }
 
-fn assert_output_matches_current(output_ind: u32) {
-    assert_eq_256(unwrap(jet::output_script_hash(output_ind)), jet::current_script_hash());
+fn assert_output_script_hash_matches_current(output_index: u32) {
+    assert_eq_256(get_output_script_hash(output_index), jet::current_script_hash());
 }
 
 /// 1. Authorized inclusion in a transaction without storage updating.
-fn auth_without_storage_updating(storage: Storage, output_ind: u32) {
+fn auth_without_storage_updating(storage: Storage, output_index: u32) {
     assert_storage_with_current(storage);
-    assert_output_matches_current(output_ind);
-    assert_output_preserves_utxo(output_ind);
+    assert_output_script_hash_matches_current(output_index);
+    assert_output_preserves_utxo(output_index);
 }
 
 /// 2. Authorized inclusion in a transaction with an update
 /// to the Storm Tree root using the network signature.
-fn auth_with_update_storm_tree_root(storage: Storage, new_merkle_root: u256, output_ind: u32) {
+fn auth_with_update_storm_tree_root(storage: Storage, new_merkle_root: u256, output_index: u32) {
     let (_, rescue_block_number): Storage = storage;
     let new_storage: Storage = (new_merkle_root, rescue_block_number);
 
     assert_storage_with_current(storage);
-    assert_storage_with_output(new_storage, output_ind);
-    assert_output_preserves_utxo(output_ind);
+    assert_storage_with_output(new_storage, output_index);
+    assert_output_preserves_utxo(output_index);
 }
 
 /// 3. Authorized inclusion in a transaction with an update
@@ -76,7 +79,7 @@ fn auth_with_update_storm_tree_root(storage: Storage, new_merkle_root: u256, out
 fn auth_with_update_rescue_block(
     storage: Storage,
     new_rescue_block_number: Height,
-    output_ind: u32
+    output_index: u32
 ) {
     // Minutes in 3 years.
     let (merkle_root, current_rescue_block_number): Storage = storage;
@@ -86,13 +89,11 @@ fn auth_with_update_rescue_block(
     );
     assert_eq_32(new_rescue_block_number, expected_new_rescue_block_number);
 
-    // Mirror of path 2: only the block number moves, the root carries over.
     let new_storage: Storage = (merkle_root, new_rescue_block_number);
 
     assert_storage_with_current(storage);
-    assert_storage_with_output(new_storage, output_ind);
-
-    assert_output_preserves_utxo(output_ind);
+    assert_storage_with_output(new_storage, output_index);
+    assert_output_preserves_utxo(output_index);
 }
 
 /// Loop-invariant data for the split: how many outputs to visit, and what each must look like.
@@ -109,10 +110,13 @@ fn step_collect_total_amount(
     // Past the last split output: stop, carrying the total.
     match jet::lt_8(counter, split_utxos_count) {
         true => {
-            let output_ind: u32 = u8_to_u32(counter);
-            let (output_asset, output_amount): (u256, u64) = get_explicit_output_amount(output_ind);
+            let output_index: u32 = u8_to_u32(counter);
+            let (
+                output_asset,
+                output_amount
+            ): (u256, u64) = get_explicit_output_amount(output_index);
 
-            assert_eq_256(unwrap(jet::output_script_hash(output_ind)), expected_script_hash);
+            assert_eq_256(get_output_script_hash(output_index), expected_script_hash);
             assert_eq_256(output_asset, current_asset);
 
             Right(safe_add_64(total_outputs_amount, output_amount))
@@ -147,10 +151,10 @@ fn step_collect_input_total_amount(
 
     match jet::lt_8(counter, utxos_to_merge) {
         true => {
-            let input_ind: u32 = u8_to_u32(counter);
-            let (input_asset, input_amount): (u256, u64) = get_explicit_input_amount(input_ind);
+            let input_index: u32 = u8_to_u32(counter);
+            let (input_asset, input_amount): (u256, u64) = get_explicit_input_amount(input_index);
 
-            assert_eq_256(unwrap(jet::input_script_hash(input_ind)), expected_script_hash);
+            assert_eq_256(get_input_script_hash(input_index), expected_script_hash);
             assert_eq_256(input_asset, current_asset);
 
             Right(safe_add_64(total_inputs_amount, input_amount))
@@ -163,18 +167,13 @@ fn step_collect_input_total_amount(
 /// a single Storm Eye UTXO with the same Storm Tree root.
 fn auth_merge_multiple_storm_eyes_into_single_utxo(storage: Storage, utxos_to_merge: u8) {
     assert_storage_with_current(storage);
-    assert_output_matches_current(0);
+    assert_output_script_hash_matches_current(0);
 
     assert!(gt_8(utxos_to_merge, 1));
     assert!(jet::lt_8(utxos_to_merge, param::MAX_MERGE_UTXOS_COUNT));
-
-    // LLM NOTE: The loop below only sums inputs 0..utxos_to_merge, so a Storm Eye spent from beyond
-    // that range would satisfy every check while its own amount is in nobody's total, and
-    // that value would leave the covenant. Split pins this with `current_index() == 0`;
-    // merge has to bound the index instead, because any of the merged inputs may run.
     assert!(jet::lt_32(jet::current_index(), u8_to_u32(utxos_to_merge)));
 
-    let current_asset: u256 = unwrap_right::<Point>(jet::current_asset());
+    let current_asset: u256 = get_current_asset();
     let ctx: StepUtxosCtx = (utxos_to_merge, jet::current_script_hash(), current_asset);
 
     let total_inputs_amount: u64 = unwrap_left::<u64>(
@@ -188,26 +187,26 @@ fn auth_merge_multiple_storm_eyes_into_single_utxo(storage: Storage, utxos_to_me
 
 /// 6. Inclusion in a transaction upon reaching the rescue block number,
 /// with the option to spend to output with the RESCUE_OUTPUT_SCRIPT_HASH script hash
-fn rescue_after_block_number(storage: Storage, output_ind: u32) {
+fn rescue_after_block_number(storage: Storage, output_index: u32) {
     let (_, rescue_block_number): Storage = storage;
 
     assert_storage_with_current(storage);
     jet::check_lock_height(rescue_block_number);
 
-    assert_eq_256(unwrap(jet::output_script_hash(output_ind)), param::RESCUE_OUTPUT_SCRIPT_HASH);
-    assert_output_preserves_utxo(output_ind);
+    assert_eq_256(get_output_script_hash(output_index), param::RESCUE_OUTPUT_SCRIPT_HASH);
+    assert_output_preserves_utxo(output_index);
 }
 
 /// Paths 2-3: the storage-rotating arms.
 fn dispatch_update(storage: Storage, update: UpdateKind) {
     match update {
         Left(wit: RootUpdateWit) => {
-            let (new_merkle_root, output_ind): RootUpdateWit = wit;
-            auth_with_update_storm_tree_root(storage, new_merkle_root, output_ind);
+            let (new_merkle_root, output_index): RootUpdateWit = wit;
+            auth_with_update_storm_tree_root(storage, new_merkle_root, output_index);
         },
         Right(wit: RescueBlockUpdateWit) => {
-            let (new_rescue_block_number, output_ind): RescueBlockUpdateWit = wit;
-            auth_with_update_rescue_block(storage, new_rescue_block_number, output_ind);
+            let (new_rescue_block_number, output_index): RescueBlockUpdateWit = wit;
+            auth_with_update_rescue_block(storage, new_rescue_block_number, output_index);
         },
     }
 }
@@ -233,8 +232,8 @@ fn dispatch_authorized(authorized: AuthorizedWit) {
     assert_network_authorization(merkle_root, bloom);
 
     match kind {
-        Left(output_ind: InclusionWit) => {
-            auth_without_storage_updating(storage, output_ind);
+        Left(output_index: InclusionWit) => {
+            auth_without_storage_updating(storage, output_index);
         },
         Right(update_or_reshape: Either<UpdateKind, ReshapeKind>) => match update_or_reshape {
             Left(update: UpdateKind) => dispatch_update(storage, update),
@@ -247,8 +246,8 @@ fn main() {
     match witness::PATH {
         Left(authorized: AuthorizedWit) => dispatch_authorized(authorized),
         Right(rescue: RescueWit) => {
-            let (storage, output_ind): RescueWit = rescue;
-            rescue_after_block_number(storage, output_ind);
+            let (storage, output_index): RescueWit = rescue;
+            rescue_after_block_number(storage, output_index);
         },
     }
 }
