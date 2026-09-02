@@ -79,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storm.handle(),
         database.node_operators(),
         database.user_requests(),
+        &config.service.elements_rpc,
     )
     .await?;
     tracing::info!(address = %external_api.local_addr()?, "external API is listening");

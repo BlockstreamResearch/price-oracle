@@ -1,4 +1,9 @@
 use ::secp256k1::{Keypair as SchnorrKeypair, SecretKey as SchnorrSecretKey, schnorr};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use axum::{
     Router,
     body::Body,
@@ -11,11 +16,12 @@ use secp256k1_zkp::{Secp256k1, SecretKey};
 use storm::{Peer, Storm};
 use tower::ServiceExt;
 
-use crate::{HighStorm, db::Database};
+use crate::{HighStorm, NetworkAsset, db::Database};
 
 use super::{
+    fee_utxo::{AcceptAllFeeUtxos, Error as FeeUtxoError, FeeUtxoValidator},
     operators::AuthService,
-    router,
+    router_with_fee_utxo_validator,
     users::{NetworkUserRequests, UserRequest, UserRequestHeader, signing_hash},
 };
 
@@ -205,6 +211,54 @@ async fn registers_tick_requests_and_returns_pending_status() {
 }
 
 #[tokio::test]
+async fn rejects_fee_utxos_reserved_by_another_user_request() {
+    let (app, _, _) = setup().await;
+    let first = signed_user_request("tick-utxo", "signature-auth");
+    let mut second = first.clone();
+    second.requests[0].payload.push(' ');
+    sign_user_request(&mut second);
+
+    let created = app.clone().oneshot(user_request(&first)).await.unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let conflict = app.oneshot(user_request(&second)).await.unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(conflict).await,
+        serde_json::json!({
+            "error": format!(
+                "fee UTXO '{}:3' is reserved by another user request",
+                hex::encode([8; 32])
+            )
+        })
+    );
+}
+
+#[tokio::test]
+async fn validates_fee_utxos_before_storing_the_request() {
+    let (app, _, _) = setup_with_fee_utxo_validator(Arc::new(RejectFeeUtxosOnce {
+        rejected: AtomicBool::new(false),
+    }))
+    .await;
+    let request = signed_user_request("tick-utxo", "signature-auth");
+
+    let invalid = app.clone().oneshot(user_request(&request)).await.unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(invalid).await,
+        serde_json::json!({
+            "error": format!(
+                "fee UTXO '{}:3' does not exist or is already spent",
+                hex::encode([8; 32])
+            )
+        })
+    );
+
+    let created = app.oneshot(user_request(&request)).await.unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
 async fn rejects_unsupported_or_invalid_user_requests() {
     let (app, _, _) = setup().await;
 
@@ -242,8 +296,29 @@ async fn rejects_unsupported_or_invalid_user_requests() {
 }
 
 async fn setup() -> (Router, PrivateKey, String) {
+    setup_with_fee_utxo_validator(Arc::new(AcceptAllFeeUtxos)).await
+}
+
+async fn setup_with_fee_utxo_validator(
+    fee_utxo_validator: Arc<dyn FeeUtxoValidator>,
+) -> (Router, PrivateKey, String) {
     let database = Database::connect("sqlite::memory:", 1).await.unwrap();
     let operators = database.node_operators();
+    database
+        .network_assets()
+        .insert_active(&NetworkAsset {
+            kind: "storm-eye".to_string(),
+            name: "Storm Eye".to_string(),
+            asset_id: [1; 32],
+            reissuance_token_id: None,
+            entropy: None,
+            issuance_txid: [2; 32],
+            contract_script: vec![0x51],
+            supply: 10_000,
+            created_at_block: 1,
+        })
+        .await
+        .unwrap();
 
     let operator_secret = secp256k1::SecretKey::from_slice(&[42; 32]).unwrap();
     let operator_private_key = PrivateKey::new(operator_secret, Network::Bitcoin);
@@ -266,10 +341,39 @@ async fn setup() -> (Router, PrivateKey, String) {
     .await;
 
     (
-        router(node.handle(), operators, database.user_requests()),
+        router_with_fee_utxo_validator(
+            node.handle(),
+            operators,
+            database.user_requests(),
+            fee_utxo_validator,
+        ),
         operator_private_key,
         hex::encode(operator_public_key),
     )
+}
+
+struct RejectFeeUtxosOnce {
+    rejected: AtomicBool,
+}
+
+impl FeeUtxoValidator for RejectFeeUtxosOnce {
+    fn validate(
+        &self,
+        fee_utxos: &[crate::db::user_request::FeeUtxo],
+        _account_owner_pubkey: [u8; 32],
+        _storm_eye_asset_id: [u8; 32],
+    ) -> Result<(), FeeUtxoError> {
+        if !self.rejected.swap(true, Ordering::SeqCst) {
+            let fee_utxo = &fee_utxos[0];
+            return Err(FeeUtxoError::Missing(format!(
+                "{}:{}",
+                hex::encode(fee_utxo.txid),
+                fee_utxo.output_index
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 fn json_request(uri: &str, body: serde_json::Value) -> Request<Body> {
@@ -327,6 +431,13 @@ fn signed_user_request(kind: &str, auth_kind: &str) -> NetworkUserRequests {
     request.header.signature =
         hex::encode(schnorr::sign(&signing_hash(&request), &keypair).to_byte_array());
     request
+}
+
+fn sign_user_request(request: &mut NetworkUserRequests) {
+    let secret_key = SchnorrSecretKey::from_secret_bytes([31; 32]).unwrap();
+    let keypair = SchnorrKeypair::from_secret_key(&secret_key);
+    request.header.signature =
+        hex::encode(schnorr::sign(&signing_hash(request), &keypair).to_byte_array());
 }
 
 fn user_request(request: &NetworkUserRequests) -> Request<Body> {

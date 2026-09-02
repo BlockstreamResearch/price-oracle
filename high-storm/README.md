@@ -171,9 +171,12 @@ an empty object as its payload.
 
 User submissions contain a `header` and a non-empty `requests` array. Each fee
 UTXO is encoded as `<64-character txid>:<u32 output index>`. The coordinator
-currently validates only this format; it does not query Elements to verify the
-UTXO, its value, or its ownership. Only `tick-utxo` requests are accepted at this
-stage. Its `payload` is a JSON-encoded string with this shape:
+queries Elements to confirm that every fee UTXO is unspent LBTC and is locked by
+the Account contract derived from the request's public key and the active Storm
+Eye asset. Accepted fee UTXOs are reserved atomically with the pending request,
+so another request cannot use them until the first request is executed. Only
+`tick-utxo` requests are accepted at this stage. Its `payload` is a JSON-encoded
+string with this shape:
 
 ```json
 {"utxo_auth_method":{"kind":"signature-auth","auth_data":"<64-character x-only public key>"}}

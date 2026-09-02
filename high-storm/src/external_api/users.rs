@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{ApiError, ExternalApiState};
+use crate::db::{
+    network_asset::STORM_EYE_KIND,
+    user_request::{FeeUtxo, InsertPendingResult},
+};
 
 const USER_REQUEST_TAG: &str = "OracleNetworkV1/NetworkUserRequests";
 const MAX_REQUESTS_PER_BATCH: usize = 100;
@@ -73,16 +77,52 @@ async fn create_request(
     Json(request): Json<NetworkUserRequests>,
 ) -> Result<(StatusCode, Json<CreatedRequest>), ApiError> {
     require_coordinator(&state).await?;
-    validate_request(&request)?;
+    let validated = validate_request(&request)?;
+    let storm_eye = state
+        .node
+        .network_asset(STORM_EYE_KIND)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::unavailable("Storm Eye asset is not initialized"))?;
+    let validator = state.fee_utxo_validator.clone();
+    let fee_utxos = validated.fee_utxos.clone();
+    let account_owner_pubkey = validated.account_owner_pubkey;
+    let validation = tokio::task::spawn_blocking(move || {
+        validator.validate(&fee_utxos, account_owner_pubkey, storm_eye.asset_id)
+    })
+    .await
+    .map_err(ApiError::internal)?;
+    if let Err(error) = validation {
+        if error.is_invalid_request() {
+            return Err(ApiError::bad_request(error));
+        }
+        return Err(ApiError::internal(error));
+    }
+
     let encoded = serde_json::to_vec(&request).map_err(ApiError::internal)?;
     let request_hash: [u8; 32] = Sha256::digest(&encoded).into();
-    if !state
+    match state
         .user_requests
-        .insert_pending(request_hash, &encoded, state.node.block_height())
+        .insert_pending(
+            request_hash,
+            &encoded,
+            state.node.block_height(),
+            &validated.fee_utxos,
+        )
         .await
         .map_err(ApiError::internal)?
     {
-        return Err(ApiError::conflict("user request already exists"));
+        InsertPendingResult::Inserted => {}
+        InsertPendingResult::RequestExists => {
+            return Err(ApiError::conflict("user request already exists"));
+        }
+        InsertPendingResult::FeeUtxoReserved(fee_utxo) => {
+            return Err(ApiError::conflict(format!(
+                "fee UTXO '{}:{}' is reserved by another user request",
+                hex::encode(fee_utxo.txid),
+                fee_utxo.output_index
+            )));
+        }
     }
     Ok((
         StatusCode::CREATED,
@@ -123,7 +163,12 @@ async fn require_coordinator(state: &ExternalApiState) -> Result<(), ApiError> {
     }
 }
 
-fn validate_request(request: &NetworkUserRequests) -> Result<(), ApiError> {
+struct ValidatedRequest {
+    account_owner_pubkey: [u8; 32],
+    fee_utxos: Vec<FeeUtxo>,
+}
+
+fn validate_request(request: &NetworkUserRequests) -> Result<ValidatedRequest, ApiError> {
     if request.requests.is_empty() {
         return Err(ApiError::bad_request(
             "at least one user request is required",
@@ -134,14 +179,19 @@ fn validate_request(request: &NetworkUserRequests) -> Result<(), ApiError> {
             "a batch cannot contain more than {MAX_REQUESTS_PER_BATCH} requests"
         )));
     }
-    validate_fee_utxos(&request.header.fee_utxos)?;
+    let fee_utxos = validate_fee_utxos(&request.header.fee_utxos)?;
     for user_request in &request.requests {
         validate_tick_request(user_request)?;
     }
-    verify_signature(request)
+    let account_owner_pubkey = verify_signature(request)?;
+
+    Ok(ValidatedRequest {
+        account_owner_pubkey,
+        fee_utxos,
+    })
 }
 
-fn validate_fee_utxos(fee_utxos: &[String]) -> Result<(), ApiError> {
+fn validate_fee_utxos(fee_utxos: &[String]) -> Result<Vec<FeeUtxo>, ApiError> {
     if fee_utxos.is_empty() {
         return Err(ApiError::bad_request("at least one fee UTXO is required"));
     }
@@ -150,22 +200,26 @@ fn validate_fee_utxos(fee_utxos: &[String]) -> Result<(), ApiError> {
             "a batch cannot contain more than {MAX_FEE_UTXOS_PER_BATCH} fee UTXOs"
         )));
     }
+    let mut parsed = Vec::with_capacity(fee_utxos.len());
     let mut seen = HashSet::with_capacity(fee_utxos.len());
     for utxo in fee_utxos {
         let (txid, output_index) = utxo
             .split_once(':')
             .ok_or_else(|| ApiError::bad_request(format!("invalid fee UTXO '{utxo}'")))?;
-        parse_hex_array::<32>(txid, "fee UTXO transaction id")?;
-        output_index
-            .parse::<u32>()
-            .map_err(|_| ApiError::bad_request(format!("invalid fee UTXO '{utxo}'")))?;
-        if !seen.insert(utxo) {
+        let fee_utxo = FeeUtxo {
+            txid: parse_hex_array::<32>(txid, "fee UTXO transaction id")?,
+            output_index: output_index
+                .parse::<u32>()
+                .map_err(|_| ApiError::bad_request(format!("invalid fee UTXO '{utxo}'")))?,
+        };
+        if !seen.insert(fee_utxo.clone()) {
             return Err(ApiError::bad_request(format!(
                 "duplicate fee UTXO '{utxo}'"
             )));
         }
+        parsed.push(fee_utxo);
     }
-    Ok(())
+    Ok(parsed)
 }
 
 fn validate_tick_request(request: &UserRequest) -> Result<(), ApiError> {
@@ -219,14 +273,16 @@ fn validate_auth_method(method: &UtxoAuthMethod) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn verify_signature(request: &NetworkUserRequests) -> Result<(), ApiError> {
+fn verify_signature(request: &NetworkUserRequests) -> Result<[u8; 32], ApiError> {
     let public_key_bytes = parse_hex_array::<32>(&request.header.public_key, "user public key")?;
     let public_key = XOnlyPublicKey::from_byte_array(public_key_bytes)
         .map_err(|_| ApiError::bad_request("invalid user public key"))?;
     let signature_bytes = parse_hex_array::<64>(&request.header.signature, "user signature")?;
     let signature = schnorr::Signature::from_byte_array(signature_bytes);
     schnorr::verify(&signature, &signing_hash(request), &public_key)
-        .map_err(|_| ApiError::unauthorized("user signature is invalid"))
+        .map_err(|_| ApiError::unauthorized("user signature is invalid"))?;
+
+    Ok(public_key_bytes)
 }
 
 pub(super) fn signing_hash(request: &NetworkUserRequests) -> [u8; 32] {

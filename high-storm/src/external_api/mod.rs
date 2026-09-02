@@ -1,9 +1,10 @@
+mod fee_utxo;
 mod operators;
 #[cfg(test)]
 mod tests;
 mod users;
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -14,8 +15,10 @@ use serde::Serialize;
 
 use crate::{
     HighStormHandle, VotingError,
+    config::ElementsRpcConfig,
     db::{node_operator::NodeOperatorStore, user_request::UserRequestStore},
 };
+use fee_utxo::{ElementsFeeUtxoValidator, FeeUtxoValidator};
 use operators::{AuthError, AuthService};
 
 #[derive(Clone)]
@@ -23,6 +26,7 @@ pub(super) struct ExternalApiState {
     pub(super) node: HighStormHandle,
     pub(super) auth: AuthService,
     pub(super) user_requests: UserRequestStore,
+    fee_utxo_validator: Arc<dyn FeeUtxoValidator>,
 }
 
 pub struct ExternalApiServer {
@@ -36,11 +40,12 @@ impl ExternalApiServer {
         node: HighStormHandle,
         operators: NodeOperatorStore,
         user_requests: UserRequestStore,
+        elements_rpc: &ElementsRpcConfig,
     ) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(address).await?;
         Ok(Self {
             listener,
-            router: router(node, operators, user_requests),
+            router: router(node, operators, user_requests, elements_rpc),
         })
     }
 
@@ -57,11 +62,27 @@ pub fn router(
     node: HighStormHandle,
     operators: NodeOperatorStore,
     user_requests: UserRequestStore,
+    elements_rpc: &ElementsRpcConfig,
+) -> Router {
+    router_with_fee_utxo_validator(
+        node,
+        operators,
+        user_requests,
+        Arc::new(ElementsFeeUtxoValidator::new(elements_rpc)),
+    )
+}
+
+fn router_with_fee_utxo_validator(
+    node: HighStormHandle,
+    operators: NodeOperatorStore,
+    user_requests: UserRequestStore,
+    fee_utxo_validator: Arc<dyn FeeUtxoValidator>,
 ) -> Router {
     let state = ExternalApiState {
         node,
         auth: AuthService::new(operators),
         user_requests,
+        fee_utxo_validator,
     };
     Router::new()
         .nest("/users", users::router())
