@@ -1,0 +1,33 @@
+use std::lib::asserts::{assert_eq_64, assert_eq_256};
+
+use crate::helper::{
+    assert_output_preserves_utxo,
+    get_output_script_hash,
+    get_explicit_input_amount
+};
+
+// TODO: Load this from helper, after #27 was merged;
+fn get_input_asset(input_index: u32) -> u256 {
+    unwrap_right::<Point>(unwrap(jet::input_asset(input_index)))
+}
+
+fn authorized_asset_issuance_via_storm_eye(
+    storm_eye_input_index: u32,
+    inflation_tokne_output_index: u32
+) {
+    assert_eq_256(get_input_asset(storm_eye_input_index), param::STORM_EYE_ASSET_ID);
+    assert_eq_256(jet::current_script_hash(), get_output_script_hash(inflation_tokne_output_index));
+    assert_output_preserves_utxo(inflation_tokne_output_index);
+
+    let reissuance_amount: u64 = unwrap_right::<Point>(
+        unwrap(jet::current_issuance_asset_amount())
+    );
+    assert!(jet::lt_64(0, reissuance_amount));
+}
+
+fn main() {
+    let storm_eye_input_index: u32 = witness::STORM_EYE_INPUT_INDEX;
+    let inflation_token_output_index: u32 = witness::INFLATION_TOKEN_OUTPUT_INDEX;
+
+    authorized_asset_issuance_via_storm_eye(storm_eye_input_index, inflation_token_output_index);
+}
