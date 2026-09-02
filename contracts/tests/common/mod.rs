@@ -1,9 +1,24 @@
 #![allow(dead_code)]
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use simplex::signer::SignerError;
 use simplex::simplicityhl::elements::{AssetId, Script};
 use simplex::transaction::partial_input::IssuanceInput;
 use simplex::transaction::utxo::UTXO;
 use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, RequiredSignature};
+
+// Prevent contracts failed with:
+// Error: Covenant input 1 did not execute (transaction locktime 0, input sequence 4294967295): Failed to prune program: Jet failed during execution
+pub fn unique_contract_hash() -> [u8; 32] {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    let mut hash = [0u8; 32];
+    hash[..4].copy_from_slice(&std::process::id().to_le_bytes());
+    hash[4..8].copy_from_slice(&COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+
+    dbg!(hash);
+    hash
+}
 
 pub fn issue_asset(context: &simplex::TestContext, amount: u64) -> anyhow::Result<AssetId> {
     let signer = context.get_default_signer();

@@ -1,19 +1,18 @@
-use std::lib::asserts::{assert_eq_64, assert_eq_256};
+use std::lib::asserts::assert_eq_256;
 
-use crate::helper::{
-    assert_output_preserves_utxo,
-    get_output_script_hash,
-    get_explicit_input_amount,
-    get_input_asset
-};
+use crate::helper::{assert_output_preserves_blinded_utxo, get_output_script_hash, get_input_asset};
 
 fn authorized_asset_issuance_via_storm_eye(
     storm_eye_input_index: u32,
-    inflation_tokne_output_index: u32
+    inflation_token_output_index: u32,
+    abf: Scalar,
+    vbf: Scalar
 ) {
     assert_eq_256(get_input_asset(storm_eye_input_index), param::STORM_EYE_ASSET_ID);
-    assert_eq_256(jet::current_script_hash(), get_output_script_hash(inflation_tokne_output_index));
-    assert_output_preserves_utxo(inflation_tokne_output_index);
+    assert_eq_256(jet::current_script_hash(), get_output_script_hash(inflation_token_output_index));
+
+    // Elements require reissuance token to be blinded.
+    assert_output_preserves_blinded_utxo(inflation_token_output_index, abf, vbf);
 
     let reissuance_amount: u64 = unwrap_right::<Point>(
         unwrap(jet::current_issuance_asset_amount())
@@ -24,6 +23,13 @@ fn authorized_asset_issuance_via_storm_eye(
 fn main() {
     let storm_eye_input_index: u32 = witness::STORM_EYE_INPUT_INDEX;
     let inflation_token_output_index: u32 = witness::INFLATION_TOKEN_OUTPUT_INDEX;
+    let abf: Scalar = witness::ASSET_BLINDING_FACTOR;
+    let vbf: Scalar = witness::VALUE_BLINDING_FACTOR;
 
-    authorized_asset_issuance_via_storm_eye(storm_eye_input_index, inflation_token_output_index);
+    authorized_asset_issuance_via_storm_eye(
+        storm_eye_input_index,
+        inflation_token_output_index,
+        abf,
+        vbf
+    );
 }
