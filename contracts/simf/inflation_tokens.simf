@@ -3,13 +3,9 @@ use std::lib::asserts::{assert_eq_64, assert_eq_256};
 use crate::helper::{
     assert_output_preserves_utxo,
     get_output_script_hash,
-    get_explicit_input_amount
+    get_explicit_input_amount,
+    get_input_asset
 };
-
-// TODO: Load this from helper, after #27 was merged;
-fn get_input_asset(input_index: u32) -> u256 {
-    unwrap_right::<Point>(unwrap(jet::input_asset(input_index)))
-}
 
 fn authorized_asset_issuance_via_storm_eye(
     storm_eye_input_index: u32,

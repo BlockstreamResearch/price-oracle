@@ -21,6 +21,7 @@ const STORM_EYE_SUPPLY: u64 = 10_000;
 
 const INFLATION_TOKEN_AMOUNT: u64 = 1;
 const CONTRACT_HASH: [u8; 32] = [1u8; 32];
+const GENESIS_ISSUANCE: u64 = 1;
 
 /// A Tick UTXO's amount is the timestamp it encodes.
 const REISSUE_AMOUNT: u64 = 1_700_000_000;
@@ -49,13 +50,18 @@ impl InflationFixture {
 
         let details = ft.add_issuance_input(
             PartialInput::new(funding_utxo),
-            IssuanceInput::new_issuance(0, INFLATION_TOKEN_AMOUNT, CONTRACT_HASH),
+            IssuanceInput::new_issuance(GENESIS_ISSUANCE, INFLATION_TOKEN_AMOUNT, CONTRACT_HASH),
             RequiredSignature::NativeEcdsa,
         );
         ft.add_output(PartialOutput::new(
             program.get_script_pubkey(context.get_network()),
             INFLATION_TOKEN_AMOUNT,
             details.inflation_asset_id,
+        ));
+        ft.add_output(PartialOutput::new(
+            signer.get_address().script_pubkey(),
+            GENESIS_ISSUANCE,
+            details.asset_id,
         ));
 
         signer.broadcast(&ft)?.wait()?;
@@ -161,7 +167,7 @@ impl InflationFixture {
 /// The first happy path.
 #[simplex::test]
 fn reissues_asset_when_storm_eye_is_present(context: simplex::TestContext) -> anyhow::Result<()> {
-    let fixture = InflationFixture::new(&context)?;
+    let fixture: InflationFixture = InflationFixture::new(&context)?;
     let storm_eye_utxo = fixture.storm_eye_utxo(&context)?;
 
     let ft = fixture.reissue_transaction(
