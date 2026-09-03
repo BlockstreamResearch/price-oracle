@@ -63,6 +63,7 @@ services:
       - -anyonecanspendaremine=1
       - -blindedaddresses=0
       - -fallbackfee=0.0001
+      - -txindex=1
     volumes:
       - elements-1-data:/home/elements/.elements
     ports:
@@ -94,6 +95,7 @@ services:
       - -anyonecanspendaremine=0
       - -blindedaddresses=0
       - -fallbackfee=0.0001
+      - -txindex=1
     volumes:
       - elements-2-data:/home/elements/.elements
     ports:
@@ -125,6 +127,7 @@ services:
       - -anyonecanspendaremine=0
       - -blindedaddresses=0
       - -fallbackfee=0.0001
+      - -txindex=1
     volumes:
       - elements-3-data:/home/elements/.elements
     ports:

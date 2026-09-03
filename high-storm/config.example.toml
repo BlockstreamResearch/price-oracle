@@ -15,6 +15,12 @@ username = "high-storm"
 password = "high-storm"
 wallet = "funded-key"
 
+[service.user_requests]
+# Protocol policy values; the architecture specification intentionally does not fix amounts.
+operational_fee_sats = 1000
+tick_burn_reserve_sats = 1000
+issuance_transaction_fee_sats = 1000
+
 [service.db]
 url = "localhost:5432"
 username = "high-storm"

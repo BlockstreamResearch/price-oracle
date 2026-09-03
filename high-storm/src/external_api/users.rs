@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{ApiError, ExternalApiState};
+use crate::db::user_request::{FeeUtxo, InsertPendingResult};
 
 const USER_REQUEST_TAG: &str = "OracleNetworkV1/NetworkUserRequests";
 const MAX_REQUESTS_PER_BATCH: usize = 100;
@@ -24,14 +25,14 @@ pub(super) fn router() -> axum::Router<ExternalApiState> {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct NetworkUserRequests {
+pub(crate) struct NetworkUserRequests {
     pub header: UserRequestHeader,
     pub requests: Vec<UserRequest>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct UserRequestHeader {
+pub(crate) struct UserRequestHeader {
     pub signature: String,
     pub public_key: String,
     pub fee_utxos: Vec<String>,
@@ -39,22 +40,22 @@ pub(super) struct UserRequestHeader {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct UserRequest {
+pub(crate) struct UserRequest {
     pub kind: String,
     pub payload: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct TickUtxoRequestDetails {
-    utxo_auth_method: UtxoAuthMethod,
+pub(crate) struct TickUtxoRequestDetails {
+    pub(crate) utxo_auth_method: UtxoAuthMethod,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct UtxoAuthMethod {
-    kind: String,
-    auth_data: String,
+pub(crate) struct UtxoAuthMethod {
+    pub(crate) kind: String,
+    pub(crate) auth_data: String,
 }
 
 #[derive(Serialize)]
@@ -73,16 +74,48 @@ async fn create_request(
     Json(request): Json<NetworkUserRequests>,
 ) -> Result<(StatusCode, Json<CreatedRequest>), ApiError> {
     require_coordinator(&state).await?;
-    validate_request(&request)?;
+    let fee_utxos = validate_request(&request)?;
+    let owner = parse_hex_array::<32>(&request.header.public_key, "user public key")?;
+    state
+        .fee_utxos
+        .validate(&fee_utxos, owner, request.requests.len())
+        .await
+        .map_err(|error| match error {
+            super::fee_utxo::FeeUtxoValidationError::MissingUtxo(_)
+            | super::fee_utxo::FeeUtxoValidationError::InsufficientConfirmations { .. }
+            | super::fee_utxo::FeeUtxoValidationError::WrongAsset(_)
+            | super::fee_utxo::FeeUtxoValidationError::WrongOwner(_)
+            | super::fee_utxo::FeeUtxoValidationError::InsufficientValue { .. }
+            | super::fee_utxo::FeeUtxoValidationError::InvalidValue(_)
+            | super::fee_utxo::FeeUtxoValidationError::InvalidPublicKey => {
+                ApiError::bad_request(error)
+            }
+            _ => ApiError::unavailable(error),
+        })?;
     let encoded = serde_json::to_vec(&request).map_err(ApiError::internal)?;
     let request_hash: [u8; 32] = Sha256::digest(&encoded).into();
-    if !state
+    match state
         .user_requests
-        .insert_pending(request_hash, &encoded, state.node.block_height())
+        .insert_pending(
+            request_hash,
+            &encoded,
+            state.node.block_height(),
+            &fee_utxos,
+        )
         .await
         .map_err(ApiError::internal)?
     {
-        return Err(ApiError::conflict("user request already exists"));
+        InsertPendingResult::Inserted => {}
+        InsertPendingResult::RequestExists => {
+            return Err(ApiError::conflict("user request already exists"));
+        }
+        InsertPendingResult::FeeUtxoReserved(fee_utxo) => {
+            return Err(ApiError::conflict(format!(
+                "fee UTXO '{}:{}' is reserved by another user request",
+                hex::encode(fee_utxo.txid),
+                fee_utxo.output_index
+            )));
+        }
     }
     Ok((
         StatusCode::CREATED,
@@ -123,7 +156,7 @@ async fn require_coordinator(state: &ExternalApiState) -> Result<(), ApiError> {
     }
 }
 
-fn validate_request(request: &NetworkUserRequests) -> Result<(), ApiError> {
+fn validate_request(request: &NetworkUserRequests) -> Result<Vec<FeeUtxo>, ApiError> {
     if request.requests.is_empty() {
         return Err(ApiError::bad_request(
             "at least one user request is required",
@@ -134,14 +167,26 @@ fn validate_request(request: &NetworkUserRequests) -> Result<(), ApiError> {
             "a batch cannot contain more than {MAX_REQUESTS_PER_BATCH} requests"
         )));
     }
-    validate_fee_utxos(&request.header.fee_utxos)?;
+    let fee_utxos = validate_fee_utxos(&request.header.fee_utxos)?;
     for user_request in &request.requests {
         validate_tick_request(user_request)?;
     }
-    verify_signature(request)
+    verify_signature(request)?;
+
+    Ok(fee_utxos)
 }
 
-fn validate_fee_utxos(fee_utxos: &[String]) -> Result<(), ApiError> {
+pub(crate) fn validate_encoded_request(
+    encoded: &[u8],
+) -> Result<(NetworkUserRequests, Vec<FeeUtxo>), String> {
+    let request: NetworkUserRequests =
+        serde_json::from_slice(encoded).map_err(|error| error.to_string())?;
+    let fee_utxos = validate_request(&request).map_err(|error| error.message)?;
+
+    Ok((request, fee_utxos))
+}
+
+fn validate_fee_utxos(fee_utxos: &[String]) -> Result<Vec<FeeUtxo>, ApiError> {
     if fee_utxos.is_empty() {
         return Err(ApiError::bad_request("at least one fee UTXO is required"));
     }
@@ -150,22 +195,26 @@ fn validate_fee_utxos(fee_utxos: &[String]) -> Result<(), ApiError> {
             "a batch cannot contain more than {MAX_FEE_UTXOS_PER_BATCH} fee UTXOs"
         )));
     }
+    let mut parsed = Vec::with_capacity(fee_utxos.len());
     let mut seen = HashSet::with_capacity(fee_utxos.len());
     for utxo in fee_utxos {
         let (txid, output_index) = utxo
             .split_once(':')
             .ok_or_else(|| ApiError::bad_request(format!("invalid fee UTXO '{utxo}'")))?;
-        parse_hex_array::<32>(txid, "fee UTXO transaction id")?;
-        output_index
-            .parse::<u32>()
-            .map_err(|_| ApiError::bad_request(format!("invalid fee UTXO '{utxo}'")))?;
-        if !seen.insert(utxo) {
+        let fee_utxo = FeeUtxo {
+            txid: parse_hex_array::<32>(txid, "fee UTXO transaction id")?,
+            output_index: output_index
+                .parse::<u32>()
+                .map_err(|_| ApiError::bad_request(format!("invalid fee UTXO '{utxo}'")))?,
+        };
+        if !seen.insert(fee_utxo.clone()) {
             return Err(ApiError::bad_request(format!(
                 "duplicate fee UTXO '{utxo}'"
             )));
         }
+        parsed.push(fee_utxo);
     }
-    Ok(())
+    Ok(parsed)
 }
 
 fn validate_tick_request(request: &UserRequest) -> Result<(), ApiError> {

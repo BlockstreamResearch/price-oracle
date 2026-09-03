@@ -3,6 +3,7 @@ use sqlx::{AnyPool, Error, Row};
 use crate::NetworkAsset;
 
 pub const STORM_EYE_KIND: &str = "storm-eye";
+pub const TICK_ASSET_KIND: &str = "tick-asset";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingNetworkAsset {
@@ -25,8 +26,8 @@ impl NetworkAssetStore {
         let result = sqlx::query(
             "INSERT INTO network_assets (
                 kind, name, asset_id, reissuance_token_id, entropy, issuance_txid,
-                     issuance_tx, contract_script, supply, created_at_block, status
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
+                     issuance_tx, contract_script, contract_data, supply, created_at_block, status
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
              ON CONFLICT (kind) DO NOTHING",
         )
         .bind(&asset.kind)
@@ -37,6 +38,7 @@ impl NetworkAssetStore {
         .bind(asset.issuance_txid.to_vec())
         .bind(&pending.issuance_tx)
         .bind(&asset.contract_script)
+        .bind(&asset.contract_data)
         .bind(i64::try_from(asset.supply).map_err(|error| Error::Encode(Box::new(error)))?)
         .bind(
             i64::try_from(asset.created_at_block)
@@ -52,8 +54,8 @@ impl NetworkAssetStore {
         let result = sqlx::query(
             "INSERT INTO network_assets (
                 kind, name, asset_id, reissuance_token_id, entropy, issuance_txid,
-                     issuance_tx, contract_script, supply, created_at_block, status
-                 ) VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, 'active')
+                     issuance_tx, contract_script, contract_data, supply, created_at_block, status
+                 ) VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, 'active')
              ON CONFLICT (kind) DO NOTHING",
         )
         .bind(&asset.kind)
@@ -63,6 +65,7 @@ impl NetworkAssetStore {
         .bind(asset.entropy.map(|value| value.to_vec()))
         .bind(asset.issuance_txid.to_vec())
         .bind(&asset.contract_script)
+        .bind(&asset.contract_data)
         .bind(i64::try_from(asset.supply).map_err(|error| Error::Encode(Box::new(error)))?)
         .bind(
             i64::try_from(asset.created_at_block)
@@ -90,7 +93,7 @@ impl NetworkAssetStore {
     pub async fn get(&self, kind: &str) -> Result<Option<NetworkAsset>, Error> {
         sqlx::query(
             "SELECT kind, name, asset_id, reissuance_token_id, entropy, issuance_txid,
-                    contract_script, supply, created_at_block
+                    contract_script, contract_data, supply, created_at_block
              FROM network_assets WHERE kind = $1 AND status = 'active'",
         )
         .bind(kind)
@@ -106,7 +109,7 @@ impl NetworkAssetStore {
     ) -> Result<Vec<NetworkAsset>, Error> {
         sqlx::query(
             "SELECT kind, name, asset_id, reissuance_token_id, entropy, issuance_txid,
-                    contract_script, supply, created_at_block
+                    contract_script, contract_data, supply, created_at_block
              FROM network_assets AS asset
              WHERE status = 'active' AND NOT EXISTS (
                  SELECT 1 FROM network_asset_announcements AS announcement
@@ -148,7 +151,7 @@ impl NetworkAssetStore {
     pub async fn get_pending(&self, kind: &str) -> Result<Option<PendingNetworkAsset>, Error> {
         sqlx::query(
             "SELECT kind, name, asset_id, reissuance_token_id, entropy, issuance_txid,
-                    issuance_tx, contract_script, supply, created_at_block
+                    issuance_tx, contract_script, contract_data, supply, created_at_block
              FROM network_assets WHERE kind = $1 AND status = 'pending'",
         )
         .bind(kind)
@@ -167,7 +170,7 @@ impl NetworkAssetStore {
     pub async fn list(&self) -> Result<Vec<NetworkAsset>, Error> {
         sqlx::query(
             "SELECT kind, name, asset_id, reissuance_token_id, entropy, issuance_txid,
-                    contract_script, supply, created_at_block
+                    contract_script, contract_data, supply, created_at_block
              FROM network_assets WHERE status = 'active' ORDER BY kind",
         )
         .fetch_all(&self.pool)
@@ -193,6 +196,7 @@ fn decode_asset(row: sqlx::any::AnyRow) -> Result<NetworkAsset, Error> {
             .transpose()?,
         issuance_txid: decode_array(row.try_get("issuance_txid")?)?,
         contract_script: row.try_get("contract_script")?,
+        contract_data: row.try_get("contract_data")?,
         supply: decode_u64(row.try_get("supply")?)?,
         created_at_block: decode_u64(row.try_get("created_at_block")?)?,
     })
@@ -224,6 +228,7 @@ mod tests {
                 entropy: None,
                 issuance_txid: [2; 32],
                 contract_script: vec![0x51],
+                contract_data: None,
                 supply: 10_000,
                 created_at_block: 42,
             },

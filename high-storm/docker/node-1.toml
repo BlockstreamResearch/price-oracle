@@ -12,6 +12,11 @@ username = "high-storm"
 password = "high-storm"
 wallet = "funded-key"
 
+[service.user_requests]
+operational_fee_sats = 1000
+tick_burn_reserve_sats = 1000
+issuance_transaction_fee_sats = 1000
+
 [service.db]
 url = "postgres:5432"
 username = "high-storm"

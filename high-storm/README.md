@@ -76,7 +76,8 @@ the one-time Storm Eye issuance and defaults to `funded-key`. The `service.db.ur
 value is the database host and optional port, for example `localhost:5432`. Set
 `service.ipc_path` to a unique Unix socket path for each high-storm process running
 on the same host. The external API binds to `service.external_api_address`, which
-defaults to `127.0.0.1:9001`.
+defaults to `127.0.0.1:9001`. Elements must run with `txindex=1` so HighStorm can
+reconcile confirmed request transactions after they leave the mempool.
 
 ## Initialize a network
 
@@ -171,9 +172,13 @@ an empty object as its payload.
 
 User submissions contain a `header` and a non-empty `requests` array. Each fee
 UTXO is encoded as `<64-character txid>:<u32 output index>`. The coordinator
-currently validates only this format; it does not query Elements to verify the
-UTXO, its value, or its ownership. Only `tick-utxo` requests are accepted at this
-stage. Its `payload` is a JSON-encoded string with this shape:
+queries Elements before accepting a request and requires every fee UTXO to be
+unspent, explicit policy asset, and locked by the requester's Account covenant.
+Their combined value must cover the configured operational fee and Tick burn
+reserve for every requested output, plus one issuance transaction fee. Accepted
+fee UTXOs are reserved atomically, cannot be reused by another request, and remain
+reserved until the issuance transaction confirms. Only `tick-utxo` requests are
+accepted at this stage. Its `payload` is a JSON-encoded string with this shape:
 
 ```json
 {"utxo_auth_method":{"kind":"signature-auth","auth_data":"<64-character x-only public key>"}}
@@ -187,10 +192,15 @@ request's payload, in array order, followed by each fee UTXO string, in array
 order. Encode the 64-byte Schnorr signature as hex in `header.signature`.
 
 Accepted submissions return `201` and a `request_hash`; submitting the same
-request again returns `409`. `GET /users/requests/{request_hash}` initially
-returns `{"status":"pending","payload":null}`. A node that is not the current
-coordinator returns `503` for both user routes. `signed-price-data` returns `422`
-until price request processing is implemented.
+request, or another request using one of its reserved fee UTXOs, returns `409`.
+`GET /users/requests/{request_hash}` initially returns
+`{"status":"pending","payload":null}`. Every 20 seconds the coordinator batches
+pending requests, reissues timestamp-valued Tick outputs, collects a two-thirds
+Storm Tree signature, and broadcasts the covenant transaction. The status becomes
+`processing` after broadcast and `executed` after confirmation. A node that is not
+the current coordinator returns `503` for both user routes. `signed-price-data`
+returns `422` until price request processing is implemented. Tick UTXO burning is
+not part of this processing path yet.
 
 The API has no TLS termination. Keep the default loopback bind or place it behind
 an authenticated TLS reverse proxy before exposing it beyond a trusted network.

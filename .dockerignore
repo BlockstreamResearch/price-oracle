@@ -4,5 +4,4 @@
 **/node_modules
 **/*.tmp
 
-contracts/src/artifacts
 contracts/deps

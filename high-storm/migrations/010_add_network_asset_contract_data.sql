@@ -1,0 +1,1 @@
+ALTER TABLE network_assets ADD COLUMN contract_data BYTEA;

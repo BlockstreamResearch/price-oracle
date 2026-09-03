@@ -1,32 +1,56 @@
-use std::{
-    ops::{Deref, DerefMut},
-    time::Duration,
-};
+use std::ops::{Deref, DerefMut};
 
 use storm::{Storm, StormHandle};
-use storm_tree::NodePublicKey;
 
 mod assets;
 mod handler;
 mod message;
 mod signing;
 mod state;
+mod user_requests;
 mod voting;
 
 pub use assets::AssetError;
 pub use message::{
-    ApproveVotingRequest, MergeStormEyes, NetworkAsset, NetworkAssets, NetworkVoteKind,
-    NetworkVoteRequest, NodeMessage, NodeMessageKind, SplitStormEye, StormEyeUtxo, TestNodeMessage,
-    UpdateNetworkMembers,
+    ApproveVotingRequest, ExecuteUserRequests, ExternalRequests, MergeStormEyes, NetworkAsset,
+    NetworkAssets, NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind,
+    SplitStormEye, StormEyeUtxo, UpdateNetworkMembers,
 };
 pub use signing::{SigningError, SigningResult};
 use state::NetworkState;
+pub use user_requests::UserRequestError;
 pub use voting::{VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError, VotingRequest, VotingStatus};
 
 /// A long-lived Oracle Network node and its higher-level protocol state.
 pub struct HighStorm {
     storm: Storm,
     state: NetworkState,
+}
+
+pub(crate) struct HighStormDependencies {
+    voting_store: crate::db::voting::VotingStore,
+    network_assets: crate::db::network_asset::NetworkAssetStore,
+    user_requests: crate::db::user_request::UserRequestStore,
+    elements_rpc: crate::config::ElementsRpcConfig,
+    user_request_config: crate::config::UserRequestsConfig,
+}
+
+impl HighStormDependencies {
+    pub(crate) fn new(
+        voting_store: crate::db::voting::VotingStore,
+        network_assets: crate::db::network_asset::NetworkAssetStore,
+        user_requests: crate::db::user_request::UserRequestStore,
+        elements_rpc: crate::config::ElementsRpcConfig,
+        user_request_config: crate::config::UserRequestsConfig,
+    ) -> Self {
+        Self {
+            voting_store,
+            network_assets,
+            user_requests,
+            elements_rpc,
+            user_request_config,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -40,17 +64,10 @@ impl HighStorm {
         storm: Storm,
         secret_key: [u8; 32],
         coordinator_public_key: [u8; 33],
-        voting_store: crate::db::voting::VotingStore,
-        network_assets: crate::db::network_asset::NetworkAssetStore,
+        dependencies: HighStormDependencies,
     ) -> Self {
-        let state = NetworkState::new(
-            &storm,
-            secret_key,
-            coordinator_public_key,
-            voting_store,
-            network_assets,
-        )
-        .await;
+        let state =
+            NetworkState::new(&storm, secret_key, coordinator_public_key, dependencies).await;
         let handler_state = state.clone();
 
         storm
@@ -91,40 +108,16 @@ impl HighStorm {
         local_public_key == Some(self.coordinator_public_key())
     }
 
-    /// Signs one or more dummy message hashes using an active Storm Tree branch.
-    pub async fn sign_test(
+    pub async fn sign_execute_user_requests(
         &self,
-        message_hashes: Vec<[u8; 32]>,
+        tx: Vec<u8>,
+        signing_hash: [u8; 32],
+        external_requests: Vec<ExternalRequests>,
     ) -> Result<SigningResult, SigningError> {
         self.state
             .signing()
-            .sign_test(&self.storm, message_hashes)
+            .sign_execute_user_requests(&self.storm, tx, signing_hash, external_requests)
             .await
-    }
-
-    /// Runs a temporary signing request with controls used by disconnect tests.
-    pub async fn sign_test_with_delay(
-        &self,
-        message_hashes: Vec<[u8; 32]>,
-        attempt_timeout: Duration,
-        delayed_signer: NodePublicKey,
-        delay: Duration,
-    ) -> Result<SigningResult, SigningError> {
-        self.state
-            .signing()
-            .sign_test_with_delay(
-                &self.storm,
-                message_hashes,
-                attempt_timeout,
-                delayed_signer,
-                delay,
-            )
-            .await
-    }
-
-    /// Returns the signer subset HighStorm would currently choose.
-    pub async fn selected_signers(&self) -> Result<Vec<NodePublicKey>, SigningError> {
-        self.state.signing().selected_signers(&self.storm).await
     }
 
     pub async fn create_voting_request(
@@ -201,8 +194,74 @@ impl HighStorm {
             .map(Some)
     }
 
+    pub async fn initialize_tick_asset(
+        &self,
+        config: &crate::config::ElementsRpcConfig,
+    ) -> Result<Option<NetworkAsset>, AssetError> {
+        if !self.is_coordinator().await {
+            return Ok(None);
+        }
+
+        let storm_eye = self
+            .state
+            .assets()
+            .storm_eye()
+            .await?
+            .ok_or_else(|| AssetError::Conflict("Storm Eye is not initialized".to_string()))?;
+        self.state
+            .assets()
+            .initialize_tick_asset(&self.storm.handle(), config, storm_eye.asset_id)
+            .await
+            .map(Some)
+    }
+
     pub async fn network_asset(&self, kind: &str) -> Result<Option<NetworkAsset>, AssetError> {
         self.state.assets().get(kind).await
+    }
+
+    pub async fn process_user_requests(&self) -> Result<usize, user_requests::UserRequestError> {
+        if !self.is_coordinator().await {
+            return Ok(0);
+        }
+
+        let prepared = match self.state.user_requests().prepare_round().await? {
+            Some(prepared) => prepared,
+            None => return Ok(0),
+        };
+        self.state
+            .user_requests()
+            .validate_execute(&prepared.request)
+            .await?;
+        let signing = self
+            .state
+            .signing()
+            .sign_execute_user_requests(
+                &self.storm,
+                prepared.request.tx.clone(),
+                prepared.request.signing_hash,
+                prepared.request.external_requests.clone(),
+            )
+            .await
+            .map_err(user_requests::UserRequestError::Signing)?;
+        let proof = self
+            .state
+            .signing()
+            .storm_tree_proof(&signing.signing_storm_tree_branch)
+            .await
+            .map_err(user_requests::UserRequestError::Signing)?;
+
+        self.state
+            .user_requests()
+            .finalize_and_broadcast(prepared, signing, proof)
+            .await
+    }
+
+    pub async fn reconcile_user_requests(&self) -> Result<usize, user_requests::UserRequestError> {
+        if !self.is_coordinator().await {
+            return Ok(0);
+        }
+
+        self.state.user_requests().reconcile_confirmations().await
     }
 
     pub async fn storm_eye_asset(&self) -> Result<Option<NetworkAsset>, AssetError> {

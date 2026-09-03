@@ -20,16 +20,17 @@ use tokio::{
 };
 
 use super::message::{
-    NodeMessage, NodeMessageKind, PartialSignaturesMessage, SigningNoncesMessage, TestNodeMessage,
+    ExecuteUserRequests, ExternalRequests, NodeMessage, NodeMessageKind, PartialSignaturesMessage,
+    SigningNoncesMessage,
 };
 
 const SIGNING_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 type OutboundNodeMessage = (NodeMessage, Vec<[u8; 33]>);
 
-/// A completed temporary signing request.
+/// A completed signing request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SigningResult {
-    /// Hash of the successful Test [`NodeMessage`].
+    /// Hash of the [`NodeMessage`] that initiated signing.
     pub request_hash: [u8; 32],
     /// Storm Tree branch used by the successful attempt.
     pub signing_storm_tree_branch: StormTreeBranch,
@@ -67,12 +68,17 @@ struct SignerContribution {
 
 struct SigningSession {
     requestor: NodePublicKey,
-    request: TestNodeMessage,
+    request: SigningRequest,
     signers: Vec<NodePublicKey>,
     contributions: BTreeMap<NodePublicKey, SignerContribution>,
     secret_nonces: Option<Vec<SecretNonce>>,
     completion: Option<oneshot::Sender<SigningResult>>,
     created_at: Instant,
+}
+
+struct SigningRequest {
+    signing_storm_tree_branch: StormTreeBranch,
+    message_hashes: Vec<[u8; 32]>,
 }
 
 struct SigningState {
@@ -86,10 +92,15 @@ struct SigningState {
 #[derive(Clone)]
 pub(crate) struct Signing {
     state: Arc<Mutex<SigningState>>,
+    coordinator_public_key: [u8; 33],
 }
 
 impl Signing {
-    pub(crate) async fn new(storm: &Storm, secret_key: [u8; 32]) -> Self {
+    pub(crate) async fn new(
+        storm: &Storm,
+        secret_key: [u8; 32],
+        coordinator_public_key: [u8; 33],
+    ) -> Self {
         let peers = storm.peers().await;
         let state = Arc::new(Mutex::new(SigningState::new(secret_key, &peers)));
         let cleanup_state = Arc::downgrade(&state);
@@ -103,7 +114,10 @@ impl Signing {
             }
         });
 
-        Self { state }
+        Self {
+            state,
+            coordinator_public_key,
+        }
     }
 
     pub(crate) async fn storm_tree_root(&self) -> Result<[u8; 32], SigningError> {
@@ -116,57 +130,67 @@ impl Signing {
             .ok_or(SigningError::TooFewMembers)
     }
 
-    pub(crate) async fn sign_test(
+    pub(crate) async fn storm_tree_proof(
         &self,
-        storm: &Storm,
-        message_hashes: Vec<[u8; 32]>,
-    ) -> Result<SigningResult, SigningError> {
-        self.sign_test_inner(storm, message_hashes, SIGNING_SESSION_TIMEOUT, None)
-            .await
+        branch: &StormTreeBranch,
+    ) -> Result<storm_tree::StormTreeProof, SigningError> {
+        let state = self.state.lock().await;
+        state
+            .tree
+            .as_ref()
+            .ok_or(SigningError::TooFewMembers)?
+            .proof(branch)
+            .map_err(SigningError::StormTree)
     }
 
-    pub(crate) async fn sign_test_with_delay(
+    pub(crate) async fn sign_execute_user_requests(
         &self,
         storm: &Storm,
-        message_hashes: Vec<[u8; 32]>,
-        attempt_timeout: Duration,
-        delayed_signer: NodePublicKey,
-        delay: Duration,
+        tx: Vec<u8>,
+        signing_hash: [u8; 32],
+        external_requests: Vec<ExternalRequests>,
     ) -> Result<SigningResult, SigningError> {
-        self.sign_test_inner(
+        if tx.is_empty() {
+            return Err(SigningError::InvalidMessage(
+                "issuance transaction cannot be empty".into(),
+            ));
+        }
+        if external_requests.is_empty() {
+            return Err(SigningError::InvalidMessage(
+                "issuance transaction has no external requests".into(),
+            ));
+        }
+
+        self.sign_with_message(
             storm,
-            message_hashes,
-            attempt_timeout,
-            Some((delayed_signer, delay)),
+            vec![signing_hash],
+            SIGNING_SESSION_TIMEOUT,
+            move |branch| {
+                NodeMessage::new(
+                    NodeMessageKind::ExecuteUserRequests,
+                    None,
+                    &ExecuteUserRequests {
+                        tx: tx.clone(),
+                        signing_hash,
+                        signing_storm_tree_branch: branch,
+                        external_requests: external_requests.clone(),
+                    },
+                )
+            },
         )
         .await
     }
 
-    pub(crate) async fn selected_signers(
-        &self,
-        storm: &Storm,
-    ) -> Result<Vec<NodePublicKey>, SigningError> {
-        let peers = storm.peers().await;
-        let mut state = self.state.lock().await;
-        state.refresh_members(&peers)?;
-        let branch = state
-            .select_branch(&peers, &BTreeSet::new())
-            .ok_or(SigningError::NoAvailableBranch)?;
-        Ok(state
-            .tree
-            .as_ref()
-            .expect("tree exists when a branch was selected")
-            .nodes_for_branch(&branch)?
-            .to_vec())
-    }
-
-    async fn sign_test_inner(
+    async fn sign_with_message<F>(
         &self,
         storm: &Storm,
         message_hashes: Vec<[u8; 32]>,
         attempt_timeout: Duration,
-        delay: Option<(NodePublicKey, Duration)>,
-    ) -> Result<SigningResult, SigningError> {
+        make_message: F,
+    ) -> Result<SigningResult, SigningError>
+    where
+        F: Fn(StormTreeBranch) -> Result<NodeMessage, postcard::Error>,
+    {
         let mut attempted = BTreeSet::new();
 
         loop {
@@ -189,15 +213,11 @@ impl Signing {
                     .expect("tree exists when a branch was selected")
                     .nodes_for_branch(&branch)?
                     .to_vec();
-                let request = TestNodeMessage {
+                let request = SigningRequest {
                     signing_storm_tree_branch: branch,
                     message_hashes: message_hashes.clone(),
-                    delayed_signer: delay.map(|(signer, _)| signer),
-                    delay_millis: delay
-                        .map(|(_, duration)| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-                        .unwrap_or(0),
                 };
-                let initial = NodeMessage::new(NodeMessageKind::Test, None, &request)?;
+                let initial = make_message(branch)?;
                 let request_hash = initial.hash()?;
                 let (sender, receiver) = oneshot::channel();
                 let requestor = state.local_node;
@@ -263,28 +283,37 @@ impl Signing {
         recipient_transport_keys(&state, signers, requestor)
     }
 
-    pub(crate) async fn handle_test(
+    pub(crate) async fn handle_execute_user_requests(
         &self,
         message: NodeMessage,
         context: &StormContext,
     ) -> Result<(), SigningError> {
-        let request: TestNodeMessage = message.decode_payload()?;
-        let request_hash = message.hash()?;
-        let delay = if request.delayed_signer == Some(self.state.lock().await.local_node) {
-            Duration::from_millis(request.delay_millis)
-        } else {
-            Duration::ZERO
-        };
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
+        require_coordinator(
+            self.coordinator_public_key,
+            context.message_context.peer_public_key,
+        )?;
+        let request: ExecuteUserRequests = message.decode_payload()?;
+        if request.tx.is_empty() || request.external_requests.is_empty() {
+            return Err(SigningError::InvalidMessage(
+                "invalid user request issuance transaction".into(),
+            ));
         }
+        let request_hash = message.hash()?;
         let peers = context.storm_handle.peers().await;
         let sender = node_key(&context.message_context.peer_public_key)?;
         let outbound = {
             let mut state = self.state.lock().await;
             state.refresh_members(&peers)?;
             state.remove_expired_sessions();
-            state.start_session(request_hash, sender, request, None)?
+            state.start_session(
+                request_hash,
+                sender,
+                SigningRequest {
+                    signing_storm_tree_branch: request.signing_storm_tree_branch,
+                    message_hashes: vec![request.signing_hash],
+                },
+                None,
+            )?
         };
         if let Some(outbound) = outbound {
             send_from_handle(
@@ -294,6 +323,7 @@ impl Signing {
             )
             .await?;
         }
+
         Ok(())
     }
 
@@ -401,7 +431,7 @@ impl SigningState {
         &mut self,
         request_hash: [u8; 32],
         requestor: NodePublicKey,
-        request: TestNodeMessage,
+        request: SigningRequest,
         completion: Option<oneshot::Sender<SigningResult>>,
     ) -> Result<Option<NodeMessage>, SigningError> {
         if self.sessions.contains_key(&request_hash) {
@@ -735,6 +765,20 @@ fn required_link(message: &NodeMessage) -> Result<[u8; 32], SigningError> {
         .ok_or_else(|| SigningError::InvalidMessage("signing contribution is not linked".into()))
 }
 
+fn require_coordinator(
+    coordinator_public_key: [u8; 33],
+    sender_public_key: [u8; 33],
+) -> Result<(), SigningError> {
+    if sender_public_key != coordinator_public_key {
+        return Err(SigningError::UnauthorizedMessage(format!(
+            "only coordinator {} may initiate user request signing",
+            hex::encode(coordinator_public_key)
+        )));
+    }
+
+    Ok(())
+}
+
 fn recipient_transport_keys(
     state: &SigningState,
     signers: &[NodePublicKey],
@@ -781,4 +825,24 @@ fn transport_public_keys(recipients: &[[u8; 33]]) -> Result<Vec<TransportPublicK
                 .map_err(|_| SigningError::InvalidMessage("invalid transport public key".into()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COORDINATOR: [u8; 33] = [1; 33];
+    const MEMBER: [u8; 33] = [2; 33];
+
+    #[test]
+    fn coordinator_can_initiate_user_request_signing() {
+        require_coordinator(COORDINATOR, COORDINATOR).unwrap();
+    }
+
+    #[test]
+    fn member_cannot_initiate_user_request_signing() {
+        let error = require_coordinator(COORDINATOR, MEMBER).unwrap_err();
+
+        assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
+    }
 }

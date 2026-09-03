@@ -90,6 +90,7 @@ async fn initializes_persists_and_restores_a_network() {
             entropy: None,
             issuance_txid: [4; 32],
             contract_script: vec![0x51],
+            contract_data: None,
             supply: 10_000,
             created_at_block: 1,
         },
