@@ -12,11 +12,13 @@ use secp256k1_zkp::{PublicKey, Secp256k1, SecretKey};
 use storm::{Peer, Storm};
 
 use crate::config::Config;
+use crate::high_storm::HighStormDependencies;
 pub use high_storm::{
-    ApproveVotingRequest, AssetError, HighStorm, HighStormHandle, MergeStormEyes, NetworkAsset,
-    NetworkAssets, NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind, SigningError,
-    SigningResult, SplitStormEye, StormEyeUtxo, TestNodeMessage, UpdateNetworkMembers,
-    VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError, VotingRequest, VotingStatus,
+    ApproveVotingRequest, AssetError, ExecuteUserRequests, ExternalRequests, HighStorm,
+    HighStormHandle, MergeStormEyes, NetworkAsset, NetworkAssets, NetworkVoteKind,
+    NetworkVoteRequest, NodeMessage, NodeMessageKind, SigningError, SigningResult, SplitStormEye,
+    StormEyeUtxo, UpdateNetworkMembers, UserRequestError, VOTING_TIMEOUT_BLOCKS, VotingApproval,
+    VotingError, VotingRequest, VotingStatus,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -120,8 +122,13 @@ pub async fn start_initialized(config: &Config, store: &NetworkStore) -> Result<
         storm,
         secret_key_bytes,
         coordinator_public_key,
-        store.voting(),
-        store.network_assets(),
+        HighStormDependencies::new(
+            store.voting(),
+            store.network_assets(),
+            store.user_requests(),
+            config.service.elements_rpc.clone(),
+            config.service.user_requests.clone(),
+        ),
     )
     .await)
 }
@@ -157,8 +164,13 @@ async fn initialize(
                 storm,
                 secret_key,
                 coordinator_public_key,
-                store.voting(),
-                store.network_assets(),
+                HighStormDependencies::new(
+                    store.voting(),
+                    store.network_assets(),
+                    store.user_requests(),
+                    config.service.elements_rpc.clone(),
+                    config.service.user_requests.clone(),
+                ),
             )
             .await);
         }

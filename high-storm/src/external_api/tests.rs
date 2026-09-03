@@ -14,6 +14,7 @@ use tower::ServiceExt;
 use crate::{HighStorm, db::Database};
 
 use super::{
+    fee_utxo::FeeUtxoValidator,
     operators::AuthService,
     router,
     users::{NetworkUserRequests, UserRequest, UserRequestHeader, signing_hash},
@@ -260,13 +261,32 @@ async fn setup() -> (Router, PrivateKey, String) {
         storm,
         node_secret.secret_bytes(),
         node_public_key,
-        database.voting(),
-        database.network_assets(),
+        crate::high_storm::HighStormDependencies::new(
+            database.voting(),
+            database.network_assets(),
+            database.user_requests(),
+            crate::config::ElementsRpcConfig {
+                url: "http://127.0.0.1:18884".to_string(),
+                username: "unused".to_string(),
+                password: "unused".to_string(),
+                wallet: "unused".to_string(),
+            },
+            crate::config::UserRequestsConfig {
+                operational_fee_sats: 1_000,
+                tick_burn_reserve_sats: 1_000,
+                issuance_transaction_fee_sats: 1_000,
+            },
+        ),
     )
     .await;
 
     (
-        router(node.handle(), operators, database.user_requests()),
+        router(
+            node.handle(),
+            operators,
+            database.user_requests(),
+            FeeUtxoValidator::allow_all(),
+        ),
         operator_private_key,
         hex::encode(operator_public_key),
     )

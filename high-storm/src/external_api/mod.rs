@@ -1,7 +1,8 @@
+pub(crate) mod fee_utxo;
 mod operators;
 #[cfg(test)]
 mod tests;
-mod users;
+pub(crate) mod users;
 
 use std::net::SocketAddr;
 
@@ -16,6 +17,7 @@ use crate::{
     HighStormHandle, VotingError,
     db::{node_operator::NodeOperatorStore, user_request::UserRequestStore},
 };
+use fee_utxo::{FeeUtxoValidationError, FeeUtxoValidator};
 use operators::{AuthError, AuthService};
 
 #[derive(Clone)]
@@ -23,6 +25,7 @@ pub(super) struct ExternalApiState {
     pub(super) node: HighStormHandle,
     pub(super) auth: AuthService,
     pub(super) user_requests: UserRequestStore,
+    pub(super) fee_utxos: FeeUtxoValidator,
 }
 
 pub struct ExternalApiServer {
@@ -36,11 +39,15 @@ impl ExternalApiServer {
         node: HighStormHandle,
         operators: NodeOperatorStore,
         user_requests: UserRequestStore,
-    ) -> std::io::Result<Self> {
+        network_assets: crate::db::network_asset::NetworkAssetStore,
+        elements_rpc: &crate::config::ElementsRpcConfig,
+        user_requests_config: &crate::config::UserRequestsConfig,
+    ) -> Result<Self, ExternalApiError> {
         let listener = tokio::net::TcpListener::bind(address).await?;
+        let fee_utxos = FeeUtxoValidator::new(elements_rpc, network_assets, user_requests_config)?;
         Ok(Self {
             listener,
-            router: router(node, operators, user_requests),
+            router: router(node, operators, user_requests, fee_utxos),
         })
     }
 
@@ -53,20 +60,30 @@ impl ExternalApiServer {
     }
 }
 
-pub fn router(
+pub(crate) fn router(
     node: HighStormHandle,
     operators: NodeOperatorStore,
     user_requests: UserRequestStore,
+    fee_utxos: FeeUtxoValidator,
 ) -> Router {
     let state = ExternalApiState {
         node,
         auth: AuthService::new(operators),
         user_requests,
+        fee_utxos,
     };
     Router::new()
         .nest("/users", users::router())
         .nest("/operators", operators::router())
         .with_state(state)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ExternalApiError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    FeeUtxoValidation(#[from] FeeUtxoValidationError),
 }
 
 #[derive(Serialize)]

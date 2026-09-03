@@ -26,7 +26,15 @@ pub struct ServiceConfig {
     pub external_api_address: SocketAddr,
     pub signer: SignerConfig,
     pub elements_rpc: ElementsRpcConfig,
+    pub user_requests: UserRequestsConfig,
     pub db: DbConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct UserRequestsConfig {
+    pub operational_fee_sats: u64,
+    pub tick_burn_reserve_sats: u64,
+    pub issuance_transaction_fee_sats: u64,
 }
 
 fn default_ipc_path() -> PathBuf {

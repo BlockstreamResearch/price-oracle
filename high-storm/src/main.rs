@@ -74,11 +74,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    if let Some(tick_asset) = storm
+        .initialize_tick_asset(&config.service.elements_rpc)
+        .await?
+    {
+        tracing::info!(
+            asset_id = %hex::encode(tick_asset.asset_id),
+            reissuance_token_id = %tick_asset.reissuance_token_id.map(hex::encode).unwrap_or_default(),
+            issuance_txid = %hex::encode(tick_asset.issuance_txid),
+            "Tick asset is initialized"
+        );
+    }
+
     let external_api = ExternalApiServer::bind(
         config.service.external_api_address,
         storm.handle(),
         database.node_operators(),
         database.user_requests(),
+        database.network_assets(),
+        &config.service.elements_rpc,
+        &config.service.user_requests,
     )
     .await?;
     tracing::info!(address = %external_api.local_addr()?, "external API is listening");
@@ -121,6 +136,18 @@ async fn run_until_shutdown(
     );
     persist_runtime.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    let mut issuance_round = tokio::time::interval_at(
+        Instant::now() + Duration::from_secs(20),
+        Duration::from_secs(20),
+    );
+    issuance_round.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let mut reconcile_requests = tokio::time::interval_at(
+        Instant::now() + Duration::from_secs(10),
+        Duration::from_secs(10),
+    );
+    reconcile_requests.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -149,6 +176,28 @@ async fn run_until_shutdown(
                 let peers = storm.peers().await;
                 if let Err(error) = store.update_runtime(&peers).await {
                     tracing::warn!(%error, "failed to persist current peer state");
+                }
+            }
+            _ = issuance_round.tick() => {
+                match storm.process_user_requests().await {
+                    Ok(0) => {}
+                    Ok(request_count) => {
+                        tracing::info!(request_count, "broadcast Tick issuance transaction");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "user request issuance round failed");
+                    }
+                }
+            }
+            _ = reconcile_requests.tick() => {
+                match storm.reconcile_user_requests().await {
+                    Ok(0) => {}
+                    Ok(request_count) => {
+                        tracing::info!(request_count, "confirmed executed user requests");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to reconcile user request confirmations");
+                    }
                 }
             }
             result = &mut ipc_task => {

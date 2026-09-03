@@ -17,6 +17,8 @@ pub(crate) enum HandlerError {
     #[error(transparent)]
     Asset(#[from] AssetError),
     #[error(transparent)]
+    UserRequest(#[from] super::user_requests::UserRequestError),
+    #[error(transparent)]
     Encoding(#[from] postcard::Error),
 }
 
@@ -42,6 +44,15 @@ pub(crate) async fn handle(
     )?;
 
     match kind {
+        NodeMessageKind::ExecuteUserRequests => {
+            let request = message.decode_payload()?;
+            state.user_requests().validate_execute(&request).await?;
+            state
+                .signing()
+                .handle_execute_user_requests(message, &context)
+                .await?;
+            Ok(())
+        }
         NodeMessageKind::NetworkAssets => {
             state
                 .assets()
@@ -68,10 +79,6 @@ pub(crate) async fn handle(
                 .voting()
                 .handle_synchronization(message, &context)
                 .await?;
-            Ok(())
-        }
-        NodeMessageKind::Test => {
-            state.signing().handle_test(message, &context).await?;
             Ok(())
         }
         NodeMessageKind::SigningNonces => {

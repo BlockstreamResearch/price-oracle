@@ -5,9 +5,10 @@ use std::sync::{
 
 use storm::Storm;
 
-use crate::db::{network_asset::NetworkAssetStore, voting::VotingStore};
-
-use super::{assets::Assets, signing::Signing, voting::Voting};
+use super::{
+    HighStormDependencies, assets::Assets, signing::Signing, user_requests::UserRequestProcessor,
+    voting::Voting,
+};
 
 /// Cloneable higher-level state shared by HighStorm message handlers.
 #[derive(Clone)]
@@ -16,6 +17,7 @@ pub(crate) struct NetworkState {
     signing: Signing,
     voting: Voting,
     assets: Assets,
+    user_requests: UserRequestProcessor,
     block_height: Arc<AtomicU64>,
 }
 
@@ -24,14 +26,27 @@ impl NetworkState {
         storm: &Storm,
         secret_key: [u8; 32],
         coordinator_public_key: [u8; 33],
-        voting_store: VotingStore,
-        network_assets: NetworkAssetStore,
+        dependencies: HighStormDependencies,
     ) -> Self {
+        let HighStormDependencies {
+            voting_store,
+            network_assets,
+            user_requests,
+            elements_rpc,
+            user_request_config,
+        } = dependencies;
+
         Self {
             coordinator_public_key,
-            signing: Signing::new(storm, secret_key).await,
+            signing: Signing::new(storm, secret_key, coordinator_public_key).await,
             voting: Voting::new(secret_key, voting_store),
-            assets: Assets::new(network_assets),
+            assets: Assets::new(network_assets.clone()),
+            user_requests: UserRequestProcessor::new(
+                user_requests,
+                network_assets,
+                elements_rpc,
+                user_request_config,
+            ),
             block_height: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -50,6 +65,10 @@ impl NetworkState {
 
     pub(crate) fn assets(&self) -> &Assets {
         &self.assets
+    }
+
+    pub(crate) fn user_requests(&self) -> &UserRequestProcessor {
+        &self.user_requests
     }
 
     pub(crate) fn block_height(&self) -> u64 {

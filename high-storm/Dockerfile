@@ -1,7 +1,5 @@
 FROM rust:1.97.1-bookworm AS builder
 
-ENV PATH="/root/.simplex/bin:${PATH}"
-
 WORKDIR /workspace
 RUN apt-get update \
 	&& apt-get install --yes --no-install-recommends jq \
@@ -12,15 +10,6 @@ COPY high-storm ./high-storm
 COPY storm ./storm
 COPY storm-operator ./storm-operator
 COPY storm-tree ./storm-tree
-RUN curl -L https://smplx.simplicity-lang.org | bash \
-	&& sed --in-place \
-		--expression '/say "Successfully compiled simplex from commit:/a\    BINS=("${SMPLX_BIN_NAME}")\n    use' \
-		--expression 's|ensure git clone --revision="${commit}" --depth=1 "${repo_url}" "${tmp_dir}"|ensure git init "${tmp_dir}" \&\& ensure git -C "${tmp_dir}" fetch --depth=1 "${repo_url}" "${commit}" \&\& ensure git -C "${tmp_dir}" checkout --detach FETCH_HEAD|' \
-		/root/.simplex/bin/simplexup \
-	&& simplexup -C 53087018cd1a8e12c710a44bafc5e32c077edc5a \
-	&& cd contracts \
-	&& simplex install \
-	&& simplex build
 RUN cargo build --locked --release --package high-storm --package storm-operator
 
 FROM debian:bookworm-slim AS runtime

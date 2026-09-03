@@ -74,7 +74,6 @@ pub enum NodeMessageKind {
     AttestPrice = 10,
     NetworkAssets = 11,
     RenewStormUtxos = 12,
-    Test = 13,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +131,7 @@ pub struct NetworkAsset {
     pub entropy: Option<[u8; 32]>,
     pub issuance_txid: [u8; 32],
     pub contract_script: Vec<u8>,
+    pub contract_data: Option<Vec<u8>>,
     pub supply: u64,
     pub created_at_block: u64,
 }
@@ -139,6 +139,22 @@ pub struct NetworkAsset {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkAssets {
     pub assets: Vec<NetworkAsset>,
+    pub snapshot_id: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalRequests {
+    pub request_hash: [u8; 32],
+    pub network_user_requests: Vec<u8>,
+    pub additional_payload: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteUserRequests {
+    pub tx: Vec<u8>,
+    pub signing_hash: [u8; 32],
+    pub signing_storm_tree_branch: StormTreeBranch,
+    pub external_requests: Vec<ExternalRequests>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,7 +210,6 @@ impl NodeMessageKind {
             10 => Self::AttestPrice,
             11 => Self::NetworkAssets,
             12 => Self::RenewStormUtxos,
-            13 => Self::Test,
             _ => return None,
         })
     }
@@ -202,17 +217,6 @@ impl NodeMessageKind {
     pub(crate) fn requires_coordinator(self) -> bool {
         matches!(self, Self::ExecuteUserRequests | Self::NetworkAssets)
     }
-}
-
-/// Temporary message used to exercise signing before transaction validation exists.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TestNodeMessage {
-    /// Storm Tree branch whose participants must sign.
-    pub signing_storm_tree_branch: StormTreeBranch,
-    /// Already-hashed 32-byte messages to sign.
-    pub message_hashes: Vec<[u8; 32]>,
-    pub(crate) delayed_signer: Option<NodePublicKey>,
-    pub(crate) delay_millis: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
