@@ -1,0 +1,66 @@
+use std::lib::asserts::{assert_eq_64, assert_eq_256};
+use std::lib::u64::convert::u64_to_u256;
+
+/// The x coordinate of a Jacobian point.
+fn gej_x(p: Gej) -> u256 {
+    let (x, _): Ge = unwrap(jet::gej_normalize(p));
+    x
+}
+
+/// Decompress a `Point` into affine coordinates.
+fn point_to_ge(p: Point) -> Ge {
+    unwrap(jet::decompress(p))
+}
+
+pub fn assert_asset_generator(h: Ge, asset_id: u256, abf: Scalar) {
+    let (actual_x, _): Ge = h;
+    let expected: Gej = jet::gej_ge_add(jet::generate(abf), jet::hash_to_curve(asset_id));
+
+    assert_eq_256(actual_x, gej_x(expected));
+}
+
+/// Asserts that `c` matches `v*h + vbf*G`, where `h` is the asset generator `c` commits
+/// against. Compared on x only, because parity bit is different from run to run.
+pub fn assert_value_commitment(c: Ge, v: u64, h: Ge, vbf: Scalar) {
+    let (actual_x, _): Ge = c;
+    let expected: Gej = jet::linear_combination_1((u64_to_u256(v), (h, 1)), vbf);
+
+    assert_eq_256(actual_x, gej_x(expected));
+}
+
+/// Asserts that an `(asset, amount)` pair opens to `expected_asset_id` and
+/// `expected_amount`, whichever of the two are confidential.
+pub fn assert_opens_to(
+    asset: Asset1,
+    amount: Amount1,
+    expected_asset_id: u256,
+    expected_amount: u64,
+    abf: Scalar,
+    vbf: Scalar
+) {
+    match asset {
+        Left(conf_asset: Point) => {
+            let h: Ge = point_to_ge(conf_asset);
+            assert_asset_generator(h, expected_asset_id, abf);
+
+            match amount {
+                Left(conf_amount: Point) => {
+                    assert_value_commitment(point_to_ge(conf_amount), expected_amount, h, vbf);
+                },
+                Right(explicit_amount: u64) => assert_eq_64(explicit_amount, expected_amount),
+            };
+        },
+        Right(explicit_asset: u256) => {
+            assert_eq_256(explicit_asset, expected_asset_id);
+
+            match amount {
+                // An explicit asset commits against the unblinded generator.
+                Left(conf_amount: Point) => {
+                    let h: Ge = jet::hash_to_curve(expected_asset_id);
+                    assert_value_commitment(point_to_ge(conf_amount), expected_amount, h, vbf);
+                },
+                Right(explicit_amount: u64) => assert_eq_64(explicit_amount, expected_amount),
+            };
+        },
+    };
+}

@@ -1,5 +1,7 @@
 use std::lib::asserts::{assert_eq_64, assert_eq_256};
 
+use crate::ct::assert_opens_to;
+
 // TODO: Maybe it would be better to separate asset/amount getters into separate file.
 // Add them into std library for future.
 
@@ -39,6 +41,14 @@ pub fn assert_output_preserves_utxo(output_index: u32) {
 
     assert_eq_256(output_asset, current_asset);
     assert_eq_64(output_amount, current_amount);
+}
+
+/// The confidential counterpart of [`assert_output_preserves_utxo`].
+pub fn assert_output_preserves_blinded_utxo(output_index: u32, abf: Scalar, vbf: Scalar) {
+    let (output_asset, output_amount): (u256, u64) = get_explicit_output_amount(output_index);
+    let (current_asset, current_amount): (Asset1, Amount1) = jet::current_amount();
+
+    assert_opens_to(current_asset, current_amount, output_asset, output_amount, abf, vbf);
 }
 
 // Asset getters
