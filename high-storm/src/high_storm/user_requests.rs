@@ -40,6 +40,7 @@ use crate::{
     NetworkAsset,
     config::{ElementsRpcConfig, UserRequestsConfig},
     db::{
+        monitored_utxo::MonitoredUtxoStore,
         network_asset::{NetworkAssetStore, STORM_EYE_KIND, TICK_ASSET_KIND},
         user_request::{FeeUtxo, UserRequestStore},
     },
@@ -54,14 +55,16 @@ use super::{
     assets::{
         StormEyeContractData, TickAssetContractData, storm_eye_program, treasury_blinding_secret,
     },
+    issuance::{IssuedTickDescriptor, MAX_ISSUED_TICK_DESCRIPTORS},
     message::{ExecuteUserRequests, ExternalRequests},
     signing::SigningError,
 };
 
 const MAX_TICK_TIME_SKEW_SECS: u64 = 120;
-const STORM_EYE_TAG: &str = "OracleNetworkV1/StormEye";
+pub(crate) const STORM_EYE_TAG: &str = "OracleNetworkV1/StormEye";
 const MAX_REQUESTS_PER_ROUND: u32 = 100;
-type PackedStormTreeProof = [Either<(), (bool, [u8; 32])>; storm_tree::TREE_DEPTH as usize];
+pub(crate) type PackedStormTreeProof =
+    [Either<(), (bool, [u8; 32])>; storm_tree::TREE_DEPTH as usize];
 
 pub(crate) struct PreparedRound {
     pub(crate) request: ExecuteUserRequests,
@@ -134,6 +137,7 @@ pub enum UserRequestError {
 #[derive(Clone)]
 pub(crate) struct UserRequestProcessor {
     requests: UserRequestStore,
+    monitored_utxos: MonitoredUtxoStore,
     assets: NetworkAssetStore,
     elements_rpc: ElementsRpcConfig,
     config: UserRequestsConfig,
@@ -142,12 +146,14 @@ pub(crate) struct UserRequestProcessor {
 impl UserRequestProcessor {
     pub(crate) fn new(
         requests: UserRequestStore,
+        monitored_utxos: MonitoredUtxoStore,
         assets: NetworkAssetStore,
         elements_rpc: ElementsRpcConfig,
         config: UserRequestsConfig,
     ) -> Self {
         Self {
             requests,
+            monitored_utxos,
             assets,
             elements_rpc,
             config,
@@ -215,6 +221,16 @@ impl UserRequestProcessor {
             let mut unavailable = None;
             for fee_utxo in fee_utxos {
                 let outpoint = format!("{}:{}", hex::encode(fee_utxo.txid), fee_utxo.output_index);
+                if self
+                    .monitored_utxos
+                    .is_reserved_for_burning(fee_utxo.txid, fee_utxo.output_index)
+                    .await?
+                {
+                    unavailable = Some(format!(
+                        "fee UTXO '{outpoint}' is reserved for burning issued Ticks"
+                    ));
+                    break;
+                }
                 let Some(utxo) = get_confirmed_fee_outpoint(&rpc, &fee_utxo)? else {
                     unavailable = Some(format!(
                         "fee UTXO '{outpoint}' is unavailable or has fewer than \
@@ -244,6 +260,9 @@ impl UserRequestProcessor {
                 continue;
             }
 
+            if tick_count + request.requests.len() > MAX_ISSUED_TICK_DESCRIPTORS {
+                break;
+            }
             tick_count += request.requests.len();
             decoded.push((stored, request, resolved_fee_utxos));
         }
@@ -345,8 +364,10 @@ impl UserRequestProcessor {
         final_transaction.add_output(output_from_utxo(&storm_eye_utxo));
         final_transaction.add_output(output_from_utxo(&token_utxo));
         let mut request_results = Vec::with_capacity(decoded.len());
-        for (stored, request, _) in &decoded {
+        let mut descriptor_data = Vec::with_capacity(tick_count);
+        for (request_index, (stored, request, _)) in decoded.iter().enumerate() {
             let mut results = Vec::with_capacity(request.requests.len());
+            let owner = decode_array(&request.header.public_key)?;
             for user_request in &request.requests {
                 let details: TickUtxoRequestDetails = serde_json::from_str(&user_request.payload)?;
                 let vout = final_transaction.n_outputs();
@@ -358,9 +379,17 @@ impl UserRequestProcessor {
                 results.push(RequestResult {
                     kind: user_request.kind.clone(),
                     vout: vout as u64,
-                    auth_method: details.utxo_auth_method,
+                    auth_method: details.utxo_auth_method.clone(),
                     payload: serde_json::to_string(&TickUtxoDetails { timestamp })?,
                 });
+                descriptor_data.push((
+                    u32::try_from(vout).map_err(|_| {
+                        UserRequestError::Invalid("Tick output index overflow".into())
+                    })?,
+                    request_index,
+                    owner,
+                    details.utxo_auth_method,
+                ));
             }
             request_results.push(PreparedRequestResult {
                 request_hash: stored.request_hash,
@@ -384,6 +413,24 @@ impl UserRequestProcessor {
                 policy_asset,
             ));
         }
+        let first_reserve_output = 2 + tick_count;
+        let mut descriptors = Vec::with_capacity(descriptor_data.len());
+        for (tick_output_index, request_index, owner, auth_method) in descriptor_data {
+            let reserve_output_index = u32::try_from(first_reserve_output + request_index)
+                .map_err(|_| UserRequestError::Invalid("reserve output index overflow".into()))?;
+            descriptors.push(
+                IssuedTickDescriptor::from_request(
+                    tick_output_index,
+                    reserve_output_index,
+                    owner,
+                    &auth_method,
+                )
+                .map_err(UserRequestError::Invalid)?,
+            );
+        }
+        let descriptor_script =
+            IssuedTickDescriptor::script_pubkey(&descriptors).map_err(UserRequestError::Invalid)?;
+        final_transaction.add_output(PartialOutput::new(descriptor_script, 0, policy_asset));
         final_transaction.add_output(PartialOutput::new(
             treasury.get_script_pubkey(&network),
             self.config.operational_fee_sats * tick_count as u64,
@@ -576,13 +623,11 @@ impl UserRequestProcessor {
         let final_tx = pset
             .extract_tx()
             .map_err(|error| UserRequestError::Pset(error.to_string()))?;
-        final_tx
-            .verify_tx_amt_proofs(&Secp256k1::new(), &prepared.spent_utxos)
-            .map_err(|error| {
-                UserRequestError::Invalid(format!(
-                    "failed to verify Tick issuance amounts and proofs: {error}"
-                ))
-            })?;
+        verify_tx_amt_proofs(&final_tx, &prepared.spent_utxos).map_err(|error| {
+            UserRequestError::Invalid(format!(
+                "failed to verify Tick issuance amounts and proofs: {error}"
+            ))
+        })?;
         let txid = final_tx.txid().to_string();
         let transaction_hex = hex::encode(encode::serialize(&final_tx));
         tracing::debug!(%txid, "prepared Tick issuance transaction");
@@ -595,6 +640,19 @@ impl UserRequestProcessor {
             ));
         }
 
+        fn verify_tx_amt_proofs(
+            transaction: &simplex::simplicityhl::elements::Transaction,
+            spent_utxos: &[TxOut],
+        ) -> Result<(), String> {
+            let mut verifiable = transaction.clone();
+            verifiable.output.retain(|output| {
+                output.value.explicit() != Some(0)
+                    || !output.script_pubkey.is_provably_unspendable()
+            });
+            verifiable
+                .verify_tx_amt_proofs(&Secp256k1::new(), spent_utxos)
+                .map_err(|error| error.to_string())
+        }
         let mut updated = 0;
         for result in prepared.request_results {
             let payload = serde_json::to_vec(&NetworkRequestsResult {
@@ -680,7 +738,7 @@ fn elements_regtest_network(
     })
 }
 
-fn find_contract_utxo(
+pub(crate) fn find_contract_utxo(
     client: &Client,
     script: &[u8],
     expected_asset: Option<[u8; 32]>,
@@ -807,13 +865,25 @@ struct SidechainInfo {
     pegged_asset: String,
 }
 
-fn get_explicit_outpoint(
+pub(crate) fn get_explicit_outpoint(
     client: &Client,
     txid: Txid,
     output_index: u32,
 ) -> Result<UTXO, UserRequestError> {
-    let output = get_txout(client, txid, output_index)?;
-    explicit_outpoint(txid, output_index, output)
+    get_optional_explicit_outpoint(client, txid, output_index)?
+        .ok_or_else(|| UserRequestError::Invalid("required UTXO is unavailable".into()))
+}
+
+pub(crate) fn get_optional_explicit_outpoint(
+    client: &Client,
+    txid: Txid,
+    output_index: u32,
+) -> Result<Option<UTXO>, UserRequestError> {
+    let Some(output) = get_txout_optional(client, txid, output_index)? else {
+        return Ok(None);
+    };
+
+    explicit_outpoint(txid, output_index, output).map(Some)
 }
 
 fn explicit_outpoint(
@@ -848,11 +918,6 @@ fn explicit_outpoint(
         },
         secrets: None,
     })
-}
-
-fn get_txout(client: &Client, txid: Txid, output_index: u32) -> Result<GetTxOut, UserRequestError> {
-    get_txout_optional(client, txid, output_index)?
-        .ok_or_else(|| UserRequestError::Invalid("required UTXO is unavailable".into()))
 }
 
 fn get_confirmed_fee_outpoint(
@@ -906,7 +971,7 @@ fn get_raw_transaction(
     .map_err(UserRequestError::Transaction)
 }
 
-fn explicit_txout_secrets(txout: &TxOut) -> Result<TxOutSecrets, UserRequestError> {
+pub(crate) fn explicit_txout_secrets(txout: &TxOut) -> Result<TxOutSecrets, UserRequestError> {
     let asset = txout
         .asset
         .explicit()
@@ -923,7 +988,7 @@ fn explicit_txout_secrets(txout: &TxOut) -> Result<TxOutSecrets, UserRequestErro
     ))
 }
 
-fn output_from_utxo(utxo: &UTXO) -> PartialOutput {
+pub(crate) fn output_from_utxo(utxo: &UTXO) -> PartialOutput {
     PartialOutput::new(
         utxo.txout.script_pubkey.clone(),
         utxo.amount(),
@@ -931,7 +996,7 @@ fn output_from_utxo(utxo: &UTXO) -> PartialOutput {
     )
 }
 
-fn pack_proof(
+pub(crate) fn pack_proof(
     proof: &storm_tree::StormTreeProof,
 ) -> Result<PackedStormTreeProof, UserRequestError> {
     if proof.siblings.len() > storm_tree::TREE_DEPTH as usize {
@@ -1039,6 +1104,7 @@ fn validate_execute_request(
 
     let mut expected_fee_inputs = 0usize;
     let mut expected_ticks = Vec::new();
+    let mut expected_descriptor_data = Vec::new();
     let mut expected_account_scripts = Vec::new();
     for external in &request.external_requests {
         let request_hash: [u8; 32] = sha2::Sha256::digest(&external.network_user_requests).into();
@@ -1099,6 +1165,7 @@ fn validate_execute_request(
         for user_request in &user_request.requests {
             let details: TickUtxoRequestDetails = serde_json::from_str(&user_request.payload)
                 .map_err(|error| UserRequestError::Invalid(error.to_string()))?;
+            expected_descriptor_data.push((owner.serialize(), details.utxo_auth_method.clone()));
             expected_ticks.push(details);
         }
         expected_account_scripts.push((account_script, user_request.requests.len(), input_total));
@@ -1150,6 +1217,43 @@ fn validate_execute_request(
     }
 
     let policy_asset = network.policy_asset();
+    let first_reserve_output = 2 + expected_ticks.len();
+    let first_descriptor_output = first_reserve_output + expected_account_scripts.len();
+    let mut descriptors = Vec::with_capacity(expected_descriptor_data.len());
+    let mut tick_offset = 0usize;
+    for (request_index, (_, request_count, _)) in expected_account_scripts.iter().enumerate() {
+        for _ in 0..*request_count {
+            let (owner, auth_method) = &expected_descriptor_data[tick_offset];
+            descriptors.push(
+                IssuedTickDescriptor::from_request(
+                    u32::try_from(2 + tick_offset).map_err(|_| {
+                        UserRequestError::Invalid("Tick output index overflow".into())
+                    })?,
+                    u32::try_from(first_reserve_output + request_index).map_err(|_| {
+                        UserRequestError::Invalid("reserve output index overflow".into())
+                    })?,
+                    *owner,
+                    auth_method,
+                )
+                .map_err(UserRequestError::Invalid)?,
+            );
+            tick_offset += 1;
+        }
+    }
+    let expected_descriptor_script =
+        IssuedTickDescriptor::script_pubkey(&descriptors).map_err(UserRequestError::Invalid)?;
+    let output = pset
+        .outputs()
+        .get(first_descriptor_output)
+        .ok_or_else(|| UserRequestError::Invalid("issued Tick descriptor is missing".into()))?;
+    if output.asset != Some(policy_asset)
+        || output.amount != Some(0)
+        || output.script_pubkey != expected_descriptor_script
+    {
+        return Err(UserRequestError::Invalid(
+            "invalid issued Tick descriptor".into(),
+        ));
+    }
     validate_accounting_outputs(
         &pset,
         &expected_account_scripts,
@@ -1221,7 +1325,7 @@ fn validate_accounting_outputs(
     config: &UserRequestsConfig,
     network: &SimplicityNetwork,
 ) -> Result<(), UserRequestError> {
-    let expected_output_count = 2 + tick_count + accounts.len() + 2;
+    let expected_output_count = 2 + tick_count + accounts.len() + 1 + 2;
     if pset.outputs().len() != expected_output_count {
         return Err(UserRequestError::Invalid(
             "issuance transaction has unexpected outputs".into(),
@@ -1362,7 +1466,7 @@ fn allocate_account_reserves(
     Ok(reserves)
 }
 
-fn witness_utxo(
+pub(crate) fn witness_utxo(
     pset: &PartiallySignedTransaction,
     index: usize,
 ) -> Result<&simplex::simplicityhl::elements::TxOut, UserRequestError> {
@@ -1372,7 +1476,7 @@ fn witness_utxo(
         .ok_or_else(|| UserRequestError::Invalid(format!("input {index} has no witness UTXO")))
 }
 
-fn require_explicit_utxo(
+pub(crate) fn require_explicit_utxo(
     utxo: &simplex::simplicityhl::elements::TxOut,
     asset: AssetId,
     script: &[u8],
@@ -1389,7 +1493,7 @@ fn require_explicit_utxo(
     Ok(())
 }
 
-fn require_preserved_output(
+pub(crate) fn require_preserved_output(
     pset: &PartiallySignedTransaction,
     index: usize,
     input: &simplex::simplicityhl::elements::TxOut,
@@ -1411,7 +1515,7 @@ fn require_preserved_output(
     Ok(())
 }
 
-fn asset_id(bytes: [u8; 32]) -> Result<AssetId, UserRequestError> {
+pub(crate) fn asset_id(bytes: [u8; 32]) -> Result<AssetId, UserRequestError> {
     Ok(AssetId::from_byte_array(bytes))
 }
 
@@ -1454,6 +1558,8 @@ mod tests {
             operational_fee_sats: 100,
             tick_burn_reserve_sats: 200,
             issuance_transaction_fee_sats: 150,
+            burn_transaction_fee_sats: 50,
+            tick_lifetime_blocks: 60,
         }
     }
 

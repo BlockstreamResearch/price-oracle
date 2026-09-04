@@ -2,7 +2,9 @@ use storm::{CustomMsg, StormContext};
 
 use super::{
     assets::AssetError,
-    message::{NodeMessage, NodeMessageKind},
+    burning::BurningError,
+    leader,
+    message::{BurnExpiredUtxos, ExpiredUtxosBurned, NodeMessage, NodeMessageKind},
     signing::SigningError,
     state::NetworkState,
     voting::VotingError,
@@ -18,6 +20,8 @@ pub(crate) enum HandlerError {
     Asset(#[from] AssetError),
     #[error(transparent)]
     UserRequest(#[from] super::user_requests::UserRequestError),
+    #[error(transparent)]
+    Burning(#[from] BurningError),
     #[error(transparent)]
     Encoding(#[from] postcard::Error),
 }
@@ -51,6 +55,23 @@ pub(crate) async fn handle(
                 .signing()
                 .handle_execute_user_requests(message, &context)
                 .await?;
+            Ok(())
+        }
+        NodeMessageKind::BurnExpiredUtxos => {
+            let request: BurnExpiredUtxos = message.decode_payload()?;
+            let expected_leader =
+                require_current_leader(&state, &context, request.block_height).await?;
+            state.burning().validate_request(&request).await?;
+            state
+                .signing()
+                .handle_burn_expired_utxos(message, &context, expected_leader)
+                .await?;
+            Ok(())
+        }
+        NodeMessageKind::ExpiredUtxosBurned => {
+            let notification: ExpiredUtxosBurned = message.decode_payload()?;
+            require_current_leader(&state, &context, notification.block_height).await?;
+            state.burning().observe_broadcast(&notification).await?;
             Ok(())
         }
         NodeMessageKind::NetworkAssets => {
@@ -102,6 +123,32 @@ pub(crate) async fn handle(
     }
 }
 
+async fn require_current_leader(
+    state: &NetworkState,
+    context: &StormContext,
+    block_height: u64,
+) -> Result<[u8; 33], SigningError> {
+    if block_height != state.block_height() {
+        return Err(SigningError::UnauthorizedMessage(
+            "burn message does not target the currently indexed block".into(),
+        ));
+    }
+    let expected = leader::leader_for_height(&context.storm_handle.peers().await, block_height)
+        .ok_or_else(|| SigningError::UnauthorizedMessage("network has no leader".into()))?;
+    authorize_burn_sender(expected, context.message_context.peer_public_key)?;
+    Ok(expected)
+}
+
+fn authorize_burn_sender(expected: [u8; 33], sender: [u8; 33]) -> Result<(), SigningError> {
+    if sender != expected {
+        return Err(SigningError::UnauthorizedMessage(format!(
+            "only network leader {} may send burn messages",
+            hex::encode(expected)
+        )));
+    }
+    Ok(())
+}
+
 fn authorize_sender(
     kind: NodeMessageKind,
     coordinator_public_key: [u8; 33],
@@ -150,6 +197,18 @@ mod tests {
     fn only_coordinator_can_announce_network_assets() {
         let error =
             authorize_sender(NodeMessageKind::NetworkAssets, COORDINATOR, MEMBER).unwrap_err();
+
+        assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
+    }
+
+    #[test]
+    fn current_leader_can_send_burn_messages() {
+        authorize_burn_sender(COORDINATOR, COORDINATOR).unwrap();
+    }
+
+    #[test]
+    fn non_leader_cannot_send_burn_messages() {
+        let error = authorize_burn_sender(COORDINATOR, MEMBER).unwrap_err();
 
         assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
     }

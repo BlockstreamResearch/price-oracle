@@ -264,6 +264,7 @@ async fn setup() -> (Router, PrivateKey, String) {
         crate::high_storm::HighStormDependencies::new(
             database.voting(),
             database.network_assets(),
+            database.monitored_utxos(),
             database.user_requests(),
             crate::config::ElementsRpcConfig {
                 url: "http://127.0.0.1:18884".to_string(),
@@ -275,6 +276,8 @@ async fn setup() -> (Router, PrivateKey, String) {
                 operational_fee_sats: 1_000,
                 tick_burn_reserve_sats: 1_000,
                 issuance_transaction_fee_sats: 1_000,
+                burn_transaction_fee_sats: 500,
+                tick_lifetime_blocks: 60,
             },
         ),
     )
@@ -285,7 +288,7 @@ async fn setup() -> (Router, PrivateKey, String) {
             node.handle(),
             operators,
             database.user_requests(),
-            FeeUtxoValidator::allow_all(),
+            FeeUtxoValidator::allow_all(database.monitored_utxos()),
         ),
         operator_private_key,
         hex::encode(operator_public_key),

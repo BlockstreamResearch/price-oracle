@@ -916,7 +916,7 @@ The nodes perform the following validation on the burning request:
 3. For each burned UTXO, the remaining fee in LBTC is returned to the user.  
 4. Creates an LBTC UTXO for the miner as the transaction fee.  
 5. Network-issued UTXOs are expired.  
-6. Network-issued UTXOs are being sent to the OP\_RETURN.  
+6. Network-issued UTXOs are aggregated into one empty OP\_RETURN output. Its asset is the network-issued asset and its amount is the sum of the burned inputs.  
 7. The branch of signers is within Storm Tree.
 
 After each node completes validation, it creates signing sessions to sign `jet::sig_all_hash`.  
