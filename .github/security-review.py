@@ -328,6 +328,9 @@ Your job is to identify genuine security vulnerabilities.
 
 IMPORTANT:
 - Report ONLY HIGH or CRITICAL vulnerabilities.
+- Report every distinct qualifying vulnerability you find; do not stop after the first.
+- Keep each description, attack scenario, and recommendation to one concise sentence
+    of at most 30 words.
 - Ignore LOW and MEDIUM issues.
 - Ignore style issues.
 - Ignore maintainability issues.
@@ -335,6 +338,8 @@ IMPORTANT:
 - Ignore theoretical vulnerabilities without a realistic attack path.
 - Be conservative.
 - Do not invent vulnerabilities.
+- Deduplicate findings that share the same root cause.
+- Order findings by severity, then expected impact.
 - A finding must have a concrete security impact and plausible exploitation path.
 
 Look for issues such as:
@@ -489,14 +494,10 @@ for finding in findings:
         [
             f"### {severity}: {title}",
             "",
-            f"**Location:** `{file}:{line}`  ",
-            f"**CWE:** `{cwe}`",
-            "",
-            description,
-            "",
-            f"**Attack scenario:** {attack_scenario}",
-            "",
-            f"**Recommendation:** {recommendation}",
+            f"`{file}:{line}` | `{cwe}`",
+            f"- **Impact:** {description}",
+            f"- **Attack:** {attack_scenario}",
+            f"- **Fix:** {recommendation}",
             "",
         ]
     )

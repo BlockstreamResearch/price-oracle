@@ -20,6 +20,9 @@ wallet = "funded-key"
 operational_fee_sats = 1000
 tick_burn_reserve_sats = 1000
 issuance_transaction_fee_sats = 1000
+burn_transaction_fee_sats = 500
+# 60 blocks at the target one-minute block interval is one hour.
+tick_lifetime_blocks = 60
 
 [service.db]
 url = "localhost:5432"

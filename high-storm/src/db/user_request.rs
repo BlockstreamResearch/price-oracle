@@ -112,6 +112,31 @@ impl UserRequestStore {
         .collect()
     }
 
+    pub async fn observe_processing(
+        &self,
+        request_hash: [u8; 32],
+        request: &[u8],
+        block_height: u64,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "INSERT INTO network_user_requests \
+             (request_hash, request, block_height, status, payload) \
+             VALUES ($1, $2, $3, 'processing', $4) \
+             ON CONFLICT (request_hash) DO NOTHING",
+        )
+        .bind(request_hash.to_vec())
+        .bind(request)
+        .bind(
+            i64::try_from(block_height)
+                .map_err(|error| Error::Sqlx(sqlx::Error::Encode(Box::new(error))))?,
+        )
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn mark_processing(
         &self,
         request_hash: [u8; 32],

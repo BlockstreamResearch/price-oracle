@@ -1,3 +1,2 @@
 [env]
-RUST_TEST_THREADS = { value = "2", force = false }
 SIMPLEX_TEST_ENV = { value = "contracts/simplex-test.toml", relative = true }

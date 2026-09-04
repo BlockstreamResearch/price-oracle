@@ -9,8 +9,8 @@ type AssetAuthWit = (u32, u32);
 type ScriptAuthWit = (u32, u32);
 /// 3. auth_signature, tick_utxo_output_index
 type SignAuthWit = (Signature, u32);
-/// 4. storm_eye_input_index, tick_utxo_output_index
-type NetworkAuthWit = (u32, u32);
+/// 4. storm_eye_input_index
+type NetworkAuthWit = u32;
 
 type AuthKindLeft = Either<AssetAuthWit, ScriptAuthWit>;
 type AuthKindRight = Either<SignAuthWit, NetworkAuthWit>;
@@ -45,10 +45,8 @@ fn user_spend_via_sign_auth(auth_signature: Signature, tick_utxo_output_index: u
 }
 
 /// 4. Network authorized spending.
-fn network_auth_spend(storm_eye_input_index: u32, tick_utxo_output_index: u32) {
+fn network_auth_spend(storm_eye_input_index: u32) {
     assert_eq_256(get_input_asset(storm_eye_input_index), param::STORM_EYE_ASSET_ID);
-
-    assert_tick_utxo_burned(tick_utxo_output_index);
 }
 
 fn main() {
@@ -68,9 +66,8 @@ fn main() {
                 let (signature, output_index): SignAuthWit = wit;
                 user_spend_via_sign_auth(signature, output_index);
             },
-            Right(wit: NetworkAuthWit) => {
-                let (input_index, output_index): NetworkAuthWit = wit;
-                network_auth_spend(input_index, output_index);
+            Right(input_index: NetworkAuthWit) => {
+                network_auth_spend(input_index);
             },
         },
     }

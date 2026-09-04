@@ -158,6 +158,21 @@ pub struct ExecuteUserRequests {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BurnExpiredUtxos {
+    pub tx: Vec<u8>,
+    pub signing_hash: [u8; 32],
+    pub signing_storm_tree_branch: StormTreeBranch,
+    pub block_height: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpiredUtxosBurned {
+    pub txid: [u8; 32],
+    pub utxos: Vec<StormEyeUtxo>,
+    pub block_height: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeStormEyes {
     pub utxos_to_merge: Vec<StormEyeUtxo>,
 }

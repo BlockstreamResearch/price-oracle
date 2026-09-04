@@ -328,17 +328,15 @@ This spending path will include the following checks:
 
 In this scenario, the network can spend a Tick UTXO. To spend it, the network must include the Storm Eye UTXO in the transaction.
 
-The following witness parameters are accepted for spending:
+The following witness parameter is accepted for spending:
 
 1. *storm\_eye\_input\_index* \- the Storm Eye UTXO input index  
-2. *tick\_utxo\_output\_index* \- the output index of the Tick UTXO
 
-This spending path will include the following checks:
+This spending path includes only the following covenant check:
 
 1. assert(jet::input\_asset(*storm\_eye\_input\_index*) \== param::STORM\_EYE\_ASSET\_ID)  
-2. assert(jet::output\_asset(*tick\_utxo\_output\_index*) \== jet::current\_asset())  
-3. assert(jet::output\_amount(*tick\_utxo\_output\_index*) \== jet::current\_amount())  
-4. assert(is\_op\_return(*tick\_utxo\_output\_index*))
+
+Before signing, every network node validates that all selected Tick amounts are summed exactly into one empty OP\_RETURN output with the Tick asset. This permits many Tick inputs to share one aggregate burn output without relying on an invalid per-input inequality.
 
 ## 3.5. Contract creation transaction
 

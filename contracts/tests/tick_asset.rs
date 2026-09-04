@@ -27,7 +27,7 @@ const AUTH_METHOD_ASSET: u32 = 0;
 const AUTH_METHOD_SCRIPT: u32 = 1;
 const AUTH_METHOD_SIGNATURE: u32 = 2;
 
-type TickPath = Either<Either<(u32, u32), (u32, u32)>, Either<([u8; 64], u32), (u32, u32)>>;
+type TickPath = Either<Either<(u32, u32), (u32, u32)>, Either<([u8; 64], u32), u32>>;
 
 /// One constructor per spending path, in the order `tick_asset.simf` declares them.
 mod path {
@@ -45,8 +45,8 @@ mod path {
         Either::Right(Either::Left(([0u8; 64], output_index)))
     }
 
-    pub fn network_auth(input_index: u32, output_index: u32) -> TickPath {
-        Either::Right(Either::Right((input_index, output_index)))
+    pub fn network_auth(input_index: u32) -> TickPath {
+        Either::Right(Either::Right(input_index))
     }
 }
 
@@ -95,14 +95,18 @@ impl TickFixture {
     }
 
     fn tick_utxo(&self, context: &simplex::TestContext) -> anyhow::Result<UTXO> {
+        self.tick_utxos(context)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("the covenant holds no Tick UTXO"))
+    }
+
+    fn tick_utxos(&self, context: &simplex::TestContext) -> anyhow::Result<Vec<UTXO>> {
         let script_pubkey = self.program.get_script_pubkey(context.get_network());
 
-        context
+        Ok(context
             .get_default_provider()
-            .fetch_scripthash_utxos(&script_pubkey)?
-            .first()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("the covenant holds no Tick UTXO"))
+            .fetch_scripthash_utxos(&script_pubkey)?)
     }
 
     fn storm_eye_utxo(&self, context: &simplex::TestContext) -> anyhow::Result<UTXO> {
@@ -166,14 +170,16 @@ fn issue_tick_asset(
 
     let issuance = ft.add_issuance_input(
         PartialInput::new(funding_utxo),
-        IssuanceInput::new_issuance(TICK_TIMESTAMP, 0, [1u8; 32]),
+        IssuanceInput::new_issuance(TICK_TIMESTAMP * 2, 0, [1u8; 32]),
         RequiredSignature::NativeEcdsa,
     );
-    ft.add_output(PartialOutput::new(
-        program.get_script_pubkey(context.get_network()),
-        TICK_TIMESTAMP,
-        issuance.asset_id,
-    ));
+    for _ in 0..2 {
+        ft.add_output(PartialOutput::new(
+            program.get_script_pubkey(context.get_network()),
+            TICK_TIMESTAMP,
+            issuance.asset_id,
+        ));
+    }
 
     signer.broadcast(&ft)?.wait()?;
 
@@ -191,7 +197,7 @@ fn rejects_network_burn_without_storm_eye(context: simplex::TestContext) -> anyh
     let ft = fixture.burn_transaction(
         &context,
         &decoy_utxo,
-        path::network_auth(1, 0),
+        path::network_auth(1),
         RequiredSignature::None,
         op_return_output(TICK_TIMESTAMP, fixture.tick_asset),
     )?;
@@ -204,13 +210,12 @@ fn rejects_network_burn_without_storm_eye(context: simplex::TestContext) -> anyh
 #[simplex::test]
 fn rejects_burn_to_a_spendable_output(context: simplex::TestContext) -> anyhow::Result<()> {
     let fixture = TickFixture::new(&context, AUTH_METHOD_ASSET)?;
-    let storm_eye_utxo = fixture.storm_eye_utxo(&context)?;
+    let auth_utxo = fixture.auth_utxo(&context)?;
 
-    // Everything is a valid burn except that the tick lands somewhere spendable.
     let ft = fixture.burn_transaction(
         &context,
-        &storm_eye_utxo,
-        path::network_auth(1, 0),
+        &auth_utxo,
+        path::asset_auth(1, 0),
         RequiredSignature::None,
         PartialOutput::new(
             context.get_default_signer().get_address().script_pubkey(),
@@ -229,17 +234,41 @@ fn rejects_burn_that_does_not_preserve_the_amount(
     context: simplex::TestContext,
 ) -> anyhow::Result<()> {
     let fixture = TickFixture::new(&context, AUTH_METHOD_ASSET)?;
-    let storm_eye_utxo = fixture.storm_eye_utxo(&context)?;
+    let auth_utxo = fixture.auth_utxo(&context)?;
 
     let ft = fixture.burn_transaction(
         &context,
-        &storm_eye_utxo,
-        path::network_auth(1, 0),
+        &auth_utxo,
+        path::asset_auth(1, 0),
         RequiredSignature::None,
         op_return_output(TICK_TIMESTAMP - 1, fixture.tick_asset),
     )?;
 
     assert_covenant_rejects(&context, &ft);
+
+    Ok(())
+}
+
+#[simplex::test]
+fn network_authorization_does_not_constrain_tick_outputs(
+    context: simplex::TestContext,
+) -> anyhow::Result<()> {
+    let fixture = TickFixture::new(&context, AUTH_METHOD_ASSET)?;
+    let storm_eye_utxo = fixture.storm_eye_utxo(&context)?;
+
+    let ft = fixture.burn_transaction(
+        &context,
+        &storm_eye_utxo,
+        path::network_auth(1),
+        RequiredSignature::None,
+        PartialOutput::new(
+            context.get_default_signer().get_address().script_pubkey(),
+            TICK_TIMESTAMP,
+            fixture.tick_asset,
+        ),
+    )?;
+
+    context.get_default_signer().broadcast(&ft)?.wait()?;
 
     Ok(())
 }
@@ -330,12 +359,53 @@ fn burns_tick_utxo_when_storm_eye_is_present(context: simplex::TestContext) -> a
     let ft = fixture.burn_transaction(
         &context,
         &storm_eye_utxo,
-        path::network_auth(1, 0),
+        path::network_auth(1),
         RequiredSignature::None,
         op_return_output(TICK_TIMESTAMP, fixture.tick_asset),
     )?;
 
     context.get_default_signer().broadcast(&ft)?.wait()?;
+
+    Ok(())
+}
+
+#[simplex::test]
+fn burns_multiple_tick_utxos_to_one_empty_op_return(
+    context: simplex::TestContext,
+) -> anyhow::Result<()> {
+    let fixture = TickFixture::new(&context, AUTH_METHOD_ASSET)?;
+    let tick_utxos = fixture.tick_utxos(&context)?;
+    let storm_eye_utxo = fixture.storm_eye_utxo(&context)?;
+    assert_eq!(tick_utxos.len(), 2);
+
+    let mut transaction = FinalTransaction::new();
+    for tick_utxo in tick_utxos {
+        transaction.add_program_input(
+            PartialInput::new(tick_utxo),
+            ProgramInput::new(
+                Box::new(fixture.program.as_ref().clone()),
+                Box::new(TickAssetWitness {
+                    path: path::network_auth(2),
+                }),
+            ),
+            RequiredSignature::None,
+        );
+    }
+    transaction.add_input(
+        PartialInput::new(storm_eye_utxo.clone()),
+        RequiredSignature::NativeEcdsa,
+    );
+    transaction.add_output(op_return_output(TICK_TIMESTAMP * 2, fixture.tick_asset));
+    transaction.add_output(PartialOutput::new(
+        context.get_default_signer().get_address().script_pubkey(),
+        storm_eye_utxo.explicit_amount(),
+        storm_eye_utxo.explicit_asset(),
+    ));
+
+    context
+        .get_default_signer()
+        .broadcast(&transaction)?
+        .wait()?;
 
     Ok(())
 }

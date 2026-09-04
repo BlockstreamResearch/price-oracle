@@ -15,9 +15,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  SIMPLEX_COMMIT: 53087018cd1a8e12c710a44bafc5e32c077edc5a
-  # Set up after release version and fixed bug with RequiredSignature
-  # SIMPLEX_VERSION: 0.0.11
+  SIMPLEX_COMMIT: c1e9d8b06231973d81fbaa677cf3f03787104b81
 
 jobs:
   test:
@@ -45,13 +43,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 https://smplx.simplicity-lang.org | bash
           BASE_DIR="${XDG_CONFIG_HOME:-$HOME}"
           SIMPLEX_DIR="${SIMPLEX_DIR:-$BASE_DIR/.simplex}"
           SIMPLEX_BIN_DIR="$SIMPLEX_DIR/bin"
-          
+          mkdir -p "$SIMPLEX_BIN_DIR"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+            "https://raw.githubusercontent.com/BlockstreamResearch/smplx/$SIMPLEX_COMMIT/simplexup/simplexup" \
+            -o "$SIMPLEX_BIN_DIR/simplexup"
+          chmod +x "$SIMPLEX_BIN_DIR/simplexup"
+
           "$SIMPLEX_BIN_DIR/simplexup" -C "$SIMPLEX_COMMIT"
-          # "$SIMPLEX_BIN_DIR/simplexup" --install "$SIMPLEX_VERSION"
           echo "$SIMPLEX_BIN_DIR" >> "$GITHUB_PATH"
           "$SIMPLEX_BIN_DIR/simplex" --version
 
@@ -83,7 +84,7 @@ jobs:
           # code (crates/cli/src/commands/test.rs). That printed line is the only
           # reliable signal, so read it back out of the log. A missing line means
           # the child was killed by a signal ("Process terminated.") and also fails.
-          simplex test --test-threads 2 2>&1 | tee simplex.log
+          simplex test --test-threads 1 2>&1 | tee simplex.log
 
           status=$(grep -Eo 'Exit Status: [0-9]+' simplex.log | tail -1 | grep -Eo '[0-9]+$')
           if [ -z "${status}" ] || [ "${status}" -ne 0 ]; then
