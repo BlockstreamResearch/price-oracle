@@ -15,7 +15,7 @@ use serde::Serialize;
 
 use crate::{
     HighStormHandle, VotingError,
-    db::{node_operator::NodeOperatorStore, user_request::UserRequestStore},
+    db::{Database, node_operator::NodeOperatorStore, user_request::UserRequestStore},
 };
 use fee_utxo::{FeeUtxoValidationError, FeeUtxoValidator};
 use operators::{AuthError, AuthService};
@@ -37,17 +37,25 @@ impl ExternalApiServer {
     pub async fn bind(
         address: SocketAddr,
         node: HighStormHandle,
-        operators: NodeOperatorStore,
-        user_requests: UserRequestStore,
-        network_assets: crate::db::network_asset::NetworkAssetStore,
+        database: &Database,
         elements_rpc: &crate::config::ElementsRpcConfig,
         user_requests_config: &crate::config::UserRequestsConfig,
     ) -> Result<Self, ExternalApiError> {
         let listener = tokio::net::TcpListener::bind(address).await?;
-        let fee_utxos = FeeUtxoValidator::new(elements_rpc, network_assets, user_requests_config)?;
+        let fee_utxos = FeeUtxoValidator::new(
+            elements_rpc,
+            database.network_assets(),
+            database.monitored_utxos(),
+            user_requests_config,
+        )?;
         Ok(Self {
             listener,
-            router: router(node, operators, user_requests, fee_utxos),
+            router: router(
+                node,
+                database.node_operators(),
+                database.user_requests(),
+                fee_utxos,
+            ),
         })
     }
 

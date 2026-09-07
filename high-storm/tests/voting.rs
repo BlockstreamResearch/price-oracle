@@ -16,14 +16,17 @@ use tokio::time::timeout;
 use common::TestNode;
 
 const START_HEIGHT: u64 = 50_000;
+static VOTING_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct TestNetwork {
+    _test_guard: tokio::sync::MutexGuard<'static, ()>,
     definitions: [TestNode; 3],
     nodes: [HighStorm; 3],
 }
 
 impl TestNetwork {
     async fn start() -> Self {
+        let test_guard = VOTING_TEST_LOCK.lock().await;
         let first = TestNode::new(21).await;
         let second = TestNode::new(22).await;
         let third = TestNode::new(23).await;
@@ -68,6 +71,7 @@ impl TestNetwork {
         }
 
         Self {
+            _test_guard: test_guard,
             definitions: [first, second, third],
             nodes,
         }

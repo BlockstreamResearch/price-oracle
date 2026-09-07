@@ -9,7 +9,10 @@ use url::Url;
 
 use crate::{
     config::{ElementsRpcConfig, UserRequestsConfig},
-    db::{network_asset::NetworkAssetStore, network_asset::STORM_EYE_KIND, user_request::FeeUtxo},
+    db::{
+        monitored_utxo::MonitoredUtxoStore, network_asset::NetworkAssetStore,
+        network_asset::STORM_EYE_KIND, user_request::FeeUtxo,
+    },
 };
 
 pub(crate) const MIN_FEE_UTXO_CONFIRMATIONS: u64 = 1;
@@ -38,6 +41,8 @@ pub enum FeeUtxoValidationError {
     WrongAsset(String),
     #[error("fee UTXO '{0}' is not owned by the requester's Account contract")]
     WrongOwner(String),
+    #[error("fee UTXO '{0}' is reserved for burning issued Ticks")]
+    ReservedForBurning(String),
     #[error("fee UTXOs provide {actual} sats but at least {required} sats are required")]
     InsufficientValue { actual: u64, required: u64 },
     #[error("configured user request fees overflow")]
@@ -53,6 +58,7 @@ pub enum FeeUtxoValidationError {
 #[derive(Clone)]
 pub(crate) struct FeeUtxoValidator {
     inner: FeeUtxoValidatorInner,
+    monitored_utxos: MonitoredUtxoStore,
 }
 
 #[derive(Clone)]
@@ -66,6 +72,7 @@ impl FeeUtxoValidator {
     pub(super) fn new(
         config: &ElementsRpcConfig,
         assets: NetworkAssetStore,
+        monitored_utxos: MonitoredUtxoStore,
         user_requests: &UserRequestsConfig,
     ) -> Result<Self, FeeUtxoValidationError> {
         let mut url = Url::parse(&config.url)?;
@@ -82,13 +89,15 @@ impl FeeUtxoValidator {
                 assets,
                 user_requests: user_requests.clone(),
             })),
+            monitored_utxos,
         })
     }
 
     #[cfg(test)]
-    pub(super) fn allow_all() -> Self {
+    pub(super) fn allow_all(monitored_utxos: MonitoredUtxoStore) -> Self {
         Self {
             inner: FeeUtxoValidatorInner::AllowAll,
+            monitored_utxos,
         }
     }
 
@@ -98,6 +107,20 @@ impl FeeUtxoValidator {
         owner: [u8; 32],
         request_count: usize,
     ) -> Result<(), FeeUtxoValidationError> {
+        for fee_utxo in fee_utxos {
+            if self
+                .monitored_utxos
+                .is_reserved_for_burning(fee_utxo.txid, fee_utxo.output_index)
+                .await?
+            {
+                return Err(FeeUtxoValidationError::ReservedForBurning(format!(
+                    "{}:{}",
+                    hex::encode(fee_utxo.txid),
+                    fee_utxo.output_index
+                )));
+            }
+        }
+
         match &self.inner {
             FeeUtxoValidatorInner::Elements(validator) => {
                 validator.validate(fee_utxos, owner, request_count).await
@@ -288,6 +311,11 @@ struct ScriptPubKey {
 
 #[cfg(test)]
 mod tests {
+    use crate::db::{
+        Database,
+        monitored_utxo::{IndexedBlock, MonitoredUtxo},
+    };
+
     use super::*;
 
     fn output_with_confirmations(confirmations: u64) -> GetTxOut {
@@ -334,8 +362,59 @@ mod tests {
             operational_fee_sats: 1_000,
             tick_burn_reserve_sats: 2_000,
             issuance_transaction_fee_sats: 500,
+            burn_transaction_fee_sats: 500,
+            tick_lifetime_blocks: 60,
         };
 
         assert_eq!(minimum_fee_value(3, &config).unwrap(), 9_500);
+    }
+
+    #[tokio::test]
+    async fn rejects_fee_utxos_reserved_for_tick_burning() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let monitored_utxos = database.monitored_utxos();
+        monitored_utxos
+            .apply_block(
+                "burning-v1",
+                &IndexedBlock {
+                    height: 1,
+                    hash: [1; 32],
+                },
+                &[MonitoredUtxo {
+                    txid: [2; 32],
+                    output_index: 3,
+                    asset_kind: "tick".into(),
+                    amount: 1_700_000_000,
+                    script_pubkey: vec![0x51],
+                    auth_method: "signature-auth".into(),
+                    auth_data: vec![4; 32],
+                    account_owner_pubkey: [5; 32],
+                    burning_fee_txid: [6; 32],
+                    burning_fee_output_index: 7,
+                    block_height: 1,
+                    status: "active".into(),
+                    status_block_height: 1,
+                    burn_txid: None,
+                }],
+                &[],
+                60,
+            )
+            .await
+            .unwrap();
+        let validator = FeeUtxoValidator::allow_all(monitored_utxos);
+        let reserved = FeeUtxo {
+            txid: [6; 32],
+            output_index: 7,
+        };
+
+        let error = validator
+            .validate(&[reserved], [5; 32], 1)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FeeUtxoValidationError::ReservedForBurning(_)
+        ));
     }
 }

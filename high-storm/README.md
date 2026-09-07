@@ -199,8 +199,21 @@ pending requests, reissues timestamp-valued Tick outputs, collects a two-thirds
 Storm Tree signature, and broadcasts the covenant transaction. The status becomes
 `processing` after broadcast and `executed` after confirmation. A node that is not
 the current coordinator returns `503` for both user routes. `signed-price-data`
-returns `422` until price request processing is implemented. Tick UTXO burning is
-not part of this processing path yet.
+returns `422` until price request processing is implemented.
+
+Each node indexes confirmed Tick outputs and their dedicated Account burn
+reserves. A Tick expires after 60 blocks, or one hour at the target one-minute
+block interval, in both production and the bundled Docker deployment. The
+deterministic round-robin leader batches expired Ticks across users, obtains a
+Storm Tree signature, and burns their summed value into one empty `OP_RETURN`. The
+remaining reserve is returned to each Account covenant after deducting its
+share of `burn_transaction_fee_sats`. After broadcasting, the leader announces
+the burn transaction and selected Tick outpoints to the other nodes. Nodes also
+reconcile their burn state from the mempool before each leader round so missed
+announcements do not cause duplicate burns. Unconfirmed burns return to the
+expired queue after five blocks. The indexer immediately removes confirmed
+spent Ticks; the returned Account output becomes eligible for later requests
+once no tracked Tick still reserves it and it has the required confirmation.
 
 The API has no TLS termination. Keep the default loopback bind or place it behind
 an authenticated TLS reverse proxy before exposing it beyond a trusted network.

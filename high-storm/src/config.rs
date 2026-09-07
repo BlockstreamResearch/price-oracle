@@ -35,6 +35,18 @@ pub struct UserRequestsConfig {
     pub operational_fee_sats: u64,
     pub tick_burn_reserve_sats: u64,
     pub issuance_transaction_fee_sats: u64,
+    #[serde(default = "default_burn_transaction_fee_sats")]
+    pub burn_transaction_fee_sats: u64,
+    #[serde(default = "default_tick_lifetime_blocks")]
+    pub tick_lifetime_blocks: u64,
+}
+
+fn default_burn_transaction_fee_sats() -> u64 {
+    500
+}
+
+fn default_tick_lifetime_blocks() -> u64 {
+    60
 }
 
 fn default_ipc_path() -> PathBuf {

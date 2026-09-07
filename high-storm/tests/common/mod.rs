@@ -40,6 +40,8 @@ impl TestNode {
                     operational_fee_sats: 1_000,
                     tick_burn_reserve_sats: 1_000,
                     issuance_transaction_fee_sats: 1_000,
+                    burn_transaction_fee_sats: 500,
+                    tick_lifetime_blocks: 60,
                 },
                 db: DbConfig {
                     url: "unused".to_string(),

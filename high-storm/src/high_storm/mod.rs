@@ -1,9 +1,14 @@
 use std::ops::{Deref, DerefMut};
 
-use storm::{Storm, StormHandle};
+use secp256k1_zkp::PublicKey;
+use storm::{PeerStatus, Storm, StormHandle};
 
 mod assets;
+mod burning;
 mod handler;
+mod indexer;
+mod issuance;
+mod leader;
 mod message;
 mod signing;
 mod state;
@@ -11,10 +16,13 @@ mod user_requests;
 mod voting;
 
 pub use assets::AssetError;
+pub use burning::BurningError;
+pub use indexer::IndexerError;
 pub use message::{
-    ApproveVotingRequest, ExecuteUserRequests, ExternalRequests, MergeStormEyes, NetworkAsset,
-    NetworkAssets, NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind,
-    SplitStormEye, StormEyeUtxo, UpdateNetworkMembers,
+    ApproveVotingRequest, BurnExpiredUtxos, ExecuteUserRequests, ExpiredUtxosBurned,
+    ExternalRequests, MergeStormEyes, NetworkAsset, NetworkAssets, NetworkVoteKind,
+    NetworkVoteRequest, NodeMessage, NodeMessageKind, SplitStormEye, StormEyeUtxo,
+    UpdateNetworkMembers,
 };
 pub use signing::{SigningError, SigningResult};
 use state::NetworkState;
@@ -30,6 +38,7 @@ pub struct HighStorm {
 pub(crate) struct HighStormDependencies {
     voting_store: crate::db::voting::VotingStore,
     network_assets: crate::db::network_asset::NetworkAssetStore,
+    monitored_utxos: crate::db::monitored_utxo::MonitoredUtxoStore,
     user_requests: crate::db::user_request::UserRequestStore,
     elements_rpc: crate::config::ElementsRpcConfig,
     user_request_config: crate::config::UserRequestsConfig,
@@ -39,6 +48,7 @@ impl HighStormDependencies {
     pub(crate) fn new(
         voting_store: crate::db::voting::VotingStore,
         network_assets: crate::db::network_asset::NetworkAssetStore,
+        monitored_utxos: crate::db::monitored_utxo::MonitoredUtxoStore,
         user_requests: crate::db::user_request::UserRequestStore,
         elements_rpc: crate::config::ElementsRpcConfig,
         user_request_config: crate::config::UserRequestsConfig,
@@ -46,6 +56,7 @@ impl HighStormDependencies {
         Self {
             voting_store,
             network_assets,
+            monitored_utxos,
             user_requests,
             elements_rpc,
             user_request_config,
@@ -106,6 +117,16 @@ impl HighStorm {
             .map(|peer| peer.compressed_public_key);
 
         local_public_key == Some(self.coordinator_public_key())
+    }
+
+    pub async fn current_leader(&self) -> Option<[u8; 33]> {
+        leader::leader_for_height(&self.peers().await, self.state.block_height())
+    }
+
+    pub async fn is_leader(&self) -> bool {
+        let peers = self.peers().await;
+        leader::local_public_key(&peers)
+            == leader::leader_for_height(&peers, self.state.block_height())
     }
 
     pub async fn sign_execute_user_requests(
@@ -169,6 +190,14 @@ impl HighStorm {
 
     pub fn set_block_height(&self, block_height: u64) {
         self.state.set_block_height(block_height);
+    }
+
+    pub async fn index_blocks(&self) -> Result<u64, IndexerError> {
+        let indexed = self.state.indexer().sync().await?;
+        if let Some(cursor) = self.state.indexer().cursor().await? {
+            self.state.set_block_height(cursor.height);
+        }
+        Ok(indexed)
     }
 
     pub async fn announce_network_assets(&self) -> Result<(), AssetError> {
@@ -254,6 +283,79 @@ impl HighStorm {
             .user_requests()
             .finalize_and_broadcast(prepared, signing, proof)
             .await
+    }
+
+    pub async fn burn_expired_utxos(&self) -> Result<usize, BurningError> {
+        let block_height = self.state.block_height();
+        let reconciled = self.state.burning().reconcile_mempool(block_height).await?;
+        if reconciled > 0 {
+            tracing::info!(
+                reconciled,
+                "recovered in-flight Tick burns from the mempool"
+            );
+        }
+
+        let peers = self.peers().await;
+        if !leader::is_local_leader(&peers, block_height) {
+            return Ok(0);
+        }
+
+        let prepared = match self.state.burning().prepare_round(block_height).await? {
+            Some(prepared) => prepared,
+            None => return Ok(0),
+        };
+        self.state
+            .burning()
+            .validate_request(&prepared.request)
+            .await?;
+        let signing = self
+            .state
+            .signing()
+            .sign_burn_expired_utxos(
+                &self.storm,
+                prepared.request.tx.clone(),
+                prepared.request.signing_hash,
+                block_height,
+            )
+            .await?;
+        let proof = self
+            .state
+            .signing()
+            .storm_tree_proof(&signing.signing_storm_tree_branch)
+            .await?;
+        let notification = self
+            .state
+            .burning()
+            .finalize_and_broadcast(prepared, signing, proof, block_height)
+            .await?;
+        let count = notification.utxos.len();
+        if let Err(error) = self.announce_burn(&notification).await {
+            tracing::warn!(%error, "failed to announce broadcast Tick burn");
+        }
+
+        Ok(count)
+    }
+
+    async fn announce_burn(&self, notification: &ExpiredUtxosBurned) -> Result<(), SigningError> {
+        let recipients = self
+            .peers()
+            .await
+            .into_iter()
+            .filter(|peer| peer.status == PeerStatus::Active)
+            .map(|peer| {
+                PublicKey::from_slice(&peer.compressed_public_key).map_err(|_| {
+                    SigningError::InvalidMessage("invalid burn notification recipient".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if recipients.is_empty() {
+            return Ok(());
+        }
+        let message = NodeMessage::new(NodeMessageKind::ExpiredUtxosBurned, None, notification)?
+            .into_storm_message()?;
+        self.storm.send_message(message, &recipients).await?;
+
+        Ok(())
     }
 
     pub async fn reconcile_user_requests(&self) -> Result<usize, user_requests::UserRequestError> {

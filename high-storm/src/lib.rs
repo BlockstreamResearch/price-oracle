@@ -125,6 +125,7 @@ pub async fn start_initialized(config: &Config, store: &NetworkStore) -> Result<
         HighStormDependencies::new(
             store.voting(),
             store.network_assets(),
+            store.monitored_utxos(),
             store.user_requests(),
             config.service.elements_rpc.clone(),
             config.service.user_requests.clone(),
@@ -167,6 +168,7 @@ async fn initialize(
                 HighStormDependencies::new(
                     store.voting(),
                     store.network_assets(),
+                    store.monitored_utxos(),
                     store.user_requests(),
                     config.service.elements_rpc.clone(),
                     config.service.user_requests.clone(),

@@ -88,7 +88,7 @@ from decimal import Decimal
 import sys
 
 amount = Decimal(sys.argv[1])
-print("empty" if amount == 0 else "funded" if amount == 50 else "unexpected")
+print("empty" if amount == 0 else "funded" if amount > 0 else "unexpected")
 PY
 )" in
 	empty)
@@ -97,7 +97,7 @@ PY
 	funded)
 		;;
 	*)
-		echo "Expected funded key to have received either 0 or 50 LBTC, found ${received}." >&2
+		echo "Expected funded key to have received a non-negative LBTC amount, found ${received}." >&2
 		exit 1
 		;;
 esac

@@ -20,8 +20,8 @@ use tokio::{
 };
 
 use super::message::{
-    ExecuteUserRequests, ExternalRequests, NodeMessage, NodeMessageKind, PartialSignaturesMessage,
-    SigningNoncesMessage,
+    BurnExpiredUtxos, ExecuteUserRequests, ExternalRequests, NodeMessage, NodeMessageKind,
+    PartialSignaturesMessage, SigningNoncesMessage,
 };
 
 const SIGNING_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -181,6 +181,39 @@ impl Signing {
         .await
     }
 
+    pub(crate) async fn sign_burn_expired_utxos(
+        &self,
+        storm: &Storm,
+        tx: Vec<u8>,
+        signing_hash: [u8; 32],
+        block_height: u64,
+    ) -> Result<SigningResult, SigningError> {
+        if tx.is_empty() {
+            return Err(SigningError::InvalidMessage(
+                "burn transaction cannot be empty".into(),
+            ));
+        }
+
+        self.sign_with_message(
+            storm,
+            vec![signing_hash],
+            SIGNING_SESSION_TIMEOUT,
+            move |branch| {
+                NodeMessage::new(
+                    NodeMessageKind::BurnExpiredUtxos,
+                    None,
+                    &BurnExpiredUtxos {
+                        tx: tx.clone(),
+                        signing_hash,
+                        signing_storm_tree_branch: branch,
+                        block_height,
+                    },
+                )
+            },
+        )
+        .await
+    }
+
     async fn sign_with_message<F>(
         &self,
         storm: &Storm,
@@ -296,6 +329,52 @@ impl Signing {
         if request.tx.is_empty() || request.external_requests.is_empty() {
             return Err(SigningError::InvalidMessage(
                 "invalid user request issuance transaction".into(),
+            ));
+        }
+        let request_hash = message.hash()?;
+        let peers = context.storm_handle.peers().await;
+        let sender = node_key(&context.message_context.peer_public_key)?;
+        let outbound = {
+            let mut state = self.state.lock().await;
+            state.refresh_members(&peers)?;
+            state.remove_expired_sessions();
+            state.start_session(
+                request_hash,
+                sender,
+                SigningRequest {
+                    signing_storm_tree_branch: request.signing_storm_tree_branch,
+                    message_hashes: vec![request.signing_hash],
+                },
+                None,
+            )?
+        };
+        if let Some(outbound) = outbound {
+            send_from_handle(
+                &context.storm_handle,
+                outbound,
+                self.session_recipients(request_hash).await?,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn handle_burn_expired_utxos(
+        &self,
+        message: NodeMessage,
+        context: &StormContext,
+        expected_leader: [u8; 33],
+    ) -> Result<(), SigningError> {
+        require_sender(
+            expected_leader,
+            context.message_context.peer_public_key,
+            "network leader",
+        )?;
+        let request: BurnExpiredUtxos = message.decode_payload()?;
+        if request.tx.is_empty() {
+            return Err(SigningError::InvalidMessage(
+                "invalid Tick burn transaction".into(),
             ));
         }
         let request_hash = message.hash()?;
@@ -769,14 +848,21 @@ fn require_coordinator(
     coordinator_public_key: [u8; 33],
     sender_public_key: [u8; 33],
 ) -> Result<(), SigningError> {
-    if sender_public_key != coordinator_public_key {
-        return Err(SigningError::UnauthorizedMessage(format!(
-            "only coordinator {} may initiate user request signing",
-            hex::encode(coordinator_public_key)
-        )));
-    }
+    require_sender(coordinator_public_key, sender_public_key, "coordinator")
+}
 
-    Ok(())
+fn require_sender(
+    expected_public_key: [u8; 33],
+    sender_public_key: [u8; 33],
+    role: &str,
+) -> Result<(), SigningError> {
+    if sender_public_key == expected_public_key {
+        return Ok(());
+    }
+    Err(SigningError::UnauthorizedMessage(format!(
+        "only {role} {} may initiate signing",
+        hex::encode(expected_public_key)
+    )))
 }
 
 fn recipient_transport_keys(

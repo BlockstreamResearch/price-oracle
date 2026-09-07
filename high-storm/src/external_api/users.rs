@@ -90,6 +90,9 @@ async fn create_request(
             | super::fee_utxo::FeeUtxoValidationError::InvalidPublicKey => {
                 ApiError::bad_request(error)
             }
+            super::fee_utxo::FeeUtxoValidationError::ReservedForBurning(_) => {
+                ApiError::conflict(error)
+            }
             _ => ApiError::unavailable(error),
         })?;
     let encoded = serde_json::to_vec(&request).map_err(ApiError::internal)?;

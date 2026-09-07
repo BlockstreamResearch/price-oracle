@@ -6,8 +6,8 @@ use std::sync::{
 use storm::Storm;
 
 use super::{
-    HighStormDependencies, assets::Assets, signing::Signing, user_requests::UserRequestProcessor,
-    voting::Voting,
+    HighStormDependencies, assets::Assets, burning::Burning, indexer::Indexer, signing::Signing,
+    user_requests::UserRequestProcessor, voting::Voting,
 };
 
 /// Cloneable higher-level state shared by HighStorm message handlers.
@@ -17,6 +17,8 @@ pub(crate) struct NetworkState {
     signing: Signing,
     voting: Voting,
     assets: Assets,
+    burning: Burning,
+    indexer: Indexer,
     user_requests: UserRequestProcessor,
     block_height: Arc<AtomicU64>,
 }
@@ -31,6 +33,7 @@ impl NetworkState {
         let HighStormDependencies {
             voting_store,
             network_assets,
+            monitored_utxos,
             user_requests,
             elements_rpc,
             user_request_config,
@@ -41,8 +44,21 @@ impl NetworkState {
             signing: Signing::new(storm, secret_key, coordinator_public_key).await,
             voting: Voting::new(secret_key, voting_store),
             assets: Assets::new(network_assets.clone()),
+            burning: Burning::new(
+                monitored_utxos.clone(),
+                network_assets.clone(),
+                elements_rpc.clone(),
+                user_request_config.clone(),
+            ),
+            indexer: Indexer::new(
+                monitored_utxos.clone(),
+                network_assets.clone(),
+                elements_rpc.clone(),
+                &user_request_config,
+            ),
             user_requests: UserRequestProcessor::new(
                 user_requests,
+                monitored_utxos,
                 network_assets,
                 elements_rpc,
                 user_request_config,
@@ -65,6 +81,14 @@ impl NetworkState {
 
     pub(crate) fn assets(&self) -> &Assets {
         &self.assets
+    }
+
+    pub(crate) fn burning(&self) -> &Burning {
+        &self.burning
+    }
+
+    pub(crate) fn indexer(&self) -> &Indexer {
+        &self.indexer
     }
 
     pub(crate) fn user_requests(&self) -> &UserRequestProcessor {

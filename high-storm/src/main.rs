@@ -89,9 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let external_api = ExternalApiServer::bind(
         config.service.external_api_address,
         storm.handle(),
-        database.node_operators(),
-        database.user_requests(),
-        database.network_assets(),
+        &database,
         &config.service.elements_rpc,
         &config.service.user_requests,
     )
@@ -130,6 +128,9 @@ async fn run_until_shutdown(
     reconnect.set_missed_tick_behavior(MissedTickBehavior::Skip);
     reconnect.tick().await;
 
+    let mut index_blocks = tokio::time::interval(Duration::from_secs(10));
+    index_blocks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     let mut persist_runtime = tokio::time::interval_at(
         Instant::now() + Duration::from_secs(10),
         Duration::from_secs(10),
@@ -141,6 +142,12 @@ async fn run_until_shutdown(
         Duration::from_secs(20),
     );
     issuance_round.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let mut burning_round = tokio::time::interval_at(
+        Instant::now() + Duration::from_secs(15),
+        Duration::from_secs(15),
+    );
+    burning_round.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut reconcile_requests = tokio::time::interval_at(
         Instant::now() + Duration::from_secs(10),
@@ -172,6 +179,17 @@ async fn run_until_shutdown(
                         tracing::warn!(%error, "network asset announcement pass failed");
                 }
             }
+            _ = index_blocks.tick() => {
+                match storm.index_blocks().await {
+                    Ok(0) => {}
+                    Ok(block_count) => {
+                        tracing::info!(block_count, "indexed confirmed blocks");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to index confirmed blocks");
+                    }
+                }
+            }
             _ = persist_runtime.tick() => {
                 let peers = storm.peers().await;
                 if let Err(error) = store.update_runtime(&peers).await {
@@ -186,6 +204,17 @@ async fn run_until_shutdown(
                     }
                     Err(error) => {
                         tracing::warn!(%error, "user request issuance round failed");
+                    }
+                }
+            }
+            _ = burning_round.tick() => {
+                match storm.burn_expired_utxos().await {
+                    Ok(0) => {}
+                    Ok(utxo_count) => {
+                        tracing::info!(utxo_count, "broadcast expired Tick burn transaction");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "expired Tick burning round failed");
                     }
                 }
             }

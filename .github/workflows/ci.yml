@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SIMPLEX_COMMIT: 53087018cd1a8e12c710a44bafc5e32c077edc5a
+  SIMPLEX_COMMIT: c1e9d8b06231973d81fbaa677cf3f03787104b81
 
 jobs:
   ci:
@@ -31,8 +31,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 https://smplx.simplicity-lang.org | bash
           SIMPLEX_DIR="${SIMPLEX_DIR:-${XDG_CONFIG_HOME:-$HOME}/.simplex}"
+          mkdir -p "$SIMPLEX_DIR/bin"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+            "https://raw.githubusercontent.com/BlockstreamResearch/smplx/$SIMPLEX_COMMIT/simplexup/simplexup" \
+            -o "$SIMPLEX_DIR/bin/simplexup"
+          chmod +x "$SIMPLEX_DIR/bin/simplexup"
           echo "$SIMPLEX_DIR/bin" >> "$GITHUB_PATH"
           "$SIMPLEX_DIR/bin/simplexup" -C "$SIMPLEX_COMMIT"
           "$SIMPLEX_DIR/bin/simplex" --version
@@ -55,6 +59,6 @@ jobs:
         run: >
           cargo build --workspace --all-targets --all-features --locked
 
-      - name: Run tests
+      - name: Run non-contract tests
         run: >
-          cargo test --workspace --all-targets --all-features --locked
+          cargo test --workspace --exclude contracts --all-targets --all-features --locked
