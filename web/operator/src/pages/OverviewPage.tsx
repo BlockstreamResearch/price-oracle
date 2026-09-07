@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
-import { Activity, Ban, Check, CircleDot, Clock3, Copy, RefreshCw, Server, ShieldCheck, Vote } from 'lucide-react'
+import { Activity, Ban, CircleDot, Clock3, RefreshCw, Server, ShieldCheck, Vote } from 'lucide-react'
 import { ApiError, authenticatedGet } from '../api'
 import { useAuth } from '../auth-context'
-import { formatNumber, formatTimestamp, shortKey } from '../format'
+import { CopyableHex } from '../components/CopyableHex'
+import { formatNumber, formatTimestamp } from '../format'
 import type { NetworkPeer, NetworkState, OperatorSession } from '../types'
 
 function fetchOverview(session: OperatorSession) {
@@ -18,7 +19,6 @@ export function OverviewPage() {
   const [peers, setPeers] = useState<NetworkPeer[]>([])
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
-  const [copied, setCopied] = useState('')
 
   async function load() {
     if (!session) return
@@ -49,11 +49,6 @@ export function OverviewPage() {
     return () => { active = false }
   }, [session, logout])
 
-  async function copyKey(key: string) {
-    await navigator.clipboard.writeText(key); setCopied(key)
-    window.setTimeout(() => setCopied(''), 1200)
-  }
-
   const onlinePercent = network?.total_peers
     ? Math.round((network.online_peers / network.total_peers) * 100) : 0
 
@@ -82,25 +77,23 @@ export function OverviewPage() {
           <strong>{network?.pending_votings ?? '—'}</strong><small>{network?.approved_votings ?? 0} approved</small></article>
         <article className="metric"><span><ShieldCheck size={17} /> Local role</span>
           <strong className="metric-role">{network?.is_coordinator ? 'Coordinator' : 'Member'}</strong>
-          <small>{network ? shortKey(network.local_public_key, 6) : '—'}</small></article>
+          <small>{network ? <CopyableHex value={network.local_public_key} visible={6} label="local public key" /> : '—'}</small></article>
       </section>
       <section className="data-section">
         <div className="section-heading"><div><span className="eyebrow">Runtime peer table</span><h2>Network members</h2></div>
           <div className="legend"><span><i className="status-dot active" /> Online</span>
             <span><i className="status-dot inactive" /> Inactive</span><span><i className="status-dot banned" /> Banned</span></div></div>
-        <div className="table-wrap"><table><thead><tr><th>Member</th><th>Status</th><th>Endpoint</th><th>Last seen</th><th><span className="sr-only">Actions</span></th></tr></thead>
+        <div className="table-wrap"><table><thead><tr><th>Member</th><th>Status</th><th>Endpoint</th><th>Last seen</th></tr></thead>
           <tbody>{peers.map((peer, index) => <tr key={peer.public_key}>
             <td><div className="member-cell"><span className="member-index">{String(index + 1).padStart(2, '0')}</span><div>
-              <code title={peer.public_key}>{shortKey(peer.public_key)}</code><span className="member-badges">
-                {peer.is_local && <b>LOCAL</b>}{peer.is_coordinator && <b>COORDINATOR</b>}</span></div></div></td>
+              <CopyableHex value={peer.public_key} label="member public key" /><span className="member-badges">
+                {peer.is_local && <b>LOCAL</b>}{peer.is_coordinator && <b>COORDINATOR</b>}{peer.is_leader && <b className="leader">LEADER</b>}</span></div></div></td>
             <td><span className={`status-pill ${peer.status}`}>{peer.status === 'banned' ? <Ban size={13} /> : <CircleDot size={13} />}
               {peer.status === 'controlled' ? 'online' : peer.status}</span></td>
             <td><code>{peer.socket_address ?? 'Not advertised'}</code></td>
             <td><span className="muted-cell"><Clock3 size={14} /> {formatTimestamp(peer.last_seen)}</span></td>
-            <td><button className="icon-button" type="button" title="Copy public key" onClick={() => void copyKey(peer.public_key)}>
-              {copied === peer.public_key ? <Check size={16} /> : <Copy size={16} />}</button></td>
           </tr>)}
-          {!loading && peers.length === 0 && <tr><td colSpan={5} className="empty-row">No peers are registered.</td></tr>}</tbody></table></div>
+          {!loading && peers.length === 0 && <tr><td colSpan={4} className="empty-row">No peers are registered.</td></tr>}</tbody></table></div>
       </section>
     </div>
   )

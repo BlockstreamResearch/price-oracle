@@ -39,14 +39,14 @@ impl ExternalApiServer {
         node: HighStormHandle,
         database: &Database,
         elements_rpc: &crate::config::ElementsRpcConfig,
-        user_requests_config: &crate::config::UserRequestsConfig,
+        protocol_config: &crate::config::ProtocolConfig,
     ) -> Result<Self, ExternalApiError> {
         let listener = tokio::net::TcpListener::bind(address).await?;
         let fee_utxos = FeeUtxoValidator::new(
             elements_rpc,
             database.network_assets(),
             database.monitored_utxos(),
-            user_requests_config,
+            protocol_config,
         )?;
         Ok(Self {
             listener,

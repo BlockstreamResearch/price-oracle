@@ -1,9 +1,7 @@
 use std::net::TcpListener;
 
 use high_storm::{
-    config::{
-        Config, DbConfig, ElementsRpcConfig, ServiceConfig, SignerConfig, UserRequestsConfig,
-    },
+    config::{Config, DbConfig, ElementsRpcConfig, ProtocolConfig, ServiceConfig, SignerConfig},
     db::{Database, network::NetworkStore, network_asset::NetworkAssetStore},
 };
 use secp256k1_zkp::{Secp256k1, SecretKey};
@@ -36,11 +34,12 @@ impl TestNode {
                     password: "unused".to_string(),
                     wallet: "unused".to_string(),
                 },
-                user_requests: UserRequestsConfig {
+                protocol: ProtocolConfig {
                     operational_fee_sats: 1_000,
                     tick_burn_reserve_sats: 1_000,
                     issuance_transaction_fee_sats: 1_000,
                     burn_transaction_fee_sats: 500,
+                    exchange_transaction_fee_sats: 500,
                     tick_lifetime_blocks: 60,
                 },
                 db: DbConfig {

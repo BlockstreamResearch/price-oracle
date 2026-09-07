@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storm.handle(),
         &database,
         &config.service.elements_rpc,
-        &config.service.user_requests,
+        &config.service.protocol,
     )
     .await?;
     tracing::info!(address = %external_api.local_addr()?, "external API is listening");
@@ -180,13 +180,25 @@ async fn run_until_shutdown(
                 }
             }
             _ = index_blocks.tick() => {
-                match storm.index_blocks().await {
+                let indexed = storm.index_blocks().await;
+                match &indexed {
                     Ok(0) => {}
                     Ok(block_count) => {
                         tracing::info!(block_count, "indexed confirmed blocks");
                     }
                     Err(error) => {
                         tracing::warn!(%error, "failed to index confirmed blocks");
+                    }
+                }
+                if indexed.is_ok() {
+                    match storm.process_droplet_exchange_request().await {
+                        Ok(Some(txid)) => {
+                            tracing::info!(txid = %hex::encode(txid), "broadcast queued Droplets exchange");
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "queued Droplets exchange failed");
+                        }
                     }
                 }
             }

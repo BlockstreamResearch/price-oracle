@@ -9,7 +9,8 @@ use simplex::provider::SimplicityNetwork;
 use simplex::simplicityhl::elements::{
     AssetId, Script, Transaction, TxOut, TxOutSecrets,
     confidential::{AssetBlindingFactor, ValueBlindingFactor},
-    encode,
+    encode, opcodes,
+    script::Instruction,
 };
 use simplex::utils::hash_script;
 use std::str::FromStr;
@@ -36,6 +37,9 @@ const MAX_SPLIT_UTXOS_COUNT: u8 = 4;
 const RESCUE_BLOCKS: u64 = 1_576_800;
 const STORM_EYE_RPC_AMOUNT: f64 = 0.000_100_00;
 const TREASURY_BLINDING_SECRET: [u8; 32] = [0x42; 32];
+const INITIAL_MEMBERS_MAGIC: [u8; 2] = *b"OM";
+const INITIAL_MEMBERS_VERSION: u8 = 1;
+const INITIAL_MEMBERS_HEADER_LEN: usize = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct StormEyeContractData {
@@ -48,6 +52,63 @@ pub(crate) struct StormEyeContractData {
 pub(crate) struct TickAssetContractData {
     pub(crate) issuance_tx: Vec<u8>,
     pub(crate) token_output_index: u32,
+}
+
+pub(crate) fn initial_members_script(members: &[[u8; 32]]) -> Result<Script, AssetError> {
+    let mut members = members.to_vec();
+    members.sort_unstable();
+    members.dedup();
+    let count = u16::try_from(members.len())
+        .map_err(|_| AssetError::InvalidRpcResponse("initial member count"))?;
+    if members.is_empty() {
+        return Err(AssetError::InvalidRpcResponse("initial members"));
+    }
+
+    let mut data = Vec::with_capacity(INITIAL_MEMBERS_HEADER_LEN + members.len() * 32);
+    data.extend_from_slice(&INITIAL_MEMBERS_MAGIC);
+    data.push(INITIAL_MEMBERS_VERSION);
+    data.extend_from_slice(&count.to_be_bytes());
+    for member in members {
+        data.extend_from_slice(&member);
+    }
+    Ok(Script::new_op_return(&data))
+}
+
+pub(crate) fn initial_members_from_script(
+    script: &Script,
+) -> Result<Option<Vec<[u8; 32]>>, AssetError> {
+    let mut instructions = script.instructions_minimal();
+    if !matches!(
+        instructions.next(),
+        Some(Ok(Instruction::Op(opcodes::all::OP_RETURN)))
+    ) {
+        return Ok(None);
+    }
+    let Some(Ok(Instruction::PushBytes(data))) = instructions.next() else {
+        return Ok(None);
+    };
+    if instructions.next().is_some()
+        || data.len() < INITIAL_MEMBERS_MAGIC.len()
+        || data[..INITIAL_MEMBERS_MAGIC.len()] != INITIAL_MEMBERS_MAGIC
+    {
+        return Ok(None);
+    }
+    if data.len() < INITIAL_MEMBERS_HEADER_LEN || data[2] != INITIAL_MEMBERS_VERSION {
+        return Err(AssetError::InvalidRpcResponse("initial members marker"));
+    }
+    let count = usize::from(u16::from_be_bytes(data[3..5].try_into().unwrap()));
+    if count == 0 || data.len() != INITIAL_MEMBERS_HEADER_LEN + count * 32 {
+        return Err(AssetError::InvalidRpcResponse("initial members marker"));
+    }
+
+    let members = data[INITIAL_MEMBERS_HEADER_LEN..]
+        .chunks_exact(32)
+        .map(|member| member.try_into().unwrap())
+        .collect::<Vec<_>>();
+    if !members.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(AssetError::InvalidRpcResponse("initial member order"));
+    }
+    Ok(Some(members))
 }
 
 pub(crate) fn treasury_blinding_secret() -> SecretKey {
@@ -173,9 +234,12 @@ impl Assets {
         storm: &StormHandle,
         config: &ElementsRpcConfig,
         storm_tree_root: [u8; 32],
+        initial_members: Vec<[u8; 32]>,
     ) -> Result<NetworkAsset, AssetError> {
         let issuer = ElementsAssetIssuer::new(config)?;
-        let asset = self.ensure_storm_eye(issuer, storm_tree_root).await?;
+        let asset = self
+            .ensure_storm_eye(issuer, storm_tree_root, initial_members)
+            .await?;
         self.announce_pending(storm).await?;
 
         Ok(asset)
@@ -198,6 +262,7 @@ impl Assets {
         &self,
         issuer: I,
         storm_tree_root: [u8; 32],
+        initial_members: Vec<[u8; 32]>,
     ) -> Result<NetworkAsset, AssetError>
     where
         I: AssetIssuer + Clone + Send + 'static,
@@ -210,8 +275,10 @@ impl Assets {
             pending
         } else {
             let issuer = issuer.clone();
-            let pending =
-                tokio::task::spawn_blocking(move || issuer.prepare(storm_tree_root)).await??;
+            let pending = tokio::task::spawn_blocking(move || {
+                issuer.prepare(storm_tree_root, &initial_members)
+            })
+            .await??;
 
             if !self.store.insert_pending(&pending).await? {
                 self.store
@@ -303,7 +370,11 @@ pub(crate) fn storm_eye_program(asset: &NetworkAsset) -> Result<AuthProgram, Ass
 }
 
 trait AssetIssuer {
-    fn prepare(&self, storm_tree_root: [u8; 32]) -> Result<PendingNetworkAsset, AssetError>;
+    fn prepare(
+        &self,
+        storm_tree_root: [u8; 32],
+        initial_members: &[[u8; 32]],
+    ) -> Result<PendingNetworkAsset, AssetError>;
     fn broadcast(&self, transaction: &[u8], expected_txid: [u8; 32]) -> Result<(), AssetError>;
 }
 
@@ -342,6 +413,7 @@ impl ElementsAssetIssuer {
     fn prepare_storm_eye(
         &self,
         storm_tree_root: [u8; 32],
+        initial_members: &[[u8; 32]],
     ) -> Result<PendingNetworkAsset, AssetError> {
         let client = self.client()?;
         let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
@@ -395,12 +467,23 @@ impl ElementsAssetIssuer {
         let change_amount = Amount::from_sat(change_sats).to_string_in(Denomination::Bitcoin);
         let fee_amount =
             Amount::from_sat(STORM_EYE_ISSUANCE_FEE_SATS).to_string_in(Denomination::Bitcoin);
+        let members_data = initial_members_script(initial_members)?;
+        let members_data = members_data
+            .instructions_minimal()
+            .nth(1)
+            .and_then(Result::ok)
+            .and_then(|instruction| match instruction {
+                Instruction::PushBytes(data) => Some(hex::encode(data)),
+                _ => None,
+            })
+            .ok_or(AssetError::InvalidRpcResponse("initial members marker"))?;
         let raw: String = client.call(
             "createrawtransaction",
             &[
                 json!([{ "txid": funding.txid, "vout": funding.vout }]),
                 json!([
                     { (funding.address): change_amount },
+                    { "data": members_data },
                     { "fee": fee_amount },
                 ]),
             ],
@@ -646,8 +729,12 @@ impl ElementsAssetIssuer {
 }
 
 impl AssetIssuer for ElementsAssetIssuer {
-    fn prepare(&self, storm_tree_root: [u8; 32]) -> Result<PendingNetworkAsset, AssetError> {
-        self.prepare_storm_eye(storm_tree_root)
+    fn prepare(
+        &self,
+        storm_tree_root: [u8; 32],
+        initial_members: &[[u8; 32]],
+    ) -> Result<PendingNetworkAsset, AssetError> {
+        self.prepare_storm_eye(storm_tree_root, initial_members)
     }
 
     fn broadcast(&self, transaction: &[u8], expected_txid: [u8; 32]) -> Result<(), AssetError> {
@@ -921,7 +1008,11 @@ mod tests {
     }
 
     impl AssetIssuer for FakeIssuer {
-        fn prepare(&self, _storm_tree_root: [u8; 32]) -> Result<PendingNetworkAsset, AssetError> {
+        fn prepare(
+            &self,
+            _storm_tree_root: [u8; 32],
+            _initial_members: &[[u8; 32]],
+        ) -> Result<PendingNetworkAsset, AssetError> {
             self.prepared.fetch_add(1, Ordering::SeqCst);
             Ok(self.pending.clone())
         }
@@ -966,7 +1057,11 @@ mod tests {
     }
 
     impl AssetIssuer for FakeTickAssetIssuer {
-        fn prepare(&self, _storm_tree_root: [u8; 32]) -> Result<PendingNetworkAsset, AssetError> {
+        fn prepare(
+            &self,
+            _storm_tree_root: [u8; 32],
+            _initial_members: &[[u8; 32]],
+        ) -> Result<PendingNetworkAsset, AssetError> {
             unreachable!("Tick asset initialization uses prepare_tick_asset")
         }
 
@@ -999,11 +1094,11 @@ mod tests {
         let issuer = FakeIssuer::new();
 
         let created = assets
-            .ensure_storm_eye(issuer.clone(), [5; 32])
+            .ensure_storm_eye(issuer.clone(), [5; 32], vec![[1; 32], [2; 32]])
             .await
             .unwrap();
         let existing = assets
-            .ensure_storm_eye(issuer.clone(), [6; 32])
+            .ensure_storm_eye(issuer.clone(), [6; 32], vec![[1; 32], [2; 32]])
             .await
             .unwrap();
 
@@ -1042,7 +1137,7 @@ mod tests {
         assets.store.insert_pending(&issuer.pending).await.unwrap();
 
         let created = assets
-            .ensure_storm_eye(issuer.clone(), [5; 32])
+            .ensure_storm_eye(issuer.clone(), [5; 32], vec![[1; 32], [2; 32]])
             .await
             .unwrap();
 
@@ -1057,6 +1152,38 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn initial_members_marker_is_canonical_and_round_trips() {
+        let script = initial_members_script(&[[3; 32], [1; 32], [3; 32], [2; 32]]).unwrap();
+
+        assert_eq!(
+            initial_members_from_script(&script).unwrap(),
+            Some(vec![[1; 32], [2; 32], [3; 32]])
+        );
+        assert_eq!(
+            initial_members_from_script(&Script::new_op_return(b"other")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_initial_member_markers() {
+        assert!(initial_members_script(&[]).is_err());
+
+        let mut count_mismatch = Vec::from(INITIAL_MEMBERS_MAGIC);
+        count_mismatch.push(INITIAL_MEMBERS_VERSION);
+        count_mismatch.extend_from_slice(&2u16.to_be_bytes());
+        count_mismatch.extend_from_slice(&[1; 32]);
+        assert!(initial_members_from_script(&Script::new_op_return(&count_mismatch)).is_err());
+
+        let mut unordered = Vec::from(INITIAL_MEMBERS_MAGIC);
+        unordered.push(INITIAL_MEMBERS_VERSION);
+        unordered.extend_from_slice(&2u16.to_be_bytes());
+        unordered.extend_from_slice(&[2; 32]);
+        unordered.extend_from_slice(&[1; 32]);
+        assert!(initial_members_from_script(&Script::new_op_return(&unordered)).is_err());
     }
 
     #[test]

@@ -6,20 +6,6 @@ import type { OperatorIdentity } from "./types";
 
 const ECPair = ECPairFactory(ecc);
 
-export function createRestoredOperatorIdentity(
-  publicKey: string,
-  address: string,
-): OperatorIdentity {
-  return {
-    publicKey,
-    address,
-    async sign() {
-      throw new Error("Re-authenticate to sign this request.");
-    },
-    destroy() {},
-  };
-}
-
 export function createOperatorIdentity(
   encodedSecret: string,
 ): OperatorIdentity {

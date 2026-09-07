@@ -20,8 +20,8 @@ use tokio::{
 };
 
 use super::message::{
-    BurnExpiredUtxos, ExecuteUserRequests, ExternalRequests, NodeMessage, NodeMessageKind,
-    PartialSignaturesMessage, SigningNoncesMessage,
+    BurnExpiredUtxos, ExchangeRewards, ExecuteUserRequests, ExternalRequests, NodeMessage,
+    NodeMessageKind, PartialSignaturesMessage, SigningNoncesMessage,
 };
 
 const SIGNING_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -214,6 +214,40 @@ impl Signing {
         .await
     }
 
+    pub(crate) async fn sign_exchange_rewards(
+        &self,
+        storm: &Storm,
+        tx: Vec<u8>,
+        signing_hash: [u8; 32],
+        block_height: u64,
+    ) -> Result<SigningResult, SigningError> {
+        if tx.is_empty() {
+            return Err(SigningError::InvalidMessage(
+                "Droplets exchange transaction cannot be empty".into(),
+            ));
+        }
+
+        self.sign_with_message(
+            storm,
+            vec![signing_hash],
+            SIGNING_SESSION_TIMEOUT,
+            move |branch| {
+                NodeMessage::new(
+                    NodeMessageKind::ExchangeRewards,
+                    None,
+                    &ExchangeRewards {
+                        tx: tx.clone(),
+                        final_tx: None,
+                        signing_hash,
+                        signing_storm_tree_branch: branch,
+                        block_height,
+                    },
+                )
+            },
+        )
+        .await
+    }
+
     async fn sign_with_message<F>(
         &self,
         storm: &Storm,
@@ -375,6 +409,52 @@ impl Signing {
         if request.tx.is_empty() {
             return Err(SigningError::InvalidMessage(
                 "invalid Tick burn transaction".into(),
+            ));
+        }
+        let request_hash = message.hash()?;
+        let peers = context.storm_handle.peers().await;
+        let sender = node_key(&context.message_context.peer_public_key)?;
+        let outbound = {
+            let mut state = self.state.lock().await;
+            state.refresh_members(&peers)?;
+            state.remove_expired_sessions();
+            state.start_session(
+                request_hash,
+                sender,
+                SigningRequest {
+                    signing_storm_tree_branch: request.signing_storm_tree_branch,
+                    message_hashes: vec![request.signing_hash],
+                },
+                None,
+            )?
+        };
+        if let Some(outbound) = outbound {
+            send_from_handle(
+                &context.storm_handle,
+                outbound,
+                self.session_recipients(request_hash).await?,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn handle_exchange_rewards(
+        &self,
+        message: NodeMessage,
+        context: &StormContext,
+        expected_leader: [u8; 33],
+    ) -> Result<(), SigningError> {
+        require_sender(
+            expected_leader,
+            context.message_context.peer_public_key,
+            "network leader",
+        )?;
+        let request: ExchangeRewards = message.decode_payload()?;
+        if request.tx.is_empty() {
+            return Err(SigningError::InvalidMessage(
+                "invalid Droplets exchange transaction".into(),
             ));
         }
         let request_hash = message.hash()?;

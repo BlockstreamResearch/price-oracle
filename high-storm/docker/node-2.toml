@@ -1,5 +1,7 @@
 [service]
+# Storm peer-to-peer port inside the container.
 port = 9000
+# Operator and user HTTP API bind address inside the container.
 external_api_address = "0.0.0.0:9100"
 
 [service.signer]
@@ -7,22 +9,37 @@ external_api_address = "0.0.0.0:9100"
 private_key = "0202020202020202020202020202020202020202020202020202020202020202"
 
 [service.elements_rpc]
+# Elements RPC endpoint for this node's paired container.
 url = "http://elements-2:18884"
+# Development-only Elements RPC username.
 username = "high-storm"
+# Development-only Elements RPC password.
 password = "high-storm"
+# Elements wallet used for wallet-scoped RPC calls.
 wallet = "funded-key"
 
-[service.user_requests]
+[service.protocol]
+# Per-output user request service fee, in satoshis.
 operational_fee_sats = 1000
+# Per-Tick burn reserve, in satoshis.
 tick_burn_reserve_sats = 1000
+# Aggregate issuance transaction fee budget, in satoshis.
 issuance_transaction_fee_sats = 1000
+# Burn transaction fee budget, in satoshis.
 burn_transaction_fee_sats = 500
-# 60 blocks at the target one-minute block interval is one hour.
+# Droplets exchange transaction fee budget, in satoshis.
+exchange_transaction_fee_sats = 500
+# Tick lifetime in blocks; 60 blocks is one hour at the target interval.
 tick_lifetime_blocks = 60
 
 [service.db]
+# PostgreSQL host and port on the Compose network.
 url = "postgres:5432"
+# Development-only PostgreSQL username.
 username = "high-storm"
+# Development-only PostgreSQL password.
 password = "high-storm"
+# Database dedicated to node 2.
 database = "high-storm-node-2"
+# Maximum number of pooled PostgreSQL connections.
 max_connections = 5

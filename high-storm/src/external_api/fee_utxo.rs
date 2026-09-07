@@ -8,7 +8,7 @@ use simplex::{provider::SimplicityNetwork, simplicityhl::elements::secp256k1_zkp
 use url::Url;
 
 use crate::{
-    config::{ElementsRpcConfig, UserRequestsConfig},
+    config::{ElementsRpcConfig, ProtocolConfig},
     db::{
         monitored_utxo::MonitoredUtxoStore, network_asset::NetworkAssetStore,
         network_asset::STORM_EYE_KIND, user_request::FeeUtxo,
@@ -73,7 +73,7 @@ impl FeeUtxoValidator {
         config: &ElementsRpcConfig,
         assets: NetworkAssetStore,
         monitored_utxos: MonitoredUtxoStore,
-        user_requests: &UserRequestsConfig,
+        protocol: &ProtocolConfig,
     ) -> Result<Self, FeeUtxoValidationError> {
         let mut url = Url::parse(&config.url)?;
         url.path_segments_mut()
@@ -87,7 +87,7 @@ impl FeeUtxoValidator {
                 rpc_url: url.to_string(),
                 auth: Auth::UserPass(config.username.clone(), config.password.clone()),
                 assets,
-                user_requests: user_requests.clone(),
+                protocol: protocol.clone(),
             })),
             monitored_utxos,
         })
@@ -135,7 +135,7 @@ struct ElementsFeeUtxoValidator {
     rpc_url: String,
     auth: Auth,
     assets: NetworkAssetStore,
-    user_requests: UserRequestsConfig,
+    protocol: ProtocolConfig,
 }
 
 impl ElementsFeeUtxoValidator {
@@ -153,7 +153,7 @@ impl ElementsFeeUtxoValidator {
         let rpc_url = self.rpc_url.clone();
         let auth = self.auth.clone();
         let fee_utxos = fee_utxos.to_vec();
-        let minimum_value = minimum_fee_value(request_count, &self.user_requests)?;
+        let minimum_value = minimum_fee_value(request_count, &self.protocol)?;
 
         tokio::task::spawn_blocking(move || {
             validate_with_rpc(
@@ -249,7 +249,7 @@ fn require_confirmation_depth(
 
 fn minimum_fee_value(
     request_count: usize,
-    config: &UserRequestsConfig,
+    config: &ProtocolConfig,
 ) -> Result<u64, FeeUtxoValidationError> {
     let request_count =
         u64::try_from(request_count).map_err(|_| FeeUtxoValidationError::PolicyOverflow)?;
@@ -358,11 +358,12 @@ mod tests {
 
     #[test]
     fn requires_request_fees_reserves_and_a_round_fee() {
-        let config = UserRequestsConfig {
+        let config = ProtocolConfig {
             operational_fee_sats: 1_000,
             tick_burn_reserve_sats: 2_000,
             issuance_transaction_fee_sats: 500,
             burn_transaction_fee_sats: 500,
+            exchange_transaction_fee_sats: 500,
             tick_lifetime_blocks: 60,
         };
 

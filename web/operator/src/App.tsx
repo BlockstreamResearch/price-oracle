@@ -5,6 +5,7 @@ import { useAuth } from './auth-context'
 import { AppShell } from './components/AppShell'
 import { LoginPage } from './pages/LoginPage'
 import { OverviewPage } from './pages/OverviewPage'
+import { DropletsPage } from './pages/DropletsPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { VotingsPage } from './pages/VotingsPage'
 
@@ -16,6 +17,7 @@ function OperatorRoutes() {
     <Routes>
       <Route element={<AppShell />}>
         <Route index element={<OverviewPage />} />
+        <Route path="droplets" element={<DropletsPage />} />
         <Route path="votings" element={<VotingsPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />

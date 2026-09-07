@@ -167,6 +167,16 @@ impl AuthService {
 
         let mut state = self.state.lock().await;
         state.cleanup(now);
+        if let Some((message, challenge)) = state
+            .challenges
+            .iter()
+            .find(|(_, challenge)| challenge.public_key == public_key)
+        {
+            return Ok(Challenge {
+                message: message.clone(),
+                expires_at: challenge.expires_at,
+            });
+        }
         state.challenges.insert(
             message.clone(),
             ExpiringOperator {
@@ -271,12 +281,12 @@ impl AuthService {
 
         let mut state = self.state.lock().await;
         state.cleanup(now);
+        let nonce_expires_at = timestamp
+            .saturating_add(WRITE_WINDOW.as_secs())
+            .saturating_add(1);
         if state
             .nonces
-            .insert(
-                (public_key.clone(), nonce.to_string()),
-                now + WRITE_WINDOW.as_secs(),
-            )
+            .insert((public_key.clone(), nonce.to_string()), nonce_expires_at)
             .is_some()
         {
             return Err(AuthError::ReplayedNonce);
@@ -415,6 +425,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reuses_one_live_challenge_per_operator() {
+        let (auth, _, public_key) = setup().await;
+
+        let first = auth.issue_challenge_at(&public_key, 1_000).await.unwrap();
+        let repeated = auth.issue_challenge_at(&public_key, 1_001).await.unwrap();
+        assert_eq!(repeated.message, first.message);
+        assert_eq!(repeated.expires_at, first.expires_at);
+        assert_eq!(auth.state.lock().await.challenges.len(), 1);
+
+        let replacement = auth.issue_challenge_at(&public_key, 1_300).await.unwrap();
+        assert_ne!(replacement.message, first.message);
+        assert_eq!(auth.state.lock().await.challenges.len(), 1);
+    }
+
+    #[tokio::test]
     async fn rejects_replayed_signed_writes() {
         let (auth, private_key, public_key) = setup().await;
         let payload = serde_json::json!({"kind": "split_storm_eye"});
@@ -437,7 +462,7 @@ mod tests {
             "POST",
             "/operators/voting",
             &encoded,
-            1_001,
+            1_000,
         )
         .await
         .unwrap();
@@ -450,7 +475,50 @@ mod tests {
                 "POST",
                 "/operators/voting",
                 &encoded,
-                1_001,
+                1_300,
+            )
+            .await,
+            Err(AuthError::ReplayedNonce)
+        ));
+    }
+
+    #[tokio::test]
+    async fn retains_nonces_for_future_skewed_request_lifetime() {
+        let (auth, private_key, public_key) = setup().await;
+        let payload = serde_json::json!({"kind": "split_storm_eye"});
+        let message = AuthService::write_message(
+            "POST",
+            "/operators/voting",
+            1_300,
+            "future-skewed-nonce",
+            &payload,
+        )
+        .unwrap();
+        let signature = sign(&private_key, &message);
+        let encoded = serde_json::to_vec(&payload).unwrap();
+
+        auth.verify_write_at(
+            &public_key,
+            1_300,
+            "future-skewed-nonce",
+            &signature,
+            "POST",
+            "/operators/voting",
+            &encoded,
+            1_001,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            auth.verify_write_at(
+                &public_key,
+                1_300,
+                "future-skewed-nonce",
+                &signature,
+                "POST",
+                "/operators/voting",
+                &encoded,
+                1_600,
             )
             .await,
             Err(AuthError::ReplayedNonce)

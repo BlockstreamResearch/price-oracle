@@ -97,14 +97,14 @@ fn burning_time_is_sixty_blocks_for_production_and_docker() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let production = Config::from_file(manifest.join("config.example.toml")).unwrap();
     assert_eq!(
-        production.service.user_requests.tick_lifetime_blocks,
+        production.service.protocol.tick_lifetime_blocks,
         TICK_LIFETIME_BLOCKS
     );
 
     for node in ["node-1.toml", "node-2.toml", "node-3.toml"] {
         let config = Config::from_file(manifest.join("docker").join(node)).unwrap();
         assert_eq!(
-            config.service.user_requests.tick_lifetime_blocks, TICK_LIFETIME_BLOCKS,
+            config.service.protocol.tick_lifetime_blocks, TICK_LIFETIME_BLOCKS,
             "{node} must expire Ticks after 60 blocks"
         );
     }

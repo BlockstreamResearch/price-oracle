@@ -4,7 +4,7 @@ use sqlx::{AnyPool, Row};
 use storm::{Peer, PeerStatus};
 
 use super::{
-    monitored_utxo::MonitoredUtxoStore, network_asset::NetworkAssetStore,
+    droplet::DropletStore, monitored_utxo::MonitoredUtxoStore, network_asset::NetworkAssetStore,
     user_request::UserRequestStore, voting::VotingStore,
 };
 
@@ -34,6 +34,10 @@ impl NetworkStore {
 
     pub(crate) fn voting(&self) -> VotingStore {
         VotingStore::new(self.pool.clone())
+    }
+
+    pub(crate) fn droplets(&self) -> DropletStore {
+        DropletStore::new(self.pool.clone())
     }
 
     pub(crate) fn network_assets(&self) -> NetworkAssetStore {

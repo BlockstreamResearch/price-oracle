@@ -3,11 +3,12 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use secp256k1_zkp::PublicKey;
 use storm::Storm;
 
 use super::{
-    HighStormDependencies, assets::Assets, burning::Burning, indexer::Indexer, signing::Signing,
-    user_requests::UserRequestProcessor, voting::Voting,
+    HighStormDependencies, assets::Assets, burning::Burning, droplets::Droplets, indexer::Indexer,
+    signing::Signing, user_requests::UserRequestProcessor, voting::Voting,
 };
 
 /// Cloneable higher-level state shared by HighStorm message handlers.
@@ -18,6 +19,7 @@ pub(crate) struct NetworkState {
     voting: Voting,
     assets: Assets,
     burning: Burning,
+    droplets: Droplets,
     indexer: Indexer,
     user_requests: UserRequestProcessor,
     block_height: Arc<AtomicU64>,
@@ -34,10 +36,24 @@ impl NetworkState {
             voting_store,
             network_assets,
             monitored_utxos,
+            droplets,
             user_requests,
             elements_rpc,
-            user_request_config,
+            protocol_config,
         } = dependencies;
+
+        let initial_members = storm
+            .peers()
+            .await
+            .into_iter()
+            .map(|peer| {
+                PublicKey::from_slice(&peer.compressed_public_key)
+                    .expect("Storm peers contain validated public keys")
+                    .x_only_public_key()
+                    .0
+                    .serialize()
+            })
+            .collect();
 
         Self {
             coordinator_public_key,
@@ -48,20 +64,28 @@ impl NetworkState {
                 monitored_utxos.clone(),
                 network_assets.clone(),
                 elements_rpc.clone(),
-                user_request_config.clone(),
+                protocol_config.clone(),
+            ),
+            droplets: Droplets::new(
+                droplets.clone(),
+                network_assets.clone(),
+                elements_rpc.clone(),
+                protocol_config.exchange_transaction_fee_sats,
             ),
             indexer: Indexer::new(
                 monitored_utxos.clone(),
+                droplets,
                 network_assets.clone(),
                 elements_rpc.clone(),
-                &user_request_config,
+                &protocol_config,
+                initial_members,
             ),
             user_requests: UserRequestProcessor::new(
                 user_requests,
                 monitored_utxos,
                 network_assets,
                 elements_rpc,
-                user_request_config,
+                protocol_config,
             ),
             block_height: Arc::new(AtomicU64::new(0)),
         }
@@ -85,6 +109,10 @@ impl NetworkState {
 
     pub(crate) fn burning(&self) -> &Burning {
         &self.burning
+    }
+
+    pub(crate) fn droplets(&self) -> &Droplets {
+        &self.droplets
     }
 
     pub(crate) fn indexer(&self) -> &Indexer {

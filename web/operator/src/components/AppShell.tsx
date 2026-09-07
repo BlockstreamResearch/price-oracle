@@ -1,10 +1,11 @@
-import { Activity, LayoutDashboard, LogOut, Settings, Vote } from 'lucide-react'
+import { Activity, Coins, LayoutDashboard, LogOut, Settings, Vote } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { useAuth } from '../auth-context'
-import { shortKey } from '../format'
+import { CopyableHex } from './CopyableHex'
 
 const navigation = [
   { to: '/', label: 'Overview', icon: LayoutDashboard, end: true },
+  { to: '/droplets', label: 'Droplets', icon: Coins, end: false },
   { to: '/votings', label: 'Votings', icon: Vote, end: false },
   { to: '/settings', label: 'Settings', icon: Settings, end: false },
 ]
@@ -32,7 +33,7 @@ export function AppShell() {
 
         <div className="sidebar-session">
           <div className="session-signal"><Activity size={16} /><span>Authenticated</span></div>
-          <code title={session.identity.publicKey}>{shortKey(session.identity.publicKey, 7)}</code>
+          <CopyableHex value={session.identity.publicKey} visible={7} label="operator public key" />
           <button type="button" className="sidebar-logout" onClick={logout}>
             <LogOut size={16} /> Log out
           </button>

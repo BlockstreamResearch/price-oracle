@@ -26,22 +26,29 @@ pub struct ServiceConfig {
     pub external_api_address: SocketAddr,
     pub signer: SignerConfig,
     pub elements_rpc: ElementsRpcConfig,
-    pub user_requests: UserRequestsConfig,
+    #[serde(alias = "user_requests")]
+    pub protocol: ProtocolConfig,
     pub db: DbConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct UserRequestsConfig {
+pub struct ProtocolConfig {
     pub operational_fee_sats: u64,
     pub tick_burn_reserve_sats: u64,
     pub issuance_transaction_fee_sats: u64,
     #[serde(default = "default_burn_transaction_fee_sats")]
     pub burn_transaction_fee_sats: u64,
+    #[serde(default = "default_exchange_transaction_fee_sats")]
+    pub exchange_transaction_fee_sats: u64,
     #[serde(default = "default_tick_lifetime_blocks")]
     pub tick_lifetime_blocks: u64,
 }
 
 fn default_burn_transaction_fee_sats() -> u64 {
+    500
+}
+
+fn default_exchange_transaction_fee_sats() -> u64 {
     500
 }
 
@@ -103,5 +110,55 @@ impl Config {
         url.set_password(Some(&db.password))
             .map_err(|_| Error::Database("invalid database password".to_string()))?;
         Ok(url.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_protocol_section(section: &str) -> String {
+        format!(
+            r#"
+[service]
+port = 9000
+
+[service.signer]
+private_key = "{private_key}"
+
+[service.elements_rpc]
+url = "http://127.0.0.1:18884"
+username = "user"
+password = "password"
+
+[service.{section}]
+operational_fee_sats = 1000
+tick_burn_reserve_sats = 1000
+issuance_transaction_fee_sats = 1000
+
+[service.db]
+url = "localhost:5432"
+username = "user"
+password = "password"
+database = "high-storm"
+max_connections = 5
+"#,
+            private_key = "01".repeat(32),
+        )
+    }
+
+    #[test]
+    fn parses_protocol_section() {
+        let config: Config = toml::from_str(&config_with_protocol_section("protocol")).unwrap();
+
+        assert_eq!(config.service.protocol.operational_fee_sats, 1000);
+    }
+
+    #[test]
+    fn accepts_legacy_user_requests_section() {
+        let config: Config =
+            toml::from_str(&config_with_protocol_section("user_requests")).unwrap();
+
+        assert_eq!(config.service.protocol.operational_fee_sats, 1000);
     }
 }

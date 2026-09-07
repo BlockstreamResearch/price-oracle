@@ -1,6 +1,6 @@
 import { Clock3, KeyRound, LogOut, Radio, ShieldCheck } from 'lucide-react'
 import { useAuth } from '../auth-context'
-import { shortKey } from '../format'
+import { CopyableHex } from '../components/CopyableHex'
 
 export function SettingsPage() {
   const { session, logout } = useAuth()
@@ -13,14 +13,14 @@ export function SettingsPage() {
         <div className="section-heading"><div><span className="eyebrow">Identity</span><h2>Active operator</h2></div>
           <span className="status-pill active"><ShieldCheck size={13} /> Authenticated</span></div>
         <dl className="settings-list">
-          <div><dt><KeyRound size={16} /> Public key</dt><dd><code title={session.identity.publicKey}>{shortKey(session.identity.publicKey, 13)}</code></dd></div>
+          <div><dt><KeyRound size={16} /> Public key</dt><dd><CopyableHex value={session.identity.publicKey} visible={13} label="operator public key" /></dd></div>
           <div><dt><Radio size={16} /> Authentication address</dt><dd><code>{session.identity.address}</code></dd></div>
           <div><dt><Clock3 size={16} /> Session expires</dt><dd>{new Date(session.expiresAt * 1000).toLocaleString()}</dd></div>
         </dl>
       </section>
       <section className="settings-section danger-section">
         <div><span className="eyebrow">Session control</span><h2>End operator session</h2>
-          <p>Clears in-memory key material and this tab's saved bearer session.</p></div>
+          <p>Clears the operator key and bearer session stored in this tab.</p></div>
         <button className="danger-button" type="button" onClick={logout}><LogOut size={17} /> Log out</button>
       </section>
     </div>
