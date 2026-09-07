@@ -14,11 +14,11 @@ use storm::{Peer, Storm};
 use crate::config::Config;
 use crate::high_storm::HighStormDependencies;
 pub use high_storm::{
-    ApproveVotingRequest, AssetError, ExecuteUserRequests, ExternalRequests, HighStorm,
-    HighStormHandle, MergeStormEyes, NetworkAsset, NetworkAssets, NetworkVoteKind,
-    NetworkVoteRequest, NodeMessage, NodeMessageKind, SigningError, SigningResult, SplitStormEye,
-    StormEyeUtxo, UpdateNetworkMembers, UserRequestError, VOTING_TIMEOUT_BLOCKS, VotingApproval,
-    VotingError, VotingRequest, VotingStatus,
+    ApproveVotingRequest, AssetError, DropletsError, ExchangeRewards, ExecuteUserRequests,
+    ExternalRequests, HighStorm, HighStormHandle, MergeStormEyes, NetworkAsset, NetworkAssets,
+    NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind, SigningError, SigningResult,
+    SplitStormEye, StormEyeUtxo, UpdateNetworkMembers, UserRequestError, VOTING_TIMEOUT_BLOCKS,
+    VotingApproval, VotingError, VotingRequest, VotingStatus,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -126,9 +126,10 @@ pub async fn start_initialized(config: &Config, store: &NetworkStore) -> Result<
             store.voting(),
             store.network_assets(),
             store.monitored_utxos(),
+            store.droplets(),
             store.user_requests(),
             config.service.elements_rpc.clone(),
-            config.service.user_requests.clone(),
+            config.service.protocol.clone(),
         ),
     )
     .await)
@@ -169,9 +170,10 @@ async fn initialize(
                     store.voting(),
                     store.network_assets(),
                     store.monitored_utxos(),
+                    store.droplets(),
                     store.user_requests(),
                     config.service.elements_rpc.clone(),
-                    config.service.user_requests.clone(),
+                    config.service.protocol.clone(),
                 ),
             )
             .await);

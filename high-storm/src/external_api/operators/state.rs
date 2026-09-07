@@ -30,6 +30,7 @@ pub(super) struct NetworkPeerResponse {
     status: &'static str,
     is_local: bool,
     is_coordinator: bool,
+    is_leader: bool,
 }
 
 pub(super) async fn get_network_state(
@@ -80,6 +81,7 @@ pub(super) async fn get_network_peers(
 ) -> Result<Json<Vec<NetworkPeerResponse>>, ApiError> {
     authenticate_bearer(&state.auth, &headers).await?;
     let coordinator_public_key = state.node.coordinator_public_key();
+    let current_leader = state.node.current_leader().await;
     Ok(Json(
         state
             .node
@@ -93,6 +95,7 @@ pub(super) async fn get_network_peers(
                 status: peer_status_name(peer.status),
                 is_local: peer.status == PeerStatus::Controlled,
                 is_coordinator: peer.compressed_public_key == coordinator_public_key,
+                is_leader: Some(peer.compressed_public_key) == current_leader,
             })
             .collect(),
     ))

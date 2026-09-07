@@ -3,6 +3,7 @@ use storm::{CustomMsg, StormContext};
 use super::{
     assets::AssetError,
     burning::BurningError,
+    droplets::DropletsError,
     leader,
     message::{BurnExpiredUtxos, ExpiredUtxosBurned, NodeMessage, NodeMessageKind},
     signing::SigningError,
@@ -22,6 +23,8 @@ pub(crate) enum HandlerError {
     UserRequest(#[from] super::user_requests::UserRequestError),
     #[error(transparent)]
     Burning(#[from] BurningError),
+    #[error(transparent)]
+    Droplets(#[from] DropletsError),
     #[error(transparent)]
     Encoding(#[from] postcard::Error),
 }
@@ -49,7 +52,7 @@ pub(crate) async fn handle(
 
     match kind {
         NodeMessageKind::ExecuteUserRequests => {
-            let request = message.decode_payload()?;
+            let request: crate::ExecuteUserRequests = message.decode_payload()?;
             state.user_requests().validate_execute(&request).await?;
             state
                 .signing()
@@ -66,6 +69,38 @@ pub(crate) async fn handle(
                 .signing()
                 .handle_burn_expired_utxos(message, &context, expected_leader)
                 .await?;
+            Ok(())
+        }
+        NodeMessageKind::ExchangeRewards => {
+            let request: crate::ExchangeRewards = message.decode_payload()?;
+            let expected_leader =
+                require_current_leader(&state, &context, request.block_height).await?;
+            if request.final_tx.is_some() {
+                state
+                    .droplets()
+                    .observe_broadcast(&request, expected_leader)
+                    .await?;
+                return Ok(());
+            }
+            let exchange = state
+                .droplets()
+                .validate_request(&request, expected_leader)
+                .await?;
+            state
+                .droplets()
+                .lock_exchange(&exchange, request.block_height, &request.tx)
+                .await?;
+            if let Err(error) = state
+                .signing()
+                .handle_exchange_rewards(message, &context, expected_leader)
+                .await
+            {
+                state
+                    .droplets()
+                    .unlock_exchange(exchange.member, request.block_height)
+                    .await?;
+                return Err(error.into());
+            }
             Ok(())
         }
         NodeMessageKind::ExpiredUtxosBurned => {
@@ -135,14 +170,14 @@ async fn require_current_leader(
     }
     let expected = leader::leader_for_height(&context.storm_handle.peers().await, block_height)
         .ok_or_else(|| SigningError::UnauthorizedMessage("network has no leader".into()))?;
-    authorize_burn_sender(expected, context.message_context.peer_public_key)?;
+    authorize_leader_sender(expected, context.message_context.peer_public_key)?;
     Ok(expected)
 }
 
-fn authorize_burn_sender(expected: [u8; 33], sender: [u8; 33]) -> Result<(), SigningError> {
+fn authorize_leader_sender(expected: [u8; 33], sender: [u8; 33]) -> Result<(), SigningError> {
     if sender != expected {
         return Err(SigningError::UnauthorizedMessage(format!(
-            "only network leader {} may send burn messages",
+            "only network leader {} may send leader-only messages",
             hex::encode(expected)
         )));
     }
@@ -203,12 +238,19 @@ mod tests {
 
     #[test]
     fn current_leader_can_send_burn_messages() {
-        authorize_burn_sender(COORDINATOR, COORDINATOR).unwrap();
+        authorize_leader_sender(COORDINATOR, COORDINATOR).unwrap();
     }
 
     #[test]
     fn non_leader_cannot_send_burn_messages() {
-        let error = authorize_burn_sender(COORDINATOR, MEMBER).unwrap_err();
+        let error = authorize_leader_sender(COORDINATOR, MEMBER).unwrap_err();
+
+        assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
+    }
+
+    #[test]
+    fn non_leader_cannot_send_exchange_messages() {
+        let error = authorize_leader_sender(COORDINATOR, MEMBER).unwrap_err();
 
         assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
     }

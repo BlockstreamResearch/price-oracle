@@ -104,7 +104,7 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
         .oneshot(
             Request::builder()
                 .uri("/operators/state/peers")
-                .header(header::AUTHORIZATION, authorization)
+                .header(header::AUTHORIZATION, &authorization)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -115,6 +115,32 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
     assert_eq!(peers.as_array().unwrap().len(), 1);
     assert_eq!(peers[0]["status"], "controlled");
     assert_eq!(peers[0]["is_local"], true);
+    assert_eq!(peers[0]["is_leader"], true);
+
+    let droplets = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/operators/droplets")
+                .header(header::AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(droplets.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(droplets).await,
+        serde_json::json!({
+            "amount": 0,
+            "exchange_fee_sats": 500,
+            "exchange_locked": false,
+            "block_height": 0,
+            "next_leader_block": 0,
+            "request": null,
+            "history": [],
+        })
+    );
 
     let users = app
         .oneshot(
@@ -172,6 +198,64 @@ async fn creates_and_approves_voting_with_signed_requests() {
         .await
         .unwrap();
     assert_eq!(approve.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn rejects_invalid_droplets_exchange_fields_before_registration() {
+    let (app, private_key, public_key) = setup().await;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let response = app
+        .oneshot(signed_request(
+            &private_key,
+            &public_key,
+            "/operators/droplets/exchange",
+            timestamp,
+            "exchange-droplets",
+            serde_json::json!({
+                "amount": 0,
+                "address": "not-an-address",
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({"error": "invalid Droplets exchange: exchange amount must be positive"})
+    );
+}
+
+#[tokio::test]
+async fn rejects_malformed_droplets_destination_before_registration() {
+    let (app, private_key, public_key) = setup().await;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let response = app
+        .oneshot(signed_request(
+            &private_key,
+            &public_key,
+            "/operators/droplets/exchange",
+            timestamp,
+            "exchange-droplets-address",
+            serde_json::json!({
+                "amount": 1,
+                "address": "not-an-address",
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({"error": "invalid Droplets exchange: invalid destination address"})
+    );
 }
 
 #[tokio::test]
@@ -265,6 +349,7 @@ async fn setup() -> (Router, PrivateKey, String) {
             database.voting(),
             database.network_assets(),
             database.monitored_utxos(),
+            database.droplets(),
             database.user_requests(),
             crate::config::ElementsRpcConfig {
                 url: "http://127.0.0.1:18884".to_string(),
@@ -272,11 +357,12 @@ async fn setup() -> (Router, PrivateKey, String) {
                 password: "unused".to_string(),
                 wallet: "unused".to_string(),
             },
-            crate::config::UserRequestsConfig {
+            crate::config::ProtocolConfig {
                 operational_fee_sats: 1_000,
                 tick_burn_reserve_sats: 1_000,
                 issuance_transaction_fee_sats: 1_000,
                 burn_transaction_fee_sats: 500,
+                exchange_transaction_fee_sats: 500,
                 tick_lifetime_blocks: 60,
             },
         ),

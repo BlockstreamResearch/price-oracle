@@ -22,6 +22,20 @@ pub(crate) fn is_local_leader(peers: &[Peer], block_height: u64) -> bool {
     local_public_key(peers) == leader_for_height(peers, block_height)
 }
 
+pub(crate) fn next_local_leader_height(peers: &[Peer], block_height: u64) -> Option<u64> {
+    let local = local_public_key(peers)?;
+    let mut members = peers
+        .iter()
+        .map(|peer| peer.compressed_public_key)
+        .collect::<Vec<_>>();
+    members.sort_unstable();
+    members.dedup();
+    let local_index = u64::try_from(members.iter().position(|member| *member == local)?).ok()?;
+    let member_count = u64::try_from(members.len()).ok()?;
+    let offset = (local_index + member_count - block_height % member_count) % member_count;
+    block_height.checked_add(offset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,5 +72,15 @@ mod tests {
         assert!(is_local_leader(&peers, 1));
         assert!(!is_local_leader(&peers, 0));
         assert!(!is_local_leader(&peers, 2));
+    }
+
+    #[test]
+    fn finds_the_next_block_led_by_the_local_node() {
+        let mut peers = peers(&[[1; 33], [2; 33], [3; 33]]);
+        peers[1].status = PeerStatus::Controlled;
+
+        assert_eq!(next_local_leader_height(&peers, 0), Some(1));
+        assert_eq!(next_local_leader_height(&peers, 1), Some(1));
+        assert_eq!(next_local_leader_height(&peers, 2), Some(4));
     }
 }

@@ -1,32 +1,48 @@
-
 [service]
+# TCP port used for Storm peer-to-peer traffic.
 port = 9000
+# Unix socket used by storm-operator. Use a unique path for each local node.
 ipc_path = "/tmp/high-storm.sock"
+# Bind address for the operator and user HTTP API. Keep loopback-only unless remote access is required.
 external_api_address = "127.0.0.1:9001"
 
 [service.signer]
-# secpr256k1 32-byte hex-encoded private key, used for signing,
-# this is a example key, do not use it anywhere else
+# 32-byte hex-encoded secp256k1 private key that identifies and signs for this node.
+# This example key is public and must never be used in production.
 private_key = "804622cda0d8e634317a12651d91751ceff5c081f2b5f63ef7912725c7275e5d"
 
 [service.elements_rpc]
+# Full HTTP URL of this node's Elements RPC server.
 url = "http://127.0.0.1:18884"
+# Elements RPC username.
 username = "high-storm"
+# Elements RPC password.
 password = "high-storm"
+# Elements wallet selected for RPC calls that require wallet context.
 wallet = "funded-key"
 
-[service.user_requests]
-# Protocol policy values; the architecture specification intentionally does not fix amounts.
+[service.protocol]
+# Service fee charged for each output in a submitted user request, in satoshis.
 operational_fee_sats = 1000
+# LBTC reserve attached to each issued Tick account for its eventual burn, in satoshis.
 tick_burn_reserve_sats = 1000
+# Fee budget for an aggregate Tick issuance transaction, in satoshis.
 issuance_transaction_fee_sats = 1000
+# Fee budget for a Tick burn transaction, in satoshis. Defaults to 500 when omitted.
 burn_transaction_fee_sats = 500
-# 60 blocks at the target one-minute block interval is one hour.
+# Fee budget for a Droplets LBTC exchange transaction, in satoshis. Defaults to 500 when omitted.
+exchange_transaction_fee_sats = 500
+# Tick lifetime measured in blocks. The default 60 blocks is one hour at the target interval.
 tick_lifetime_blocks = 60
 
 [service.db]
+# PostgreSQL host and optional port, without a URL scheme.
 url = "localhost:5432"
+# PostgreSQL username.
 username = "high-storm"
+# PostgreSQL password.
 password = "high-storm"
+# PostgreSQL database name.
 database = "high-storm"
+# Maximum number of connections in the database pool.
 max_connections = 5

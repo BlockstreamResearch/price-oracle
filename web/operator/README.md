@@ -1,6 +1,6 @@
 # Storm Operator
 
-React operator console for `high-storm`. The app provides network status, peer visibility, voting creation and approval, and operator session settings.
+React operator console for `high-storm`. The app provides network status, peer visibility, queued Droplets exchanges, voting creation and approval, and operator session settings.
 
 ## Development
 
@@ -26,4 +26,4 @@ bun run build
 
 ## Key handling
 
-The login form accepts a 32-byte secp256k1 secret key as hexadecimal text. The browser derives the compressed public key and signs BIP322 messages locally. Secret key material remains only in application memory and is cleared on logout or page exit. The bearer token, expiry, public key, and address are stored in tab-scoped session storage so read access survives a refresh; logout, tab closure, or token expiry clears that session. Signed actions after a hard refresh require re-authentication because the secret key is never persisted.
+The login form accepts a 32-byte secp256k1 secret key as hexadecimal text. The browser derives the compressed public key and signs BIP322 messages locally. The bearer token, expiry, identity, and secret key are stored in tab-scoped session storage so authenticated reads and signed actions survive a page refresh. Logout, tab closure, or token expiry clears the session. The secret key is never sent to HighStorm, but scripts running in the same browser origin can access it while the tab session exists.

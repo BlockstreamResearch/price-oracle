@@ -1,4 +1,5 @@
 pub(super) mod auth;
+mod droplets;
 mod state;
 mod voting;
 
@@ -16,6 +17,8 @@ pub(super) fn router() -> Router<ExternalApiState> {
         .route("/auth/token", post(auth::exchange_token))
         .route("/state", get(state::get_network_state))
         .route("/state/peers", get(state::get_network_peers))
+        .route("/droplets", get(droplets::get_droplets))
+        .route("/droplets/exchange", post(droplets::exchange_droplets))
         .route(
             "/voting",
             get(voting::list_votings).post(voting::create_voting),

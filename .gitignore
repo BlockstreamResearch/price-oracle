@@ -1,6 +1,7 @@
 **/target
 /storm/config/*-peers.toml
 .vscode/
+high-storm/.devenv-network.env
 
 # SimplicityHL
 contracts/deps

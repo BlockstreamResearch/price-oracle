@@ -3,7 +3,8 @@ import { createPortal } from 'react-dom'
 import { ArrowRight, CheckCircle2, Eye, Plus, RefreshCw, Vote, X } from 'lucide-react'
 import { ApiError, authenticatedGet, signedPost } from '../api'
 import { useAuth } from '../auth-context'
-import { formatNumber, proposalName, proposalSummary, shortKey } from '../format'
+import { CopyableHex } from '../components/CopyableHex'
+import { formatNumber, proposalName, proposalSummary } from '../format'
 import type { OperatorSession, Utxo, Voting, VotingProposal } from '../types'
 
 type Filter = 'all' | 'pending' | 'approved'
@@ -90,7 +91,7 @@ export function VotingsPage() {
         <div className="voting-list-head"><span>Proposal</span><span>Created</span><span>Approvals</span><span>Status</span><span /></div>
         {visible.map((voting) => <article className="voting-row" key={voting.message_hash}>
           <div className="proposal-cell"><span className="proposal-icon"><Vote size={18} /></span><div>
-            <strong>{proposalName(voting.proposal)}</strong><small>{proposalSummary(voting.proposal)} · {shortKey(voting.message_hash, 7)}</small></div></div>
+            <strong>{proposalName(voting.proposal)}</strong><small>{proposalSummary(voting.proposal)} · <CopyableHex value={voting.message_hash} visible={7} label="voting hash" /></small></div></div>
           <span className="block-cell">Block {formatNumber(voting.block_height)}</span>
           <span className="approval-count">{voting.approvals.length}</span>
           <span className={`status-pill ${voting.status}`}>{voting.status === 'approved' && <CheckCircle2 size={13} />}{voting.status}</span>
@@ -122,7 +123,7 @@ function VotingDetail({ voting, busy, onApprove }: { voting: Voting; busy: boole
       <div className="full"><dt>Proposal</dt><dd><strong>{proposalName(voting.proposal)}</strong><span>{proposalSummary(voting.proposal)}</span></dd></div></dl>
     <div className="approval-section"><h3>Approvals <span>{voting.approvals.length}</span></h3>
       {voting.approvals.map((approval) => <div className="approval-row" key={`${approval.public_key}-${approval.block_height}`}>
-        <code>{shortKey(approval.public_key, 10)}</code><span>Block {formatNumber(approval.block_height)}</span></div>)}
+        <CopyableHex value={approval.public_key} visible={10} label="approver public key" /><span>Block {formatNumber(approval.block_height)}</span></div>)}
       {voting.approvals.length === 0 && <p>No approvals recorded.</p>}</div>
     {voting.status === 'pending' && <footer className="modal-actions"><button className="primary-button" type="button" disabled={busy} onClick={onApprove}>
       <CheckCircle2 size={17} /> {busy ? 'Signing…' : 'Approve voting'}</button></footer>}

@@ -53,6 +53,13 @@ docker compose -f high-storm/compose.yml exec -T elements-1 \
 The chain, RPC credentials, signer keys, and funded private key are for local
 development only.
 
+`devenv.sh` creates a dedicated Docker bridge on the first `create`, `up`, or
+`rebuild`. It selects an unused `/24` subnet and stores the prefix in the ignored
+`.devenv-network.env` file. The external bridge remains reserved after `down` so
+persisted peer addresses stay stable and other Compose projects cannot claim its
+subnet. Set `STORM_NETWORK_PREFIX` before the first start to choose a specific
+three-octet prefix, such as `172.30.4`.
+
 On its first successful startup, the coordinator compiles the Storm Eye covenant
 with the current Storm Tree root and a three-year rescue height, issues the fixed
 10,000-unit asset from its configured Elements wallet, and persists the signed
@@ -77,7 +84,9 @@ value is the database host and optional port, for example `localhost:5432`. Set
 `service.ipc_path` to a unique Unix socket path for each high-storm process running
 on the same host. The external API binds to `service.external_api_address`, which
 defaults to `127.0.0.1:9001`. Elements must run with `txindex=1` so HighStorm can
-reconcile confirmed request transactions after they leave the mempool.
+reconcile confirmed request transactions after they leave the mempool. Protocol-wide
+fee budgets, burn reserves, and Tick lifetime are grouped under `service.protocol`.
+The legacy `service.user_requests` section remains accepted for existing deployments.
 
 ## Initialize a network
 
@@ -135,6 +144,8 @@ key's mainnet P2WPKH address and verifies BIP322-simple signatures against it.
 | `POST` | `/operators/auth/token` | BIP322 signature of the returned challenge |
 | `GET` | `/operators/state` | `Authorization: Bearer <token>` |
 | `GET` | `/operators/state/peers` | `Authorization: Bearer <token>` |
+| `GET` | `/operators/droplets` | `Authorization: Bearer <token>` |
+| `POST` | `/operators/droplets/exchange` | Signed request envelope |
 | `GET` | `/operators/voting` | `Authorization: Bearer <token>` |
 | `GET` | `/operators/voting/{hash}` | `Authorization: Bearer <token>` |
 | `POST` | `/operators/voting` | Signed request envelope |
@@ -169,6 +180,21 @@ order is preserved. Timestamps must be within five minutes of the server clock a
 nonces may only be used once during that window. Vote payloads use the tagged kinds
 `update_network_members`, `merge_storm_eyes`, and `split_storm_eye`. Approval uses
 an empty object as its payload.
+
+Droplets exchanges specify the LBTC amount in satoshis and an unconfidential
+destination address for the node's current Elements network:
+
+```json
+{"amount":1000,"address":"<unconfidential Elements address>"}
+```
+
+The node selects indexed explicit Treasury LBTC, constructs and validates the
+PSET with the configured `exchange_transaction_fee_sats`, and persists it. The
+node invokes the request only when it is the current block leader. A new valid
+request replaces that node's previous request. Droplets responses expose the fee
+as `exchange_fee_sats`. The recipient receives the requested amount; the fee is
+an Elements transaction fee output and is not returned to Treasury, so the
+member's Droplets balance must cover the requested amount plus that fee.
 
 User submissions contain a `header` and a non-empty `requests` array. Each fee
 UTXO is encoded as `<64-character txid>:<u32 output index>`. The coordinator

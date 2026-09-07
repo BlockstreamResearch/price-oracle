@@ -34,7 +34,7 @@ use url::Url;
 
 use crate::{
     NetworkAsset,
-    config::{ElementsRpcConfig, UserRequestsConfig},
+    config::{ElementsRpcConfig, ProtocolConfig},
     db::{
         monitored_utxo::{MonitoredUtxo, MonitoredUtxoStore},
         network_asset::{NetworkAssetStore, STORM_EYE_KIND, TICK_ASSET_KIND},
@@ -98,7 +98,7 @@ pub(crate) struct Burning {
     store: MonitoredUtxoStore,
     assets: NetworkAssetStore,
     elements_rpc: ElementsRpcConfig,
-    config: UserRequestsConfig,
+    config: ProtocolConfig,
 }
 
 #[derive(Debug)]
@@ -113,7 +113,7 @@ impl Burning {
         store: MonitoredUtxoStore,
         assets: NetworkAssetStore,
         elements_rpc: ElementsRpcConfig,
-        config: UserRequestsConfig,
+        config: ProtocolConfig,
     ) -> Self {
         Self {
             store,

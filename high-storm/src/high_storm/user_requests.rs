@@ -38,7 +38,7 @@ use url::Url;
 
 use crate::{
     NetworkAsset,
-    config::{ElementsRpcConfig, UserRequestsConfig},
+    config::{ElementsRpcConfig, ProtocolConfig},
     db::{
         monitored_utxo::MonitoredUtxoStore,
         network_asset::{NetworkAssetStore, STORM_EYE_KIND, TICK_ASSET_KIND},
@@ -140,7 +140,7 @@ pub(crate) struct UserRequestProcessor {
     monitored_utxos: MonitoredUtxoStore,
     assets: NetworkAssetStore,
     elements_rpc: ElementsRpcConfig,
-    config: UserRequestsConfig,
+    config: ProtocolConfig,
 }
 
 impl UserRequestProcessor {
@@ -149,7 +149,7 @@ impl UserRequestProcessor {
         monitored_utxos: MonitoredUtxoStore,
         assets: NetworkAssetStore,
         elements_rpc: ElementsRpcConfig,
-        config: UserRequestsConfig,
+        config: ProtocolConfig,
     ) -> Self {
         Self {
             requests,
@@ -1017,7 +1017,7 @@ fn validate_execute_request(
     request: &ExecuteUserRequests,
     storm_eye: &NetworkAsset,
     tick_asset: &NetworkAsset,
-    config: &UserRequestsConfig,
+    config: &ProtocolConfig,
     network: &SimplicityNetwork,
 ) -> Result<(), UserRequestError> {
     if request.external_requests.is_empty() {
@@ -1322,7 +1322,7 @@ fn validate_accounting_outputs(
     tick_count: usize,
     storm_eye_asset_id: [u8; 32],
     policy_asset: AssetId,
-    config: &UserRequestsConfig,
+    config: &ProtocolConfig,
     network: &SimplicityNetwork,
 ) -> Result<(), UserRequestError> {
     let expected_output_count = 2 + tick_count + accounts.len() + 1 + 2;
@@ -1419,7 +1419,9 @@ fn validate_accounting_outputs(
     Ok(())
 }
 
-fn is_fully_explicit_output(output: &simplex::simplicityhl::elements::pset::Output) -> bool {
+pub(crate) fn is_fully_explicit_output(
+    output: &simplex::simplicityhl::elements::pset::Output,
+) -> bool {
     output.amount.is_some()
         && output.asset.is_some()
         && output.amount_comm.is_none()
@@ -1435,7 +1437,7 @@ fn is_fully_explicit_output(output: &simplex::simplicityhl::elements::pset::Outp
 
 fn allocate_account_reserves(
     accounts: &[(usize, u64)],
-    config: &UserRequestsConfig,
+    config: &ProtocolConfig,
 ) -> Result<Vec<u64>, UserRequestError> {
     let mut transaction_fee_remaining = config.issuance_transaction_fee_sats;
     let mut reserves = Vec::with_capacity(accounts.len());
@@ -1553,12 +1555,13 @@ struct RawTransactionInfo {
 mod tests {
     use super::*;
 
-    fn config() -> UserRequestsConfig {
-        UserRequestsConfig {
+    fn config() -> ProtocolConfig {
+        ProtocolConfig {
             operational_fee_sats: 100,
             tick_burn_reserve_sats: 200,
             issuance_transaction_fee_sats: 150,
             burn_transaction_fee_sats: 50,
+            exchange_transaction_fee_sats: 50,
             tick_lifetime_blocks: 60,
         }
     }

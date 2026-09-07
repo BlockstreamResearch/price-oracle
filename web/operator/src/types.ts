@@ -18,6 +18,7 @@ export type NetworkPeer = {
   status: "controlled" | "active" | "inactive" | "banned";
   is_local: boolean;
   is_coordinator: boolean;
+  is_leader: boolean;
 };
 
 export type Utxo = {
@@ -65,4 +66,23 @@ export type OperatorSession = {
   token: string;
   expiresAt: number;
   identity: OperatorIdentity;
+};
+
+export type DropletExchangeRequest = {
+  id: string;
+  status: "pending" | "completed" | "failed";
+  amount: number;
+  requested_at_block: number;
+  completed_txid: string | null;
+  last_error: string | null;
+};
+
+export type DropletsState = {
+  amount: number;
+  exchange_fee_sats: number;
+  exchange_locked: boolean;
+  block_height: number;
+  next_leader_block: number | null;
+  request: DropletExchangeRequest | null;
+  history: DropletExchangeRequest[];
 };

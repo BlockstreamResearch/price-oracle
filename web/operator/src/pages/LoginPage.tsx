@@ -48,7 +48,7 @@ export function LoginPage() {
               aria-describedby="secret-note" required />
           </div>
           <div className="form-footnote" id="secret-note">
-            <ShieldCheck size={15} /><span>Held in this tab's memory until logout.</span>
+            <ShieldCheck size={15} /><span>Stored in this tab until logout.</span>
           </div>
           {error && <div className="form-error" role="alert">{error}</div>}
           <button className="primary-button login-button" disabled={submitting}>

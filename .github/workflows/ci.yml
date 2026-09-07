@@ -36,6 +36,9 @@ jobs:
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
             "https://raw.githubusercontent.com/BlockstreamResearch/smplx/$SIMPLEX_COMMIT/simplexup/simplexup" \
             -o "$SIMPLEX_DIR/bin/simplexup"
+          grep -Fq 'curl -#o "$2" -L "$1"' "$SIMPLEX_DIR/bin/simplexup"
+          sed -i 's/curl -#o "$2" -L "$1"/curl -#fL --retry 5 --retry-all-errors --retry-delay 2 -o "$2" "$1"/' \
+            "$SIMPLEX_DIR/bin/simplexup"
           chmod +x "$SIMPLEX_DIR/bin/simplexup"
           echo "$SIMPLEX_DIR/bin" >> "$GITHUB_PATH"
           "$SIMPLEX_DIR/bin/simplexup" -C "$SIMPLEX_COMMIT"

@@ -71,7 +71,7 @@ services:
       - "127.0.0.1:18884:18884"
     networks:
       storm:
-        ipv4_address: 172.28.0.21
+        ipv4_address: ${STORM_NETWORK_PREFIX:-172.28.0}.21
 
   elements-2:
     <<: *elements-node
@@ -104,7 +104,7 @@ services:
       - "127.0.0.1:18885:18884"
     networks:
       storm:
-        ipv4_address: 172.28.0.22
+        ipv4_address: ${STORM_NETWORK_PREFIX:-172.28.0}.22
 
   elements-3:
     <<: *elements-node
@@ -137,7 +137,7 @@ services:
       - "127.0.0.1:18886:18884"
     networks:
       storm:
-        ipv4_address: 172.28.0.23
+        ipv4_address: ${STORM_NETWORK_PREFIX:-172.28.0}.23
 
   elements-bootstrap:
     build:
@@ -168,7 +168,7 @@ services:
       retries: 60
     networks:
       storm:
-        ipv4_address: 172.28.0.24
+        ipv4_address: ${STORM_NETWORK_PREFIX:-172.28.0}.24
 
   postgres:
     image: postgres:17-bookworm
@@ -189,7 +189,7 @@ services:
       - "5432:5432"
     networks:
       storm:
-        ipv4_address: 172.28.0.10
+        ipv4_address: ${STORM_NETWORK_PREFIX:-172.28.0}.10
 
   node-1:
     <<: *node
@@ -219,7 +219,7 @@ services:
       - "9100:9100"
     networks:
       storm:
-        ipv4_address: 172.28.0.11
+        ipv4_address: ${STORM_NETWORK_PREFIX:-172.28.0}.11
 
   node-2:
     <<: *node
@@ -243,13 +243,13 @@ services:
         high-storm run --config /etc/high-storm/config.toml ||
         exec high-storm initialize join --config /etc/high-storm/config.toml
         --discovery-public-key 031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f
-        --discovery-address 172.28.0.11:9000
+        --discovery-address ${STORM_NETWORK_PREFIX:-172.28.0}.11:9000
     ports:
       - "9001:9000"
       - "9101:9100"
     networks:
       storm:
-        ipv4_address: 172.28.0.12
+        ipv4_address: ${STORM_NETWORK_PREFIX:-172.28.0}.12
 
   node-3:
     <<: *node
@@ -273,13 +273,13 @@ services:
         high-storm run --config /etc/high-storm/config.toml ||
         exec high-storm initialize join --config /etc/high-storm/config.toml
         --discovery-public-key 031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f
-        --discovery-address 172.28.0.11:9000
+        --discovery-address ${STORM_NETWORK_PREFIX:-172.28.0}.11:9000
     ports:
       - "9002:9000"
       - "9102:9100"
     networks:
       storm:
-        ipv4_address: 172.28.0.13
+        ipv4_address: ${STORM_NETWORK_PREFIX:-172.28.0}.13
 
   operator-1:
     <<: *operator-platform
@@ -319,6 +319,5 @@ volumes:
 
 networks:
   storm:
-    ipam:
-      config:
-        - subnet: 172.28.0.0/24
+    name: ${STORM_NETWORK_NAME:-high-storm-local_storm}
+    external: true

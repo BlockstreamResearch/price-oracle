@@ -2,6 +2,7 @@ use std::str::FromStr;
 
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use contracts::artifacts::account::{AccountProgram, derived_account::AccountArguments};
+use contracts::artifacts::treasury::{TreasuryProgram, derived_treasury::TreasuryArguments};
 use secp256k1_zkp::Secp256k1;
 use simplex::{
     provider::SimplicityNetwork,
@@ -12,23 +13,37 @@ use simplex::{
 };
 
 use crate::{
-    config::{ElementsRpcConfig, UserRequestsConfig},
+    config::{ElementsRpcConfig, ProtocolConfig},
     db::{
+        droplet::{DropletBalance, DropletError, DropletStore, TreasuryTransaction},
         monitored_utxo::{IndexedBlock, MonitoredUtxo, MonitoredUtxoStore},
         network_asset::{NetworkAssetStore, STORM_EYE_KIND, TICK_ASSET_KIND},
     },
 };
 
 use super::{
-    assets::treasury_blinding_secret, issuance::IssuedTickDescriptor, user_requests::asset_id,
+    assets::{initial_members_from_script, treasury_blinding_secret},
+    droplets::member_from_script,
+    issuance::IssuedTickDescriptor,
+    user_requests::asset_id,
 };
 
-const RULE_SET: &str = "issued-utxo-burning-v1";
+const ISSUED_UTXO_RULE_SET: &str = "issued-utxo-burning-v1";
+const DROPLETS_RULE_SET: &str = "droplets-v1";
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExchangeRecovery {
+    Keep,
+    Unlock,
+    Rebroadcast { transaction: Vec<u8>, txid: String },
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexerError {
     #[error("indexer database operation failed: {0}")]
     Database(#[from] sqlx::Error),
+    #[error(transparent)]
+    Droplets(#[from] DropletError),
     #[error("Elements RPC operation failed: {0}")]
     Rpc(#[from] bitcoincore_rpc::Error),
     #[error("invalid Elements RPC URL: {0}")]
@@ -46,23 +61,29 @@ pub enum IndexerError {
 #[derive(Clone)]
 pub(crate) struct Indexer {
     store: MonitoredUtxoStore,
+    droplets: DropletStore,
     assets: NetworkAssetStore,
     elements_rpc: ElementsRpcConfig,
     tick_lifetime_blocks: u64,
+    initial_members: Vec<[u8; 32]>,
 }
 
 impl Indexer {
     pub(crate) fn new(
         store: MonitoredUtxoStore,
+        droplets: DropletStore,
         assets: NetworkAssetStore,
         elements_rpc: ElementsRpcConfig,
-        user_requests: &UserRequestsConfig,
+        protocol: &ProtocolConfig,
+        initial_members: Vec<[u8; 32]>,
     ) -> Self {
         Self {
             store,
+            droplets,
             assets,
             elements_rpc,
-            tick_lifetime_blocks: user_requests.tick_lifetime_blocks,
+            tick_lifetime_blocks: protocol.tick_lifetime_blocks,
+            initial_members,
         }
     }
 
@@ -81,9 +102,10 @@ impl Indexer {
         let client = self.client()?;
         let network = network(&client)?;
         let tip: u64 = client.call("getblockcount", &[])?;
-        let cursor = self.store.cursor(RULE_SET).await?;
+        let issued_cursor = self.store.cursor(ISSUED_UTXO_RULE_SET).await?;
+        let droplets_cursor = self.droplets.cursor(DROPLETS_RULE_SET).await?;
 
-        if let Some(cursor) = &cursor {
+        for cursor in [&issued_cursor, &droplets_cursor].into_iter().flatten() {
             let canonical = block_hash(&client, cursor.height)?;
             if canonical != cursor.hash {
                 return Err(IndexerError::Reorganization {
@@ -92,30 +114,56 @@ impl Indexer {
             }
         }
 
-        let first_height = cursor.map_or(tick_asset.created_at_block, |cursor| cursor.height + 1);
+        let issued_height = issued_cursor
+            .as_ref()
+            .map_or(tick_asset.created_at_block, |cursor| cursor.height + 1);
+        let droplets_height = droplets_cursor
+            .as_ref()
+            .map_or(storm_eye.created_at_block, |cursor| cursor.height + 1);
+        let first_height = issued_height.min(droplets_height);
+        let treasury_script = TreasuryProgram::new(&TreasuryArguments {
+            storm_eye_asset_id: storm_eye.asset_id,
+        })
+        .get_script_pubkey(&network);
         let mut indexed = 0;
         for height in first_height..=tip {
             let hash = block_hash(&client, height)?;
             let block = get_block(&client, hash)?;
-            let issued = issued_tick_utxos(
-                &client,
-                &block.txdata,
-                height,
-                &storm_eye,
-                &tick_asset,
-                tick_asset_id,
-                &network,
-            )?;
-            let spent = spent_monitored_outpoints(&block.txdata);
-            self.store
-                .apply_block(
-                    RULE_SET,
-                    &IndexedBlock { height, hash },
-                    &issued,
-                    &spent,
-                    self.tick_lifetime_blocks,
-                )
-                .await?;
+            let indexed_block = IndexedBlock { height, hash };
+            if height >= issued_height {
+                let issued = issued_tick_utxos(
+                    &client,
+                    &block.txdata,
+                    height,
+                    &storm_eye,
+                    &tick_asset,
+                    tick_asset_id,
+                    &network,
+                )?;
+                let spent = spent_monitored_outpoints(&block.txdata);
+                self.store
+                    .apply_block(
+                        ISSUED_UTXO_RULE_SET,
+                        &indexed_block,
+                        &issued,
+                        &spent,
+                        self.tick_lifetime_blocks,
+                    )
+                    .await?;
+            }
+            if height >= droplets_height {
+                verify_initial_members(&block.txdata, &storm_eye, &self.initial_members)?;
+                let treasury_transactions =
+                    treasury_transactions(&block.txdata, &treasury_script, network.policy_asset())?;
+                self.droplets
+                    .apply_block(
+                        DROPLETS_RULE_SET,
+                        &indexed_block,
+                        &treasury_transactions,
+                        &self.initial_members,
+                    )
+                    .await?;
+            }
             indexed += 1;
         }
 
@@ -123,7 +171,36 @@ impl Indexer {
     }
 
     pub(crate) async fn cursor(&self) -> Result<Option<IndexedBlock>, IndexerError> {
-        Ok(self.store.cursor(RULE_SET).await?)
+        Ok(self.store.cursor(ISSUED_UTXO_RULE_SET).await?)
+    }
+
+    pub(crate) async fn recover_droplet_exchanges(
+        &self,
+        block_height: u64,
+        is_leader: bool,
+    ) -> Result<(), IndexerError> {
+        let client = self.client()?;
+        let mempool: Vec<String> = client.call("getrawmempool", &[])?;
+        for balance in self.droplets.locked().await? {
+            match exchange_recovery(&balance, block_height, is_leader, &mempool) {
+                ExchangeRecovery::Keep => {}
+                ExchangeRecovery::Unlock => {
+                    self.droplets
+                        .unlock_exchange(balance.xonly_pubkey, block_height)
+                        .await?;
+                }
+                ExchangeRecovery::Rebroadcast { transaction, txid } => {
+                    let broadcast_txid: String =
+                        client.call("sendrawtransaction", &[hex::encode(transaction).into()])?;
+                    if broadcast_txid != txid {
+                        return Err(IndexerError::Invalid(
+                            "rebroadcast Droplets transaction id mismatch".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn client(&self) -> Result<Client, IndexerError> {
@@ -136,6 +213,146 @@ impl Indexer {
             ),
         )?)
     }
+}
+
+fn exchange_recovery(
+    balance: &DropletBalance,
+    block_height: u64,
+    is_leader: bool,
+    mempool: &[String],
+) -> ExchangeRecovery {
+    let Some(last_tx) = balance.last_tx.as_ref() else {
+        return ExchangeRecovery::Unlock;
+    };
+    let Ok(transaction) = encode::deserialize::<Transaction>(last_tx) else {
+        return if balance.block_height < block_height {
+            ExchangeRecovery::Unlock
+        } else {
+            ExchangeRecovery::Keep
+        };
+    };
+    let txid = transaction.txid().to_string();
+    if !is_leader || mempool.contains(&txid) {
+        ExchangeRecovery::Keep
+    } else {
+        ExchangeRecovery::Rebroadcast {
+            transaction: last_tx.clone(),
+            txid,
+        }
+    }
+}
+
+fn verify_initial_members(
+    transactions: &[Transaction],
+    storm_eye: &crate::NetworkAsset,
+    expected_members: &[[u8; 32]],
+) -> Result<(), IndexerError> {
+    let Some(transaction) = transactions
+        .iter()
+        .find(|transaction| transaction.txid().to_byte_array() == storm_eye.issuance_txid)
+    else {
+        return Ok(());
+    };
+    let markers = transaction
+        .output
+        .iter()
+        .filter_map(|output| {
+            initial_members_from_script(&output.script_pubkey)
+                .map_err(|error| IndexerError::Invalid(error.to_string()))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if markers.len() != 1 {
+        return Err(IndexerError::Invalid(
+            "Storm Eye issuance must contain one initial-members marker".into(),
+        ));
+    }
+    let mut expected_members = expected_members.to_vec();
+    expected_members.sort_unstable();
+    expected_members.dedup();
+    if markers[0] != expected_members {
+        return Err(IndexerError::Invalid(
+            "Storm Eye initial members do not match the configured network".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn treasury_transactions(
+    transactions: &[Transaction],
+    treasury_script: &simplex::simplicityhl::elements::Script,
+    policy_asset: AssetId,
+) -> Result<Vec<TreasuryTransaction>, IndexerError> {
+    transactions
+        .iter()
+        .map(|transaction| {
+            let outputs = transaction
+                .output
+                .iter()
+                .enumerate()
+                .filter_map(|(index, output)| {
+                    treasury_output_amount(output, treasury_script, policy_asset)
+                        .transpose()
+                        .map(|result| {
+                            result.and_then(|amount| {
+                                u32::try_from(index)
+                                    .map(|index| (index, amount))
+                                    .map_err(|_| {
+                                        IndexerError::Invalid(
+                                            "Treasury output index overflow".into(),
+                                        )
+                                    })
+                            })
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let markers = transaction
+                .output
+                .iter()
+                .filter_map(|output| member_from_script(&output.script_pubkey))
+                .collect::<std::collections::BTreeSet<_>>();
+            let exchange_member = (markers.len() == 1)
+                .then(|| markers.first().copied())
+                .flatten();
+            let deposit_member = outputs.iter().find_map(|(index, _)| {
+                transaction
+                    .output
+                    .get(*index as usize + 1)
+                    .and_then(|output| member_from_script(&output.script_pubkey))
+            });
+
+            Ok(TreasuryTransaction {
+                txid: transaction.txid().to_byte_array(),
+                inputs: transaction
+                    .input
+                    .iter()
+                    .map(|input| {
+                        (
+                            input.previous_output.txid.to_byte_array(),
+                            input.previous_output.vout,
+                        )
+                    })
+                    .collect(),
+                outputs,
+                deposit_member,
+                exchange_member,
+            })
+        })
+        .collect()
+}
+
+fn treasury_output_amount(
+    output: &TxOut,
+    treasury_script: &simplex::simplicityhl::elements::Script,
+    policy_asset: AssetId,
+) -> Result<Option<u64>, IndexerError> {
+    if output.script_pubkey != *treasury_script {
+        return Ok(None);
+    }
+    if let (Some(asset), Some(value)) = (output.asset.explicit(), output.value.explicit()) {
+        return Ok((asset == policy_asset).then_some(value));
+    }
+    Ok(None)
 }
 
 fn issued_tick_utxos(
@@ -439,7 +656,11 @@ fn get_block(client: &Client, hash: [u8; 32]) -> Result<Block, IndexerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use simplex::simplicityhl::elements::{Script, TxOut, Txid, confidential};
+    use secp256k1_zkp::PublicKey;
+    use simplex::simplicityhl::elements::{
+        Script, TxOut, TxOutSecrets, Txid,
+        confidential::{self, AssetBlindingFactor, ValueBlindingFactor},
+    };
 
     #[test]
     fn collects_spent_outpoints_from_a_block() {
@@ -462,6 +683,248 @@ mod tests {
             spent_monitored_outpoints(&[transaction]),
             vec![([1; 32], 7, spending_txid)]
         );
+    }
+
+    #[test]
+    fn recovers_locked_exchanges_according_to_leadership_and_mempool_state() {
+        let transaction = Transaction {
+            version: 2,
+            lock_time: simplex::simplicityhl::elements::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        let transaction_bytes = encode::serialize(&transaction);
+        let txid = transaction.txid().to_string();
+        let balance = |last_tx| DropletBalance {
+            xonly_pubkey: [1; 32],
+            amount: 100,
+            block_height: 10,
+            exchange_locked: true,
+            last_tx,
+        };
+
+        assert_eq!(
+            exchange_recovery(&balance(None), 10, true, &[]),
+            ExchangeRecovery::Unlock
+        );
+        assert_eq!(
+            exchange_recovery(&balance(Some(vec![1, 2])), 10, true, &[]),
+            ExchangeRecovery::Keep
+        );
+        assert_eq!(
+            exchange_recovery(&balance(Some(vec![1, 2])), 11, true, &[]),
+            ExchangeRecovery::Unlock
+        );
+        assert_eq!(
+            exchange_recovery(
+                &balance(Some(transaction_bytes.clone())),
+                11,
+                true,
+                std::slice::from_ref(&txid),
+            ),
+            ExchangeRecovery::Keep
+        );
+        assert_eq!(
+            exchange_recovery(&balance(Some(transaction_bytes.clone())), 11, false, &[],),
+            ExchangeRecovery::Keep
+        );
+        assert_eq!(
+            exchange_recovery(&balance(Some(transaction_bytes.clone())), 11, true, &[]),
+            ExchangeRecovery::Rebroadcast {
+                transaction: transaction_bytes,
+                txid,
+            }
+        );
+    }
+
+    #[test]
+    fn extracts_tagged_treasury_deposits_and_spends() {
+        let policy_asset = AssetId::from_byte_array([8; 32]);
+        let treasury_script = Script::from(vec![0x51]);
+        let member = [7; 32];
+        let deposit = Transaction {
+            version: 2,
+            lock_time: simplex::simplicityhl::elements::LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                explicit_output(policy_asset, 1_000, treasury_script.clone()),
+                explicit_output(
+                    policy_asset,
+                    0,
+                    super::super::droplets::member_script(member),
+                ),
+            ],
+        };
+        let deposit_txid = deposit.txid().to_byte_array();
+        let spend = Transaction {
+            version: 2,
+            lock_time: simplex::simplicityhl::elements::LockTime::ZERO,
+            input: vec![simplex::simplicityhl::elements::TxIn {
+                previous_output: simplex::simplicityhl::elements::OutPoint {
+                    txid: Txid::from_byte_array(deposit_txid),
+                    vout: 0,
+                },
+                ..Default::default()
+            }],
+            output: vec![explicit_output(
+                policy_asset,
+                0,
+                super::super::droplets::member_script(member),
+            )],
+        };
+
+        let extracted =
+            treasury_transactions(&[deposit, spend], &treasury_script, policy_asset).unwrap();
+
+        assert_eq!(extracted[0].outputs, vec![(0, 1_000)]);
+        assert_eq!(extracted[0].deposit_member, Some(member));
+        assert_eq!(extracted[1].inputs, vec![(deposit_txid, 0)]);
+        assert!(extracted[1].outputs.is_empty());
+        assert_eq!(extracted[1].exchange_member, Some(member));
+    }
+
+    #[test]
+    fn ignores_confidential_lbtc_treasury_deposits() {
+        let policy_asset = AssetId::from_byte_array([8; 32]);
+        let treasury_script = Script::from(vec![0x51]);
+        let member = [7; 32];
+        let confidential_output = confidential_output(
+            policy_asset,
+            1_000,
+            treasury_script.clone(),
+            treasury_blinding_secret(),
+        );
+        let transaction = Transaction {
+            version: 2,
+            lock_time: simplex::simplicityhl::elements::LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                confidential_output,
+                explicit_output(
+                    policy_asset,
+                    0,
+                    super::super::droplets::member_script(member),
+                ),
+            ],
+        };
+
+        let extracted =
+            treasury_transactions(&[transaction], &treasury_script, policy_asset).unwrap();
+
+        assert!(extracted[0].outputs.is_empty());
+        assert_eq!(extracted[0].deposit_member, None);
+    }
+
+    #[test]
+    fn ignores_treasury_outputs_blinded_for_a_foreign_key() {
+        let policy_asset = AssetId::from_byte_array([8; 32]);
+        let treasury_script = Script::from(vec![0x51]);
+        let foreign_secret = secp256k1_zkp::SecretKey::from_slice(&[1; 32]).unwrap();
+        let transaction = Transaction {
+            version: 2,
+            lock_time: simplex::simplicityhl::elements::LockTime::ZERO,
+            input: vec![],
+            output: vec![confidential_output(
+                policy_asset,
+                1_000,
+                treasury_script.clone(),
+                foreign_secret,
+            )],
+        };
+
+        let extracted =
+            treasury_transactions(&[transaction], &treasury_script, policy_asset).unwrap();
+
+        assert!(extracted[0].outputs.is_empty());
+    }
+
+    #[test]
+    fn ignores_conflicting_member_markers_without_treasury_activity() {
+        let policy_asset = AssetId::from_byte_array([8; 32]);
+        let treasury_script = Script::from(vec![0x51]);
+        let transaction = Transaction {
+            version: 2,
+            lock_time: simplex::simplicityhl::elements::LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                explicit_output(
+                    policy_asset,
+                    0,
+                    super::super::droplets::member_script([1; 32]),
+                ),
+                explicit_output(
+                    policy_asset,
+                    0,
+                    super::super::droplets::member_script([2; 32]),
+                ),
+            ],
+        };
+
+        let extracted =
+            treasury_transactions(&[transaction], &treasury_script, policy_asset).unwrap();
+
+        assert!(extracted[0].inputs.is_empty());
+        assert!(extracted[0].outputs.is_empty());
+        assert_eq!(extracted[0].deposit_member, None);
+        assert_eq!(extracted[0].exchange_member, None);
+    }
+
+    #[test]
+    fn applies_deposit_tag_only_to_the_immediately_preceding_treasury_output() {
+        let policy_asset = AssetId::from_byte_array([8; 32]);
+        let treasury_script = Script::from(vec![0x51]);
+        let member = [7; 32];
+        let transaction = Transaction {
+            version: 2,
+            lock_time: simplex::simplicityhl::elements::LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                explicit_output(policy_asset, 1_000, treasury_script.clone()),
+                explicit_output(policy_asset, 1, Script::new()),
+                explicit_output(
+                    policy_asset,
+                    0,
+                    super::super::droplets::member_script(member),
+                ),
+            ],
+        };
+
+        let extracted =
+            treasury_transactions(&[transaction], &treasury_script, policy_asset).unwrap();
+
+        assert_eq!(extracted[0].outputs, vec![(0, 1_000)]);
+        assert_eq!(extracted[0].deposit_member, None);
+        assert_eq!(extracted[0].exchange_member, Some(member));
+    }
+
+    #[test]
+    fn leaves_conflicting_treasury_markers_unassigned() {
+        let policy_asset = AssetId::from_byte_array([8; 32]);
+        let treasury_script = Script::from(vec![0x51]);
+        let transaction = Transaction {
+            version: 2,
+            lock_time: simplex::simplicityhl::elements::LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                explicit_output(policy_asset, 1_000, treasury_script.clone()),
+                explicit_output(
+                    policy_asset,
+                    0,
+                    super::super::droplets::member_script([1; 32]),
+                ),
+                explicit_output(
+                    policy_asset,
+                    0,
+                    super::super::droplets::member_script([2; 32]),
+                ),
+            ],
+        };
+
+        let extracted =
+            treasury_transactions(&[transaction], &treasury_script, policy_asset).unwrap();
+
+        assert_eq!(extracted[0].deposit_member, Some([1; 32]));
+        assert_eq!(extracted[0].exchange_member, None);
     }
 
     #[test]
@@ -572,5 +1035,33 @@ mod tests {
             script_pubkey,
             ..Default::default()
         }
+    }
+
+    fn confidential_output(
+        asset: AssetId,
+        amount: u64,
+        script_pubkey: Script,
+        blinding_secret: secp256k1_zkp::SecretKey,
+    ) -> TxOut {
+        let secp = Secp256k1::new();
+        let blinding_public_key = PublicKey::from_secret_key(&secp, &blinding_secret);
+        let input_secrets = [TxOutSecrets::new(
+            asset,
+            AssetBlindingFactor::zero(),
+            amount,
+            ValueBlindingFactor::zero(),
+        )];
+        TxOut::new_last_confidential(
+            &mut secp256k1_zkp::rand::thread_rng(),
+            &secp,
+            amount,
+            asset,
+            script_pubkey,
+            blinding_public_key,
+            &input_secrets,
+            &[],
+        )
+        .unwrap()
+        .0
     }
 }
