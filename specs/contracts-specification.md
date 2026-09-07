@@ -191,54 +191,33 @@ Outputs:
 2. Change from the input policy asset UTXO  
 3. Transaction fee
 
-# 2\. Tick and Verifier inflation tokens contract
+# 2\. Treasury contract
 
 ## 2.1. Description
 
-This contract is intended for Tick and Verifier inflation token UTXOs, specifically so that only the protocol can issue Tick and Verifier assets.
+This contract is intended for storing UTXOs owned by the Oracle network. These UTXOs may be used by the network in accordance with the network's rules.
 
 ## 2.2. Compilation parameters
 
-1. STORM\_EYE\_ASSET\_ID \- the Storm Eye asset ID that will be used for authorized asset issuance.
+1. STORM\_EYE\_ASSET\_ID \- the Storm Eye asset ID that will be used for the network authorization.
 
 ## 2.3. Spending paths
 
-The Tick and Verifier inflation tokens contract has next spending paths:
+The Treasury contract has next spending paths:
 
-1. Asset issuance authorized via Storm Eye
+1. Network authorized spending
 
-### 2.3.1. Asset issuance authorized via Storm Eye
+### 2.3.1. Network authorized spending
 
-In this scenario, the issuance of additional assets is permitted if the transaction includes a Storm Eye UTXO; however, the amount and *script\_pubkey* of inflation tokens must not change.
+In this scenario, the network can spend a Treasury UTXO. To spend it, the network must include the Storm Eye UTXO in the transaction.
 
 The following witness parameters are accepted for spending:
 
-1. *storm\_eye\_input\_index \-* the input index of the Storm Eye UTXO  
-2. *inflation\_token\_output\_index \-* the output index of the inflation token UTXO
+1. *storm\_eye\_input\_index* \- the Storm Eye UTXO input index  
 
 This spending path will include the following checks:
 
-1. assert(jet::input\_asset(*storm\_eye\_input\_index*) \== param::STORM\_EYE\_ASSET\_ID)  
-2. assert(jet::current\_asset() \== output\_asset(*inflation\_token\_output\_index*))  
-3. assert(jet::current\_amount() \== output\_amount(*inflation\_token\_output\_index*))  
-4. assert(jet::current\_script\_hash() \== output\_script\_hash(*inflation\_token\_output\_index*))  
-5. assert(get\_reissuance\_amount(jet::current\_index()) \> 0\)
-
-## 2.4. Contract creation transaction
-
-In the transaction to create Tick and Verifier inflation tokens, you must set *issuance\_amount* to 0, *inflation\_amount* to 1, and use the appropriate covenant for inflation tokens. These conditions must be verified by the network before the Tick and Verifier inflation tokens can be used.
-
-Inputs:
-
-1. A policy asset UTXO with the issuance\_amount set to 0 and inflation\_amount set to 1  
-2. A policy asset UTXO with the issuance\_amount set to 0 and inflation\_amount set to 1
-
-Outputs:
-
-1. A Tick inflation token UTXO with the amount of 1 and the corresponding covenant  
-2. A Verifier inflation token UTXO with the amount of 1 and the corresponding covenant  
-3. Change from the input policy asset UTXOs  
-4. Transaction fee
+1. assert(jet::input\_asset(*storm\_eye\_input\_index*) \== param::STORM\_EYE\_ASSET\_ID)
 
 # 3\. Tick asset contract
 
@@ -494,34 +473,6 @@ The Verifier asset contract has next spending paths:
 ### 5.3.1. Network authorized spending
 
 In this scenario, the network can spend a user Account UTXO. To spend it, the network must include the Storm Eye UTXO in the transaction.
-
-The following witness parameters are accepted for spending:
-
-1. *storm\_eye\_input\_index* \- the Storm Eye UTXO input index  
-
-This spending path will include the following checks:
-
-1. assert(jet::input\_asset(*storm\_eye\_input\_index*) \== param::STORM\_EYE\_ASSET\_ID)  
-
-# 6\. Treasury contract
-
-## 6.1. Description
-
-This contract is intended to store the Oracle network's LBTC asset, which can be used to pay fees for system transactions.
-
-## 6.2. Compilation parameters
-
-1. STORM\_EYE\_ASSET\_ID \- the Storm Eye asset ID that will be used for the network authorization.
-
-## 6.3. Spending paths
-
-The Verifier asset contract has next spending paths:
-
-1. Network authorized spending
-
-### 6.3.1. Network authorized spending
-
-In this scenario, the network can spend a user Treasury UTXO. To spend it, the network must include the Storm Eye UTXO in the transaction.
 
 The following witness parameters are accepted for spending:
 
