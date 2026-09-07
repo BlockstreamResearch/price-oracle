@@ -2309,6 +2309,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "price-feed"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "primeorder"
 version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

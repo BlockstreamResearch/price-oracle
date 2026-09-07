@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "high-storm",
+    "price-feed",
     "storm",
     "storm-operator",
     "storm-tree",
