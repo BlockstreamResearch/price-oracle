@@ -1,8 +1,7 @@
 #![allow(dead_code)]
 use simplex::signer::SignerError;
-use simplex::simplicityhl::elements::{AssetId, Script};
+use simplex::simplicityhl::elements::AssetId;
 use simplex::transaction::partial_input::IssuanceInput;
-use simplex::transaction::utxo::UTXO;
 use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, RequiredSignature};
 
 pub fn issue_asset(context: &simplex::TestContext, amount: u64) -> anyhow::Result<AssetId> {
@@ -25,26 +24,6 @@ pub fn issue_asset(context: &simplex::TestContext, amount: u64) -> anyhow::Resul
     signer.broadcast(&ft)?.wait()?;
 
     Ok(issuance.asset_id)
-}
-
-/// Sends `amount` of the policy asset to `script_pubkey` and returns the resulting UTXO,
-/// which is how a covenant under test gets something to guard.
-pub fn fund_script(
-    context: &simplex::TestContext,
-    script_pubkey: &Script,
-    amount: u64,
-) -> anyhow::Result<UTXO> {
-    context
-        .get_default_signer()
-        .send(script_pubkey.clone(), amount)?
-        .wait()?;
-
-    context
-        .get_default_provider()
-        .fetch_scripthash_utxos(script_pubkey)?
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("funding transaction produced no UTXO"))
 }
 
 /// Asserts the transaction is rejected by the covenant
