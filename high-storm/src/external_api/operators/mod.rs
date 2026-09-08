@@ -1,6 +1,7 @@
 pub(super) mod auth;
 mod droplets;
 mod state;
+mod storm_eyes;
 mod voting;
 
 use axum::{
@@ -17,6 +18,7 @@ pub(super) fn router() -> Router<ExternalApiState> {
         .route("/auth/token", post(auth::exchange_token))
         .route("/state", get(state::get_network_state))
         .route("/state/peers", get(state::get_network_peers))
+        .route("/storm-eyes", get(storm_eyes::get_storm_eyes))
         .route("/droplets", get(droplets::get_droplets))
         .route("/droplets/exchange", post(droplets::exchange_droplets))
         .route(
@@ -25,4 +27,5 @@ pub(super) fn router() -> Router<ExternalApiState> {
         )
         .route("/voting/{hash}", get(voting::get_voting))
         .route("/voting/{hash}/approve", post(voting::approve_voting))
+        .route("/voting/{hash}/execute", post(voting::execute_voting))
 }

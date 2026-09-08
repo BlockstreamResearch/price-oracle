@@ -26,6 +26,20 @@ export type Utxo = {
   output_index: number;
 };
 
+export type StormEyeState = "available" | "proposed" | "executing";
+
+export type StormEye = Utxo & {
+  amount: number;
+  confirmations: number;
+  state: StormEyeState;
+  voting_request_hashes: string[];
+};
+
+export type StormEyesState = {
+  block_height: number;
+  utxos: StormEye[];
+};
+
 export type VotingProposal =
   | {
       kind: "update_network_members";
@@ -50,14 +64,20 @@ export type VotingApproval = {
 export type Voting = {
   message_hash: string;
   proposal: VotingProposal;
+  proposer_public_key: string | null;
   block_height: number;
-  status: "pending" | "approved";
+  status: "pending" | "approved" | "executing" | "executed";
+  execution_txid: string | null;
   approvals: VotingApproval[];
 };
 
+export type AuthNetwork = "liquidv1" | "liquidtestnet" | "elementsregtest";
+
 export type OperatorIdentity = {
   publicKey: string;
-  address: string;
+  address: string | null;
+  network: AuthNetwork | null;
+  configureNetwork: (network: AuthNetwork) => void;
   sign: (message: string) => Promise<string>;
   destroy: () => void;
 };

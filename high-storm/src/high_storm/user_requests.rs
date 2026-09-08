@@ -66,6 +66,12 @@ const MAX_REQUESTS_PER_ROUND: u32 = 100;
 pub(crate) type PackedStormTreeProof =
     [Either<(), (bool, [u8; 32])>; storm_tree::TREE_DEPTH as usize];
 
+#[derive(Clone, Copy)]
+pub(crate) enum StormEyePool {
+    UserRequests,
+    NetworkLeader,
+}
+
 pub(crate) struct PreparedRound {
     pub(crate) request: ExecuteUserRequests,
     final_transaction: FinalTransaction,
@@ -196,8 +202,12 @@ impl UserRequestProcessor {
             .ok_or(UserRequestError::MissingAsset(TICK_ASSET_KIND))?;
         let network = self.network()?;
         let rpc = self.client()?;
-        let storm_eye_utxo =
-            find_contract_utxo(&rpc, &storm_eye.contract_script, Some(storm_eye.asset_id))?;
+        let storm_eye_utxo = find_contract_utxo(
+            &rpc,
+            &storm_eye.contract_script,
+            Some(storm_eye.asset_id),
+            StormEyePool::UserRequests,
+        )?;
         let token_utxo = find_token_utxo(&rpc, &tick_asset)?;
         let token_secrets = token_utxo
             .secrets
@@ -742,12 +752,14 @@ pub(crate) fn find_contract_utxo(
     client: &Client,
     script: &[u8],
     expected_asset: Option<[u8; 32]>,
+    pool: StormEyePool,
 ) -> Result<UTXO, UserRequestError> {
     let descriptor = format!("raw({})", hex::encode(script));
     let scan: ScanResult = client.call(
         "scantxoutset",
         &["start".into(), serde_json::json!([descriptor])],
     )?;
+    let mut candidates = Vec::new();
     for unspent in scan.unspents {
         let outpoint = FeeUtxo {
             txid: decode_array(&unspent.txid)?,
@@ -757,13 +769,29 @@ pub(crate) fn find_contract_utxo(
         let asset_matches = expected_asset
             .is_none_or(|expected| utxo.asset() == AssetId::from_byte_array(expected));
         if asset_matches {
-            return Ok(utxo);
+            candidates.push(utxo);
         }
     }
 
+    candidates
+        .sort_unstable_by_key(|utxo| (utxo.outpoint.txid.to_byte_array(), utxo.outpoint.vout));
+    let selected =
+        storm_eye_pool_index(candidates.len(), pool).and_then(|index| candidates.get(index));
+    if let Some(utxo) = selected {
+        return Ok(utxo.clone());
+    }
+
     Err(UserRequestError::Invalid(
-        "required network covenant UTXO is unavailable".into(),
+        "required Storm Eye pool is unavailable".into(),
     ))
+}
+
+fn storm_eye_pool_index(candidate_count: usize, pool: StormEyePool) -> Option<usize> {
+    let index = match pool {
+        StormEyePool::UserRequests => 0,
+        StormEyePool::NetworkLeader => candidate_count.div_ceil(2),
+    };
+    (index < candidate_count).then_some(index)
 }
 
 fn find_token_utxo(client: &Client, tick_asset: &NetworkAsset) -> Result<UTXO, UserRequestError> {
@@ -1554,6 +1582,16 @@ struct RawTransactionInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserves_three_of_six_storm_eyes_for_network_leader_operations() {
+        assert_eq!(storm_eye_pool_index(6, StormEyePool::UserRequests), Some(0));
+        assert_eq!(
+            storm_eye_pool_index(6, StormEyePool::NetworkLeader),
+            Some(3)
+        );
+        assert_eq!(storm_eye_pool_index(1, StormEyePool::NetworkLeader), None);
+    }
 
     fn config() -> ProtocolConfig {
         ProtocolConfig {

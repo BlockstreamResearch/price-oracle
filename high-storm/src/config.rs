@@ -8,6 +8,10 @@ pub enum Error {
     Io(std::io::Error),
     #[error("failed to parse config file: {0}")]
     Toml(toml::de::Error),
+    #[error(
+        "signer private key must be a valid 32-byte secp256k1 scalar encoded as 64 hexadecimal characters"
+    )]
+    InvalidSignerPrivateKey,
     #[error("invalid database configuration: {0}")]
     Database(String),
 }
@@ -97,8 +101,21 @@ impl Config {
     pub fn from_file(path: PathBuf) -> Result<Self, Error> {
         let contents = std::fs::read_to_string(path).map_err(Error::Io)?;
         let config: Config = toml::from_str(&contents).map_err(Error::Toml)?;
+        config.validate()?;
 
         Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        let encoded = &self.service.signer.private_key;
+        if encoded.len() != 64 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::InvalidSignerPrivateKey);
+        }
+
+        let bytes = hex::decode(encoded).map_err(|_| Error::InvalidSignerPrivateKey)?;
+        secp256k1_zkp::SecretKey::from_slice(&bytes)
+            .map(|_| ())
+            .map_err(|_| Error::InvalidSignerPrivateKey)
     }
 
     pub fn database_url(&self) -> Result<String, Error> {
@@ -160,5 +177,49 @@ max_connections = 5
             toml::from_str(&config_with_protocol_section("user_requests")).unwrap();
 
         assert_eq!(config.service.protocol.operational_fee_sats, 1000);
+    }
+
+    #[test]
+    fn validates_a_32_byte_signer_private_key() {
+        let config: Config = toml::from_str(&config_with_protocol_section("protocol")).unwrap();
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_development_node_signer_keys_at_startup() {
+        for node in 1..=3 {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("docker/node-{node}.toml"));
+
+            Config::from_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_a_compressed_public_key_as_signer_private_key() {
+        let config: Config = toml::from_str(
+            &config_with_protocol_section("protocol")
+                .replace(&"01".repeat(32), &format!("02{}", "01".repeat(32))),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            config.validate(),
+            Err(Error::InvalidSignerPrivateKey)
+        ));
+    }
+
+    #[test]
+    fn rejects_an_invalid_signer_scalar() {
+        let config: Config = toml::from_str(
+            &config_with_protocol_section("protocol").replace(&"01".repeat(32), &"00".repeat(32)),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            config.validate(),
+            Err(Error::InvalidSignerPrivateKey)
+        ));
     }
 }

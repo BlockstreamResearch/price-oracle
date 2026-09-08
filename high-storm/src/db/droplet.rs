@@ -241,7 +241,8 @@ impl DropletStore {
     ) -> Result<bool, sqlx::Error> {
         let updated = sqlx::query(
             "UPDATE droplets SET block_height = $1, exchange_locked = 1, last_tx = $2 \
-               WHERE xonly_pubkey = $3 AND exchange_locked = 0 AND amount >= $4",
+               WHERE xonly_pubkey = $3 AND amount >= $4 \
+               AND (exchange_locked = 0 OR last_tx = $2)",
         )
         .bind(encode_u64(block_height)?)
         .bind(transaction)
@@ -519,6 +520,7 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(store.lock_exchange(member, 900, 12, &[1, 2]).await.unwrap());
         assert!(store.lock_exchange(member, 900, 12, &[1, 2]).await.unwrap());
         assert!(!store.lock_exchange(member, 1, 12, &[3]).await.unwrap());
 

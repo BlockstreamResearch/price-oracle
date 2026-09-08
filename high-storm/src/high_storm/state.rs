@@ -9,6 +9,7 @@ use storm::Storm;
 use super::{
     HighStormDependencies, assets::Assets, burning::Burning, droplets::Droplets, indexer::Indexer,
     signing::Signing, user_requests::UserRequestProcessor, voting::Voting,
+    voting_execution::VotingExecution,
 };
 
 /// Cloneable higher-level state shared by HighStorm message handlers.
@@ -17,6 +18,7 @@ pub(crate) struct NetworkState {
     coordinator_public_key: [u8; 33],
     signing: Signing,
     voting: Voting,
+    voting_execution: VotingExecution,
     assets: Assets,
     burning: Burning,
     droplets: Droplets,
@@ -58,7 +60,14 @@ impl NetworkState {
         Self {
             coordinator_public_key,
             signing: Signing::new(storm, secret_key, coordinator_public_key).await,
-            voting: Voting::new(secret_key, voting_store),
+            voting: Voting::new(secret_key, voting_store.clone()),
+            voting_execution: VotingExecution::new(
+                voting_store,
+                droplets.clone(),
+                network_assets.clone(),
+                elements_rpc.clone(),
+                protocol_config.exchange_transaction_fee_sats,
+            ),
             assets: Assets::new(network_assets.clone()),
             burning: Burning::new(
                 monitored_utxos.clone(),
@@ -101,6 +110,10 @@ impl NetworkState {
 
     pub(crate) fn voting(&self) -> &Voting {
         &self.voting
+    }
+
+    pub(crate) fn voting_execution(&self) -> &VotingExecution {
+        &self.voting_execution
     }
 
     pub(crate) fn assets(&self) -> &Assets {

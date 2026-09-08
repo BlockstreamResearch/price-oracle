@@ -15,10 +15,11 @@ use crate::config::Config;
 use crate::high_storm::HighStormDependencies;
 pub use high_storm::{
     ApproveVotingRequest, AssetError, DropletsError, ExchangeRewards, ExecuteUserRequests,
-    ExternalRequests, HighStorm, HighStormHandle, MergeStormEyes, NetworkAsset, NetworkAssets,
-    NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind, SigningError, SigningResult,
-    SplitStormEye, StormEyeUtxo, UpdateNetworkMembers, UserRequestError, VOTING_TIMEOUT_BLOCKS,
-    VotingApproval, VotingError, VotingRequest, VotingStatus,
+    ExecuteVotingRequest, ExternalRequests, HighStorm, HighStormHandle, MergeStormEyes,
+    NetworkAsset, NetworkAssets, NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind,
+    SigningError, SigningResult, SplitStormEye, StormEyeInventoryItem, StormEyeState, StormEyeUtxo,
+    UpdateNetworkMembers, UserRequestError, VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError,
+    VotingExecutionError, VotingRequest, VotingStatus,
 };
 
 #[derive(Debug, thiserror::Error)]

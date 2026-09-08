@@ -193,6 +193,15 @@ pub struct SplitStormEye {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteVotingRequest {
+    pub tx: Vec<u8>,
+    pub final_tx: Option<Vec<u8>>,
+    pub signing_hashes: Vec<[u8; 32]>,
+    pub signing_storm_tree_branch: StormTreeBranch,
+    pub proposer_public_key: NodePublicKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApproveVotingRequest {
     pub public_key: NodePublicKey,
     pub signature: Vec<u8>,
@@ -201,14 +210,12 @@ pub struct ApproveVotingRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VotingSyncApproval {
     pub(crate) message: Vec<u8>,
-    pub(crate) block_height: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VotingSyncRequest {
     pub(crate) message_hash: [u8; 32],
     pub(crate) message: Vec<u8>,
-    pub(crate) block_height: u64,
     pub(crate) approvals: Vec<VotingSyncApproval>,
 }
 

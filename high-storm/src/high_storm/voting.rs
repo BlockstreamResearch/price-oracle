@@ -19,6 +19,8 @@ pub const VOTING_TIMEOUT_BLOCKS: u64 = 10_080;
 pub enum VotingStatus {
     Pending,
     Approved,
+    Executing,
+    Executed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,8 +33,10 @@ pub struct VotingApproval {
 pub struct VotingRequest {
     pub message_hash: [u8; 32],
     pub request: NetworkVoteRequest,
+    pub proposer_public_key: Option<[u8; 32]>,
     pub block_height: u64,
     pub status: VotingStatus,
+    pub execution_txid: Option<[u8; 32]>,
     pub approvals: Vec<VotingApproval>,
 }
 
@@ -87,10 +91,11 @@ impl Voting {
         let message = NodeMessage::new(NodeMessageKind::NetworkVoteRequest, None, &request)?;
         let hash = message.hash()?;
         let encoded = postcard::to_stdvec(&message)?;
+        let proposer = controlled_member_key(&peers)?;
         let _guard = self.operations.lock().await;
         if !self
             .store
-            .insert_request(hash, &encoded, block_height)
+            .insert_request(hash, &encoded, proposer, block_height)
             .await?
         {
             return Err(VotingError::DuplicateRequest(hex::encode(hash)));
@@ -155,9 +160,10 @@ impl Voting {
         validate_request(&request, &peers)?;
         let hash = message.hash()?;
         let encoded = postcard::to_stdvec(&message)?;
+        let proposer = node_key(context.message_context.peer_public_key)?;
         let _guard = self.operations.lock().await;
         self.store
-            .insert_request(hash, &encoded, block_height)
+            .insert_request(hash, &encoded, proposer, block_height)
             .await?;
         Ok(())
     }
@@ -181,6 +187,7 @@ impl Voting {
         &self,
         message: NodeMessage,
         context: &StormContext,
+        block_height: u64,
     ) -> Result<(), VotingError> {
         if message.linked_to.is_some() {
             return Err(VotingError::InvalidRequest(
@@ -189,8 +196,12 @@ impl Voting {
         }
         let sync: VotingSyncMessage = message.decode_payload()?;
         if sync.is_response {
-            self.accept_synchronized(sync.requests, &context.storm_handle.peers().await)
-                .await
+            self.accept_synchronized(
+                sync.requests,
+                &context.storm_handle.peers().await,
+                block_height,
+            )
+            .await
         } else {
             if !sync.requests.is_empty() {
                 return Err(VotingError::InvalidRequest(
@@ -205,13 +216,11 @@ impl Voting {
                 .map(|request| VotingSyncRequest {
                     message_hash: request.message_hash,
                     message: request.message,
-                    block_height: request.block_height,
                     approvals: request
                         .approvals
                         .into_iter()
                         .map(|approval| VotingSyncApproval {
                             message: approval.message,
-                            block_height: approval.block_height,
                         })
                         .collect(),
                 })
@@ -234,6 +243,7 @@ impl Voting {
         &self,
         requests: Vec<VotingSyncRequest>,
         peers: &[Peer],
+        block_height: u64,
     ) -> Result<(), VotingError> {
         for synchronized in requests {
             let message: NodeMessage = postcard::from_bytes(&synchronized.message)?;
@@ -250,10 +260,11 @@ impl Voting {
             {
                 let _guard = self.operations.lock().await;
                 self.store
-                    .insert_request(
+                    .insert_synchronized_request(
                         synchronized.message_hash,
                         &synchronized.message,
-                        synchronized.block_height,
+                        None,
+                        block_height,
                     )
                     .await?;
             }
@@ -274,7 +285,7 @@ impl Voting {
                         approval_message,
                         approval,
                         synchronized.message_hash,
-                        synchronized_approval.block_height,
+                        block_height,
                         peers,
                     )
                     .await
@@ -405,6 +416,11 @@ fn validate_request(request: &NetworkVoteRequest, peers: &[Peer]) -> Result<(), 
                     "at least two Storm Eye UTXOs are required for a merge".into(),
                 ));
             }
+            if merge.utxos_to_merge.len() > 3 {
+                return Err(VotingError::InvalidRequest(
+                    "at most three Storm Eye UTXOs can be merged".into(),
+                ));
+            }
             if unique.len() != merge.utxos_to_merge.len() {
                 return Err(VotingError::InvalidRequest(
                     "a Storm Eye UTXO cannot appear twice in a merge".into(),
@@ -416,6 +432,11 @@ fn validate_request(request: &NetworkVoteRequest, peers: &[Peer]) -> Result<(), 
             if split.number_of_splits < 2 {
                 return Err(VotingError::InvalidRequest(
                     "a Storm Eye must be split into at least two outputs".into(),
+                ));
+            }
+            if split.number_of_splits > 3 {
+                return Err(VotingError::InvalidRequest(
+                    "a Storm Eye can be split into at most three outputs".into(),
                 ));
             }
         }
@@ -472,12 +493,18 @@ fn decode_stored(stored: StoredVotingRequest) -> Result<VotingRequest, VotingErr
     Ok(VotingRequest {
         message_hash: stored.message_hash,
         request,
+        proposer_public_key: stored.proposer_public_key,
         block_height: stored.block_height,
-        status: if stored.approved_at_block_height.is_some() {
+        status: if stored.execution_txid.is_some() {
+            VotingStatus::Executed
+        } else if stored.execution_started {
+            VotingStatus::Executing
+        } else if stored.approved_at_block_height.is_some() {
             VotingStatus::Approved
         } else {
             VotingStatus::Pending
         },
+        execution_txid: stored.execution_txid,
         approvals: stored
             .approvals
             .into_iter()
@@ -487,6 +514,20 @@ fn decode_stored(stored: StoredVotingRequest) -> Result<VotingRequest, VotingErr
             })
             .collect(),
     })
+}
+
+fn controlled_member_key(peers: &[Peer]) -> Result<[u8; 32], VotingError> {
+    let peer = peers
+        .iter()
+        .find(|peer| peer.status == PeerStatus::Controlled)
+        .ok_or_else(|| VotingError::InvalidRequest("local network member is missing".into()))?;
+    node_key(peer.compressed_public_key)
+}
+
+fn node_key(encoded: [u8; 33]) -> Result<[u8; 32], VotingError> {
+    PublicKey::from_slice(&encoded)
+        .map(|key| key.x_only_public_key().0.serialize())
+        .map_err(|error| VotingError::InvalidRequest(error.to_string()))
 }
 
 async fn send_from_storm(
@@ -523,4 +564,66 @@ fn transport_keys(keys: &[[u8; 33]]) -> Result<Vec<TransportPublicKey>, VotingEr
                 .map_err(|error| VotingError::InvalidRequest(error.to_string()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod reshape_tests {
+    use super::*;
+    use crate::StormEyeUtxo;
+
+    #[test]
+    fn accepts_two_or_three_reshape_outputs_only() {
+        for count in 2..=3 {
+            let merge = NetworkVoteRequest::new(
+                NetworkVoteKind::MergeStormEyes,
+                &MergeStormEyes {
+                    utxos_to_merge: (0..count).map(storm_eye).collect(),
+                },
+            )
+            .unwrap();
+            assert!(validate_request(&merge, &[]).is_ok());
+
+            let split = NetworkVoteRequest::new(
+                NetworkVoteKind::SplitStormEye,
+                &SplitStormEye {
+                    utxo_to_split: storm_eye(0),
+                    number_of_splits: count.into(),
+                },
+            )
+            .unwrap();
+            assert!(validate_request(&split, &[]).is_ok());
+        }
+
+        let merge = NetworkVoteRequest::new(
+            NetworkVoteKind::MergeStormEyes,
+            &MergeStormEyes {
+                utxos_to_merge: (0..4).map(storm_eye).collect(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_request(&merge, &[]),
+            Err(VotingError::InvalidRequest(_))
+        ));
+
+        let split = NetworkVoteRequest::new(
+            NetworkVoteKind::SplitStormEye,
+            &SplitStormEye {
+                utxo_to_split: storm_eye(0),
+                number_of_splits: 4,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_request(&split, &[]),
+            Err(VotingError::InvalidRequest(_))
+        ));
+    }
+
+    fn storm_eye(byte: u8) -> StormEyeUtxo {
+        StormEyeUtxo {
+            txid: [byte; 32],
+            output_index: byte.into(),
+        }
+    }
 }

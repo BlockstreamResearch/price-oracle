@@ -5,7 +5,7 @@ use axum::{
     http::{Request, StatusCode, header},
     response::Response,
 };
-use bitcoin::{Address, CompressedPublicKey, Network, PrivateKey, address::KnownHrp, secp256k1};
+use bitcoin::{Address, Network, PrivateKey, secp256k1};
 use http_body_util::BodyExt;
 use secp256k1_zkp::{Secp256k1, SecretKey};
 use storm::{Peer, Storm};
@@ -15,7 +15,7 @@ use crate::{HighStorm, db::Database};
 
 use super::{
     fee_utxo::FeeUtxoValidator,
-    operators::AuthService,
+    operators::{AuthService, auth::AuthNetwork},
     router,
     users::{NetworkUserRequests, UserRequest, UserRequestHeader, signing_hash},
 };
@@ -98,6 +98,8 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
     assert_eq!(network["total_peers"], 1);
     assert_eq!(network["online_peers"], 1);
     assert_eq!(network["is_coordinator"], true);
+    assert_xonly_public_key(&network["local_public_key"]);
+    assert_xonly_public_key(&network["coordinator_public_key"]);
 
     let peers = app
         .clone()
@@ -116,6 +118,7 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
     assert_eq!(peers[0]["status"], "controlled");
     assert_eq!(peers[0]["is_local"], true);
     assert_eq!(peers[0]["is_leader"], true);
+    assert_xonly_public_key(&peers[0]["public_key"]);
 
     let droplets = app
         .clone()
@@ -152,6 +155,16 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
         .await
         .unwrap();
     assert_eq!(users.status(), StatusCode::NOT_FOUND);
+}
+
+fn assert_xonly_public_key(value: &serde_json::Value) {
+    let encoded = value.as_str().expect("public key must be a string");
+    let bytes: [u8; 32] = hex::decode(encoded)
+        .expect("public key must be hexadecimal")
+        .try_into()
+        .expect("public key must contain exactly 32 bytes");
+    secp256k1::XOnlyPublicKey::from_slice(&bytes)
+        .expect("public key must be a valid x-only secp256k1 key");
 }
 
 #[tokio::test]
@@ -331,12 +344,17 @@ async fn setup() -> (Router, PrivateKey, String) {
     let operators = database.node_operators();
 
     let operator_secret = secp256k1::SecretKey::from_slice(&[42; 32]).unwrap();
-    let operator_private_key = PrivateKey::new(operator_secret, Network::Bitcoin);
-    let operator_public_key = operator_private_key
+    let operator_private_key = PrivateKey::new(operator_secret, Network::Regtest);
+    let compressed_operator_public_key = operator_private_key
         .public_key(&secp256k1::Secp256k1::new())
         .inner
         .serialize();
-    operators.add(operator_public_key).await.unwrap();
+    let operator_public_key = secp256k1::PublicKey::from_slice(&compressed_operator_public_key)
+        .unwrap()
+        .x_only_public_key()
+        .0
+        .serialize();
+    operators.add(compressed_operator_public_key).await.unwrap();
 
     let node_secret = SecretKey::from_slice(&[21; 32]).unwrap();
     let node_public_key = node_secret.public_key(&Secp256k1::new()).serialize();
@@ -375,6 +393,7 @@ async fn setup() -> (Router, PrivateKey, String) {
             operators,
             database.user_requests(),
             FeeUtxoValidator::allow_all(database.monitored_utxos()),
+            AuthNetwork::ElementsRegtest,
         ),
         operator_private_key,
         hex::encode(operator_public_key),
@@ -448,10 +467,19 @@ async fn response_json(response: Response) -> serde_json::Value {
 }
 
 fn sign(private_key: &PrivateKey, message: &str) -> String {
-    let public_key =
-        CompressedPublicKey::from_private_key(&secp256k1::Secp256k1::new(), private_key).unwrap();
+    let public_key = private_key
+        .public_key(&secp256k1::Secp256k1::new())
+        .inner
+        .x_only_public_key()
+        .0;
     bip322::sign_simple_encoded(
-        &Address::p2wpkh(&public_key, KnownHrp::Mainnet).to_string(),
+        &Address::p2tr(
+            &secp256k1::Secp256k1::new(),
+            public_key,
+            None,
+            Network::Regtest,
+        )
+        .to_string(),
         message,
         &[private_key.to_wif()],
         None,

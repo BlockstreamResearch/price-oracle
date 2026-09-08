@@ -1,4 +1,5 @@
 use axum::{Json, extract::State, http::HeaderMap};
+use secp256k1::PublicKey;
 use serde::Serialize;
 use storm::PeerStatus;
 
@@ -57,8 +58,8 @@ pub(super) async fn get_network_state(
 
     Ok(Json(NetworkStateResponse {
         block_height: state.node.block_height(),
-        local_public_key: hex::encode(local_public_key),
-        coordinator_public_key: hex::encode(coordinator_public_key),
+        local_public_key: xonly_public_key(local_public_key)?,
+        coordinator_public_key: xonly_public_key(coordinator_public_key)?,
         is_coordinator: local_public_key == coordinator_public_key,
         total_peers: peers.len(),
         online_peers,
@@ -82,14 +83,14 @@ pub(super) async fn get_network_peers(
     authenticate_bearer(&state.auth, &headers).await?;
     let coordinator_public_key = state.node.coordinator_public_key();
     let current_leader = state.node.current_leader().await;
-    Ok(Json(
-        state
-            .node
-            .peers()
-            .await
-            .into_iter()
-            .map(|peer| NetworkPeerResponse {
-                public_key: hex::encode(peer.compressed_public_key),
+    let peers = state
+        .node
+        .peers()
+        .await
+        .into_iter()
+        .map(|peer| {
+            Ok(NetworkPeerResponse {
+                public_key: xonly_public_key(peer.compressed_public_key)?,
                 socket_address: peer.socket_address,
                 last_seen: peer.last_seen,
                 status: peer_status_name(peer.status),
@@ -97,8 +98,16 @@ pub(super) async fn get_network_peers(
                 is_coordinator: peer.compressed_public_key == coordinator_public_key,
                 is_leader: Some(peer.compressed_public_key) == current_leader,
             })
-            .collect(),
-    ))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    Ok(Json(peers))
+}
+
+fn xonly_public_key(compressed: [u8; 33]) -> Result<String, ApiError> {
+    PublicKey::from_slice(&compressed)
+        .map(|key| hex::encode(key.x_only_public_key().0.serialize()))
+        .map_err(|_| ApiError::internal("network contains an invalid secp256k1 public key"))
 }
 
 fn peer_status_name(status: PeerStatus) -> &'static str {
@@ -107,5 +116,15 @@ fn peer_status_name(status: PeerStatus) -> &'static str {
         PeerStatus::Active => "active",
         PeerStatus::Inactive => "inactive",
         PeerStatus::Banned => "banned",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_transport_keys_instead_of_serializing_them() {
+        assert!(xonly_public_key([0; 33]).is_err());
     }
 }

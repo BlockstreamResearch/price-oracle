@@ -1,4 +1,4 @@
-import { Activity, Coins, LayoutDashboard, LogOut, Settings, Vote } from 'lucide-react'
+import { Activity, Coins, Eye, LayoutDashboard, LogOut, Settings, Vote } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { useAuth } from '../auth-context'
 import { CopyableHex } from './CopyableHex'
@@ -6,6 +6,7 @@ import { CopyableHex } from './CopyableHex'
 const navigation = [
   { to: '/', label: 'Overview', icon: LayoutDashboard, end: true },
   { to: '/droplets', label: 'Droplets', icon: Coins, end: false },
+  { to: '/storm-eyes', label: 'Storm Eyes', icon: Eye, end: false },
   { to: '/votings', label: 'Votings', icon: Vote, end: false },
   { to: '/settings', label: 'Settings', icon: Settings, end: false },
 ]

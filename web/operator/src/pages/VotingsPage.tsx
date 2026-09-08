@@ -1,11 +1,11 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { createPortal } from 'react-dom'
-import { ArrowRight, CheckCircle2, Eye, Plus, RefreshCw, Vote, X } from 'lucide-react'
+import { ArrowRight, CheckCircle2, Eye, Play, Plus, RefreshCw, Vote, X } from 'lucide-react'
 import { ApiError, authenticatedGet, signedPost } from '../api'
 import { useAuth } from '../auth-context'
 import { CopyableHex } from '../components/CopyableHex'
 import { formatNumber, proposalName, proposalSummary } from '../format'
-import type { OperatorSession, Utxo, Voting, VotingProposal } from '../types'
+import type { NetworkState, OperatorSession, Utxo, Voting, VotingProposal } from '../types'
 
 type Filter = 'all' | 'pending' | 'approved'
 
@@ -13,9 +13,26 @@ function fetchVotings(session: OperatorSession) {
   return authenticatedGet<Voting[]>(session, '/operators/voting')
 }
 
+function requireXOnlyPublicKey(value: string, name: string) {
+  if (!/^[0-9a-f]{64}$/i.test(value)) {
+    throw new Error(`${name} must be a 32-byte x-only public key.`)
+  }
+  return value.toLowerCase()
+}
+
+function canExecuteVoting(voting: Voting, localPublicKey: string) {
+  if (!voting.proposer_public_key) return false
+  const localXOnlyPublicKey = requireXOnlyPublicKey(localPublicKey, 'Local public key')
+  const proposerPublicKey = requireXOnlyPublicKey(voting.proposer_public_key, 'Voting proposer public key')
+  return voting.status === 'approved'
+    && voting.proposal.kind !== 'update_network_members'
+    && proposerPublicKey === localXOnlyPublicKey
+}
+
 export function VotingsPage() {
   const { session, logout } = useAuth()
   const [votings, setVotings] = useState<Voting[]>([])
+  const [localPublicKey, setLocalPublicKey] = useState('')
   const [filter, setFilter] = useState<Filter>('all')
   const [selected, setSelected] = useState<Voting | null>(null)
   const [creating, setCreating] = useState(false)
@@ -26,7 +43,13 @@ export function VotingsPage() {
   async function load() {
     if (!session) return
     setLoading(true); setError('')
-    try { setVotings(await fetchVotings(session)) }
+    try {
+      const [nextVotings, network] = await Promise.all([
+        fetchVotings(session),
+        authenticatedGet<NetworkState>(session, '/operators/state'),
+      ])
+      setVotings(nextVotings); setLocalPublicKey(network.local_public_key)
+    }
     catch (cause) {
       if (cause instanceof ApiError && cause.status === 401) logout()
       else setError(cause instanceof Error ? cause.message : 'Could not load votings.')
@@ -36,8 +59,13 @@ export function VotingsPage() {
   useEffect(() => {
     if (!session) return
     let active = true
-    fetchVotings(session)
-      .then((nextVotings) => { if (active) setVotings(nextVotings) })
+    Promise.all([
+      fetchVotings(session),
+      authenticatedGet<NetworkState>(session, '/operators/state'),
+    ])
+      .then(([nextVotings, network]) => {
+        if (active) { setVotings(nextVotings); setLocalPublicKey(network.local_public_key) }
+      })
       .catch((cause: unknown) => {
         if (!active) return
         if (cause instanceof ApiError && cause.status === 401) logout()
@@ -64,6 +92,17 @@ export function VotingsPage() {
       setSelected(null); await load()
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not approve voting.')
+    } finally { setActionBusy(false) }
+  }
+
+  async function execute(voting: Voting) {
+    if (!session) return
+    setActionBusy(true); setError('')
+    try {
+      await signedPost<{ execution_txid: string }>(session, `/operators/voting/${voting.message_hash}/execute`, {})
+      setSelected(null); await load()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not execute voting.')
     } finally { setActionBusy(false) }
   }
 
@@ -95,7 +134,10 @@ export function VotingsPage() {
           <span className="block-cell">Block {formatNumber(voting.block_height)}</span>
           <span className="approval-count">{voting.approvals.length}</span>
           <span className={`status-pill ${voting.status}`}>{voting.status === 'approved' && <CheckCircle2 size={13} />}{voting.status}</span>
-          <button className="icon-button" type="button" title="View voting" onClick={() => setSelected(voting)}><Eye size={17} /></button>
+          <div className="voting-actions">
+            {canExecuteVoting(voting, localPublicKey) && <button className="icon-button execute" type="button" title="Execute voting" disabled={actionBusy} onClick={() => void execute(voting)}><Play size={17} /></button>}
+            <button className="icon-button" type="button" title="View voting" onClick={() => setSelected(voting)}><Eye size={17} /></button>
+          </div>
         </article>)}
         {!loading && visible.length === 0 && <div className="empty-state"><Vote size={25} /><strong>No votings found</strong><span>Create a proposal or change the current filter.</span></div>}
       </section>
@@ -104,7 +146,8 @@ export function VotingsPage() {
         <VotingForm busy={actionBusy} onCancel={() => setCreating(false)} onSubmit={create} />
       </Modal>}
       {selected && <Modal title="Voting details" onClose={() => setSelected(null)}>
-        <VotingDetail voting={selected} busy={actionBusy} onApprove={() => void approve(selected)} />
+        <VotingDetail voting={selected} localPublicKey={localPublicKey} busy={actionBusy}
+          onApprove={() => void approve(selected)} onExecute={() => void execute(selected)} />
       </Modal>}
     </div>
   )
@@ -116,10 +159,15 @@ function Modal({ title, onClose, children }: { title: string; onClose: () => voi
       <button className="icon-button" type="button" title="Close" onClick={onClose}><X size={18} /></button></header>{children}</section></div>, document.body)
 }
 
-function VotingDetail({ voting, busy, onApprove }: { voting: Voting; busy: boolean; onApprove: () => void }) {
+function VotingDetail({ voting, localPublicKey, busy, onApprove, onExecute }: {
+  voting: Voting; localPublicKey: string; busy: boolean; onApprove: () => void; onExecute: () => void
+}) {
+  const canExecute = canExecuteVoting(voting, localPublicKey)
   return <div className="voting-detail">
     <dl className="detail-grid"><div><dt>Status</dt><dd><span className={`status-pill ${voting.status}`}>{voting.status}</span></dd></div>
       <div><dt>Created at</dt><dd>Block {formatNumber(voting.block_height)}</dd></div><div className="full"><dt>Message hash</dt><dd><code>{voting.message_hash}</code></dd></div>
+      {voting.proposer_public_key && <div className="full"><dt>Proposer</dt><dd><CopyableHex value={voting.proposer_public_key} visible={12} label="proposer public key" /></dd></div>}
+      {voting.execution_txid && <div className="full"><dt>Execution transaction</dt><dd><CopyableHex value={voting.execution_txid} visible={12} label="execution transaction ID" /></dd></div>}
       <div className="full"><dt>Proposal</dt><dd><strong>{proposalName(voting.proposal)}</strong><span>{proposalSummary(voting.proposal)}</span></dd></div></dl>
     <div className="approval-section"><h3>Approvals <span>{voting.approvals.length}</span></h3>
       {voting.approvals.map((approval) => <div className="approval-row" key={`${approval.public_key}-${approval.block_height}`}>
@@ -127,6 +175,8 @@ function VotingDetail({ voting, busy, onApprove }: { voting: Voting; busy: boole
       {voting.approvals.length === 0 && <p>No approvals recorded.</p>}</div>
     {voting.status === 'pending' && <footer className="modal-actions"><button className="primary-button" type="button" disabled={busy} onClick={onApprove}>
       <CheckCircle2 size={17} /> {busy ? 'Signing…' : 'Approve voting'}</button></footer>}
+    {canExecute && <footer className="modal-actions"><button className="primary-button" type="button" disabled={busy} onClick={onExecute}>
+      <Play size={17} /> {busy ? 'Executing…' : 'Execute voting'}</button></footer>}
   </div>
 }
 
@@ -165,10 +215,10 @@ function VotingForm({ busy, onCancel, onSubmit }: { busy: boolean; onCancel: () 
       <label>Transaction ID<input value={utxo.txid} onChange={(event) => updateUtxo(index, 'txid', event.target.value)} required /></label>
       <label>Output<input type="number" min="0" value={utxo.output_index} onChange={(event) => updateUtxo(index, 'output_index', event.target.value)} required /></label>
       {utxos.length > 2 && <button className="icon-button" type="button" title="Remove UTXO" onClick={() => setUtxos((rows) => rows.filter((_, row) => row !== index))}><X size={16} /></button>}</div>)}</div>
-      <button className="text-button" type="button" onClick={() => setUtxos((rows) => [...rows, { txid: '', output_index: 0 }])}><Plus size={15} /> Add UTXO</button></fieldset>}
+      {utxos.length < 3 && <button className="text-button" type="button" onClick={() => setUtxos((rows) => [...rows, { txid: '', output_index: 0 }])}><Plus size={15} /> Add UTXO</button>}</fieldset>}
     {kind === 'split_storm_eye' && <div className="form-grid split"><label>Transaction ID<input value={splitTxid} onChange={(event) => setSplitTxid(event.target.value)} required /></label>
       <label>Output index<input type="number" min="0" value={splitIndex} onChange={(event) => setSplitIndex(Number(event.target.value))} required /></label>
-      <label>Number of splits<input type="number" min="2" value={splitCount} onChange={(event) => setSplitCount(Number(event.target.value))} required /></label></div>}
+      <label>Number of splits<input type="number" min="2" max="3" value={splitCount} onChange={(event) => setSplitCount(Number(event.target.value))} required /></label></div>}
     {error && <div className="form-error" role="alert">{error}</div>}
     <footer className="modal-actions"><button className="secondary-button" type="button" onClick={onCancel}>Cancel</button>
       <button className="primary-button" disabled={busy}>{busy ? 'Signing proposal…' : 'Create voting'}<ArrowRight size={17} /></button></footer>

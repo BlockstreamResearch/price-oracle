@@ -27,6 +27,7 @@ use super::{NodeMessage, NodeMessageKind, SigningError};
 
 const STORM_EYE_NAME: &str = "Storm Eye";
 const STORM_EYE_SUPPLY: u64 = 10_000;
+const INITIAL_STORM_EYE_UTXO_COUNT: usize = 6;
 const TICK_ASSET_NAME: &str = "Tick Asset";
 const TICK_ASSET_SUPPLY: u64 = 0;
 const REISSUANCE_TOKEN_SUPPLY: u64 = 1;
@@ -503,8 +504,20 @@ impl ElementsAssetIssuer {
             .into_iter()
             .next()
             .ok_or(AssetError::InvalidRpcResponse("raw issuance"))?;
+        let asset_id = decode_asset_hash(&issuance.asset, "asset id")?;
+        let mut transaction: Transaction = encode::deserialize(
+            &hex::decode(&issuance.hex)
+                .map_err(|_| AssetError::InvalidRpcResponse("raw Storm Eye issuance"))?,
+        )
+        .map_err(|_| AssetError::InvalidRpcResponse("raw Storm Eye issuance"))?;
+        Self::split_initial_storm_eye_output(
+            &mut transaction,
+            AssetId::from_byte_array(asset_id),
+            &Script::from(contract_script.clone()),
+        )?;
+        let issuance_hex = hex::encode(encode::serialize(&transaction));
         let signed: SignedTransaction =
-            client.call("signrawtransactionwithwallet", &[issuance.hex.into()])?;
+            client.call("signrawtransactionwithwallet", &[issuance_hex.into()])?;
         if !signed.complete {
             return Err(AssetError::InvalidRpcResponse(
                 "complete signed transaction",
@@ -518,7 +531,7 @@ impl ElementsAssetIssuer {
             asset: NetworkAsset {
                 kind: STORM_EYE_KIND.to_string(),
                 name: STORM_EYE_NAME.to_string(),
-                asset_id: decode_asset_hash(&issuance.asset, "asset id")?,
+                asset_id,
                 reissuance_token_id: None,
                 entropy: Some(decode_asset_hash(&issuance.entropy, "asset entropy")?),
                 issuance_txid: decode_hash(&decoded.txid, "issuance transaction id")?,
@@ -530,6 +543,39 @@ impl ElementsAssetIssuer {
             issuance_tx: hex::decode(signed.hex)
                 .map_err(|_| AssetError::InvalidRpcResponse("signed transaction hex"))?,
         })
+    }
+
+    fn split_initial_storm_eye_output(
+        transaction: &mut Transaction,
+        asset_id: AssetId,
+        contract_script: &Script,
+    ) -> Result<(), AssetError> {
+        let output_index = transaction
+            .output
+            .iter()
+            .position(|output| {
+                output.asset.explicit() == Some(asset_id)
+                    && output.value.explicit() == Some(STORM_EYE_SUPPLY)
+                    && output.script_pubkey == *contract_script
+            })
+            .ok_or(AssetError::InvalidRpcResponse("Storm Eye issuance output"))?;
+        let template = transaction.output[output_index].clone();
+        let amount = STORM_EYE_SUPPLY / INITIAL_STORM_EYE_UTXO_COUNT as u64;
+        let remainder = STORM_EYE_SUPPLY % INITIAL_STORM_EYE_UTXO_COUNT as u64;
+
+        for index in 0..INITIAL_STORM_EYE_UTXO_COUNT {
+            let mut output = template.clone();
+            output.value = simplex::simplicityhl::elements::confidential::Value::Explicit(
+                amount + u64::from((index as u64) < remainder),
+            );
+            if index == 0 {
+                transaction.output[output_index] = output;
+            } else {
+                transaction.output.push(output);
+            }
+        }
+
+        Ok(())
     }
 
     fn prepare_tick_asset(
@@ -974,6 +1020,46 @@ mod tests {
             ensure_explicit_outputs(&transaction),
             Err(AssetError::ConfidentialOutput(2))
         ));
+    }
+
+    #[test]
+    fn creates_six_initial_storm_eye_outputs_with_the_full_supply() {
+        let asset_id = AssetId::from_slice(&[1; 32]).unwrap();
+        let contract_script = Script::from(vec![0x51]);
+        let mut transaction = Transaction {
+            version: 2,
+            lock_time: simplex::simplicityhl::elements::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![TxOut {
+                asset: simplex::simplicityhl::elements::confidential::Asset::Explicit(asset_id),
+                value: simplex::simplicityhl::elements::confidential::Value::Explicit(
+                    STORM_EYE_SUPPLY,
+                ),
+                nonce: simplex::simplicityhl::elements::confidential::Nonce::Null,
+                script_pubkey: contract_script.clone(),
+                witness: Default::default(),
+            }],
+        };
+
+        ElementsAssetIssuer::split_initial_storm_eye_output(
+            &mut transaction,
+            asset_id,
+            &contract_script,
+        )
+        .unwrap();
+
+        assert_eq!(transaction.output.len(), INITIAL_STORM_EYE_UTXO_COUNT);
+        assert_eq!(
+            transaction
+                .output
+                .iter()
+                .map(|output| output.value.explicit().unwrap())
+                .sum::<u64>(),
+            STORM_EYE_SUPPLY
+        );
+        assert!(transaction.output.iter().all(|output| {
+            output.asset.explicit() == Some(asset_id) && output.script_pubkey == contract_script
+        }));
     }
 
     #[derive(Clone)]
