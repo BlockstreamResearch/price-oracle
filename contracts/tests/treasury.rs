@@ -6,36 +6,23 @@ mod common;
 use common::{assert_covenant_rejects, fund_script, issue_asset};
 
 use simplex::transaction::utxo::UTXO;
-use simplex::transaction::{
-    FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
-};
+use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, RequiredSignature};
 
-use contracts::artifacts::treasury::TreasuryProgram;
-use contracts::artifacts::treasury::derived_treasury::{TreasuryArguments, TreasuryWitness};
+use contracts::treasury::Treasury;
 
 const STORM_EYE_SUPPLY: u64 = 10_000;
 const TREASURY_AMOUNT: u64 = 1_000;
 
-// TODO: Consider to separate similar functions in commond dirctory.
 fn spend_transaction(
     context: &simplex::TestContext,
-    treasury: &TreasuryProgram,
+    treasury: &Treasury,
     treasury_utxo: &UTXO,
     auth_utxo: &UTXO,
 ) -> FinalTransaction {
     let signer = context.get_default_signer();
     let mut ft = FinalTransaction::new();
 
-    ft.add_program_input(
-        PartialInput::new(treasury_utxo.clone()),
-        ProgramInput::new(
-            Box::new(treasury.as_ref().clone()),
-            Box::new(TreasuryWitness {
-                storm_eye_input_index: 1,
-            }),
-        ),
-        RequiredSignature::None,
-    );
+    treasury.attach_spend(&mut ft, treasury_utxo, 1);
     ft.add_input(
         PartialInput::new(auth_utxo.clone()),
         RequiredSignature::NativeEcdsa,
@@ -60,9 +47,7 @@ fn spends_treasury_when_storm_eye_is_present(context: simplex::TestContext) -> a
     let signer = context.get_default_signer();
 
     let storm_eye_asset = issue_asset(&context, STORM_EYE_SUPPLY)?;
-    let treasury = TreasuryProgram::new(&TreasuryArguments {
-        storm_eye_asset_id: storm_eye_asset.into_inner().to_byte_array(),
-    });
+    let treasury = Treasury::new(storm_eye_asset);
 
     let treasury_script_pubkey = treasury.get_script_pubkey(context.get_network());
     let treasury_utxo = fund_script(&context, &treasury_script_pubkey, TREASURY_AMOUNT)?;
@@ -82,9 +67,7 @@ fn rejects_treasury_spend_without_storm_eye(context: simplex::TestContext) -> an
     let decoy_asset = issue_asset(&context, STORM_EYE_SUPPLY)?;
     assert_ne!(storm_eye_asset, decoy_asset);
 
-    let treasury = TreasuryProgram::new(&TreasuryArguments {
-        storm_eye_asset_id: storm_eye_asset.into_inner().to_byte_array(),
-    });
+    let treasury = Treasury::new(storm_eye_asset);
 
     let treasury_script_pubkey = treasury.get_script_pubkey(context.get_network());
     let treasury_utxo = fund_script(&context, &treasury_script_pubkey, TREASURY_AMOUNT)?;
