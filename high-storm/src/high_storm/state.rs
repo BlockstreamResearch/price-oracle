@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 
 use super::{
     HighStormDependencies, assets::Assets, burning::Burning, droplets::Droplets, indexer::Indexer,
-    signing::Signing, user_requests::UserRequestProcessor, voting::Voting,
+    prices::Prices, signing::Signing, user_requests::UserRequestProcessor, voting::Voting,
     voting_execution::VotingExecution,
 };
 
@@ -24,6 +24,7 @@ pub(crate) struct NetworkState {
     signing: Signing,
     voting: Voting,
     voting_execution: VotingExecution,
+    prices: Prices,
     assets: Assets,
     burning: Burning,
     droplets: Droplets,
@@ -90,6 +91,7 @@ impl NetworkState {
             monitored_utxos,
             droplets,
             user_requests,
+            price_attestations,
             elements_rpc,
             protocol_config,
         } = dependencies;
@@ -119,6 +121,7 @@ impl NetworkState {
                 elements_rpc.clone(),
                 protocol_config.exchange_transaction_fee_sats,
             ),
+            prices: Prices::new(secret_key, price_attestations, price_feed::Clock::System),
             assets: Assets::new(network_assets.clone()),
             burning: Burning::new(
                 monitored_utxos.clone(),
@@ -178,6 +181,10 @@ impl NetworkState {
         request_hash: [u8; 32],
     ) -> Option<VotingExecutionAttempt> {
         self.voting_execution_attempts.begin(request_hash)
+    }
+
+    pub(crate) fn prices(&self) -> &Prices {
+        &self.prices
     }
 
     pub(crate) fn assets(&self) -> &Assets {
@@ -311,6 +318,7 @@ mod tests {
                 database.monitored_utxos(),
                 database.droplets(),
                 database.user_requests(),
+                database.price_attestations(),
                 ElementsRpcConfig {
                     url: "http://127.0.0.1:18884".to_string(),
                     username: "unused".to_string(),
