@@ -1,3 +1,4 @@
+use price_feed::PriceFeedData;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use storm::{CustomMsg, StormMessage};
@@ -232,6 +233,20 @@ impl NodeMessageKind {
     pub(crate) fn requires_coordinator(self) -> bool {
         matches!(self, Self::ExecuteUserRequests | Self::NetworkAssets)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriceAttestation {
+    pub feed: PriceFeedData,
+    // BIP-340 over the canonical encoding of `feed`
+    pub signature: Vec<u8>,
+    pub public_key: [u8; 32],
+}
+
+/// Carries only the feeds that produced a new observation this cycle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestPriceMsg {
+    pub attestations: Vec<PriceAttestation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
