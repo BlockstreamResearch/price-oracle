@@ -8,9 +8,9 @@ use bitcoincore_rpc::{Auth, Client, RpcApi};
 use contracts::artifacts::{
     account::{AccountProgram, derived_account::AccountArguments},
     auth::derived_auth::AuthWitness,
-    tick_asset::{
-        TickAssetProgram,
-        derived_tick_asset::{TickAssetArguments, TickAssetWitness},
+    voucher::{
+        VoucherProgram,
+        derived_voucher::{VoucherArguments, VoucherWitness},
     },
 };
 use secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
@@ -258,7 +258,7 @@ impl Burning {
                     PartialInput::new(tick_utxo.clone()),
                     ProgramInput::new(
                         Box::new(program.as_ref().clone()),
-                        Box::new(TickAssetWitness {
+                        Box::new(VoucherWitness {
                             path: Either::Right(Either::Right(0)),
                         }),
                     ),
@@ -720,8 +720,8 @@ fn select_groups(expired: Vec<MonitoredUtxo>) -> Result<Vec<BurnGroup>, BurningE
 fn tick_program(
     storm_eye_asset_id: [u8; 32],
     tick: &MonitoredUtxo,
-) -> Result<TickAssetProgram, BurningError> {
-    let mut arguments = TickAssetArguments {
+) -> Result<VoucherProgram, BurningError> {
+    let mut arguments = VoucherArguments {
         storm_eye_asset_id,
         auth_method: 0,
         auth_asset_id: [0; 32],
@@ -744,7 +744,7 @@ fn tick_program(
             ));
         }
     }
-    Ok(TickAssetProgram::new(&arguments))
+    Ok(VoucherProgram::new(&arguments))
 }
 
 fn fee_share(total: u64, groups: usize, index: usize) -> Result<u64, BurningError> {

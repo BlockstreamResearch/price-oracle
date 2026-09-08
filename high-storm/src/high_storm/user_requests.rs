@@ -7,11 +7,11 @@ use bitcoincore_rpc::{Auth, Client, RpcApi};
 use contracts::artifacts::{
     account::{AccountProgram, derived_account::AccountArguments},
     auth::derived_auth::AuthWitness,
-    tick_asset::{TickAssetProgram, derived_tick_asset::TickAssetArguments},
     treasury::{
         TreasuryProgram,
         derived_treasury::{TreasuryArguments, TreasuryWitness},
     },
+    voucher::{VoucherProgram, derived_voucher::VoucherArguments},
 };
 use secp256k1_zkp::{
     Message, PublicKey, RangeProof, Secp256k1, SurjectionProof, XOnlyPublicKey, schnorr::Signature,
@@ -1310,8 +1310,8 @@ fn validate_execute_request(
 fn tick_program(
     storm_eye_asset_id: [u8; 32],
     details: &TickUtxoRequestDetails,
-) -> Result<TickAssetProgram, UserRequestError> {
-    let mut arguments = TickAssetArguments {
+) -> Result<VoucherProgram, UserRequestError> {
+    let mut arguments = VoucherArguments {
         storm_eye_asset_id,
         auth_method: 0,
         auth_asset_id: [0; 32],
@@ -1341,7 +1341,7 @@ fn tick_program(
         }
     }
 
-    Ok(TickAssetProgram::new(&arguments))
+    Ok(VoucherProgram::new(&arguments))
 }
 
 fn validate_accounting_outputs(

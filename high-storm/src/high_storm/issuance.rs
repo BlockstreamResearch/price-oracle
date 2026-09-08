@@ -1,4 +1,4 @@
-use contracts::artifacts::tick_asset::{TickAssetProgram, derived_tick_asset::TickAssetArguments};
+use contracts::artifacts::voucher::{VoucherProgram, derived_voucher::VoucherArguments};
 use simplex::{
     provider::SimplicityNetwork,
     simplicityhl::elements::{Script, opcodes, script::Instruction},
@@ -130,8 +130,8 @@ impl IssuedTickDescriptor {
         }
     }
 
-    pub(crate) fn tick_program(&self, storm_eye_asset_id: [u8; 32]) -> TickAssetProgram {
-        let mut arguments = TickAssetArguments {
+    pub(crate) fn tick_program(&self, storm_eye_asset_id: [u8; 32]) -> VoucherProgram {
+        let mut arguments = VoucherArguments {
             storm_eye_asset_id,
             auth_method: self.auth_kind as u32,
             auth_asset_id: [0; 32],
@@ -144,7 +144,7 @@ impl IssuedTickDescriptor {
             2 => arguments.auth_pubkey = self.auth_data,
             _ => unreachable!("descriptor authentication kind is validated"),
         }
-        TickAssetProgram::new(&arguments)
+        VoucherProgram::new(&arguments)
     }
 
     pub(crate) fn matches_tick_script(
