@@ -5,10 +5,8 @@ edition = "2024"
 
 [dependencies]
 smplx-std = { git = "https://github.com/BlockstreamResearch/smplx", rev = "c1e9d8b06231973d81fbaa677cf3f03787104b81" }
-
-[dev-dependencies]
 thiserror.workspace = true
-
 storm-tree = { path = "../storm-tree" }
 
+[dev-dependencies]
 anyhow = "1"
