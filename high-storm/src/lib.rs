@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+mod crypto;
 pub mod db;
 pub mod external_api;
 pub mod high_storm;
@@ -14,11 +15,11 @@ use storm::{Peer, Storm};
 use crate::config::Config;
 use crate::high_storm::HighStormDependencies;
 pub use high_storm::{
-    ApproveVotingRequest, AssetError, ExecuteUserRequests, ExternalRequests, HighStorm,
-    HighStormHandle, MergeStormEyes, NetworkAsset, NetworkAssets, NetworkVoteKind,
-    NetworkVoteRequest, NodeMessage, NodeMessageKind, SigningError, SigningResult, SplitStormEye,
-    StormEyeUtxo, UpdateNetworkMembers, UserRequestError, VOTING_TIMEOUT_BLOCKS, VotingApproval,
-    VotingError, VotingRequest, VotingStatus,
+    ApproveVotingRequest, AssetError, AttestPriceMsg, ExecuteUserRequests, ExternalRequests,
+    HighStorm, HighStormHandle, MergeStormEyes, NetworkAsset, NetworkAssets, NetworkVoteKind,
+    NetworkVoteRequest, NodeMessage, NodeMessageKind, PriceAttestation, PriceError, SigningError,
+    SigningResult, SplitStormEye, StormEyeUtxo, UpdateNetworkMembers, UserRequestError,
+    VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError, VotingRequest, VotingStatus,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -127,6 +128,7 @@ pub async fn start_initialized(config: &Config, store: &NetworkStore) -> Result<
             store.network_assets(),
             store.monitored_utxos(),
             store.user_requests(),
+            store.price_attestations(),
             config.service.elements_rpc.clone(),
             config.service.user_requests.clone(),
         ),
@@ -170,6 +172,7 @@ async fn initialize(
                     store.network_assets(),
                     store.monitored_utxos(),
                     store.user_requests(),
+                    store.price_attestations(),
                     config.service.elements_rpc.clone(),
                     config.service.user_requests.clone(),
                 ),
