@@ -5,7 +5,7 @@ use storm::{Peer, PeerStatus};
 
 use super::{
     monitored_utxo::MonitoredUtxoStore, network_asset::NetworkAssetStore,
-    user_request::UserRequestStore, voting::VotingStore,
+    price_attestation::PriceAttestationStore, user_request::UserRequestStore, voting::VotingStore,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +42,10 @@ impl NetworkStore {
 
     pub(crate) fn monitored_utxos(&self) -> MonitoredUtxoStore {
         MonitoredUtxoStore::new(self.pool.clone())
+    }
+
+    pub(crate) fn price_attestations(&self) -> PriceAttestationStore {
+        PriceAttestationStore::new(self.pool.clone())
     }
 
     pub(crate) fn user_requests(&self) -> UserRequestStore {

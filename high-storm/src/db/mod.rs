@@ -2,6 +2,7 @@ pub mod monitored_utxo;
 pub mod network;
 pub mod network_asset;
 pub mod node_operator;
+pub mod price_attestation;
 pub mod user_request;
 pub mod voting;
 
@@ -11,6 +12,7 @@ use sqlx::{AnyPool, any::AnyPoolOptions};
 use monitored_utxo::MonitoredUtxoStore;
 use network::NetworkStore;
 use network_asset::NetworkAssetStore;
+use price_attestation::PriceAttestationStore;
 use user_request::UserRequestStore;
 use voting::VotingStore;
 
@@ -56,6 +58,10 @@ impl Database {
 
     pub fn node_operators(&self) -> NodeOperatorStore {
         NodeOperatorStore::new(self.pool.clone())
+    }
+
+    pub fn price_attestations(&self) -> PriceAttestationStore {
+        PriceAttestationStore::new(self.pool.clone())
     }
 
     pub fn user_requests(&self) -> UserRequestStore {
