@@ -3,7 +3,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{assert_covenant_rejects, fund_script, issue_asset};
+use common::{assert_covenant_rejects, issue_asset};
 
 use simplex::transaction::utxo::UTXO;
 use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, RequiredSignature};
@@ -12,6 +12,33 @@ use contracts::treasury::{Treasury, TreasuryParameters};
 
 const STORM_EYE_SUPPLY: u64 = 10_000;
 const TREASURY_AMOUNT: u64 = 1_000;
+
+/// Funds `treasury` with `amount` of the policy asset and returns the resulting UTXO.
+fn fund_treasury(
+    context: &simplex::TestContext,
+    treasury: &Treasury,
+    amount: u64,
+) -> anyhow::Result<UTXO> {
+    let signer = context.get_default_signer();
+    let funding_utxo = signer.get_utxos_asset(context.get_network().policy_asset())?[0].clone();
+
+    let mut ft = FinalTransaction::new();
+    ft.add_input(
+        PartialInput::new(funding_utxo),
+        RequiredSignature::NativeEcdsa,
+    );
+
+    treasury.attach_treasury_output(&mut ft, amount, context.get_network().policy_asset());
+
+    signer.broadcast(&ft)?.wait()?;
+
+    context
+        .get_default_provider()
+        .fetch_scripthash_utxos(&treasury.get_script_pubkey())?
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("funding transaction produced no UTXO"))
+}
 
 fn spend_transaction(
     context: &simplex::TestContext,
@@ -52,8 +79,7 @@ fn spends_treasury_when_storm_eye_is_present(context: simplex::TestContext) -> a
         network: *context.get_network(),
     });
 
-    let treasury_script_pubkey = treasury.get_script_pubkey();
-    let treasury_utxo = fund_script(&context, &treasury_script_pubkey, TREASURY_AMOUNT)?;
+    let treasury_utxo = fund_treasury(&context, &treasury, TREASURY_AMOUNT)?;
     let storm_eye_utxo = signer.get_utxos_asset(storm_eye_asset)?[0].clone();
 
     let ft = spend_transaction(&context, &treasury, &treasury_utxo, &storm_eye_utxo);
@@ -75,8 +101,7 @@ fn rejects_treasury_spend_without_storm_eye(context: simplex::TestContext) -> an
         network: *context.get_network(),
     });
 
-    let treasury_script_pubkey = treasury.get_script_pubkey();
-    let treasury_utxo = fund_script(&context, &treasury_script_pubkey, TREASURY_AMOUNT)?;
+    let treasury_utxo = fund_treasury(&context, &treasury, TREASURY_AMOUNT)?;
 
     let decoy_utxo = signer.get_utxos_asset(decoy_asset)?[0].clone();
 
