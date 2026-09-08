@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use simplex::simplicityhl::elements::AssetId;
 
 use super::{ApiError, ExternalApiState};
+use crate::crypto::tagged_hash;
 use crate::db::{
     network_asset::{STORM_EYE_KIND, TICK_ASSET_KIND},
     user_request::{FeeUtxo, InsertPendingResult},
@@ -353,15 +354,6 @@ pub(super) fn signing_hash(request: &NetworkUserRequests) -> [u8; 32] {
         message.extend_from_slice(fee_utxo.as_bytes());
     }
     tagged_hash(USER_REQUEST_TAG, &message)
-}
-
-fn tagged_hash(tag: &str, message: &[u8]) -> [u8; 32] {
-    let tag_hash = Sha256::digest(tag.as_bytes());
-    let mut hash = Sha256::new();
-    hash.update(tag_hash);
-    hash.update(tag_hash);
-    hash.update(message);
-    hash.finalize().into()
 }
 
 fn parse_hex_array<const N: usize>(encoded: &str, name: &str) -> Result<[u8; N], ApiError> {
