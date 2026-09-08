@@ -443,7 +443,7 @@ fn checked_unique_keys(keys: &[[u8; 32]], label: &str) -> Result<BTreeSet<[u8; 3
     Ok(unique)
 }
 
-fn member_keys(peers: &[Peer]) -> Result<BTreeSet<[u8; 32]>, VotingError> {
+pub(super) fn member_keys(peers: &[Peer]) -> Result<BTreeSet<[u8; 32]>, VotingError> {
     peers
         .iter()
         .map(|peer| {
@@ -458,7 +458,7 @@ fn required_approvals(member_count: usize) -> usize {
     (member_count * 2).div_ceil(3)
 }
 
-fn active_remote_peers(peers: &[Peer]) -> Vec<[u8; 33]> {
+pub(super) fn active_remote_peers(peers: &[Peer]) -> Vec<[u8; 33]> {
     peers
         .iter()
         .filter(|peer| peer.status == PeerStatus::Active)
