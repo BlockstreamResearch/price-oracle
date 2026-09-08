@@ -109,15 +109,15 @@ require_docker() {
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") {create|up|rebuild|down|connections NODE|top-up-droplets NODE AMOUNT|elements NODE [RPC ARGUMENTS...]}
+Usage: $(basename "$0") {create|up|rebuild|down|connections NODE|droplets NODE SATS|elements NODE [RPC ARGUMENTS...]}
 
     create             Delete the deployment and data, rebuild, and start fresh.
     up                 Start the deployment while preserving existing data.
     rebuild            Rebuild application images and restart while preserving data.
     down               Stop and remove the deployment while preserving existing data.
     connections NODE   List active Storm connections for node 1, 2, or 3.
-    top-up-droplets NODE AMOUNT
-                       Deposit AMOUNT LBTC to Treasury and credit all Droplets to NODE.
+    droplets NODE SATS
+                       Deposit SATS to Treasury and credit all Droplets to NODE.
     elements NODE ...  Call Elements RPC on node 1, 2, or 3. Defaults to getblockchaininfo.
 EOF
 }
@@ -163,7 +163,7 @@ case "${1:-}" in
             --pset pager=off \
             --command "SELECT public_key AS peer_public_key, socket_address, to_timestamp(last_seen) AS last_heartbeat FROM network_peers WHERE status = 'active' AND last_seen >= EXTRACT(EPOCH FROM now())::BIGINT - 15 ORDER BY public_key"
         ;;
-    top-up-droplets)
+    droplets)
         case "${2:-}" in
             1|2|3)
                 database="high-storm-node-${2}"
@@ -173,14 +173,12 @@ case "${1:-}" in
                 exit 2
                 ;;
         esac
-        amount="${3:-}"
-        amount_digits="${amount//./}"
-        amount_digits="${amount_digits//0/}"
-        if [[ ! "${amount}" =~ ^[0-9]+([.][0-9]{1,8})?$ ]] || \
-            [[ "${amount}" =~ ^0[0-9] ]] || [[ -z "${amount_digits}" ]]; then
-            echo "AMOUNT must be a positive LBTC amount with at most 8 decimals." >&2
+        amount_sats="${3:-}"
+        if [[ ! "${amount_sats}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "SATS must be a positive integer." >&2
             exit 2
         fi
+        amount_lbtc="$(python3 -c 'import sys; sats = int(sys.argv[1]); print(f"{sats // 100_000_000}.{sats % 100_000_000:08d}")' "${amount_sats}")"
         for service in postgres elements-1; do
             if [[ "$(compose ps --status running --services "${service}")" != "${service}" ]]; then
                 echo "${service} is not running." >&2
@@ -219,7 +217,7 @@ case "${1:-}" in
             exit 1
         fi
 
-        outputs="[{\"${treasury_address}\":${amount}},{\"data\":\"${member_marker}\"}]"
+        outputs="[{\"${treasury_address}\":${amount_lbtc}},{\"data\":\"${member_marker}\"}]"
         wallet_utxos="$(compose exec -T elements-1 elements-cli \
             -chain=elementsregtest -rpcport=18884 -rpcuser=high-storm -rpcpassword=high-storm \
             -rpcwallet=funded-key listunspent 1 9999999)"
@@ -233,7 +231,8 @@ case "${1:-}" in
             -rpcwallet=funded-key createrawtransaction '[]' "${outputs}")"
         funded="$(compose exec -T elements-1 elements-cli \
             -chain=elementsregtest -rpcport=18884 -rpcuser=high-storm -rpcpassword=high-storm \
-            -rpcwallet=funded-key fundrawtransaction "${raw}" "{\"changeAddress\":\"${change_address}\"}")"
+            -rpcwallet=funded-key fundrawtransaction "${raw}" \
+            "{\"changeAddress\":\"${change_address}\",\"changePosition\":2}")"
         funded_hex="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["hex"])' <<<"${funded}")"
         signed="$(compose exec -T elements-1 elements-cli \
             -chain=elementsregtest -rpcport=18884 -rpcuser=high-storm -rpcpassword=high-storm \
@@ -249,7 +248,7 @@ case "${1:-}" in
             -chain=elementsregtest -rpcport=18884 -rpcuser=high-storm -rpcpassword=high-storm \
             generatetoaddress 1 "${mining_address}" >/dev/null
 
-        echo "Deposited ${amount} LBTC for node-${2} (${xonly_key}) in ${txid}."
+        echo "Deposited ${amount_sats} sats for node-${2} (${xonly_key}) in ${txid}."
         ;;
     elements)
         case "${2:-}" in

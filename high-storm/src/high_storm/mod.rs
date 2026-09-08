@@ -15,6 +15,7 @@ mod signing;
 mod state;
 mod user_requests;
 mod voting;
+mod voting_execution;
 
 pub use assets::AssetError;
 pub use burning::BurningError;
@@ -23,14 +24,15 @@ pub(crate) use droplets::exchange_recipient_amount;
 pub use indexer::IndexerError;
 pub use message::{
     ApproveVotingRequest, BurnExpiredUtxos, ExchangeRewards, ExecuteUserRequests,
-    ExpiredUtxosBurned, ExternalRequests, MergeStormEyes, NetworkAsset, NetworkAssets,
-    NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind, SplitStormEye, StormEyeUtxo,
-    UpdateNetworkMembers,
+    ExecuteVotingRequest, ExpiredUtxosBurned, ExternalRequests, MergeStormEyes, NetworkAsset,
+    NetworkAssets, NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind,
+    SplitStormEye, StormEyeUtxo, UpdateNetworkMembers,
 };
 pub use signing::{SigningError, SigningResult};
 use state::NetworkState;
 pub use user_requests::UserRequestError;
 pub use voting::{VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError, VotingRequest, VotingStatus};
+pub use voting_execution::{StormEyeInventoryItem, StormEyeState, VotingExecutionError};
 
 /// A long-lived Oracle Network node and its higher-level protocol state.
 pub struct HighStorm {
@@ -638,6 +640,162 @@ impl HighStormHandle {
             .await
     }
 
+    pub async fn execute_voting_request(
+        &self,
+        request_hash: [u8; 32],
+    ) -> Result<[u8; 32], VotingExecutionError> {
+        let request = self.state.voting_execution().prepare(request_hash).await?;
+        let proposer = request.proposer_public_key;
+        let local = leader::local_public_key(&self.peers().await).ok_or_else(|| {
+            VotingExecutionError::Invalid("local network member is missing".into())
+        })?;
+        let local = PublicKey::from_slice(&local)
+            .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?
+            .x_only_public_key()
+            .0
+            .serialize();
+        if local != proposer {
+            return Err(VotingExecutionError::Invalid(
+                "only the node that proposed a voting request may execute it".into(),
+            ));
+        }
+
+        self.state
+            .voting_execution()
+            .begin(request_hash, &request, self.state.block_height())
+            .await?;
+        let signing = match self
+            .state
+            .signing()
+            .sign_execute_voting_request(
+                &self.storm,
+                request_hash,
+                request.tx.clone(),
+                request.signing_hashes.clone(),
+                proposer,
+            )
+            .await
+        {
+            Ok(signing) => signing,
+            Err(error) => {
+                self.cancel_voting_execution(request_hash, proposer).await;
+                return Err(error.into());
+            }
+        };
+        let proof = match self
+            .state
+            .signing()
+            .storm_tree_proof(&signing.signing_storm_tree_branch)
+            .await
+        {
+            Ok(proof) => proof,
+            Err(error) => {
+                self.cancel_voting_execution(request_hash, proposer).await;
+                return Err(error.into());
+            }
+        };
+        let prepared = match self
+            .state
+            .voting_execution()
+            .prepare_finalization(request_hash, &request)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let message = error.to_string();
+                self.schedule_cancel_voting_execution(request_hash, proposer);
+                return Err(VotingExecutionError::Invalid(message));
+            }
+        };
+        let (txid, notification) = match self
+            .state
+            .voting_execution()
+            .finalize(prepared, signing, proof)
+        {
+            Ok(finalized) => finalized,
+            Err(error) => {
+                let message = error.to_string();
+                drop(error);
+                self.cancel_voting_execution(request_hash, proposer).await;
+                return Err(VotingExecutionError::Invalid(message));
+            }
+        };
+        if let Err(error) = self.state.voting_execution().broadcast(txid, &notification) {
+            let message = error.to_string();
+            drop(error);
+            self.cancel_voting_execution(request_hash, proposer).await;
+            return Err(VotingExecutionError::Invalid(message));
+        }
+        if let Err(error) = self
+            .announce_voting_execution(request_hash, &notification)
+            .await
+        {
+            tracing::warn!(%error, "failed to announce executed voting request");
+        }
+        for attempt in 1..=3 {
+            match self
+                .state
+                .voting_execution()
+                .complete(request_hash, proposer, txid)
+                .await
+            {
+                Ok(()) => return Ok(txid),
+                Err(error) if attempt == 3 => return Err(error),
+                Err(error) => {
+                    tracing::warn!(%error, attempt, "failed to persist executed voting request");
+                }
+            }
+        }
+        unreachable!("the execution persistence loop always returns")
+    }
+
+    async fn cancel_voting_execution(&self, request_hash: [u8; 32], proposer: [u8; 32]) {
+        if let Err(error) = self
+            .state
+            .voting_execution()
+            .cancel(request_hash, proposer, self.state.block_height())
+            .await
+        {
+            tracing::error!(%error, "failed to cancel voting execution");
+        }
+    }
+
+    fn schedule_cancel_voting_execution(&self, request_hash: [u8; 32], proposer: [u8; 32]) {
+        let handle = self.clone();
+        tokio::spawn(async move {
+            handle.cancel_voting_execution(request_hash, proposer).await;
+        });
+    }
+
+    async fn announce_voting_execution(
+        &self,
+        request_hash: [u8; 32],
+        notification: &ExecuteVotingRequest,
+    ) -> Result<(), SigningError> {
+        let recipients = self
+            .peers()
+            .await
+            .into_iter()
+            .filter(|peer| peer.status == PeerStatus::Active)
+            .map(|peer| {
+                PublicKey::from_slice(&peer.compressed_public_key).map_err(|_| {
+                    SigningError::InvalidMessage("invalid voting notification recipient".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if recipients.is_empty() {
+            return Ok(());
+        }
+        let message = NodeMessage::new(
+            NodeMessageKind::ExecuteVotingRequest,
+            Some(request_hash),
+            notification,
+        )?
+        .into_storm_message()?;
+        self.storm.send_message(message, &recipients).await?;
+        Ok(())
+    }
+
     pub async fn voting_request(
         &self,
         request_hash: [u8; 32],
@@ -647,6 +805,15 @@ impl HighStormHandle {
 
     pub async fn voting_requests(&self) -> Result<Vec<VotingRequest>, VotingError> {
         self.state.voting().list().await
+    }
+
+    pub async fn storm_eye_utxos(
+        &self,
+    ) -> Result<Vec<StormEyeInventoryItem>, VotingExecutionError> {
+        self.state
+            .voting_execution()
+            .storm_eye_utxos(self.state.block_height())
+            .await
     }
 
     pub async fn network_asset(&self, kind: &str) -> Result<Option<NetworkAsset>, AssetError> {

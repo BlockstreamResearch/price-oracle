@@ -1,4 +1,4 @@
-import { Clock3, KeyRound, LogOut, Radio, ShieldCheck } from 'lucide-react'
+import { Clock3, KeyRound, LogOut, Network, Radio, ShieldCheck } from 'lucide-react'
 import { useAuth } from '../auth-context'
 import { CopyableHex } from '../components/CopyableHex'
 
@@ -15,6 +15,7 @@ export function SettingsPage() {
         <dl className="settings-list">
           <div><dt><KeyRound size={16} /> Public key</dt><dd><CopyableHex value={session.identity.publicKey} visible={13} label="operator public key" /></dd></div>
           <div><dt><Radio size={16} /> Authentication address</dt><dd><code>{session.identity.address}</code></dd></div>
+          <div><dt><Network size={16} /> Elements network</dt><dd><code>{session.identity.network}</code></dd></div>
           <div><dt><Clock3 size={16} /> Session expires</dt><dd>{new Date(session.expiresAt * 1000).toLocaleString()}</dd></div>
         </dl>
       </section>

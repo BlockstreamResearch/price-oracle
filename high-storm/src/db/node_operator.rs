@@ -46,6 +46,18 @@ impl NodeOperatorStore {
         Ok(count > 0)
     }
 
+    pub async fn contains_xonly(&self, public_key: [u8; 32]) -> Result<bool, Error> {
+        for stored_public_key in self.list().await? {
+            let stored_public_key = secp256k1::PublicKey::from_slice(&stored_public_key)
+                .map_err(|_| Error::InvalidPublicKey)?;
+            if stored_public_key.x_only_public_key().0.serialize() == public_key {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
     pub async fn list(&self) -> Result<Vec<[u8; 33]>, Error> {
         sqlx::query("SELECT public_key FROM node_operators ORDER BY public_key")
             .fetch_all(&self.pool)

@@ -1,5 +1,5 @@
 import { createWriteMessage } from "./crypto";
-import type { OperatorIdentity, OperatorSession } from "./types";
+import type { AuthNetwork, OperatorIdentity, OperatorSession } from "./types";
 
 type ApiErrorBody = { error?: string };
 
@@ -15,13 +15,15 @@ export class ApiError extends Error {
 export async function authenticateOperator(
   identity: OperatorIdentity,
 ): Promise<OperatorSession> {
-  const challenge = await requestJson<{ message: string; expires_at: number }>(
-    "/operators/auth/challenge",
-    {
-      method: "POST",
-      body: JSON.stringify({ public_key: identity.publicKey }),
-    },
-  );
+  const challenge = await requestJson<{
+    message: string;
+    expires_at: number;
+    network: AuthNetwork;
+  }>("/operators/auth/challenge", {
+    method: "POST",
+    body: JSON.stringify({ public_key: identity.publicKey }),
+  });
+  identity.configureNetwork(challenge.network);
   const signature = await identity.sign(challenge.message);
   const access = await requestJson<{ token: string; expires_at: number }>(
     "/operators/auth/token",

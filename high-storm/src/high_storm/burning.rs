@@ -47,9 +47,9 @@ use super::{
     message::{BurnExpiredUtxos, ExpiredUtxosBurned, StormEyeUtxo},
     signing::SigningError,
     user_requests::{
-        STORM_EYE_TAG, UserRequestError, asset_id, find_contract_utxo, get_explicit_outpoint,
-        get_optional_explicit_outpoint, output_from_utxo, pack_proof, require_explicit_utxo,
-        require_preserved_output, witness_utxo,
+        STORM_EYE_TAG, StormEyePool, UserRequestError, asset_id, find_contract_utxo,
+        get_explicit_outpoint, get_optional_explicit_outpoint, output_from_utxo, pack_proof,
+        require_explicit_utxo, require_preserved_output, witness_utxo,
     },
 };
 
@@ -206,6 +206,7 @@ impl Burning {
             &client,
             &storm_eye.contract_script,
             Some(storm_eye.asset_id),
+            StormEyePool::NetworkLeader,
         )?;
         let auth_program = storm_eye_program(&storm_eye)?;
         let contract_data: StormEyeContractData =

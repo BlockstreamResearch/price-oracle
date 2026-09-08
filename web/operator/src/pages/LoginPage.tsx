@@ -55,7 +55,7 @@ export function LoginPage() {
             <span>{submitting ? 'Signing challenge…' : 'Authenticate'}</span><ArrowRight size={18} />
           </button>
         </form>
-        <div className="login-meta"><span>HIGH-STORM</span><span>BIP322 / MAINNET</span></div>
+        <div className="login-meta"><span>HIGH-STORM</span><span>BIP322 / ELEMENTS</span></div>
       </section>
 
       <section className="login-visual" aria-label="Storm network status graphic">

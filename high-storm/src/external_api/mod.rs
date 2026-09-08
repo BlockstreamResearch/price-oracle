@@ -11,14 +11,15 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use serde::Serialize;
+use bitcoincore_rpc::{Auth, Client, RpcApi};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     HighStormHandle, VotingError,
     db::{Database, node_operator::NodeOperatorStore, user_request::UserRequestStore},
 };
 use fee_utxo::{FeeUtxoValidationError, FeeUtxoValidator};
-use operators::{AuthError, AuthService};
+use operators::{AuthError, AuthService, auth::AuthNetwork};
 
 #[derive(Clone)]
 pub(super) struct ExternalApiState {
@@ -42,6 +43,7 @@ impl ExternalApiServer {
         protocol_config: &crate::config::ProtocolConfig,
     ) -> Result<Self, ExternalApiError> {
         let listener = tokio::net::TcpListener::bind(address).await?;
+        let auth_network = detect_auth_network(elements_rpc.clone()).await?;
         let fee_utxos = FeeUtxoValidator::new(
             elements_rpc,
             database.network_assets(),
@@ -55,6 +57,7 @@ impl ExternalApiServer {
                 database.node_operators(),
                 database.user_requests(),
                 fee_utxos,
+                auth_network,
             ),
         })
     }
@@ -73,10 +76,11 @@ pub(crate) fn router(
     operators: NodeOperatorStore,
     user_requests: UserRequestStore,
     fee_utxos: FeeUtxoValidator,
+    auth_network: AuthNetwork,
 ) -> Router {
     let state = ExternalApiState {
         node,
-        auth: AuthService::new(operators),
+        auth: AuthService::new(operators, auth_network),
         user_requests,
         fee_utxos,
     };
@@ -92,6 +96,32 @@ pub enum ExternalApiError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     FeeUtxoValidation(#[from] FeeUtxoValidationError),
+    #[error(transparent)]
+    Rpc(#[from] bitcoincore_rpc::Error),
+    #[error("unsupported Elements chain '{0}'")]
+    UnsupportedChain(String),
+    #[error("Elements chain detection task failed: {0}")]
+    ChainDetectionTask(#[from] tokio::task::JoinError),
+}
+
+#[derive(Deserialize)]
+struct ChainInfo {
+    chain: String,
+}
+
+async fn detect_auth_network(
+    elements_rpc: crate::config::ElementsRpcConfig,
+) -> Result<AuthNetwork, ExternalApiError> {
+    tokio::task::spawn_blocking(move || {
+        let client = Client::new(
+            &elements_rpc.url,
+            Auth::UserPass(elements_rpc.username, elements_rpc.password),
+        )?;
+        let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
+        AuthNetwork::from_chain(&chain.chain)
+            .ok_or_else(|| ExternalApiError::UnsupportedChain(chain.chain))
+    })
+    .await?
 }
 
 #[derive(Serialize)]

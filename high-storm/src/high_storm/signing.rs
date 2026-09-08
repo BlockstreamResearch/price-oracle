@@ -20,8 +20,8 @@ use tokio::{
 };
 
 use super::message::{
-    BurnExpiredUtxos, ExchangeRewards, ExecuteUserRequests, ExternalRequests, NodeMessage,
-    NodeMessageKind, PartialSignaturesMessage, SigningNoncesMessage,
+    BurnExpiredUtxos, ExchangeRewards, ExecuteUserRequests, ExecuteVotingRequest, ExternalRequests,
+    NodeMessage, NodeMessageKind, PartialSignaturesMessage, SigningNoncesMessage,
 };
 
 const SIGNING_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -162,7 +162,7 @@ impl Signing {
         }
 
         self.sign_with_message(
-            storm,
+            &storm.handle(),
             vec![signing_hash],
             SIGNING_SESSION_TIMEOUT,
             move |branch| {
@@ -195,7 +195,7 @@ impl Signing {
         }
 
         self.sign_with_message(
-            storm,
+            &storm.handle(),
             vec![signing_hash],
             SIGNING_SESSION_TIMEOUT,
             move |branch| {
@@ -228,7 +228,7 @@ impl Signing {
         }
 
         self.sign_with_message(
-            storm,
+            &storm.handle(),
             vec![signing_hash],
             SIGNING_SESSION_TIMEOUT,
             move |branch| {
@@ -248,9 +248,38 @@ impl Signing {
         .await
     }
 
+    pub(crate) async fn sign_execute_voting_request(
+        &self,
+        storm: &StormHandle,
+        request_hash: [u8; 32],
+        tx: Vec<u8>,
+        signing_hashes: Vec<[u8; 32]>,
+        proposer_public_key: NodePublicKey,
+    ) -> Result<SigningResult, SigningError> {
+        self.sign_with_message(
+            storm,
+            signing_hashes.clone(),
+            SIGNING_SESSION_TIMEOUT,
+            move |branch| {
+                NodeMessage::new(
+                    NodeMessageKind::ExecuteVotingRequest,
+                    Some(request_hash),
+                    &ExecuteVotingRequest {
+                        tx: tx.clone(),
+                        final_tx: None,
+                        signing_hashes: signing_hashes.clone(),
+                        signing_storm_tree_branch: branch,
+                        proposer_public_key,
+                    },
+                )
+            },
+        )
+        .await
+    }
+
     async fn sign_with_message<F>(
         &self,
-        storm: &Storm,
+        storm: &StormHandle,
         message_hashes: Vec<[u8; 32]>,
         attempt_timeout: Duration,
         make_message: F,
@@ -483,6 +512,45 @@ impl Signing {
             .await?;
         }
 
+        Ok(())
+    }
+
+    pub(crate) async fn handle_execute_voting_request(
+        &self,
+        message: NodeMessage,
+        context: &StormContext,
+    ) -> Result<(), SigningError> {
+        let request: ExecuteVotingRequest = message.decode_payload()?;
+        if request.tx.is_empty() || request.final_tx.is_some() {
+            return Err(SigningError::InvalidMessage(
+                "invalid voting execution transaction".into(),
+            ));
+        }
+        let request_hash = message.hash()?;
+        let peers = context.storm_handle.peers().await;
+        let sender = node_key(&context.message_context.peer_public_key)?;
+        let outbound = {
+            let mut state = self.state.lock().await;
+            state.refresh_members(&peers)?;
+            state.remove_expired_sessions();
+            state.start_session(
+                request_hash,
+                sender,
+                SigningRequest {
+                    signing_storm_tree_branch: request.signing_storm_tree_branch,
+                    message_hashes: request.signing_hashes,
+                },
+                None,
+            )?
+        };
+        if let Some(outbound) = outbound {
+            send_from_handle(
+                &context.storm_handle,
+                outbound,
+                self.session_recipients(request_hash).await?,
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -957,7 +1025,7 @@ fn recipient_transport_keys(
 }
 
 async fn send_from_storm(
-    storm: &Storm,
+    storm: &StormHandle,
     message: NodeMessage,
     recipients: &[[u8; 33]],
 ) -> Result<(), SigningError> {

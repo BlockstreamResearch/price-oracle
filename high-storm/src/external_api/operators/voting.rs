@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::auth::{SignedRequest, authenticate_bearer};
 use crate::{
     MergeStormEyes, NetworkVoteKind, NetworkVoteRequest, SplitStormEye, StormEyeUtxo,
-    UpdateNetworkMembers, VotingRequest, VotingStatus,
+    UpdateNetworkMembers, VotingExecutionError, VotingRequest, VotingStatus,
     external_api::{ApiError, ExternalApiState},
 };
 
@@ -19,6 +19,11 @@ pub(super) struct EmptyPayload {}
 #[derive(Serialize)]
 pub(super) struct CreatedVoting {
     message_hash: String,
+}
+
+#[derive(Serialize)]
+pub(super) struct ExecutedVoting {
+    execution_txid: String,
 }
 
 pub(super) async fn list_votings(
@@ -94,6 +99,40 @@ pub(super) async fn approve_voting(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub(super) async fn execute_voting(
+    State(state): State<ExternalApiState>,
+    Path(hash): Path<String>,
+    Json(request): Json<SignedRequest<EmptyPayload>>,
+) -> Result<Json<ExecutedVoting>, ApiError> {
+    let path = format!("/operators/voting/{hash}/execute");
+    state.auth.verify_write(&request, "POST", &path).await?;
+
+    let hash = parse_hash(&hash)?;
+    let execution_txid = state.node.execute_voting_request(hash).await?;
+
+    Ok(Json(ExecutedVoting {
+        execution_txid: hex::encode(execution_txid),
+    }))
+}
+
+impl From<VotingExecutionError> for ApiError {
+    fn from(error: VotingExecutionError) -> Self {
+        match error {
+            VotingExecutionError::UnknownRequest(_) => Self::not_found(error),
+            VotingExecutionError::NetworkMembersUnimplemented => Self {
+                status: StatusCode::NOT_IMPLEMENTED,
+                message: error.to_string(),
+            },
+            VotingExecutionError::NotApproved
+            | VotingExecutionError::AlreadyExecuting
+            | VotingExecutionError::AlreadyExecuted
+            | VotingExecutionError::MissingProposer => Self::conflict(error),
+            VotingExecutionError::Invalid(_) => Self::bad_request(error),
+            _ => Self::internal(error),
+        }
+    }
+}
+
 fn parse_hash(encoded: &str) -> Result<[u8; 32], ApiError> {
     hex::decode(encoded)
         .map_err(|_| ApiError::bad_request("invalid voting request hash"))?
@@ -127,8 +166,10 @@ pub struct Utxo {
 pub struct VotingResponse {
     pub message_hash: String,
     pub proposal: VotingProposal,
+    pub proposer_public_key: Option<String>,
     pub block_height: u64,
     pub status: &'static str,
+    pub execution_txid: Option<String>,
     pub approvals: Vec<VotingApprovalResponse>,
 }
 
@@ -179,8 +220,16 @@ impl VotingProposal {
             NetworkVoteKind::UpdateNetworkMembers => {
                 let payload: UpdateNetworkMembers = decode_payload(request)?;
                 Ok(Self::UpdateNetworkMembers {
-                    to_accept: payload.to_accept.into_iter().map(hex::encode).collect(),
-                    to_remove: payload.to_remove.into_iter().map(hex::encode).collect(),
+                    to_accept: payload
+                        .to_accept
+                        .into_iter()
+                        .map(encode_xonly_public_key)
+                        .collect::<Result<_, _>>()?,
+                    to_remove: payload
+                        .to_remove
+                        .into_iter()
+                        .map(encode_xonly_public_key)
+                        .collect::<Result<_, _>>()?,
                 })
             }
             NetworkVoteKind::MergeStormEyes => {
@@ -207,19 +256,28 @@ impl TryFrom<VotingRequest> for VotingResponse {
         Ok(Self {
             message_hash: hex::encode(request.message_hash),
             proposal: VotingProposal::from_request(&request.request)?,
+            proposer_public_key: request
+                .proposer_public_key
+                .map(encode_xonly_public_key)
+                .transpose()?,
             block_height: request.block_height,
             status: match request.status {
                 VotingStatus::Pending => "pending",
                 VotingStatus::Approved => "approved",
+                VotingStatus::Executing => "executing",
+                VotingStatus::Executed => "executed",
             },
+            execution_txid: request.execution_txid.map(hex::encode),
             approvals: request
                 .approvals
                 .into_iter()
-                .map(|approval| VotingApprovalResponse {
-                    public_key: hex::encode(approval.public_key),
-                    block_height: approval.block_height,
+                .map(|approval| {
+                    Ok(VotingApprovalResponse {
+                        public_key: encode_xonly_public_key(approval.public_key)?,
+                        block_height: approval.block_height,
+                    })
                 })
-                .collect(),
+                .collect::<Result<_, String>>()?,
         })
     }
 }
@@ -256,6 +314,12 @@ fn parse_public_keys(keys: Vec<String>) -> Result<Vec<[u8; 32]>, String> {
                 .map_err(|_| format!("invalid public key '{key}'"))
         })
         .collect()
+}
+
+fn encode_xonly_public_key(bytes: [u8; 32]) -> Result<String, String> {
+    XOnlyPublicKey::from_byte_array(bytes)
+        .map(|key| hex::encode(key.serialize()))
+        .map_err(|_| "invalid x-only public key".to_string())
 }
 
 fn parse_hex_array<const N: usize>(encoded: &str, name: &str) -> Result<[u8; N], String> {
@@ -302,6 +366,13 @@ mod tests {
             let request = proposal.into_request().unwrap();
             VotingProposal::from_request(&request).unwrap();
         }
+    }
+
+    #[test]
+    fn rejects_non_xonly_governance_keys() {
+        let compressed = format!("02{}", "11".repeat(32));
+        assert!(parse_public_keys(vec![compressed]).is_err());
+        assert!(encode_xonly_public_key([0xff; 32]).is_err());
     }
 
     fn utxo(byte: u8) -> Utxo {

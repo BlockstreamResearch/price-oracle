@@ -5,7 +5,9 @@ use super::{
     burning::BurningError,
     droplets::DropletsError,
     leader,
-    message::{BurnExpiredUtxos, ExpiredUtxosBurned, NodeMessage, NodeMessageKind},
+    message::{
+        BurnExpiredUtxos, ExecuteVotingRequest, ExpiredUtxosBurned, NodeMessage, NodeMessageKind,
+    },
     signing::SigningError,
     state::NetworkState,
     voting::VotingError,
@@ -17,6 +19,8 @@ pub(crate) enum HandlerError {
     Signing(#[from] SigningError),
     #[error(transparent)]
     Voting(#[from] VotingError),
+    #[error(transparent)]
+    VotingExecution(#[from] super::voting_execution::VotingExecutionError),
     #[error(transparent)]
     Asset(#[from] AssetError),
     #[error(transparent)]
@@ -133,7 +137,35 @@ pub(crate) async fn handle(
         NodeMessageKind::AskAboutVotings => {
             state
                 .voting()
-                .handle_synchronization(message, &context)
+                .handle_synchronization(message, &context, state.block_height())
+                .await?;
+            Ok(())
+        }
+        NodeMessageKind::ExecuteVotingRequest => {
+            let request_hash = message.linked_to.ok_or_else(|| {
+                super::voting_execution::VotingExecutionError::Invalid(
+                    "voting execution does not link to a voting request".into(),
+                )
+            })?;
+            let request: ExecuteVotingRequest = message.decode_payload()?;
+            authorize_voting_proposer(
+                request.proposer_public_key,
+                context.message_context.peer_public_key,
+            )?;
+            if request.final_tx.is_some() {
+                state
+                    .voting_execution()
+                    .observe_broadcast(request_hash, &request)
+                    .await?;
+                return Ok(());
+            }
+            state
+                .voting_execution()
+                .begin(request_hash, &request, state.block_height())
+                .await?;
+            state
+                .signing()
+                .handle_execute_voting_request(message, &context)
                 .await?;
             Ok(())
         }
@@ -156,6 +188,20 @@ pub(crate) async fn handle(
             Ok(())
         }
     }
+}
+
+fn authorize_voting_proposer(proposer: [u8; 32], sender: [u8; 33]) -> Result<(), SigningError> {
+    let sender = secp256k1::PublicKey::from_slice(&sender)
+        .map_err(|error| SigningError::UnauthorizedMessage(error.to_string()))?
+        .x_only_public_key()
+        .0
+        .serialize();
+    if sender != proposer {
+        return Err(SigningError::UnauthorizedMessage(
+            "only the node that proposed a voting request may execute it".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn require_current_leader(

@@ -5,7 +5,7 @@ use std::{
 };
 
 use axum::{Json, extract::State, http::HeaderMap};
-use bitcoin::{Address, CompressedPublicKey, address::KnownHrp};
+use bitcoin::{Address, Network, secp256k1::XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -49,6 +49,7 @@ pub enum AuthError {
 pub struct Challenge {
     pub message: String,
     pub expires_at: u64,
+    pub network: AuthNetwork,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -78,9 +79,37 @@ pub(super) struct SignedRequest<T> {
     pub(super) payload: T,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AuthNetwork {
+    LiquidV1,
+    LiquidTestnet,
+    ElementsRegtest,
+}
+
+impl AuthNetwork {
+    pub(crate) fn from_chain(chain: &str) -> Option<Self> {
+        match chain {
+            "liquidv1" => Some(Self::LiquidV1),
+            "liquidtestnet" => Some(Self::LiquidTestnet),
+            "elementsregtest" => Some(Self::ElementsRegtest),
+            _ => None,
+        }
+    }
+
+    fn bitcoin_network(self) -> Network {
+        match self {
+            Self::LiquidV1 => Network::Bitcoin,
+            Self::LiquidTestnet => Network::Testnet,
+            Self::ElementsRegtest => Network::Regtest,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AuthService {
     operators: NodeOperatorStore,
+    network: AuthNetwork,
     state: Arc<Mutex<AuthState>>,
 }
 
@@ -97,9 +126,10 @@ struct ExpiringOperator {
 }
 
 impl AuthService {
-    pub fn new(operators: NodeOperatorStore) -> Self {
+    pub fn new(operators: NodeOperatorStore, network: AuthNetwork) -> Self {
         Self {
             operators,
+            network,
             state: Arc::new(Mutex::new(AuthState::default())),
         }
     }
@@ -175,6 +205,7 @@ impl AuthService {
             return Ok(Challenge {
                 message: message.clone(),
                 expires_at: challenge.expires_at,
+                network: self.network,
             });
         }
         state.challenges.insert(
@@ -188,6 +219,7 @@ impl AuthService {
         Ok(Challenge {
             message,
             expires_at,
+            network: self.network,
         })
     }
 
@@ -213,7 +245,7 @@ impl AuthService {
             }
         }
 
-        verify_signature(bytes, message, signature)?;
+        verify_signature(bytes, self.network, message, signature)?;
 
         let mut state = self.state.lock().await;
         let challenge = state
@@ -277,7 +309,7 @@ impl AuthService {
         self.require_operator(bytes).await?;
 
         let message = write_message(method, path, timestamp, nonce, payload);
-        verify_signature(bytes, &message, signature)?;
+        verify_signature(bytes, self.network, &message, signature)?;
 
         let mut state = self.state.lock().await;
         state.cleanup(now);
@@ -295,8 +327,8 @@ impl AuthService {
         Ok(public_key)
     }
 
-    async fn require_operator(&self, public_key: [u8; 33]) -> Result<(), AuthError> {
-        if self.operators.contains(public_key).await? {
+    async fn require_operator(&self, public_key: [u8; 32]) -> Result<(), AuthError> {
+        if self.operators.contains_xonly(public_key).await? {
             Ok(())
         } else {
             Err(AuthError::Unauthorized)
@@ -349,18 +381,27 @@ impl AuthState {
     }
 }
 
-fn parse_public_key(encoded: &str) -> Result<(String, [u8; 33]), AuthError> {
+fn parse_public_key(encoded: &str) -> Result<(String, [u8; 32]), AuthError> {
     let bytes = hex::decode(encoded).map_err(|_| AuthError::InvalidPublicKey)?;
-    let public_key =
-        CompressedPublicKey::from_slice(&bytes).map_err(|_| AuthError::InvalidPublicKey)?;
-    let bytes = public_key.to_bytes();
+    let public_key = XOnlyPublicKey::from_slice(&bytes).map_err(|_| AuthError::InvalidPublicKey)?;
+    let bytes = public_key.serialize();
     Ok((hex::encode(bytes), bytes))
 }
 
-fn verify_signature(public_key: [u8; 33], message: &str, signature: &str) -> Result<(), AuthError> {
+fn verify_signature(
+    public_key: [u8; 32],
+    network: AuthNetwork,
+    message: &str,
+    signature: &str,
+) -> Result<(), AuthError> {
     let public_key =
-        CompressedPublicKey::from_slice(&public_key).map_err(|_| AuthError::InvalidPublicKey)?;
-    let address = Address::p2wpkh(&public_key, KnownHrp::Mainnet);
+        XOnlyPublicKey::from_slice(&public_key).map_err(|_| AuthError::InvalidPublicKey)?;
+    let address = Address::p2tr(
+        &bitcoin::secp256k1::Secp256k1::verification_only(),
+        public_key,
+        None,
+        network.bitcoin_network(),
+    );
     bip322::verify_simple_encoded(&address.to_string(), message, signature)
         .map_err(|_| AuthError::InvalidSignature)
 }
@@ -405,6 +446,7 @@ mod tests {
     async fn exchanges_a_real_bip322_proof_for_a_one_time_token() {
         let (auth, private_key, public_key) = setup().await;
         let challenge = auth.issue_challenge_at(&public_key, 1_000).await.unwrap();
+        assert_eq!(challenge.network, AuthNetwork::ElementsRegtest);
         let signature = sign(&private_key, &challenge.message);
 
         let access = auth
@@ -421,6 +463,21 @@ mod tests {
             auth.exchange_token_at(&public_key, &challenge.message, &signature, 1_003)
                 .await,
             Err(AuthError::InvalidChallenge)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_compressed_operator_public_keys() {
+        let (auth, private_key, _) = setup().await;
+        let compressed_public_key = private_key
+            .public_key(&secp256k1::Secp256k1::new())
+            .inner
+            .serialize();
+
+        assert!(matches!(
+            auth.issue_challenge_at(&hex::encode(compressed_public_key), 1_000)
+                .await,
+            Err(AuthError::InvalidPublicKey)
         ));
     }
 
@@ -530,26 +587,37 @@ mod tests {
         let operators = database.node_operators();
 
         let secret_key = secp256k1::SecretKey::from_slice(&[42; 32]).unwrap();
-        let private_key = PrivateKey::new(secret_key, Network::Bitcoin);
-        let public_key = private_key
+        let private_key = PrivateKey::new(secret_key, Network::Regtest);
+        let compressed_public_key = private_key
             .public_key(&secp256k1::Secp256k1::new())
             .inner
             .serialize();
-        operators.add(public_key).await.unwrap();
+        let public_key = secp256k1::PublicKey::from_slice(&compressed_public_key)
+            .unwrap()
+            .x_only_public_key()
+            .0
+            .serialize();
+        operators.add(compressed_public_key).await.unwrap();
 
         (
-            AuthService::new(operators),
+            AuthService::new(operators, AuthNetwork::ElementsRegtest),
             private_key,
             hex::encode(public_key),
         )
     }
 
     fn sign(private_key: &PrivateKey, message: &str) -> String {
+        let public_key = private_key
+            .public_key(&secp256k1::Secp256k1::new())
+            .inner
+            .x_only_public_key()
+            .0;
         bip322::sign_simple_encoded(
-            &Address::p2wpkh(
-                &CompressedPublicKey::from_private_key(&secp256k1::Secp256k1::new(), private_key)
-                    .unwrap(),
-                KnownHrp::Mainnet,
+            &Address::p2tr(
+                &secp256k1::Secp256k1::new(),
+                public_key,
+                None,
+                Network::Regtest,
             )
             .to_string(),
             message,

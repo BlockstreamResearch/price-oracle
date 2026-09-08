@@ -42,7 +42,7 @@ use super::{
     message::ExchangeRewards,
     signing::SigningError,
     user_requests::{
-        STORM_EYE_TAG, asset_id, find_contract_utxo, get_optional_explicit_outpoint,
+        STORM_EYE_TAG, StormEyePool, asset_id, find_contract_utxo, get_optional_explicit_outpoint,
         is_fully_explicit_output, output_from_utxo, pack_proof, require_explicit_utxo,
         require_preserved_output, witness_utxo,
     },
@@ -266,6 +266,7 @@ impl Droplets {
             &client,
             &storm_eye.contract_script,
             Some(storm_eye.asset_id),
+            StormEyePool::NetworkLeader,
         )?;
         let contract_data: StormEyeContractData =
             postcard::from_bytes(storm_eye.contract_data.as_deref().ok_or_else(|| {
