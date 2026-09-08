@@ -28,9 +28,8 @@ fn spend_transaction(
         RequiredSignature::NativeEcdsa,
     );
 
-    treasury.attach_output(
+    treasury.attach_treasury_output(
         &mut ft,
-        context.get_network(),
         treasury_utxo.explicit_amount(),
         treasury_utxo.explicit_asset(),
     );
@@ -50,9 +49,10 @@ fn spends_treasury_when_storm_eye_is_present(context: simplex::TestContext) -> a
     let storm_eye_asset = issue_asset(&context, STORM_EYE_SUPPLY)?;
     let treasury = Treasury::new(TreasuryParameters {
         storm_eye_asset_id: storm_eye_asset,
+        network: *context.get_network(),
     });
 
-    let treasury_script_pubkey = treasury.get_script_pubkey(context.get_network());
+    let treasury_script_pubkey = treasury.get_script_pubkey();
     let treasury_utxo = fund_script(&context, &treasury_script_pubkey, TREASURY_AMOUNT)?;
     let storm_eye_utxo = signer.get_utxos_asset(storm_eye_asset)?[0].clone();
 
@@ -72,9 +72,10 @@ fn rejects_treasury_spend_without_storm_eye(context: simplex::TestContext) -> an
 
     let treasury = Treasury::new(TreasuryParameters {
         storm_eye_asset_id: storm_eye_asset,
+        network: *context.get_network(),
     });
 
-    let treasury_script_pubkey = treasury.get_script_pubkey(context.get_network());
+    let treasury_script_pubkey = treasury.get_script_pubkey();
     let treasury_utxo = fund_script(&context, &treasury_script_pubkey, TREASURY_AMOUNT)?;
 
     let decoy_utxo = signer.get_utxos_asset(decoy_asset)?[0].clone();

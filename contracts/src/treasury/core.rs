@@ -16,6 +16,7 @@ pub struct Treasury {
 
 pub struct TreasuryParameters {
     pub storm_eye_asset_id: AssetId,
+    pub network: SimplicityNetwork,
 }
 
 impl Treasury {
@@ -29,8 +30,8 @@ impl Treasury {
     }
 
     #[must_use]
-    pub fn get_script_pubkey(&self, network: &SimplicityNetwork) -> Script {
-        self.program.get_script_pubkey(network)
+    pub fn get_script_pubkey(&self) -> Script {
+        self.program.get_script_pubkey(&self.params.network)
     }
 
     #[must_use]
@@ -59,15 +60,14 @@ impl Treasury {
     }
 
     /// Adds an output that pays `amount` of `asset_id` to this Treasury.
-    pub fn attach_output(
+    pub fn attach_treasury_output(
         &self,
         ft: &mut FinalTransaction,
-        network: &SimplicityNetwork,
         amount: u64,
         asset_id: AssetId,
     ) {
         ft.add_output(PartialOutput::new(
-            self.get_script_pubkey(network),
+            self.get_script_pubkey(),
             amount,
             asset_id,
         ));
