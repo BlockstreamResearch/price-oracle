@@ -7,6 +7,7 @@ use high_storm::{
     external_api::ExternalApiServer,
     ipc::IpcServer,
 };
+use price_feed::constants::POLLING_INTERVAL;
 use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tracing_subscriber::EnvFilter;
 
@@ -155,6 +156,14 @@ async fn run_until_shutdown(
     );
     reconcile_requests.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // One attestation round per polling cycle, which is what keeps a price
+    // current on its peers.
+    let mut price_round = tokio::time::interval_at(
+        Instant::now() + Duration::from_secs(5),
+        Duration::from_secs(POLLING_INTERVAL),
+    );
+    price_round.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -226,6 +235,17 @@ async fn run_until_shutdown(
                     }
                     Err(error) => {
                         tracing::warn!(%error, "failed to reconcile user request confirmations");
+                    }
+                }
+            }
+            _ = price_round.tick() => {
+                match storm.attest_prices().await {
+                    Ok(0) => {}
+                    Ok(feed_count) => {
+                        tracing::info!(feed_count, "broadcast price attestations");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "price attestation round failed");
                     }
                 }
             }

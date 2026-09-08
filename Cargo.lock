@@ -1425,6 +1425,7 @@ dependencies = [
  "http-body-util",
  "log",
  "postcard",
+ "price-feed",
  "secp256k1 0.32.0-beta.2",
  "secp256k1-zkp",
  "serde",

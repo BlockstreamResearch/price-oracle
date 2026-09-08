@@ -6,8 +6,8 @@ use std::sync::{
 use storm::Storm;
 
 use super::{
-    HighStormDependencies, assets::Assets, burning::Burning, indexer::Indexer, signing::Signing,
-    user_requests::UserRequestProcessor, voting::Voting,
+    HighStormDependencies, assets::Assets, burning::Burning, indexer::Indexer, prices::Prices,
+    signing::Signing, user_requests::UserRequestProcessor, voting::Voting,
 };
 
 /// Cloneable higher-level state shared by HighStorm message handlers.
@@ -16,6 +16,7 @@ pub(crate) struct NetworkState {
     coordinator_public_key: [u8; 33],
     signing: Signing,
     voting: Voting,
+    prices: Prices,
     assets: Assets,
     burning: Burning,
     indexer: Indexer,
@@ -35,6 +36,7 @@ impl NetworkState {
             network_assets,
             monitored_utxos,
             user_requests,
+            price_attestations,
             elements_rpc,
             user_request_config,
         } = dependencies;
@@ -43,6 +45,7 @@ impl NetworkState {
             coordinator_public_key,
             signing: Signing::new(storm, secret_key, coordinator_public_key).await,
             voting: Voting::new(secret_key, voting_store),
+            prices: Prices::new(secret_key, price_attestations, price_feed::Clock::System),
             assets: Assets::new(network_assets.clone()),
             burning: Burning::new(
                 monitored_utxos.clone(),
@@ -77,6 +80,10 @@ impl NetworkState {
 
     pub(crate) fn voting(&self) -> &Voting {
         &self.voting
+    }
+
+    pub(crate) fn prices(&self) -> &Prices {
+        &self.prices
     }
 
     pub(crate) fn assets(&self) -> &Assets {

@@ -28,6 +28,7 @@ url.workspace = true
 
 contracts.workspace = true
 simplex = { package = "smplx-std", git = "https://github.com/BlockstreamResearch/smplx", rev = "c1e9d8b06231973d81fbaa677cf3f03787104b81" }
+price-feed = { path = "../price-feed" }
 storm.workspace = true
 storm-tree = { path = "../storm-tree" }
 

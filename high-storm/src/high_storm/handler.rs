@@ -23,6 +23,8 @@ pub(crate) enum HandlerError {
     #[error(transparent)]
     Burning(#[from] BurningError),
     #[error(transparent)]
+    Price(#[from] super::prices::PriceError),
+    #[error(transparent)]
     Encoding(#[from] postcard::Error),
 }
 
@@ -72,6 +74,10 @@ pub(crate) async fn handle(
             let notification: ExpiredUtxosBurned = message.decode_payload()?;
             require_current_leader(&state, &context, notification.block_height).await?;
             state.burning().observe_broadcast(&notification).await?;
+            Ok(())
+        }
+        NodeMessageKind::AttestPrice => {
+            state.prices().handle_attestation(message, &context).await?;
             Ok(())
         }
         NodeMessageKind::NetworkAssets => {

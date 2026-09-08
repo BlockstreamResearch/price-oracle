@@ -10,6 +10,7 @@ mod indexer;
 mod issuance;
 mod leader;
 mod message;
+mod prices;
 mod signing;
 mod state;
 mod user_requests;
@@ -19,11 +20,12 @@ pub use assets::AssetError;
 pub use burning::BurningError;
 pub use indexer::IndexerError;
 pub use message::{
-    ApproveVotingRequest, BurnExpiredUtxos, ExecuteUserRequests, ExpiredUtxosBurned,
-    ExternalRequests, MergeStormEyes, NetworkAsset, NetworkAssets, NetworkVoteKind,
-    NetworkVoteRequest, NodeMessage, NodeMessageKind, SplitStormEye, StormEyeUtxo,
-    UpdateNetworkMembers,
+    ApproveVotingRequest, AttestPriceMsg, BurnExpiredUtxos, ExecuteUserRequests,
+    ExpiredUtxosBurned, ExternalRequests, MergeStormEyes, NetworkAsset, NetworkAssets,
+    NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind, PriceAttestation,
+    SplitStormEye, StormEyeUtxo, UpdateNetworkMembers,
 };
+pub use prices::PriceError;
 pub use signing::{SigningError, SigningResult};
 use state::NetworkState;
 pub use user_requests::UserRequestError;
@@ -40,6 +42,7 @@ pub(crate) struct HighStormDependencies {
     network_assets: crate::db::network_asset::NetworkAssetStore,
     monitored_utxos: crate::db::monitored_utxo::MonitoredUtxoStore,
     user_requests: crate::db::user_request::UserRequestStore,
+    price_attestations: crate::db::price_attestation::PriceAttestationStore,
     elements_rpc: crate::config::ElementsRpcConfig,
     user_request_config: crate::config::UserRequestsConfig,
 }
@@ -50,6 +53,7 @@ impl HighStormDependencies {
         network_assets: crate::db::network_asset::NetworkAssetStore,
         monitored_utxos: crate::db::monitored_utxo::MonitoredUtxoStore,
         user_requests: crate::db::user_request::UserRequestStore,
+        price_attestations: crate::db::price_attestation::PriceAttestationStore,
         elements_rpc: crate::config::ElementsRpcConfig,
         user_request_config: crate::config::UserRequestsConfig,
     ) -> Self {
@@ -58,6 +62,7 @@ impl HighStormDependencies {
             network_assets,
             monitored_utxos,
             user_requests,
+            price_attestations,
             elements_rpc,
             user_request_config,
         }
@@ -205,6 +210,11 @@ impl HighStorm {
             .assets()
             .announce_pending(&self.storm.handle())
             .await
+    }
+
+    /// Returns how many feeds were attested.
+    pub async fn attest_prices(&self) -> Result<usize, PriceError> {
+        self.state.prices().attest(&self.storm.handle()).await
     }
 
     pub async fn initialize_storm_eye(
@@ -372,6 +382,29 @@ impl HighStorm {
 }
 
 impl HighStormHandle {
+    pub async fn record_price_observation(
+        &self,
+        feed: price_feed::FeedId,
+        source: usize,
+        observation: price_feed::SourceObservation,
+    ) {
+        self.state
+            .prices()
+            .record_observation(feed, source, observation)
+            .await
+    }
+
+    pub async fn record_price_failure(&self, feed: price_feed::FeedId, source: usize) {
+        self.state.prices().record_failure(feed, source).await
+    }
+
+    pub async fn price_attestations(
+        &self,
+        feed: price_feed::FeedId,
+    ) -> Result<Vec<PriceAttestation>, PriceError> {
+        self.state.prices().attestations_for(feed).await
+    }
+
     pub fn coordinator_public_key(&self) -> [u8; 33] {
         self.state.coordinator_public_key()
     }
