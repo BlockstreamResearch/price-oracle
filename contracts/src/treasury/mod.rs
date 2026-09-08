@@ -1,3 +1,3 @@
 mod core;
 
-pub use core::Treasury;
+pub use core::{Treasury, TreasuryParameters};
