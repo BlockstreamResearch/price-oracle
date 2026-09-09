@@ -1,3 +1,4 @@
+use simplex::constants::DUMMY_SIGNATURE;
 use simplex::either::Either;
 use simplex::transaction::RequiredSignature;
 
@@ -45,7 +46,7 @@ impl VoucherSpendPath {
             } => Either::Left(Either::Right((auth_input_index, voucher_output_index))),
             Self::SignatureAuth {
                 voucher_output_index,
-            } => Either::Right(Either::Left(([0u8; 64], voucher_output_index))),
+            } => Either::Right(Either::Left((DUMMY_SIGNATURE, voucher_output_index))),
             Self::NetworkAuth {
                 storm_eye_input_index,
             } => Either::Right(Either::Right(storm_eye_input_index)),

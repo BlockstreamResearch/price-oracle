@@ -1,3 +1,4 @@
+use simplex::simplicityhl::elements::schnorr::XOnlyPublicKey;
 use simplex::simplicityhl::elements::{AssetId, Script};
 use simplex::transaction::utxo::UTXO;
 use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, ProgramInput};
@@ -16,6 +17,14 @@ impl Voucher {
     pub fn new(params: VoucherParameters) -> Self {
         Self {
             program: VoucherProgram::new(&params.build_arguments()),
+            params,
+        }
+    }
+
+    #[must_use]
+    pub fn new_with_taproot_pubkey(params: VoucherParameters, pub_key: XOnlyPublicKey) -> Self {
+        Self {
+            program: VoucherProgram::new(&params.build_arguments()).with_taproot_pubkey(pub_key),
             params,
         }
     }
