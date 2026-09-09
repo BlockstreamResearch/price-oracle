@@ -5,7 +5,7 @@ use simplex::transaction::{
 
 use crate::artifacts::auth::AuthProgram;
 use crate::auth::params::AuthParameters;
-use crate::auth::storage::StormEyeStorage;
+use crate::auth::storage::AuthStorage;
 use crate::auth::storm_tree::StormTreeBloom;
 use crate::auth::witness::{AuthSpendPath, build_rescue_witness};
 
@@ -13,12 +13,12 @@ use crate::auth::witness::{AuthSpendPath, build_rescue_witness};
 pub struct Auth {
     program: AuthProgram,
     params: AuthParameters,
-    storage: StormEyeStorage,
+    storage: AuthStorage,
 }
 
 impl Auth {
     #[must_use]
-    pub fn new(params: AuthParameters, storage: StormEyeStorage) -> Self {
+    pub fn new(params: AuthParameters, storage: AuthStorage) -> Self {
         let mut program = AuthProgram::new(&params.build_arguments()).with_storage_capacity(2);
         storage.apply(&mut program);
 
@@ -40,7 +40,7 @@ impl Auth {
     }
 
     #[must_use]
-    pub fn get_storage(&self) -> StormEyeStorage {
+    pub fn get_storage(&self) -> AuthStorage {
         self.storage
     }
 

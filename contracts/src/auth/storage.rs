@@ -2,12 +2,12 @@ use crate::artifacts::auth::AuthProgram;
 
 /// The Storm Eye covenant's two Taproot storage slots.
 #[derive(Debug, Clone, Copy)]
-pub struct StormEyeStorage {
+pub struct AuthStorage {
     pub merkle_root: [u8; 32],
     pub rescue_block_number: u32,
 }
 
-impl StormEyeStorage {
+impl AuthStorage {
     /// Slot 1's on-chain encoding: the height widened to 32 bytes, big-endian, matching
     /// `storage.simf`'s `get_rescue_block_slot_leaf`.
     fn rescue_block_slot_value(&self) -> [u8; 32] {

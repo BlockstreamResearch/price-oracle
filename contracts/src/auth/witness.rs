@@ -2,7 +2,7 @@ use simplex::{either::Either, transaction::RequiredSignature};
 
 use crate::{
     artifacts::auth::derived_auth::AuthWitness,
-    auth::{storage::StormEyeStorage, storm_tree::StormTreeBloom},
+    auth::{storage::AuthStorage, storm_tree::StormTreeBloom},
 };
 
 /// The witness arm selecting a spending path, mirroring `AuthKind` in `auth.simf`.
@@ -42,11 +42,7 @@ impl AuthSpendPath {
         )
     }
 
-    pub(crate) fn build_witness(
-        self,
-        storage: StormEyeStorage,
-        bloom: StormTreeBloom,
-    ) -> AuthWitness {
+    pub(crate) fn build_witness(self, storage: AuthStorage, bloom: StormTreeBloom) -> AuthWitness {
         let kind: AuthKindRaw = match self {
             Self::Inclusion { output_index } => Either::Left(output_index),
             Self::RootUpdate {
@@ -78,7 +74,7 @@ impl AuthSpendPath {
     }
 }
 
-pub(crate) fn build_rescue_witness(storage: StormEyeStorage, output_index: u32) -> AuthWitness {
+pub(crate) fn build_rescue_witness(storage: AuthStorage, output_index: u32) -> AuthWitness {
     AuthWitness {
         path: Either::Right((
             (storage.merkle_root, storage.rescue_block_number),

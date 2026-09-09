@@ -12,7 +12,7 @@ use simplex::{
 use storm_tree::smt::MerkleTree;
 
 use contracts::auth::{
-    Auth, AuthParameters, AuthSpendPath, Branch, StormEyeStorage, StormTreeBloom, WITNESS_DEPTH,
+    Auth, AuthParameters, AuthSpendPath, AuthStorage, Branch, StormTreeBloom, WITNESS_DEPTH,
     WitnessStep, build_tree, witness_proof,
 };
 
@@ -52,7 +52,7 @@ pub fn auth_with_rescue_output(
     Auth::new(
         AuthParameters::new(MAX_SPLIT_UTXOS_COUNT, MAX_MERGE_UTXOS_COUNT, network)
             .with_rescue_output(rescue_output_script_hash),
-        StormEyeStorage {
+        AuthStorage {
             merkle_root,
             rescue_block_number,
         },

@@ -6,7 +6,7 @@ mod witness;
 
 pub use core::Auth;
 pub use params::AuthParameters;
-pub use storage::StormEyeStorage;
+pub use storage::AuthStorage;
 pub use storm_tree::{
     Branch, StormTreeBloom, StormTreeWitnessError, WITNESS_DEPTH, WitnessStep, build_tree,
     witness_proof,
