@@ -200,6 +200,7 @@ async fn creates_and_approves_voting_with_signed_requests() {
     let approval_path = format!("/operators/voting/{hash}/approve");
 
     let approve = app
+        .clone()
         .oneshot(signed_request(
             &private_key,
             &public_key,
@@ -211,6 +212,19 @@ async fn creates_and_approves_voting_with_signed_requests() {
         .await
         .unwrap();
     assert_eq!(approve.status(), StatusCode::NO_CONTENT);
+
+    let repeated_approve = app
+        .oneshot(signed_request(
+            &private_key,
+            &public_key,
+            &approval_path,
+            timestamp,
+            "approve-voting-retry",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(repeated_approve.status(), StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]
@@ -364,6 +378,7 @@ async fn setup() -> (Router, PrivateKey, String) {
         node_secret.secret_bytes(),
         node_public_key,
         crate::high_storm::HighStormDependencies::new(
+            database.network(),
             database.voting(),
             database.network_assets(),
             database.monitored_utxos(),

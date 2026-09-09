@@ -149,6 +149,34 @@ async fn wait_for_discovery_completion(storm: &Storm, peer_count: usize) {
 }
 
 #[tokio::test]
+async fn joining_member_reconnects_when_host_lacks_its_address() {
+    use std::collections::BTreeSet;
+
+    let secp = Secp256k1::new();
+    let (host_secret_key, joining_secret_key) = ordered_key_pair();
+    let host_public_key = host_secret_key.public_key(&secp).serialize();
+    let joining_public_key = joining_secret_key.public_key(&secp).serialize();
+    let mut host = Storm::from_peers(host_secret_key, vec![Peer::new(host_public_key)]);
+    host.start(Some("127.0.0.1:0".into())).await.unwrap();
+    let target = [host_public_key, joining_public_key]
+        .into_iter()
+        .map(|key| StormState::x_only_public_key(&key))
+        .collect::<BTreeSet<_>>();
+    host.begin_member_migration(target).await.unwrap();
+
+    let mut host_peer = Peer::new(host_public_key);
+    host_peer.socket_address = Some(host.listener_address.unwrap().to_string());
+    let mut joining = Storm::from_peers(joining_secret_key, vec![host_peer]);
+    joining.start(Some("127.0.0.1:0".into())).await.unwrap();
+
+    wait_for_peer_status(&joining, host_public_key, PeerStatus::Active).await;
+    assert!(host.member_migration_ready().await);
+
+    host.shutdown().await;
+    joining.shutdown().await;
+}
+
+#[tokio::test]
 async fn authenticated_peer_is_active_once_and_inactive_after_disconnect() {
     let secp = Secp256k1::new();
     let mut random = rand::thread_rng();
@@ -421,6 +449,286 @@ async fn discoverable_node_limits_provisional_connections() {
 }
 
 #[tokio::test]
+async fn member_migration_admits_only_targets_and_activates_atomically() {
+    use std::collections::BTreeSet;
+
+    let secp = Secp256k1::new();
+    let mut random = rand::thread_rng();
+    let local_secret_key = SecretKey::new(&mut random);
+    let local_public_key = local_secret_key.public_key(&secp).serialize();
+    let retained_secret_key = SecretKey::new(&mut random);
+    let retained_public_key = retained_secret_key.public_key(&secp).serialize();
+    let joining_secret_key = SecretKey::new(&mut random);
+    let joining_public_key = joining_secret_key.public_key(&secp).serialize();
+    let rejected_secret_key = SecretKey::new(&mut random);
+    let rejected_public_key = rejected_secret_key.public_key(&secp).serialize();
+    let storm = Storm::from_peers(
+        local_secret_key,
+        vec![Peer::new(local_public_key), Peer::new(retained_public_key)],
+    );
+    let members = [local_public_key, retained_public_key, joining_public_key]
+        .into_iter()
+        .map(|key| StormState::x_only_public_key(&key))
+        .collect::<BTreeSet<_>>();
+
+    storm.begin_member_migration(members).await.unwrap();
+
+    assert!(!storm.member_migration_ready().await);
+    assert!(!storm.local_member_migration_ready().await);
+    assert_eq!(storm.peers().await.len(), 2);
+    assert!(matches!(
+        Storm::claim_connection(&storm.inner, rejected_public_key, None).await,
+        Err(Error::UnauthorizedConnection)
+    ));
+
+    let retained_receiver = Storm::claim_connection(&storm.inner, retained_public_key, None)
+        .await
+        .unwrap();
+    let joining_receiver = Storm::claim_connection(
+        &storm.inner,
+        joining_public_key,
+        Some("127.0.0.1:9003".parse().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    assert!(storm.member_migration_ready().await);
+    assert_eq!(storm.peers().await.len(), 2);
+
+    Storm::release_connection(&storm.inner, joining_public_key).await;
+    drop(joining_receiver);
+    let joining_receiver = Storm::claim_connection(
+        &storm.inner,
+        joining_public_key,
+        Some("127.0.0.1:9004".parse().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    let activated = storm.activate_member_migration().await.unwrap();
+    assert_eq!(activated.len(), 3);
+    assert_eq!(storm.peers().await, activated);
+    assert!(activated.iter().any(|peer| {
+        peer.compressed_public_key == joining_public_key
+            && peer.socket_address.as_deref() == Some("127.0.0.1:9004")
+    }));
+
+    drop(retained_receiver);
+    drop(joining_receiver);
+}
+
+#[tokio::test]
+async fn member_migration_rejects_duplicate_x_only_identities_before_activation() {
+    use std::collections::BTreeSet;
+
+    let secp = Secp256k1::new();
+    let local_secret_key = SecretKey::new(&mut rand::thread_rng());
+    let local_public_key = local_secret_key.public_key(&secp).serialize();
+    let mut opposite_parity = local_public_key;
+    opposite_parity[0] = if opposite_parity[0] == 2 { 3 } else { 2 };
+    let storm = Storm::from_peers(local_secret_key, vec![Peer::new(local_public_key)]);
+    {
+        let mut state = storm.inner.write().await;
+        state.migration_members = Some(BTreeSet::from([StormState::x_only_public_key(
+            &local_public_key,
+        )]));
+        let mut duplicate = Peer::new(opposite_parity);
+        duplicate.status = PeerStatus::Active;
+        duplicate.socket_address = Some("127.0.0.1:9002".to_string());
+        state.migration_peers = vec![Peer::new(local_public_key), duplicate];
+    }
+
+    assert!(!storm.member_migration_ready().await);
+    assert!(matches!(
+        storm.handle().member_migration_peers().await,
+        Err(Error::InvalidMigrationPeerTable)
+    ));
+    assert!(matches!(
+        storm.activate_member_migration().await,
+        Err(Error::InvalidMigrationPeerTable)
+    ));
+    let peers = storm.peers().await;
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].compressed_public_key, local_public_key);
+}
+
+#[tokio::test]
+async fn member_migration_rejects_duplicate_x_only_identity_candidates() {
+    use std::collections::BTreeSet;
+
+    let secp = Secp256k1::new();
+    let local_secret_key = SecretKey::new(&mut rand::thread_rng());
+    let local_public_key = local_secret_key.public_key(&secp).serialize();
+    let mut opposite_parity = local_public_key;
+    opposite_parity[0] = if opposite_parity[0] == 2 { 3 } else { 2 };
+    let storm = Storm::from_peers(
+        local_secret_key,
+        vec![Peer::new(local_public_key), Peer::new(opposite_parity)],
+    );
+    let members = BTreeSet::from([StormState::x_only_public_key(&local_public_key)]);
+
+    assert!(matches!(
+        storm.begin_member_migration(members).await,
+        Err(Error::InvalidMigrationPeerTable)
+    ));
+    assert!(storm.inner.read().await.migration_members.is_none());
+}
+
+#[tokio::test]
+async fn removed_member_does_not_wait_for_target_connections() {
+    use std::collections::BTreeSet;
+
+    let secp = Secp256k1::new();
+    let mut random = rand::thread_rng();
+    let local_secret_key = SecretKey::new(&mut random);
+    let local_public_key = local_secret_key.public_key(&secp).serialize();
+    let retained_public_key = SecretKey::new(&mut random).public_key(&secp).serialize();
+    let joining_public_key = SecretKey::new(&mut random).public_key(&secp).serialize();
+    let mut retained_peer = Peer::new(retained_public_key);
+    retained_peer.socket_address = Some("127.0.0.1:9002".into());
+    let storm = Storm::from_peers(
+        local_secret_key,
+        vec![Peer::new(local_public_key), retained_peer],
+    );
+    assert!(storm.is_local_member().await);
+    let members = [retained_public_key, joining_public_key]
+        .into_iter()
+        .map(|key| StormState::x_only_public_key(&key))
+        .collect::<BTreeSet<_>>();
+
+    storm.begin_member_migration(members).await.unwrap();
+
+    assert!(!storm.member_migration_ready().await);
+    assert!(!storm.local_member_migration_ready().await);
+
+    let mut state = storm.inner.write().await;
+    let mut joining_peer = Peer::new(joining_public_key);
+    joining_peer.socket_address = Some("127.0.0.1:9003".into());
+    state.migration_peers.push(joining_peer);
+    drop(state);
+
+    assert!(storm.local_member_migration_ready().await);
+    let activated = storm.activate_member_migration().await.unwrap();
+    assert_eq!(activated.len(), 2);
+    assert!(
+        !activated
+            .iter()
+            .any(|peer| peer.compressed_public_key == local_public_key)
+    );
+    assert!(!storm.is_local_member().await);
+}
+
+#[tokio::test]
+async fn staged_member_requests_the_target_peer_table() {
+    use std::collections::BTreeSet;
+
+    let secp = Secp256k1::new();
+    let mut random = rand::thread_rng();
+    let local_secret_key = SecretKey::new(&mut random);
+    let local_public_key = local_secret_key.public_key(&secp).serialize();
+    let connected_secret_key = SecretKey::new(&mut random);
+    let connected_public_key = connected_secret_key.public_key(&secp).serialize();
+    let joining_public_key = SecretKey::new(&mut random).public_key(&secp).serialize();
+    let mut connected_peer = Peer::new(connected_public_key);
+    connected_peer.status = PeerStatus::Active;
+    let storm = Storm::from_peers(local_secret_key, vec![connected_peer]);
+    let (connection, mut messages) = mpsc::channel(constants::OUTBOUND_QUEUE_CAPACITY);
+    {
+        let mut state = storm.inner.write().await;
+        state
+            .peers
+            .iter_mut()
+            .find(|peer| peer.compressed_public_key == connected_public_key)
+            .unwrap()
+            .status = PeerStatus::Active;
+        state.connections.insert(connected_public_key, connection);
+    }
+    let members = [local_public_key, connected_public_key, joining_public_key]
+        .into_iter()
+        .map(|key| StormState::x_only_public_key(&key))
+        .collect::<BTreeSet<_>>();
+
+    storm.begin_member_migration(members).await.unwrap();
+
+    let framed = messages.recv().await.unwrap();
+    let message = StormMessage::from_bytes(&framed[size_of::<u32>()..]).unwrap();
+    assert_eq!(
+        message.header.payload_id,
+        message_handlers::StormMessagePayloadType::AskPeersSocketInfo as u32
+    );
+}
+
+#[tokio::test]
+async fn joining_member_discovers_staged_network_over_existing_listener() {
+    use std::collections::BTreeSet;
+
+    let secp = Secp256k1::new();
+    let mut random = rand::thread_rng();
+    let host_secret_key = SecretKey::new(&mut random);
+    let host_public_key = host_secret_key.public_key(&secp).serialize();
+    let removed_secret_key = SecretKey::new(&mut random);
+    let removed_public_key = removed_secret_key.public_key(&secp).serialize();
+    let joining_secret_key = SecretKey::new(&mut random);
+    let joining_public_key = joining_secret_key.public_key(&secp).serialize();
+    let mut host = Storm::from_peers(
+        host_secret_key,
+        vec![Peer::new(host_public_key), Peer::new(removed_public_key)],
+    );
+    host.start(Some("127.0.0.1:0".to_string())).await.unwrap();
+    let mut removed_messages = Storm::claim_connection(&host.inner, removed_public_key, None)
+        .await
+        .unwrap();
+    let host_address = host.listener_address.unwrap().to_string();
+    let target = [host_public_key, joining_public_key]
+        .into_iter()
+        .map(|key| StormState::x_only_public_key(&key))
+        .collect::<BTreeSet<_>>();
+    host.begin_member_migration(target).await.unwrap();
+
+    let mut discovery_peer = Peer::new(host_public_key);
+    discovery_peer.socket_address = Some(host_address);
+    let mut joining = Storm::discoverable(joining_secret_key, discovery_peer).unwrap();
+    joining
+        .start(Some("127.0.0.1:0".to_string()))
+        .await
+        .unwrap();
+
+    wait_for_discovery_completion(&joining, 2).await;
+    assert!(host.member_migration_ready().await);
+    let framed = timeout(Duration::from_secs(1), removed_messages.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let message = StormMessage::from_bytes(&framed[size_of::<u32>()..]).unwrap();
+    assert_eq!(
+        message.header.payload_id,
+        message_handlers::StormMessagePayloadType::PeersSocketInfo as u32
+    );
+    assert_eq!(host.peers().await.len(), 2);
+    assert!(
+        host.peers()
+            .await
+            .iter()
+            .any(|peer| peer.compressed_public_key == removed_public_key)
+    );
+
+    let activated = host.activate_member_migration().await.unwrap();
+    assert!(
+        activated
+            .iter()
+            .any(|peer| peer.compressed_public_key == joining_public_key)
+    );
+    assert!(
+        !activated
+            .iter()
+            .any(|peer| peer.compressed_public_key == removed_public_key)
+    );
+
+    host.shutdown().await;
+    joining.shutdown().await;
+}
+
+#[tokio::test]
 async fn accepted_connection_can_complete_client_discovery() {
     let secp = Secp256k1::new();
     let mut random = rand::thread_rng();
@@ -621,18 +929,22 @@ async fn authenticated_messages_reject_stale_timestamps_and_replays() {
     )));
     let message = StormMessage {
         header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Heartbeat as u32,
+            payload_id: message_handlers::StormMessagePayloadType::Custom as u32,
             timestamp: current_timestamp(),
             protocol_version: constants::PROTOCOL_VERSION,
         },
         payload: Vec::new(),
     };
 
-    Storm::handle_message(&state, peer_public_key, message.clone())
+    state
+        .write()
         .await
+        .register_message(peer_public_key, &message, current_timestamp())
         .unwrap();
-    let replay_error = Storm::handle_message(&state, peer_public_key, message)
+    let replay_error = state
+        .write()
         .await
+        .register_message(peer_public_key, &message, current_timestamp())
         .unwrap_err();
     assert!(matches!(replay_error, Error::ReplayedMessage));
 
@@ -645,10 +957,98 @@ async fn authenticated_messages_reject_stale_timestamps_and_replays() {
         },
         payload: Vec::new(),
     };
-    let stale_error = Storm::handle_message(&state, peer_public_key, stale_message)
+    let stale_error = state
+        .write()
         .await
+        .register_message(peer_public_key, &stale_message, current_timestamp())
         .unwrap_err();
     assert!(matches!(stale_error, Error::MessageTimestampOutsideWindow));
+}
+
+#[tokio::test]
+async fn authenticated_control_messages_may_repeat() {
+    let mut random = rand::thread_rng();
+    let local_secret_key = SecretKey::new(&mut random);
+    let peer_secret_key = SecretKey::new(&mut random);
+    let peer_public_key = peer_secret_key.public_key(&Secp256k1::new()).serialize();
+    let state = Arc::new(RwLock::new(StormState::new(
+        local_secret_key,
+        vec![Peer::new(peer_public_key)],
+    )));
+    let message = StormMessage {
+        header: StormMessageHeader {
+            payload_id: message_handlers::StormMessagePayloadType::Heartbeat as u32,
+            timestamp: current_timestamp(),
+            protocol_version: constants::PROTOCOL_VERSION,
+        },
+        payload: Vec::new(),
+    };
+
+    Storm::handle_message(&state, peer_public_key, message.clone())
+        .await
+        .unwrap();
+    Storm::handle_message(&state, peer_public_key, message)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_control_messages_have_an_independent_rate_limit() {
+    let mut random = rand::thread_rng();
+    let local_secret_key = SecretKey::new(&mut random);
+    let peer_secret_key = SecretKey::new(&mut random);
+    let peer_public_key = peer_secret_key.public_key(&Secp256k1::new()).serialize();
+    let state = Arc::new(RwLock::new(StormState::new(
+        local_secret_key,
+        vec![Peer::new(peer_public_key)],
+    )));
+    let received_at = current_timestamp();
+    let control_message = StormMessage {
+        header: StormMessageHeader {
+            payload_id: message_handlers::StormMessagePayloadType::Heartbeat as u32,
+            timestamp: received_at,
+            protocol_version: constants::PROTOCOL_VERSION,
+        },
+        payload: Vec::new(),
+    };
+
+    for _ in 0..constants::CONTROL_MESSAGE_RATE_CAPACITY {
+        state
+            .write()
+            .await
+            .register_message(peer_public_key, &control_message, received_at)
+            .unwrap();
+    }
+    let error = state
+        .write()
+        .await
+        .register_message(peer_public_key, &control_message, received_at)
+        .unwrap_err();
+    assert!(matches!(error, Error::MessageRateLimit));
+
+    state
+        .write()
+        .await
+        .register_message(
+            peer_public_key,
+            &control_message,
+            received_at + constants::CONTROL_MESSAGE_RATE_WINDOW.as_secs(),
+        )
+        .unwrap();
+
+    let application_message = StormMessage {
+        header: StormMessageHeader {
+            payload_id: message_handlers::StormMessagePayloadType::Custom as u32,
+            timestamp: received_at,
+            protocol_version: constants::PROTOCOL_VERSION,
+        },
+        payload: b"application".to_vec(),
+    };
+    state
+        .write()
+        .await
+        .register_message(peer_public_key, &application_message, received_at)
+        .unwrap();
 }
 
 #[tokio::test]
@@ -665,27 +1065,31 @@ async fn authenticated_messages_cannot_evict_replay_fingerprints() {
     for sequence in 0..constants::REPLAY_CACHE_CAPACITY {
         let message = StormMessage {
             header: StormMessageHeader {
-                payload_id: message_handlers::StormMessagePayloadType::Heartbeat as u32,
+                payload_id: message_handlers::StormMessagePayloadType::Custom as u32,
                 timestamp: current_timestamp(),
                 protocol_version: constants::PROTOCOL_VERSION,
             },
             payload: sequence.to_be_bytes().to_vec(),
         };
-        Storm::handle_message(&state, peer_public_key, message)
+        state
+            .write()
             .await
+            .register_message(peer_public_key, &message, current_timestamp())
             .unwrap();
     }
 
     let excess_message = StormMessage {
         header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Heartbeat as u32,
+            payload_id: message_handlers::StormMessagePayloadType::Custom as u32,
             timestamp: current_timestamp(),
             protocol_version: constants::PROTOCOL_VERSION,
         },
         payload: b"excess".to_vec(),
     };
-    let error = Storm::handle_message(&state, peer_public_key, excess_message)
+    let error = state
+        .write()
         .await
+        .register_message(peer_public_key, &excess_message, current_timestamp())
         .unwrap_err();
     assert!(matches!(error, Error::MessageRateLimit));
 }

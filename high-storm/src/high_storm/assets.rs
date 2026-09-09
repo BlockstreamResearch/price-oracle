@@ -40,6 +40,7 @@ const STORM_EYE_RPC_AMOUNT: f64 = 0.000_100_00;
 const TREASURY_BLINDING_SECRET: [u8; 32] = [0x42; 32];
 const INITIAL_MEMBERS_MAGIC: [u8; 2] = *b"OM";
 const INITIAL_MEMBERS_VERSION: u8 = 1;
+const MIGRATED_MEMBERS_VERSION: u8 = 2;
 const INITIAL_MEMBERS_HEADER_LEN: usize = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,6 +57,21 @@ pub(crate) struct TickAssetContractData {
 }
 
 pub(crate) fn initial_members_script(members: &[[u8; 32]]) -> Result<Script, AssetError> {
+    members_script(members, INITIAL_MEMBERS_VERSION, None)
+}
+
+pub(crate) fn migrated_members_script(
+    members: &[[u8; 32]],
+    proposer: [u8; 32],
+) -> Result<Script, AssetError> {
+    members_script(members, MIGRATED_MEMBERS_VERSION, Some(proposer))
+}
+
+fn members_script(
+    members: &[[u8; 32]],
+    version: u8,
+    proposer: Option<[u8; 32]>,
+) -> Result<Script, AssetError> {
     let mut members = members.to_vec();
     members.sort_unstable();
     members.dedup();
@@ -65,12 +81,17 @@ pub(crate) fn initial_members_script(members: &[[u8; 32]]) -> Result<Script, Ass
         return Err(AssetError::InvalidRpcResponse("initial members"));
     }
 
-    let mut data = Vec::with_capacity(INITIAL_MEMBERS_HEADER_LEN + members.len() * 32);
+    let mut data = Vec::with_capacity(
+        INITIAL_MEMBERS_HEADER_LEN + members.len() * 32 + proposer.map_or(0, |_| 32),
+    );
     data.extend_from_slice(&INITIAL_MEMBERS_MAGIC);
-    data.push(INITIAL_MEMBERS_VERSION);
+    data.push(version);
     data.extend_from_slice(&count.to_be_bytes());
     for member in members {
         data.extend_from_slice(&member);
+    }
+    if let Some(proposer) = proposer {
+        data.extend_from_slice(&proposer);
     }
     Ok(Script::new_op_return(&data))
 }
@@ -110,6 +131,42 @@ pub(crate) fn initial_members_from_script(
         return Err(AssetError::InvalidRpcResponse("initial member order"));
     }
     Ok(Some(members))
+}
+
+pub(crate) fn migrated_members_proposer_from_script(
+    script: &Script,
+) -> Result<Option<[u8; 32]>, AssetError> {
+    let mut instructions = script.instructions_minimal();
+    if !matches!(
+        instructions.next(),
+        Some(Ok(Instruction::Op(opcodes::all::OP_RETURN)))
+    ) {
+        return Ok(None);
+    }
+    let Some(Ok(Instruction::PushBytes(data))) = instructions.next() else {
+        return Ok(None);
+    };
+    if instructions.next().is_some()
+        || data.len() < INITIAL_MEMBERS_MAGIC.len()
+        || data[..INITIAL_MEMBERS_MAGIC.len()] != INITIAL_MEMBERS_MAGIC
+    {
+        return Ok(None);
+    }
+    if data.len() < INITIAL_MEMBERS_HEADER_LEN || data[2] != MIGRATED_MEMBERS_VERSION {
+        return Ok(None);
+    }
+    let count = usize::from(u16::from_be_bytes(data[3..5].try_into().unwrap()));
+    let members_end = INITIAL_MEMBERS_HEADER_LEN + count * 32;
+    if count == 0 || data.len() != members_end + 32 {
+        return Err(AssetError::InvalidRpcResponse("migrated members marker"));
+    }
+    let members = data[INITIAL_MEMBERS_HEADER_LEN..members_end]
+        .chunks_exact(32)
+        .collect::<Vec<_>>();
+    if !members.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(AssetError::InvalidRpcResponse("migrated member order"));
+    }
+    Ok(Some(data[members_end..].try_into().unwrap()))
 }
 
 pub(crate) fn treasury_blinding_secret() -> SecretKey {
@@ -1252,6 +1309,18 @@ mod tests {
             initial_members_from_script(&Script::new_op_return(b"other")).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn migrated_members_marker_includes_the_proposer() {
+        let proposer = [4; 32];
+        let script = migrated_members_script(&[[3; 32], [1; 32], [2; 32]], proposer).unwrap();
+
+        assert_eq!(
+            migrated_members_proposer_from_script(&script).unwrap(),
+            Some(proposer)
+        );
+        assert!(initial_members_from_script(&script).is_err());
     }
 
     #[test]

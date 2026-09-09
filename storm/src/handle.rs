@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use secp256k1_zkp::PublicKey;
 use tokio::net::TcpStream;
@@ -11,9 +11,138 @@ use crate::{
 };
 
 impl StormHandle {
+    /// Restricts migration peer tables to one Noise-authenticated transport identity.
+    pub async fn set_peer_table_authority(&self, authority: [u8; 33]) -> Result<(), Error> {
+        PublicKey::from_slice(&authority).map_err(|_| Error::UnauthorizedConnection)?;
+        self.inner.write().await.peer_table_authority = Some(authority);
+        Ok(())
+    }
+
+    /// Stages a target member set while retaining the active peer table.
+    pub async fn begin_member_migration(&self, members: BTreeSet<[u8; 32]>) -> Result<(), Error> {
+        {
+            let mut state = self.inner.write().await;
+            if let Some(staged) = &state.migration_members {
+                if staged != &members {
+                    return Err(Error::MigrationAlreadyStaged);
+                }
+                if !state.migration_peer_identities_valid() {
+                    return Err(Error::InvalidMigrationPeerTable);
+                }
+            } else {
+                let mut candidates = state
+                    .peers
+                    .iter()
+                    .chain(&state.migration_peers)
+                    .filter(|peer| {
+                        members.contains(&crate::state::StormState::x_only_public_key(
+                            &peer.compressed_public_key,
+                        ))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                candidates.sort_by_key(|peer| peer.compressed_public_key);
+                candidates.dedup_by_key(|peer| peer.compressed_public_key);
+                if !crate::state::StormState::peer_identities_unique(&candidates) {
+                    return Err(Error::InvalidMigrationPeerTable);
+                }
+                state.migration_peers = candidates;
+                state.migration_members = Some(members);
+            }
+        }
+
+        self.connect_migration_peers().await;
+        self.request_migration_peer_table().await?;
+        self.broadcast_discovery_table_if_ready().await?;
+
+        Ok(())
+    }
+
+    /// Returns whether every staged member has an authenticated connection.
+    pub async fn member_migration_ready(&self) -> bool {
+        self.inner.read().await.migration_ready()
+    }
+
+    /// Returns whether this node may process migration execution messages.
+    pub async fn local_member_migration_ready(&self) -> bool {
+        let state = self.inner.read().await;
+        if state.migration_contains(&state.initializer_public_key) {
+            state.migration_ready()
+        } else {
+            state.migration_table_complete()
+        }
+    }
+
+    /// Returns the complete staged peer table when it is ready to activate.
+    pub async fn member_migration_peers(&self) -> Result<Vec<Peer>, Error> {
+        let state = self.inner.read().await;
+        if state.migration_members.is_none() {
+            return Err(Error::MigrationNotStaged);
+        }
+        if !state.migration_peer_identities_valid() {
+            return Err(Error::InvalidMigrationPeerTable);
+        }
+        if !state.migration_ready()
+            && (state.migration_contains(&state.initializer_public_key)
+                || !state.migration_table_complete())
+        {
+            return Err(Error::MigrationNotReady);
+        }
+        if !state.migration_peer_table_matches_members() {
+            return Err(Error::InvalidMigrationPeerTable);
+        }
+        Ok(state.migration_peers.clone())
+    }
+
+    /// Activates the staged peer table after every target member is connected.
+    pub async fn activate_member_migration(&self) -> Result<Vec<Peer>, Error> {
+        let mut state = self.inner.write().await;
+        if state.migration_members.is_none() {
+            return Err(Error::MigrationNotStaged);
+        }
+        if !state.migration_peer_identities_valid() {
+            return Err(Error::InvalidMigrationPeerTable);
+        }
+        if !state.migration_ready()
+            && (state.migration_contains(&state.initializer_public_key)
+                || !state.migration_table_complete())
+        {
+            return Err(Error::MigrationNotReady);
+        }
+        if !state.migration_peer_table_matches_members() {
+            return Err(Error::InvalidMigrationPeerTable);
+        }
+
+        state.peers = std::mem::take(&mut state.migration_peers);
+        state.migration_members = None;
+        let active_keys = state
+            .peers
+            .iter()
+            .map(|peer| peer.compressed_public_key)
+            .collect::<BTreeSet<_>>();
+        state.connections.retain(|key, _| active_keys.contains(key));
+
+        Ok(state.peers.clone())
+    }
+
+    /// Discards a staged member set without changing the active network.
+    pub async fn cancel_member_migration(&self) {
+        let mut state = self.inner.write().await;
+        state.migration_members = None;
+    }
+
     /// Returns a snapshot of the current peer table.
     pub async fn peers(&self) -> Vec<Peer> {
         self.inner.read().await.peers.clone()
+    }
+
+    /// Returns whether the local transport identity belongs to the active peer table.
+    pub async fn is_local_member(&self) -> bool {
+        let state = self.inner.read().await;
+        state
+            .peers
+            .iter()
+            .any(|peer| peer.compressed_public_key == state.initializer_public_key)
     }
 
     /// Queues a message for each connected peer in `peers`.
@@ -88,17 +217,65 @@ impl StormHandle {
 
     pub(crate) async fn connect_known_peers(&self) {
         let plan = self.inner.read().await.connection_plan();
-        self.connect_targets(&plan).await;
+        self.connect_targets(&plan, false).await;
         self.finish_client_discovery_if_connected().await;
     }
 
-    async fn connect_targets(&self, plan: &ConnectionPlan) {
+    pub(crate) async fn connect_migration_peers(&self) {
+        let plan = self.inner.read().await.migration_connection_plan();
+        if let Some(plan) = plan {
+            self.connect_targets(&plan, false).await;
+        }
+    }
+
+    pub(crate) async fn reconnect_disconnected_peers(&self, reverse: bool) {
+        let plan = self.inner.read().await.connection_plan();
+        self.connect_targets(&plan, reverse).await;
+        let migration_plan = self.inner.read().await.migration_connection_plan();
+        if let Some(migration_plan) = migration_plan {
+            self.connect_targets(&migration_plan, reverse).await;
+        }
+        if let Err(error) = self.request_migration_peer_table().await {
+            log::debug!("Failed to request migration peer table: {error}");
+        }
+        self.finish_client_discovery_if_connected().await;
+    }
+
+    async fn request_migration_peer_table(&self) -> Result<(), Error> {
+        let recipients = {
+            let state = self.inner.read().await;
+            if state.migration_ready() {
+                return Ok(());
+            }
+            state
+                .peers
+                .iter()
+                .filter(|peer| {
+                    peer.compressed_public_key != state.initializer_public_key
+                        && peer.status == PeerStatus::Active
+                        && state.migration_contains(&peer.compressed_public_key)
+                })
+                .map(|peer| peer.compressed_public_key)
+                .collect::<Vec<_>>()
+        };
+        if recipients.is_empty() {
+            return Ok(());
+        }
+
+        self.send_message_by_public_keys(
+            message_handlers::ask_peers_socket_info::message(),
+            &recipients,
+        )
+        .await
+    }
+
+    async fn connect_targets(&self, plan: &ConnectionPlan, reverse: bool) {
         let mut attempts = JoinSet::new();
 
         for target in plan
             .targets
             .iter()
-            .filter(|target| plan.should_connect(target))
+            .filter(|target| plan.should_connect(target, reverse))
         {
             let handle = self.clone();
             let peer_public_key = target.public_key;
@@ -187,6 +364,34 @@ impl StormHandle {
     }
 
     pub(crate) async fn broadcast_discovery_table_if_ready(&self) -> Result<(), Error> {
+        let migration_broadcast = {
+            let state = self.inner.read().await;
+            if state.migration_ready() {
+                let recipients = state
+                    .migration_peers
+                    .iter()
+                    .chain(&state.peers)
+                    .filter(|peer| {
+                        peer.compressed_public_key != state.initializer_public_key
+                            && peer.status == PeerStatus::Active
+                    })
+                    .map(|peer| peer.compressed_public_key)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let message = message_handlers::peers_socket_info::message(&state.migration_peers)
+                    .map_err(|(_, message)| Error::Io(std::io::Error::other(message)))?;
+                Some((recipients, message))
+            } else {
+                None
+            }
+        };
+
+        if let Some((recipients, message)) = migration_broadcast {
+            self.send_message_by_public_keys(message, &recipients)
+                .await?;
+        }
+
         let broadcast = {
             let state = self.inner.read().await;
             let local_public_key = state.initializer_public_key;

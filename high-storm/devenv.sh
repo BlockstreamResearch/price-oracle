@@ -5,6 +5,7 @@ set -Eeuo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 compose_file="${script_dir}/compose.yml"
 network_state_file="${script_dir}/.devenv-network.env"
+extra_nodes_dir="${script_dir}/.devenv-nodes"
 
 project_name="${COMPOSE_PROJECT_NAME:-high-storm-local}"
 network_name="${STORM_NETWORK_NAME:-${project_name}_storm}"
@@ -107,14 +108,196 @@ require_docker() {
     fi
 }
 
+require_node_number() {
+    if [[ ! "${1:-}" =~ ^[0-9]+$ ]] || (( $1 < 1 || $1 > 99 )); then
+        echo "NODE must be an integer from 1 to 99." >&2
+        exit 2
+    fi
+}
+
+node_config_path() {
+    local node="$1"
+
+    if (( node <= 3 )); then
+        printf '%s/docker/node-%s.toml' "${script_dir}" "${node}"
+    else
+        printf '%s/node-%s.toml' "${extra_nodes_dir}" "${node}"
+    fi
+}
+
+private_key_from_config() {
+    sed -n 's/^private_key = "\([0-9a-fA-F]*\)"$/\1/p' "$1"
+}
+
+public_key_from_private_key() {
+    local encoded_der private_key public_key
+
+    private_key="$1"
+    if [[ ! "${private_key}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        return 1
+    fi
+    encoded_der="$(
+        printf '302e0201010420%sA00706052B8104000A' "${private_key}" \
+            | xxd -r -p \
+            | openssl ec -inform DER -conv_form compressed -pubout -outform DER 2>/dev/null \
+            | xxd -p -c 1000
+    )" || return 1
+    public_key="${encoded_der:${#encoded_der}-66}"
+    if [[ ! "${public_key}" =~ ^0[23][0-9a-fA-F]{64}$ ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "${public_key}" | tr '[:upper:]' '[:lower:]'
+}
+
+node_public_key() {
+    local config_path private_key
+
+    require_node_number "$1"
+    config_path="$(node_config_path "$1")"
+    if [[ ! -f "${config_path}" ]]; then
+        echo "node-$1 is not configured; deploy it first." >&2
+        exit 1
+    fi
+    private_key="$(private_key_from_config "${config_path}")"
+    if ! public_key_from_private_key "${private_key}"; then
+        echo "node-$1 has an invalid signer private key." >&2
+        exit 1
+    fi
+}
+
+remove_extra_node_containers() {
+    local containers
+
+    containers="$(docker ps --all --quiet \
+        --filter "label=high-storm.devenv.project=${project_name}" \
+        --filter "label=high-storm.devenv.role=extra-node")"
+    if [[ -n "${containers}" ]]; then
+        docker rm --force ${containers} >/dev/null
+    fi
+}
+
+deploy_node() {
+    local config_path container_name database database_exists image_name node
+    local peer_port api_port address_suffix private_key public_key coordinator_public_key
+
+    node="$1"
+    require_node_number "${node}"
+    if (( node <= 3 )); then
+        echo "NODE must be 4 or greater; nodes 1, 2, and 3 are managed by Compose." >&2
+        exit 2
+    fi
+
+    ensure_storm_network
+    for service in postgres elements-1 node-1; do
+        if [[ "$(compose ps --status running --services "${service}")" != "${service}" ]]; then
+            echo "${service} is not running; start the base deployment first." >&2
+            exit 1
+        fi
+    done
+
+    config_path="$(node_config_path "${node}")"
+    database="high-storm-node-${node}"
+    database_exists="$(compose exec -T postgres psql \
+        --username high-storm \
+        --dbname postgres \
+        --tuples-only \
+        --no-align \
+        --command "SELECT 1 FROM pg_database WHERE datname = '${database}'")"
+    if [[ ! -f "${config_path}" && "${database_exists}" == "1" ]]; then
+        echo "${database} exists but ${config_path} does not; refusing to replace its identity." >&2
+        exit 1
+    fi
+
+    if [[ ! -f "${config_path}" ]]; then
+        mkdir -p "${extra_nodes_dir}"
+        chmod 700 "${extra_nodes_dir}"
+        while :; do
+            private_key="$(openssl rand -hex 32)"
+            if public_key_from_private_key "${private_key}" >/dev/null; then
+                break
+            fi
+        done
+        cat > "${config_path}" <<EOF
+[service]
+port = 9000
+external_api_address = "0.0.0.0:9100"
+
+[service.signer]
+private_key = "${private_key}"
+
+[service.elements_rpc]
+url = "http://elements-1:18884"
+username = "high-storm"
+password = "high-storm"
+wallet = "funded-key"
+
+[service.protocol]
+operational_fee_sats = 1000
+tick_burn_reserve_sats = 1000
+issuance_transaction_fee_sats = 1000
+burn_transaction_fee_sats = 500
+exchange_transaction_fee_sats = 500
+tick_lifetime_blocks = 60
+
+[service.db]
+url = "postgres:5432"
+username = "high-storm"
+password = "high-storm"
+database = "${database}"
+max_connections = 5
+EOF
+        chmod 600 "${config_path}"
+    fi
+
+    if [[ "${database_exists}" != "1" ]]; then
+        compose exec -T postgres createdb \
+            --username high-storm \
+            --owner high-storm \
+            "${database}"
+    fi
+
+    compose build node-1
+    image_name="${project_name}-node-1:latest"
+    public_key="$(node_public_key "${node}")"
+    coordinator_public_key="$(node_public_key 1)"
+    container_name="${project_name}-extra-node-${node}"
+    peer_port="$((8999 + node))"
+    api_port="$((9099 + node))"
+    address_suffix="$((100 + node))"
+
+    docker rm --force "${container_name}" >/dev/null 2>&1 || true
+    docker run --detach \
+        --name "${container_name}" \
+        --user "$(id -u):$(id -g)" \
+        --label "high-storm.devenv.project=${project_name}" \
+        --label "high-storm.devenv.role=extra-node" \
+        --network "${network_name}" \
+        --ip "${STORM_NETWORK_PREFIX}.${address_suffix}" \
+        --publish "${peer_port}:9000" \
+        --publish "${api_port}:9100" \
+        --volume "${config_path}:/etc/high-storm/config.toml:ro" \
+        --env "OPERATOR_PUBLIC_KEY=${public_key}" \
+        --env "RUST_LOG=${RUST_LOG:-info,high_storm=debug,storm=debug,sqlx=warn}" \
+        --entrypoint /bin/sh \
+        "${image_name}" \
+        -c "(while [ ! -S /tmp/high-storm.sock ]; do sleep 1; done; until storm-operator operator add \"\${OPERATOR_PUBLIC_KEY}\"; do sleep 1; done) & high-storm run --config /etc/high-storm/config.toml || exec high-storm initialize join --config /etc/high-storm/config.toml --discovery-public-key ${coordinator_public_key} --discovery-address ${STORM_NETWORK_PREFIX}.11:9000" \
+        >/dev/null
+
+    echo "Deployed node-${node} at ${STORM_NETWORK_PREFIX}.${address_suffix}:9000 (host ports ${peer_port} and ${api_port})."
+    echo "Public key: ${public_key}"
+}
+
 usage() {
     cat <<EOF
-Usage: $(basename "$0") {create|up|rebuild|down|connections NODE|droplets NODE SATS|elements NODE [RPC ARGUMENTS...]}
+Usage: $(basename "$0") {create|up|rebuild|down|deploy-node NODE|public-key NODE|connections NODE|droplets NODE SATS|elements NODE [RPC ARGUMENTS...]}
 
     create             Delete the deployment and data, rebuild, and start fresh.
     up                 Start the deployment while preserving existing data.
     rebuild            Rebuild application images and restart while preserving data.
     down               Stop and remove the deployment while preserving existing data.
+    deploy-node NODE   Deploy an initialized-or-waiting extra node (NODE >= 4).
+    public-key NODE    Print a node's compressed secp256k1 public key.
     connections NODE   List active Storm connections for node 1, 2, or 3.
     droplets NODE SATS
                        Deposit SATS to Treasury and credit all Droplets to NODE.
@@ -127,6 +310,8 @@ require_docker
 case "${1:-}" in
     create)
         ensure_storm_network
+        remove_extra_node_containers
+        rm -rf "${extra_nodes_dir}"
         compose down --volumes --remove-orphans
         compose up --detach --build --force-recreate
         ;;
@@ -141,7 +326,14 @@ case "${1:-}" in
             node-1 node-2 node-3 operator-1 operator-2 operator-3
         ;;
     down)
+        remove_extra_node_containers
         compose down --remove-orphans
+        ;;
+    deploy-node)
+        deploy_node "${2:-}"
+        ;;
+    public-key)
+        node_public_key "${2:-}"
         ;;
     connections)
         case "${2:-}" in

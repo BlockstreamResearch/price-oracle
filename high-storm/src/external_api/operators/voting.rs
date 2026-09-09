@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::auth::{SignedRequest, authenticate_bearer};
 use crate::{
     MergeStormEyes, NetworkVoteKind, NetworkVoteRequest, SplitStormEye, StormEyeUtxo,
-    UpdateNetworkMembers, VotingExecutionError, VotingRequest, VotingStatus,
+    UpdateNetworkMembers, VotingError, VotingExecutionError, VotingRequest, VotingStatus,
     external_api::{ApiError, ExternalApiState},
 };
 
@@ -94,7 +94,10 @@ pub(super) async fn approve_voting(
     state.auth.verify_write(&request, "POST", &path).await?;
 
     let hash = parse_hash(&hash)?;
-    state.node.approve_voting_request(hash).await?;
+    match state.node.approve_voting_request(hash).await {
+        Ok(()) | Err(VotingError::DuplicateApproval(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -119,14 +122,11 @@ impl From<VotingExecutionError> for ApiError {
     fn from(error: VotingExecutionError) -> Self {
         match error {
             VotingExecutionError::UnknownRequest(_) => Self::not_found(error),
-            VotingExecutionError::NetworkMembersUnimplemented => Self {
-                status: StatusCode::NOT_IMPLEMENTED,
-                message: error.to_string(),
-            },
             VotingExecutionError::NotApproved
             | VotingExecutionError::AlreadyExecuting
             | VotingExecutionError::AlreadyExecuted
-            | VotingExecutionError::MissingProposer => Self::conflict(error),
+            | VotingExecutionError::MissingProposer
+            | VotingExecutionError::MemberMigrationNotReady => Self::conflict(error),
             VotingExecutionError::Invalid(_) => Self::bad_request(error),
             _ => Self::internal(error),
         }

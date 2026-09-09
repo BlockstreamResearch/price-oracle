@@ -15,7 +15,7 @@ use tokio::{
 };
 
 use crate::{
-    Error, MessageContext, PeerStatus, Storm, StormHandle, StormMessage, constants, crypto,
+    Error, MessageContext, Peer, PeerStatus, Storm, StormHandle, StormMessage, constants, crypto,
     message, message_handlers, state::StormState,
 };
 
@@ -24,6 +24,9 @@ impl Storm {
     pub async fn shutdown(&mut self) {
         if let Some(listener_handle) = self.listener_handle.take() {
             listener_handle.abort();
+        }
+        if let Some(reconnect_handle) = self.reconnect_handle.take() {
+            reconnect_handle.abort();
         }
         self.listener_address = None;
         let mut state = self.inner.write().await;
@@ -76,7 +79,23 @@ impl Storm {
     /// this method again reuses the existing listener and retries peer connections.
     pub async fn start(&mut self, address: Option<String>) -> Result<(), Error> {
         self.listen(address).await?;
-        self.handle().connect_to_peers().await
+        self.handle().connect_to_peers().await?;
+        if self.reconnect_handle.is_none() {
+            let handle = self.handle();
+            self.reconnect_handle = Some(tokio::spawn(async move {
+                let mut reconnect = interval_at(
+                    Instant::now() + constants::RECONNECT_INTERVAL,
+                    constants::RECONNECT_INTERVAL,
+                );
+                let mut reverse = true;
+                loop {
+                    reconnect.tick().await;
+                    handle.reconnect_disconnected_peers(reverse).await;
+                    reverse = !reverse;
+                }
+            }));
+        }
+        Ok(())
     }
 
     async fn run_listener(listener: TcpListener, state: Arc<RwLock<StormState>>) {
@@ -173,8 +192,19 @@ impl Storm {
             if let Some(peer_address) = peer_address {
                 peer.socket_address = Some(peer_address.to_string());
             }
+
+            if let Some(peer) = state
+                .migration_peers
+                .iter_mut()
+                .find(|peer| peer.compressed_public_key == peer_public_key)
+            {
+                peer.status = PeerStatus::Active;
+                if let Some(peer_address) = peer_address {
+                    peer.socket_address = Some(peer_address.to_string());
+                }
+            }
         } else {
-            if !state.accepts_unregistered_connections() {
+            if !state.accepts_unregistered_connection(&peer_public_key) {
                 return Err(Error::UnauthorizedConnection);
             }
             let provisional_connections = state
@@ -189,6 +219,24 @@ impl Storm {
                 .count();
             if provisional_connections >= constants::MAX_PROVISIONAL_CONNECTIONS {
                 return Err(Error::ProvisionalConnectionLimit);
+            }
+
+            if state.migration_contains(&peer_public_key) {
+                if let Some(peer) = state
+                    .migration_peers
+                    .iter_mut()
+                    .find(|peer| peer.compressed_public_key == peer_public_key)
+                {
+                    peer.status = PeerStatus::Active;
+                    if let Some(peer_address) = peer_address {
+                        peer.socket_address = Some(peer_address.to_string());
+                    }
+                } else {
+                    let mut peer = Peer::new(peer_public_key);
+                    peer.status = PeerStatus::Active;
+                    peer.socket_address = peer_address.map(|address| address.to_string());
+                    state.migration_peers.push(peer);
+                }
             }
         }
 
@@ -205,6 +253,14 @@ impl Storm {
         state.connections.remove(&peer_public_key);
         if let Some(peer) = state
             .peers
+            .iter_mut()
+            .find(|peer| peer.compressed_public_key == peer_public_key)
+            && peer.status == PeerStatus::Active
+        {
+            peer.status = PeerStatus::Inactive;
+        }
+        if let Some(peer) = state
+            .migration_peers
             .iter_mut()
             .find(|peer| peer.compressed_public_key == peer_public_key)
             && peer.status == PeerStatus::Active
@@ -310,17 +366,46 @@ impl Storm {
             let peer_index = state
                 .peers
                 .iter()
-                .position(|peer| peer.compressed_public_key == peer_public_key)
+                .position(|peer| peer.compressed_public_key == peer_public_key);
+            let migration_peer_index = state
+                .migration_peers
+                .iter()
+                .position(|peer| peer.compressed_public_key == peer_public_key);
+            let peer_status = peer_index
+                .map(|index| state.peers[index].status)
+                .or_else(|| migration_peer_index.map(|index| state.migration_peers[index].status))
                 .ok_or(Error::UnauthorizedConnection)?;
-            if state.peers[peer_index].status == PeerStatus::Banned {
+            if peer_status == PeerStatus::Banned {
                 return Err(Error::UnauthorizedConnection);
             }
 
             state.register_message(peer_public_key, &message, received_at)?;
-            state.peers[peer_index].last_seen = Some(received_at);
+            if let Some(index) = peer_index {
+                state.peers[index].last_seen = Some(received_at);
+            }
+            if let Some(index) = migration_peer_index {
+                state.migration_peers[index].last_seen = Some(received_at);
+            }
 
             MessageContext { peer_public_key }
         };
+
+        let staged_only = {
+            let state = state.read().await;
+            !state
+                .peers
+                .iter()
+                .any(|peer| peer.compressed_public_key == peer_public_key)
+        };
+        if staged_only
+            && message.header.payload_id
+                != message_handlers::StormMessagePayloadType::Heartbeat as u32
+            && message.header.payload_id
+                != message_handlers::StormMessagePayloadType::AskPeersSocketInfo as u32
+            && message.header.payload_id != message_handlers::StormMessagePayloadType::Error as u32
+        {
+            return Err(Error::UnauthorizedConnection);
+        }
 
         let handle = StormHandle {
             inner: Arc::clone(state),

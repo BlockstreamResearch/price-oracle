@@ -24,7 +24,9 @@ pub struct StoredVotingRequest {
     pub approved_at_block_height: Option<u64>,
     pub execution_started: bool,
     pub execution_transaction: Option<Vec<u8>>,
+    pub execution_request: Option<Vec<u8>>,
     pub execution_txid: Option<[u8; 32]>,
+    pub execution_confirmed: bool,
     pub approvals: Vec<StoredApproval>,
 }
 
@@ -135,7 +137,8 @@ impl VotingStore {
     pub async fn get(&self, message_hash: [u8; 32]) -> Result<Option<StoredVotingRequest>, Error> {
         let Some(row) = sqlx::query(
             "SELECT message_hash, message, proposer_public_key, block_height, \
-             approved_at_block_height, execution_started, execution_transaction, execution_txid \
+             approved_at_block_height, execution_started, execution_transaction, \
+             execution_request, execution_txid, execution_confirmed \
              FROM voting_requests WHERE message_hash = $1",
         )
         .bind(message_hash.to_vec())
@@ -151,7 +154,8 @@ impl VotingStore {
     pub async fn list(&self) -> Result<Vec<StoredVotingRequest>, Error> {
         let rows = sqlx::query(
             "SELECT message_hash, message, proposer_public_key, block_height, \
-             approved_at_block_height, execution_started, execution_transaction, execution_txid \
+             approved_at_block_height, execution_started, execution_transaction, \
+             execution_request, execution_txid, execution_confirmed \
              FROM voting_requests ORDER BY block_height, message_hash",
         )
         .fetch_all(&self.pool)
@@ -195,22 +199,52 @@ impl VotingStore {
         Ok(())
     }
 
-    pub async fn complete_execution(
+    pub async fn record_broadcast(
         &self,
         message_hash: [u8; 32],
         proposer_public_key: [u8; 32],
+        transaction: &[u8],
+        execution_request: &[u8],
         txid: [u8; 32],
     ) -> Result<(), Error> {
         let updated = sqlx::query(
-            "UPDATE voting_requests SET execution_started = 0, execution_transaction = NULL, \
-             proposer_public_key = COALESCE(proposer_public_key, $1), execution_txid = $2 \
-             WHERE message_hash = $3 AND approved_at_block_height IS NOT NULL \
-             AND (proposer_public_key IS NULL OR proposer_public_key = $1) \
-             AND (execution_txid IS NULL OR execution_txid = $2)",
+            "UPDATE voting_requests SET execution_started = 1, \
+             execution_transaction = COALESCE(execution_transaction, $1), \
+             execution_request = $2, proposer_public_key = COALESCE(proposer_public_key, $3), \
+             execution_txid = $4 \
+             WHERE message_hash = $5 AND approved_at_block_height IS NOT NULL \
+             AND execution_confirmed = 0 \
+             AND (execution_transaction IS NULL OR execution_transaction = $1) \
+             AND (proposer_public_key IS NULL OR proposer_public_key = $3) \
+             AND (execution_txid IS NULL OR execution_txid = $4)",
         )
+        .bind(transaction)
+        .bind(execution_request)
         .bind(proposer_public_key.to_vec())
         .bind(txid.to_vec())
         .bind(message_hash.to_vec())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            return Err(Error::ExecutionStateNotUpdated);
+        }
+        Ok(())
+    }
+
+    pub async fn confirm_execution(
+        &self,
+        message_hash: [u8; 32],
+        txid: [u8; 32],
+    ) -> Result<(), Error> {
+        let updated = sqlx::query(
+            "UPDATE voting_requests SET execution_started = 0, execution_confirmed = 1 \
+             WHERE message_hash = $1 AND approved_at_block_height IS NOT NULL \
+             AND execution_request IS NOT NULL AND execution_txid = $2 \
+             AND execution_confirmed = 0",
+        )
+        .bind(message_hash.to_vec())
+        .bind(txid.to_vec())
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -280,10 +314,12 @@ impl VotingStore {
                 .transpose()?,
             execution_started: row.try_get::<i64, _>("execution_started")? != 0,
             execution_transaction: row.try_get("execution_transaction")?,
+            execution_request: row.try_get("execution_request")?,
             execution_txid: row
                 .try_get::<Option<Vec<u8>>, _>("execution_txid")?
                 .map(bytes_to_array)
                 .transpose()?,
+            execution_confirmed: row.try_get::<i64, _>("execution_confirmed")? != 0,
             approvals,
         })
     }
@@ -315,6 +351,7 @@ mod tests {
         let proposer = [2; 32];
         let transaction = [3, 4, 5];
         let txid = [6; 32];
+        let execution_request = [10, 11, 12];
 
         assert!(
             store
@@ -347,30 +384,55 @@ mod tests {
 
         assert!(
             store
-                .complete_execution(request_hash, [9; 32], txid)
+                .record_broadcast(
+                    request_hash,
+                    [9; 32],
+                    &transaction,
+                    &execution_request,
+                    txid,
+                )
                 .await
                 .is_err()
         );
         store
-            .complete_execution(request_hash, proposer, txid)
+            .record_broadcast(
+                request_hash,
+                proposer,
+                &transaction,
+                &execution_request,
+                txid,
+            )
             .await
             .unwrap();
+        store
+            .record_broadcast(
+                request_hash,
+                proposer,
+                &transaction,
+                &execution_request,
+                txid,
+            )
+            .await
+            .unwrap();
+        let broadcast = store.get(request_hash).await.unwrap().unwrap();
+        assert!(broadcast.execution_started);
+        assert_eq!(broadcast.execution_transaction, Some(transaction.to_vec()));
+        assert_eq!(
+            broadcast.execution_request,
+            Some(execution_request.to_vec())
+        );
+        assert_eq!(broadcast.execution_txid, Some(txid));
+        assert!(!broadcast.execution_confirmed);
+
+        store.confirm_execution(request_hash, txid).await.unwrap();
         let executed = store.get(request_hash).await.unwrap().unwrap();
         assert!(!executed.execution_started);
-        assert_eq!(executed.execution_transaction, None);
+        assert_eq!(executed.execution_transaction, Some(transaction.to_vec()));
+        assert_eq!(executed.execution_request, Some(execution_request.to_vec()));
         assert_eq!(executed.execution_txid, Some(txid));
-        assert!(
-            store
-                .complete_execution(request_hash, proposer, txid)
-                .await
-                .is_ok()
-        );
-        assert!(
-            store
-                .complete_execution([0; 32], proposer, txid)
-                .await
-                .is_err()
-        );
+        assert!(executed.execution_confirmed);
+        assert!(store.confirm_execution(request_hash, txid).await.is_err());
+        assert!(store.confirm_execution([0; 32], txid).await.is_err());
     }
 
     #[tokio::test]
@@ -380,6 +442,8 @@ mod tests {
         let request_hash = [10; 32];
         let proposer = [12; 32];
         let txid = [13; 32];
+        let transaction = [14];
+        let execution_request = [15];
 
         assert!(
             store
@@ -394,11 +458,18 @@ mod tests {
                 .unwrap()
         );
         store
-            .complete_execution(request_hash, proposer, txid)
+            .record_broadcast(
+                request_hash,
+                proposer,
+                &transaction,
+                &execution_request,
+                txid,
+            )
             .await
             .unwrap();
         let completed = store.get(request_hash).await.unwrap().unwrap();
         assert_eq!(completed.proposer_public_key, Some(proposer));
         assert_eq!(completed.execution_txid, Some(txid));
+        assert!(!completed.execution_confirmed);
     }
 }

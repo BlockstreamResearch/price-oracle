@@ -25,8 +25,13 @@ function canExecuteVoting(voting: Voting, localPublicKey: string) {
   const localXOnlyPublicKey = requireXOnlyPublicKey(localPublicKey, 'Local public key')
   const proposerPublicKey = requireXOnlyPublicKey(voting.proposer_public_key, 'Voting proposer public key')
   return voting.status === 'approved'
-    && voting.proposal.kind !== 'update_network_members'
     && proposerPublicKey === localXOnlyPublicKey
+}
+
+function canApproveVoting(voting: Voting, localPublicKey: string) {
+  if (voting.status !== 'pending' || !localPublicKey) return false
+  const localXOnlyPublicKey = requireXOnlyPublicKey(localPublicKey, 'Local public key')
+  return !voting.approvals.some((approval) => approval.public_key.toLowerCase() === localXOnlyPublicKey)
 }
 
 export function VotingsPage() {
@@ -48,7 +53,11 @@ export function VotingsPage() {
         fetchVotings(session),
         authenticatedGet<NetworkState>(session, '/operators/state'),
       ])
-      setVotings(nextVotings); setLocalPublicKey(network.local_public_key)
+      setVotings(nextVotings)
+      setSelected((current) => current
+        ? nextVotings.find((voting) => voting.message_hash === current.message_hash) ?? null
+        : null)
+      setLocalPublicKey(network.local_public_key)
     }
     catch (cause) {
       if (cause instanceof ApiError && cause.status === 401) logout()
@@ -64,7 +73,13 @@ export function VotingsPage() {
       authenticatedGet<NetworkState>(session, '/operators/state'),
     ])
       .then(([nextVotings, network]) => {
-        if (active) { setVotings(nextVotings); setLocalPublicKey(network.local_public_key) }
+        if (active) {
+          setVotings(nextVotings)
+          setSelected((current) => current
+            ? nextVotings.find((voting) => voting.message_hash === current.message_hash) ?? null
+            : null)
+          setLocalPublicKey(network.local_public_key)
+        }
       })
       .catch((cause: unknown) => {
         if (!active) return
@@ -74,6 +89,24 @@ export function VotingsPage() {
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
   }, [session, logout])
+
+  const hasActiveVoting = votings.some((voting) => voting.status === 'pending' || voting.status === 'executing')
+  useEffect(() => {
+    if (!session || !hasActiveVoting) return
+    let active = true
+    const interval = window.setInterval(() => {
+      void fetchVotings(session).then((nextVotings) => {
+        if (!active) return
+        setVotings(nextVotings)
+        setSelected((current) => current
+          ? nextVotings.find((voting) => voting.message_hash === current.message_hash) ?? null
+          : null)
+      }).catch((cause: unknown) => {
+        if (active && cause instanceof ApiError && cause.status === 401) logout()
+      })
+    }, 2_000)
+    return () => { active = false; window.clearInterval(interval) }
+  }, [session, logout, hasActiveVoting])
 
   async function create(proposal: VotingProposal) {
     if (!session) return
@@ -98,10 +131,14 @@ export function VotingsPage() {
   async function execute(voting: Voting) {
     if (!session) return
     setActionBusy(true); setError('')
+    const executing = { ...voting, status: 'executing' as const }
+    setVotings((current) => current.map((item) => item.message_hash === voting.message_hash ? executing : item))
+    setSelected((current) => current?.message_hash === voting.message_hash ? executing : current)
     try {
       await signedPost<{ execution_txid: string }>(session, `/operators/voting/${voting.message_hash}/execute`, {})
       setSelected(null); await load()
     } catch (cause) {
+      await load()
       setError(cause instanceof Error ? cause.message : 'Could not execute voting.')
     } finally { setActionBusy(false) }
   }
@@ -163,6 +200,7 @@ function VotingDetail({ voting, localPublicKey, busy, onApprove, onExecute }: {
   voting: Voting; localPublicKey: string; busy: boolean; onApprove: () => void; onExecute: () => void
 }) {
   const canExecute = canExecuteVoting(voting, localPublicKey)
+  const canApprove = canApproveVoting(voting, localPublicKey)
   return <div className="voting-detail">
     <dl className="detail-grid"><div><dt>Status</dt><dd><span className={`status-pill ${voting.status}`}>{voting.status}</span></dd></div>
       <div><dt>Created at</dt><dd>Block {formatNumber(voting.block_height)}</dd></div><div className="full"><dt>Message hash</dt><dd><code>{voting.message_hash}</code></dd></div>
@@ -173,7 +211,7 @@ function VotingDetail({ voting, localPublicKey, busy, onApprove, onExecute }: {
       {voting.approvals.map((approval) => <div className="approval-row" key={`${approval.public_key}-${approval.block_height}`}>
         <CopyableHex value={approval.public_key} visible={10} label="approver public key" /><span>Block {formatNumber(approval.block_height)}</span></div>)}
       {voting.approvals.length === 0 && <p>No approvals recorded.</p>}</div>
-    {voting.status === 'pending' && <footer className="modal-actions"><button className="primary-button" type="button" disabled={busy} onClick={onApprove}>
+    {canApprove && <footer className="modal-actions"><button className="primary-button" type="button" disabled={busy} onClick={onApprove}>
       <CheckCircle2 size={17} /> {busy ? 'Signing…' : 'Approve voting'}</button></footer>}
     {canExecute && <footer className="modal-actions"><button className="primary-button" type="button" disabled={busy} onClick={onExecute}>
       <Play size={17} /> {busy ? 'Executing…' : 'Execute voting'}</button></footer>}

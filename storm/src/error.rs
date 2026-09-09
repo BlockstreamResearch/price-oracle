@@ -57,6 +57,18 @@ pub enum Error {
     /// The configured discovery peer has no socket address.
     #[error("Discovery peer has no socket address")]
     DiscoveryPeerAddressMissing,
+    /// A different member migration is already staged.
+    #[error("A different member migration is already staged")]
+    MigrationAlreadyStaged,
+    /// No member migration is currently staged.
+    #[error("No member migration is staged")]
+    MigrationNotStaged,
+    /// The staged member migration has not connected every target member.
+    #[error("Member migration is not ready")]
+    MigrationNotReady,
+    /// The staged peer table does not map one-to-one to the target x-only identities.
+    #[error("Member migration peer table contains invalid or duplicate x-only identities")]
+    InvalidMigrationPeerTable,
 }
 
 #[cfg(test)]
