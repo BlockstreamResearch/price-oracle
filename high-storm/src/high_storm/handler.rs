@@ -152,16 +152,49 @@ pub(crate) async fn handle(
                 request.proposer_public_key,
                 context.message_context.peer_public_key,
             )?;
+            let peers = context.storm_handle.peers().await;
+            let current_members = super::voting_member_keys(&peers)?;
+            let vote = state.voting().get(request_hash).await?.ok_or_else(|| {
+                super::voting_execution::VotingExecutionError::UnknownRequest(hex::encode(
+                    request_hash,
+                ))
+            })?;
+            if let Some(target_members) =
+                super::member_migration_target(&vote.request, &current_members)?
+            {
+                state
+                    .ensure_member_migration(&context.storm_handle, request_hash, target_members)
+                    .await
+                    .map_err(|error| {
+                        super::voting_execution::VotingExecutionError::Invalid(error.to_string())
+                    })?;
+                if !context.storm_handle.local_member_migration_ready().await {
+                    return Err(
+                        super::voting_execution::VotingExecutionError::MemberMigrationNotReady
+                            .into(),
+                    );
+                }
+            }
             if request.final_tx.is_some() {
                 state
                     .voting_execution()
-                    .observe_broadcast(request_hash, &request)
+                    .observe_broadcast(
+                        request_hash,
+                        &request,
+                        &current_members,
+                        state.block_height(),
+                    )
                     .await?;
                 return Ok(());
             }
             state
                 .voting_execution()
-                .begin(request_hash, &request, state.block_height())
+                .begin(
+                    request_hash,
+                    &request,
+                    state.block_height(),
+                    &current_members,
+                )
                 .await?;
             state
                 .signing()

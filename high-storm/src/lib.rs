@@ -30,12 +30,16 @@ pub enum Error {
     Database(#[from] db::network::Error),
     #[error(transparent)]
     Storm(#[from] storm::Error),
+    #[error(transparent)]
+    Voting(#[from] VotingError),
     #[error("invalid signer private key: {0}")]
     PrivateKey(String),
     #[error("invalid compressed public key '{0}'")]
     PublicKey(String),
     #[error("invalid discovery socket address '{0}'")]
     DiscoveryAddress(String),
+    #[error("the local signer is no longer a member of the persisted network")]
+    LocalNodeRemoved,
 }
 
 pub async fn initialize_host(
@@ -112,6 +116,13 @@ pub async fn start_initialized(config: &Config, store: &NetworkStore) -> Result<
 
     let secret_key = secret_key(config)?;
     let secret_key_bytes = secret_key.secret_bytes();
+    let local_public_key = secret_key.public_key(&Secp256k1::new()).serialize();
+    if !peers
+        .iter()
+        .any(|peer| peer.compressed_public_key == local_public_key)
+    {
+        return Err(Error::LocalNodeRemoved);
+    }
     let mut storm = Storm::from_peers(secret_key, peers);
 
     let listen_address = listen_address(config);
@@ -119,11 +130,12 @@ pub async fn start_initialized(config: &Config, store: &NetworkStore) -> Result<
     storm.start(Some(listen_address)).await?;
     tracing::info!("initialized node is running");
 
-    Ok(HighStorm::new(
+    let high_storm = HighStorm::new(
         storm,
         secret_key_bytes,
         coordinator_public_key,
         HighStormDependencies::new(
+            store.clone(),
             store.voting(),
             store.network_assets(),
             store.monitored_utxos(),
@@ -133,7 +145,10 @@ pub async fn start_initialized(config: &Config, store: &NetworkStore) -> Result<
             config.service.protocol.clone(),
         ),
     )
-    .await)
+    .await;
+    high_storm.restore_member_migration().await?;
+
+    Ok(high_storm)
 }
 
 async fn initialize(
@@ -168,6 +183,7 @@ async fn initialize(
                 secret_key,
                 coordinator_public_key,
                 HighStormDependencies::new(
+                    store.clone(),
                     store.voting(),
                     store.network_assets(),
                     store.monitored_utxos(),

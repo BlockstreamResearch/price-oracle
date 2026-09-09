@@ -14,9 +14,20 @@ high-storm/devenv.sh create # Reset data, rebuild, and start everything.
 high-storm/devenv.sh up     # Start while preserving initialized state.
 high-storm/devenv.sh rebuild # Rebuild Rust and restart nodes, preserving state.
 high-storm/devenv.sh down   # Stop while preserving initialized state.
+high-storm/devenv.sh deploy-node 4 # Deploy a candidate node for a later vote.
+high-storm/devenv.sh public-key 4 # Print its compressed public key.
 high-storm/devenv.sh connections 1 # List node 1's active connections.
 high-storm/devenv.sh elements 1 getblockchaininfo # Call node 1's Elements RPC.
 ```
+
+`deploy-node NODE` accepts node numbers from 4 through 99. It creates a persistent
+development signer configuration and PostgreSQL database, then starts the node on
+host ports `8999 + NODE` and `9099 + NODE`. The node waits to be admitted by an
+approved membership vote and completes discovery once the active network stages
+its public key. Generated signer configurations live in the ignored
+`high-storm/.devenv-nodes` directory. Re-running the command preserves the node's
+identity and database. `down` removes extra-node containers but preserves their
+configuration and database; `create` resets both.
 
 The Storm listeners are exposed on host ports `9000`, `9001`, and `9002`; their
 external APIs are exposed on `9100`, `9101`, and `9102`.

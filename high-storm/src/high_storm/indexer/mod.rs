@@ -22,7 +22,10 @@ use crate::{
 };
 
 use super::{
-    assets::{initial_members_from_script, treasury_blinding_secret},
+    assets::{
+        initial_members_from_script, migrated_members_proposer_from_script,
+        treasury_blinding_secret,
+    },
     droplets::member_from_script,
     issuance::IssuedTickDescriptor,
     user_requests::asset_id,
@@ -309,8 +312,15 @@ fn treasury_transactions(
             let markers = transaction
                 .output
                 .iter()
-                .filter_map(|output| member_from_script(&output.script_pubkey))
-                .collect::<std::collections::BTreeSet<_>>();
+                .filter_map(|output| {
+                    if let Some(member) = member_from_script(&output.script_pubkey) {
+                        return Some(Ok(member));
+                    }
+                    migrated_members_proposer_from_script(&output.script_pubkey)
+                        .map_err(|error| IndexerError::Invalid(error.to_string()))
+                        .transpose()
+                })
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
             let exchange_member = (markers.len() == 1)
                 .then(|| markers.first().copied())
                 .flatten();

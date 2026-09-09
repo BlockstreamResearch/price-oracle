@@ -1,4 +1,7 @@
-use std::net::TcpListener;
+use std::{
+    net::TcpListener,
+    path::{Path, PathBuf},
+};
 
 use high_storm::{
     config::{Config, DbConfig, ElementsRpcConfig, ProtocolConfig, ServiceConfig, SignerConfig},
@@ -12,6 +15,17 @@ pub struct TestNode {
     pub store: NetworkStore,
     #[allow(dead_code)]
     pub assets: NetworkAssetStore,
+    _database_file: TemporaryDatabase,
+}
+
+struct TemporaryDatabase(PathBuf);
+
+impl Drop for TemporaryDatabase {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(sidecar_path(&self.0, "-shm"));
+        let _ = std::fs::remove_file(sidecar_path(&self.0, "-wal"));
+    }
 }
 
 impl TestNode {
@@ -52,7 +66,9 @@ impl TestNode {
             },
         };
 
-        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let database_path = std::env::temp_dir().join(format!("high-storm-{port}.sqlite"));
+        let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+        let database = Database::connect(&database_url, 1).await.unwrap();
         let store = database.network();
         let assets = database.network_assets();
 
@@ -61,12 +77,19 @@ impl TestNode {
             public_key: hex::encode(public_key),
             store,
             assets,
+            _database_file: TemporaryDatabase(database_path),
         }
     }
 
     pub fn address(&self) -> String {
         format!("127.0.0.1:{}", self.config.service.port)
     }
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut path = path.as_os_str().to_owned();
+    path.push(suffix);
+    path.into()
 }
 
 fn available_port() -> u16 {

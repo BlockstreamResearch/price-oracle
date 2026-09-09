@@ -85,6 +85,22 @@ pub(super) async fn handle(
 
     let changed = {
         let mut state = storm.inner.write().await;
+        let received_members = peers_socket_info
+            .iter()
+            .map(|info| StormState::x_only_public_key(&info.compressed_public_key))
+            .collect::<std::collections::BTreeSet<_>>();
+        if state
+            .migration_members
+            .as_ref()
+            .is_some_and(|members| members == &received_members)
+        {
+            require_peer_table_authority(&state, context.peer_public_key)?;
+            replace_migration_peers(&mut state, peers_socket_info);
+            drop(state);
+            storm.connect_migration_peers().await;
+            return Ok(());
+        }
+
         let sender = state
             .peers
             .iter()
@@ -95,6 +111,11 @@ pub(super) async fn handle(
         if sender_is_discovery {
             replace_discovered_peers(&mut state, peers_socket_info, context.peer_public_key)?;
             true
+        } else if state.migration_members.is_none()
+            && state.peer_table_authority == Some(context.peer_public_key)
+            && cache_migration_peer_hints(&mut state, &peers_socket_info, context.peer_public_key)?
+        {
+            false
         } else {
             validate_known_peer_keys(&state, &peers_socket_info)?;
             false
@@ -106,6 +127,77 @@ pub(super) async fn handle(
     }
 
     Ok(())
+}
+
+fn require_peer_table_authority(
+    state: &StormState,
+    sender_public_key: [u8; 33],
+) -> Result<(), (StormErrorCode, String)> {
+    if state.peer_table_authority != Some(sender_public_key) {
+        return Err((
+            StormErrorCode::Unauthorized,
+            "Migration PeersSocketInfo must be sent by the configured authority".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn cache_migration_peer_hints(
+    state: &mut StormState,
+    peers_socket_info: &[ValidatedPeerSocketInfo],
+    sender_public_key: [u8; 33],
+) -> Result<bool, (StormErrorCode, String)> {
+    let received_keys = peers_socket_info
+        .iter()
+        .map(|info| info.compressed_public_key)
+        .collect::<HashSet<_>>();
+    let active_keys = state
+        .peers
+        .iter()
+        .map(|peer| peer.compressed_public_key)
+        .collect::<HashSet<_>>();
+    if received_keys == active_keys {
+        return Ok(false);
+    }
+    if !received_keys.contains(&sender_public_key) {
+        return Err((
+            StormErrorCode::InvalidPayload,
+            "Migration PeersSocketInfo must contain the sending peer".to_string(),
+        ));
+    }
+
+    replace_migration_peers(state, peers_socket_info.to_vec());
+    Ok(true)
+}
+
+fn replace_migration_peers(
+    state: &mut StormState,
+    peers_socket_info: Vec<ValidatedPeerSocketInfo>,
+) {
+    let local_public_key = state.initializer_public_key;
+    let mut existing = std::mem::take(&mut state.migration_peers)
+        .into_iter()
+        .map(|peer| (peer.compressed_public_key, peer))
+        .collect::<HashMap<_, _>>();
+    state.migration_peers = peers_socket_info
+        .into_iter()
+        .map(|info| {
+            let mut peer = existing
+                .remove(&info.compressed_public_key)
+                .unwrap_or_else(|| Peer::new(info.compressed_public_key));
+            peer.socket_address = Some(info.socket_address);
+            if peer.compressed_public_key == local_public_key {
+                peer.status = PeerStatus::Controlled;
+            } else if state.connections.contains_key(&peer.compressed_public_key) {
+                peer.status = PeerStatus::Active;
+            } else if peer.status != PeerStatus::Banned {
+                peer.status = PeerStatus::Inactive;
+            }
+            peer.discovery = false;
+            peer
+        })
+        .collect();
 }
 
 fn validate_known_peer_keys(
@@ -142,7 +234,7 @@ fn validate(
         ));
     }
 
-    let mut keys = HashSet::with_capacity(peers_socket_info.len());
+    let mut identities = HashSet::with_capacity(peers_socket_info.len());
     let mut validated = Vec::with_capacity(peers_socket_info.len());
     for info in peers_socket_info {
         let public_key = PublicKey::from_slice(&info.compressed_public_key).map_err(|_| {
@@ -159,10 +251,10 @@ fn validate(
         })?;
 
         let compressed_public_key = public_key.serialize();
-        if !keys.insert(compressed_public_key) {
+        if !identities.insert(StormState::canonical_identity_key(&compressed_public_key)) {
             return Err((
                 StormErrorCode::InvalidPayload,
-                "PeersSocketInfo contains duplicate public keys".to_string(),
+                "PeersSocketInfo contains duplicate x-only public keys".to_string(),
             ));
         }
 
@@ -255,6 +347,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_opposite_parity_encodings_of_one_x_only_identity() {
+        let (_, peer) = generated_peer();
+        let mut opposite_parity = peer.compressed_public_key;
+        opposite_parity[0] = if opposite_parity[0] == 2 { 3 } else { 2 };
+
+        let error = validate(vec![
+            PeerSocketInfo {
+                compressed_public_key: peer.compressed_public_key.to_vec(),
+                socket_address: "127.0.0.1:1000".to_string(),
+            },
+            PeerSocketInfo {
+                compressed_public_key: opposite_parity.to_vec(),
+                socket_address: "127.0.0.1:2000".to_string(),
+            },
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.0, StormErrorCode::InvalidPayload);
+        assert!(error.1.contains("duplicate x-only public keys"));
+    }
+
+    #[test]
     fn known_table_cannot_update_peer_addresses() {
         let (local_secret_key, mut local_peer) = generated_peer();
         local_peer.socket_address = Some("127.0.0.1:1000".to_string());
@@ -304,6 +418,165 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error.0, StormErrorCode::InvalidPayload));
+    }
+
+    #[tokio::test]
+    async fn caches_authenticated_migration_table_before_vote_staging() {
+        let (local_secret_key, mut local_peer) = generated_peer();
+        local_peer.socket_address = Some("127.0.0.1:1000".to_string());
+        let (_, mut sender_peer) = generated_peer();
+        sender_peer.status = PeerStatus::Active;
+        sender_peer.socket_address = Some("127.0.0.1:2000".to_string());
+        let (_, mut joining_peer) = generated_peer();
+        joining_peer.socket_address = Some("127.0.0.1:3000".to_string());
+        let state = Arc::new(RwLock::new(StormState::new(
+            local_secret_key,
+            vec![local_peer.clone(), sender_peer.clone()],
+        )));
+        let storm = StormHandle { inner: state };
+        storm
+            .set_peer_table_authority(sender_peer.compressed_public_key)
+            .await
+            .unwrap();
+        let table = message(&[local_peer, sender_peer.clone(), joining_peer.clone()]).unwrap();
+
+        handle(
+            &storm,
+            MessageContext {
+                peer_public_key: sender_peer.compressed_public_key,
+            },
+            table,
+        )
+        .await
+        .unwrap();
+
+        let state = storm.inner.read().await;
+        assert!(state.migration_members.is_none());
+        assert!(state.migration_peers.iter().any(|peer| {
+            peer.compressed_public_key == joining_peer.compressed_public_key
+                && peer.socket_address == joining_peer.socket_address
+        }));
+        assert_eq!(state.peers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn caches_migration_table_that_removes_local_member() {
+        let (local_secret_key, local_peer) = generated_peer();
+        let (_, mut sender_peer) = generated_peer();
+        sender_peer.status = PeerStatus::Active;
+        sender_peer.socket_address = Some("127.0.0.1:2000".to_string());
+        let (_, mut joining_peer) = generated_peer();
+        joining_peer.socket_address = Some("127.0.0.1:3000".to_string());
+        let state = Arc::new(RwLock::new(StormState::new(
+            local_secret_key,
+            vec![local_peer.clone(), sender_peer.clone()],
+        )));
+        let storm = StormHandle { inner: state };
+        storm
+            .set_peer_table_authority(sender_peer.compressed_public_key)
+            .await
+            .unwrap();
+        let table = message(&[sender_peer.clone(), joining_peer.clone()]).unwrap();
+
+        handle(
+            &storm,
+            MessageContext {
+                peer_public_key: sender_peer.compressed_public_key,
+            },
+            table,
+        )
+        .await
+        .unwrap();
+
+        let state = storm.inner.read().await;
+        assert!(state.migration_members.is_none());
+        assert_eq!(state.migration_peers.len(), 2);
+        assert!(
+            !state
+                .migration_peers
+                .iter()
+                .any(|peer| { peer.compressed_public_key == local_peer.compressed_public_key })
+        );
+        assert!(
+            state
+                .migration_peers
+                .iter()
+                .any(|peer| { peer.compressed_public_key == joining_peer.compressed_public_key })
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_migration_addresses_from_a_non_authority() {
+        let (local_secret_key, mut local_peer) = generated_peer();
+        local_peer.socket_address = Some("127.0.0.1:1000".to_string());
+        let (_, mut authority) = generated_peer();
+        authority.status = PeerStatus::Active;
+        authority.socket_address = Some("127.0.0.1:2000".to_string());
+        let (_, mut attacker) = generated_peer();
+        attacker.status = PeerStatus::Active;
+        attacker.socket_address = Some("127.0.0.1:3000".to_string());
+        let state = Arc::new(RwLock::new(StormState::new(
+            local_secret_key,
+            vec![local_peer.clone(), authority.clone(), attacker.clone()],
+        )));
+        let storm = StormHandle { inner: state };
+        storm
+            .set_peer_table_authority(authority.compressed_public_key)
+            .await
+            .unwrap();
+        let mut poisoned_local = local_peer.clone();
+        poisoned_local.socket_address = Some("127.0.0.1:9000".to_string());
+        let mut poisoned_authority = authority.clone();
+        poisoned_authority.socket_address = Some("127.0.0.1:9001".to_string());
+        let table = message(&[poisoned_local.clone(), poisoned_authority.clone()]).unwrap();
+
+        let error = handle(
+            &storm,
+            MessageContext {
+                peer_public_key: attacker.compressed_public_key,
+            },
+            table,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.0, StormErrorCode::InvalidPayload);
+        assert!(storm.inner.read().await.migration_peers.is_empty());
+        {
+            let mut state = storm.inner.write().await;
+            state.migration_members = Some(
+                [
+                    local_peer.compressed_public_key,
+                    authority.compressed_public_key,
+                ]
+                .into_iter()
+                .map(|key| StormState::x_only_public_key(&key))
+                .collect(),
+            );
+            state.migration_peers = vec![local_peer.clone(), authority.clone()];
+        }
+        let table = message(&[poisoned_local, poisoned_authority]).unwrap();
+
+        let error = handle(
+            &storm,
+            MessageContext {
+                peer_public_key: attacker.compressed_public_key,
+            },
+            table,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.0, StormErrorCode::Unauthorized);
+        let state = storm.inner.read().await;
+        assert_eq!(
+            state.migration_peers[0].socket_address,
+            local_peer.socket_address
+        );
+        assert_eq!(
+            state.migration_peers[1].socket_address,
+            authority.socket_address
+        );
     }
 
     #[test]

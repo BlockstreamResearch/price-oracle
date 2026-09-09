@@ -170,6 +170,11 @@ async fn run_until_shutdown(
                 break;
             },
             _ = reconnect.tick() => {
+                if !storm.is_local_member().await {
+                    tracing::info!("local signer was removed from the network; shutting down");
+                    break;
+                }
+
                 if let Err(error) = storm.start(None).await {
                     tracing::warn!(%error, "peer reconnection pass failed");
                 }
@@ -231,6 +236,18 @@ async fn run_until_shutdown(
                 }
             }
             _ = reconcile_requests.tick() => {
+                if let Err(error) = storm.synchronize_voting_requests().await {
+                    tracing::warn!(%error, "failed to synchronize voting requests");
+                }
+                match storm.reconcile_voting_executions().await {
+                    Ok(0) => {}
+                    Ok(request_count) => {
+                        tracing::info!(request_count, "confirmed executed voting requests");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to reconcile voting execution confirmations");
+                    }
+                }
                 match storm.reconcile_user_requests().await {
                     Ok(0) => {}
                     Ok(request_count) => {

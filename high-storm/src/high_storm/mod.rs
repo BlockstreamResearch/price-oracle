@@ -1,4 +1,7 @@
-use std::ops::{Deref, DerefMut};
+use std::{
+    collections::BTreeSet,
+    ops::{Deref, DerefMut},
+};
 
 use secp256k1_zkp::PublicKey;
 use storm::{PeerStatus, Storm, StormHandle};
@@ -41,6 +44,7 @@ pub struct HighStorm {
 }
 
 pub(crate) struct HighStormDependencies {
+    network_store: crate::db::network::NetworkStore,
     voting_store: crate::db::voting::VotingStore,
     network_assets: crate::db::network_asset::NetworkAssetStore,
     monitored_utxos: crate::db::monitored_utxo::MonitoredUtxoStore,
@@ -51,7 +55,9 @@ pub(crate) struct HighStormDependencies {
 }
 
 impl HighStormDependencies {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        network_store: crate::db::network::NetworkStore,
         voting_store: crate::db::voting::VotingStore,
         network_assets: crate::db::network_asset::NetworkAssetStore,
         monitored_utxos: crate::db::monitored_utxo::MonitoredUtxoStore,
@@ -61,6 +67,7 @@ impl HighStormDependencies {
         protocol_config: crate::config::ProtocolConfig,
     ) -> Self {
         Self {
+            network_store,
             voting_store,
             network_assets,
             monitored_utxos,
@@ -85,6 +92,11 @@ impl HighStorm {
         coordinator_public_key: [u8; 33],
         dependencies: HighStormDependencies,
     ) -> Self {
+        storm
+            .handle()
+            .set_peer_table_authority(coordinator_public_key)
+            .await
+            .expect("the configured coordinator has a validated public key");
         let state =
             NetworkState::new(&storm, secret_key, coordinator_public_key, dependencies).await;
         let handler_state = state.clone();
@@ -101,6 +113,13 @@ impl HighStorm {
             .await;
 
         Self { storm, state }
+    }
+
+    pub(crate) async fn restore_member_migration(&self) -> Result<(), VotingError> {
+        self.state
+            .voting()
+            .restore_member_migration(&self.storm.handle())
+            .await
     }
 
     /// Returns the compressed public key of the node coordinating user requests.
@@ -538,6 +557,10 @@ impl HighStorm {
         self.state.user_requests().reconcile_confirmations().await
     }
 
+    pub async fn reconcile_voting_executions(&self) -> Result<usize, VotingExecutionError> {
+        self.handle().reconcile_voting_executions().await
+    }
+
     pub async fn storm_eye_asset(&self) -> Result<Option<NetworkAsset>, AssetError> {
         self.state.assets().storm_eye().await
     }
@@ -644,7 +667,60 @@ impl HighStormHandle {
         &self,
         request_hash: [u8; 32],
     ) -> Result<[u8; 32], VotingExecutionError> {
-        let request = self.state.voting_execution().prepare(request_hash).await?;
+        self.spawn_voting_execution(request_hash)?
+            .await
+            .map_err(|error| {
+                VotingExecutionError::Invalid(format!("voting execution task failed: {error}"))
+            })?
+    }
+
+    fn spawn_voting_execution(
+        &self,
+        request_hash: [u8; 32],
+    ) -> Result<tokio::task::JoinHandle<Result<[u8; 32], VotingExecutionError>>, VotingExecutionError>
+    {
+        let attempt = self
+            .state
+            .begin_voting_execution(request_hash)
+            .ok_or(VotingExecutionError::AlreadyExecuting)?;
+        let handle = self.clone();
+        Ok(tokio::spawn(async move {
+            let _attempt = attempt;
+            let result = handle.execute_voting_request_inner(request_hash).await;
+            if let Err(error) = &result {
+                tracing::warn!(request_hash = %hex::encode(request_hash), %error, "voting execution attempt failed");
+            }
+            result
+        }))
+    }
+
+    async fn execute_voting_request_inner(
+        &self,
+        request_hash: [u8; 32],
+    ) -> Result<[u8; 32], VotingExecutionError> {
+        let peers = self.peers().await;
+        let current_members = voting_member_keys(&peers)?;
+        let vote = self
+            .state
+            .voting()
+            .get(request_hash)
+            .await
+            .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?
+            .ok_or_else(|| VotingExecutionError::UnknownRequest(hex::encode(request_hash)))?;
+        if let Some(target_members) = member_migration_target(&vote.request, &current_members)? {
+            self.state
+                .ensure_member_migration(&self.storm, request_hash, target_members)
+                .await
+                .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
+            if !self.storm.member_migration_ready().await {
+                return Err(VotingExecutionError::MemberMigrationNotReady);
+            }
+        }
+        let request = self
+            .state
+            .voting_execution()
+            .prepare(request_hash, &current_members)
+            .await?;
         let proposer = request.proposer_public_key;
         let local = leader::local_public_key(&self.peers().await).ok_or_else(|| {
             VotingExecutionError::Invalid("local network member is missing".into())
@@ -662,7 +738,12 @@ impl HighStormHandle {
 
         self.state
             .voting_execution()
-            .begin(request_hash, &request, self.state.block_height())
+            .begin(
+                request_hash,
+                &request,
+                self.state.block_height(),
+                &current_members,
+            )
             .await?;
         let signing = match self
             .state
@@ -677,10 +758,7 @@ impl HighStormHandle {
             .await
         {
             Ok(signing) => signing,
-            Err(error) => {
-                self.cancel_voting_execution(request_hash, proposer).await;
-                return Err(error.into());
-            }
+            Err(error) => return Err(error.into()),
         };
         let proof = match self
             .state
@@ -689,21 +767,17 @@ impl HighStormHandle {
             .await
         {
             Ok(proof) => proof,
-            Err(error) => {
-                self.cancel_voting_execution(request_hash, proposer).await;
-                return Err(error.into());
-            }
+            Err(error) => return Err(error.into()),
         };
         let prepared = match self
             .state
             .voting_execution()
-            .prepare_finalization(request_hash, &request)
+            .prepare_finalization(request_hash, &request, &current_members)
             .await
         {
             Ok(prepared) => prepared,
             Err(error) => {
                 let message = error.to_string();
-                self.schedule_cancel_voting_execution(request_hash, proposer);
                 return Err(VotingExecutionError::Invalid(message));
             }
         };
@@ -716,55 +790,100 @@ impl HighStormHandle {
             Err(error) => {
                 let message = error.to_string();
                 drop(error);
-                self.cancel_voting_execution(request_hash, proposer).await;
                 return Err(VotingExecutionError::Invalid(message));
             }
         };
-        if let Err(error) = self.state.voting_execution().broadcast(txid, &notification) {
-            let message = error.to_string();
-            drop(error);
-            self.cancel_voting_execution(request_hash, proposer).await;
-            return Err(VotingExecutionError::Invalid(message));
-        }
+        self.state
+            .voting_execution()
+            .record_broadcast(request_hash, txid, &notification)
+            .await?;
+        self.state
+            .voting_execution()
+            .broadcast(txid, &notification)?;
         if let Err(error) = self
             .announce_voting_execution(request_hash, &notification)
             .await
         {
             tracing::warn!(%error, "failed to announce executed voting request");
         }
-        for attempt in 1..=3 {
-            match self
+        Ok(txid)
+    }
+
+    async fn activate_member_migration(
+        &self,
+        request_hash: [u8; 32],
+        txid: [u8; 32],
+        current_members: &BTreeSet<[u8; 32]>,
+    ) -> Result<(), VotingExecutionError> {
+        activate_member_migration_state(
+            &self.state,
+            &self.storm,
+            request_hash,
+            txid,
+            current_members,
+        )
+        .await
+    }
+
+    pub async fn reconcile_voting_executions(&self) -> Result<usize, VotingExecutionError> {
+        let mut confirmed = 0;
+        if let Some(request_hash) = self.state.member_migration_request().await
+            && self
                 .state
-                .voting_execution()
-                .complete(request_hash, proposer, txid)
+                .voting()
+                .get(request_hash)
                 .await
-            {
-                Ok(()) => return Ok(txid),
-                Err(error) if attempt == 3 => return Err(error),
-                Err(error) => {
-                    tracing::warn!(%error, attempt, "failed to persist executed voting request");
-                }
+                .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?
+                .is_some_and(|request| request.status == VotingStatus::Executed)
+        {
+            finish_member_migration_state(&self.state, &self.storm).await?;
+        }
+
+        for (request_hash, txid, request) in
+            self.state.voting_execution().pending_broadcasts().await?
+        {
+            self.state.voting_execution().broadcast(txid, &request)?;
+            if let Err(error) = self.announce_voting_execution(request_hash, &request).await {
+                tracing::warn!(%error, "failed to reannounce voting execution");
+            }
+            if !self.state.voting_execution().is_confirmed(txid)? {
+                continue;
+            }
+
+            let current_members = voting_member_keys(&self.peers().await)?;
+            let vote = self
+                .state
+                .voting()
+                .get(request_hash)
+                .await
+                .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?
+                .ok_or_else(|| VotingExecutionError::UnknownRequest(hex::encode(request_hash)))?;
+            if member_migration_target(&vote.request, &current_members)?.is_some() {
+                self.activate_member_migration(request_hash, txid, &current_members)
+                    .await?;
+            } else {
+                self.state
+                    .voting_execution()
+                    .confirm(request_hash, txid)
+                    .await?;
+            }
+            confirmed += 1;
+        }
+
+        let local = leader::local_public_key(&self.peers().await)
+            .and_then(|key| PublicKey::from_slice(&key).ok())
+            .map(|key| key.x_only_public_key().0.serialize());
+        for (request_hash, proposer) in self.state.voting_execution().unfinished_attempts().await? {
+            if Some(proposer) != local {
+                continue;
+            }
+            match self.spawn_voting_execution(request_hash) {
+                Ok(task) => drop(task),
+                Err(VotingExecutionError::AlreadyExecuting) => {}
+                Err(error) => return Err(error),
             }
         }
-        unreachable!("the execution persistence loop always returns")
-    }
-
-    async fn cancel_voting_execution(&self, request_hash: [u8; 32], proposer: [u8; 32]) {
-        if let Err(error) = self
-            .state
-            .voting_execution()
-            .cancel(request_hash, proposer, self.state.block_height())
-            .await
-        {
-            tracing::error!(%error, "failed to cancel voting execution");
-        }
-    }
-
-    fn schedule_cancel_voting_execution(&self, request_hash: [u8; 32], proposer: [u8; 32]) {
-        let handle = self.clone();
-        tokio::spawn(async move {
-            handle.cancel_voting_execution(request_hash, proposer).await;
-        });
+        Ok(confirmed)
     }
 
     async fn announce_voting_execution(
@@ -819,6 +938,92 @@ impl HighStormHandle {
     pub async fn network_asset(&self, kind: &str) -> Result<Option<NetworkAsset>, AssetError> {
         self.state.assets().get(kind).await
     }
+}
+
+fn voting_member_keys(peers: &[storm::Peer]) -> Result<BTreeSet<[u8; 32]>, VotingExecutionError> {
+    peers
+        .iter()
+        .map(|peer| {
+            PublicKey::from_slice(&peer.compressed_public_key)
+                .map(|key| key.x_only_public_key().0.serialize())
+                .map_err(|error| VotingExecutionError::Invalid(error.to_string()))
+        })
+        .collect()
+}
+
+fn member_migration_target(
+    request: &NetworkVoteRequest,
+    current_members: &BTreeSet<[u8; 32]>,
+) -> Result<Option<BTreeSet<[u8; 32]>>, VotingExecutionError> {
+    if NetworkVoteKind::from_id(request.kind) != Some(NetworkVoteKind::UpdateNetworkMembers) {
+        return Ok(None);
+    }
+
+    let update: UpdateNetworkMembers = postcard::from_bytes(&request.payload)?;
+    let mut target = current_members.clone();
+    for member in update.to_remove {
+        target.remove(&member);
+    }
+    target.extend(update.to_accept);
+    Ok(Some(target))
+}
+
+async fn activate_member_migration_state(
+    state: &NetworkState,
+    storm: &StormHandle,
+    request_hash: [u8; 32],
+    txid: [u8; 32],
+    current_members: &BTreeSet<[u8; 32]>,
+) -> Result<(), VotingExecutionError> {
+    let _voting_guard = state.voting().lock_operations().await;
+    let Some(asset) = state
+        .voting_execution()
+        .member_migration_asset(request_hash, current_members)
+        .await?
+    else {
+        return Ok(());
+    };
+    let peers = storm
+        .member_migration_peers()
+        .await
+        .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
+    let contract_data = asset.contract_data.as_deref().ok_or_else(|| {
+        VotingExecutionError::Invalid("migrated Storm Eye contract data is missing".into())
+    })?;
+    state
+        .network_store()
+        .apply_member_migration(
+            &peers,
+            state.coordinator_public_key(),
+            &asset.kind,
+            &asset.contract_script,
+            contract_data,
+            crate::db::network::ConfirmedVotingExecution { request_hash, txid },
+        )
+        .await
+        .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
+    finish_member_migration_state(state, storm).await
+}
+
+async fn finish_member_migration_state(
+    state: &NetworkState,
+    storm: &StormHandle,
+) -> Result<(), VotingExecutionError> {
+    let peers = storm
+        .member_migration_peers()
+        .await
+        .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
+    state.signing().refresh_members(&peers).await?;
+    storm
+        .activate_member_migration()
+        .await
+        .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
+    state.complete_member_migration().await;
+
+    if let Err(error) = state.assets().announce_pending(storm).await {
+        tracing::warn!(%error, "failed to announce migrated network assets");
+    }
+    Ok(())
 }
 
 impl Deref for HighStorm {

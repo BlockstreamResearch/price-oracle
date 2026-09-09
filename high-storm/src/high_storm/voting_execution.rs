@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use contracts::artifacts::{
@@ -25,12 +28,12 @@ use simplex::{
         UTXO,
     },
 };
-use storm_tree::StormTreeProof;
+use storm_tree::{StormTree, StormTreeProof};
 use url::Url;
 
 use crate::{
     ExecuteVotingRequest, MergeStormEyes, NetworkAsset, NetworkVoteKind, NodeMessage,
-    SplitStormEye, StormEyeUtxo,
+    SplitStormEye, StormEyeUtxo, UpdateNetworkMembers,
     config::ElementsRpcConfig,
     db::{
         droplet::{DropletStore, TreasuryUtxo},
@@ -41,7 +44,7 @@ use crate::{
 
 use super::{
     SigningResult,
-    assets::{StormEyeContractData, storm_eye_program},
+    assets::{StormEyeContractData, migrated_members_script, storm_eye_program},
     droplets::member_script,
     user_requests::{
         STORM_EYE_TAG, asset_id, get_explicit_outpoint, get_optional_explicit_outpoint,
@@ -61,8 +64,8 @@ pub enum VotingExecutionError {
     AlreadyExecuting,
     #[error("voting request has already been executed")]
     AlreadyExecuted,
-    #[error("network member updates are not implemented")]
-    NetworkMembersUnimplemented,
+    #[error("the new Storm is waiting for all target members to connect")]
+    MemberMigrationNotReady,
     #[error("voting request has no known proposer")]
     MissingProposer,
     #[error("network asset is not initialized: {0}")]
@@ -108,6 +111,10 @@ pub(crate) struct PreparedVotingExecution {
 enum ReshapeOperation {
     Merge(Vec<StormEyeUtxo>),
     Split(StormEyeUtxo, u8),
+    UpdateMembers {
+        members: Vec<[u8; 32]>,
+        new_root: [u8; 32],
+    },
 }
 
 #[derive(Clone)]
@@ -162,12 +169,32 @@ impl VotingExecution {
     pub(crate) async fn prepare(
         &self,
         request_hash: [u8; 32],
+        current_members: &BTreeSet<[u8; 32]>,
     ) -> Result<ExecuteVotingRequest, VotingExecutionError> {
         let stored = self.stored_vote(request_hash).await?;
-        require_approved(&stored)?;
-        self.prepare_transaction(&stored)
+        require_retryable(&stored)?;
+        self.prepare_transaction(&stored, current_members)
             .await
             .map(|prepared| prepared.request)
+    }
+
+    pub(crate) async fn member_migration_asset(
+        &self,
+        request_hash: [u8; 32],
+        current_members: &BTreeSet<[u8; 32]>,
+    ) -> Result<Option<NetworkAsset>, VotingExecutionError> {
+        let stored = self.stored_vote(request_hash).await?;
+        let operation = decode_operation(&stored, current_members)?;
+        let ReshapeOperation::UpdateMembers { new_root, .. } = operation else {
+            return Ok(None);
+        };
+        let storm_eye = self
+            .assets
+            .get(STORM_EYE_KIND)
+            .await?
+            .ok_or(VotingExecutionError::MissingAsset(STORM_EYE_KIND))?;
+        let network = network(&self.client()?)?;
+        Ok(Some(migrated_storm_eye(&storm_eye, new_root, &network)?))
     }
 
     pub(crate) async fn storm_eye_utxos(
@@ -231,10 +258,11 @@ impl VotingExecution {
         &self,
         request_hash: [u8; 32],
         request: &ExecuteVotingRequest,
+        current_members: &BTreeSet<[u8; 32]>,
     ) -> Result<PreparedVotingExecution, VotingExecutionError> {
         let stored = self.stored_vote(request_hash).await?;
         require_approved_or_executing(&stored, &request.tx)?;
-        let prepared = self.prepare_transaction(&stored).await?;
+        let prepared = self.prepare_transaction(&stored, current_members).await?;
         if prepared.request.tx != request.tx
             || prepared.request.signing_hashes != request.signing_hashes
             || prepared.request.proposer_public_key != request.proposer_public_key
@@ -249,11 +277,12 @@ impl VotingExecution {
     async fn prepare_transaction(
         &self,
         stored: &StoredVotingRequest,
+        current_members: &BTreeSet<[u8; 32]>,
     ) -> Result<PreparedVotingExecution, VotingExecutionError> {
         let proposer = stored
             .proposer_public_key
             .ok_or(VotingExecutionError::MissingProposer)?;
-        let operation = decode_operation(stored)?;
+        let operation = decode_operation(stored, current_members)?;
         let storm_eye = self
             .assets
             .get(STORM_EYE_KIND)
@@ -281,10 +310,25 @@ impl VotingExecution {
         request_hash: [u8; 32],
         request: &ExecuteVotingRequest,
         block_height: u64,
+        current_members: &BTreeSet<[u8; 32]>,
     ) -> Result<(), VotingExecutionError> {
+        if request.final_tx.is_some() {
+            return Err(VotingExecutionError::Invalid(
+                "signing request unexpectedly contains a final transaction".into(),
+            ));
+        }
+
         let stored = self.stored_vote(request_hash).await?;
-        require_approved_or_executing(&stored, &request.tx)?;
-        self.validate_request(request_hash, request).await?;
+        require_retryable(&stored)?;
+        self.validate_transaction(request_hash, request, false, false, true, current_members)
+            .await?;
+
+        if stored.execution_started
+            && stored.execution_transaction.as_deref() != Some(request.tx.as_slice())
+        {
+            self.cancel(request_hash, request.proposer_public_key, block_height)
+                .await?;
+        }
 
         let started = self
             .votes
@@ -326,30 +370,21 @@ impl VotingExecution {
         Ok(())
     }
 
-    pub(crate) async fn validate_request(
-        &self,
-        request_hash: [u8; 32],
-        request: &ExecuteVotingRequest,
-    ) -> Result<(), VotingExecutionError> {
-        if request.final_tx.is_some() {
-            return Err(VotingExecutionError::Invalid(
-                "signing request unexpectedly contains a final transaction".into(),
-            ));
-        }
-
-        self.validate_transaction(request_hash, request, false, false)
-            .await
-    }
-
     async fn validate_transaction(
         &self,
         request_hash: [u8; 32],
         request: &ExecuteVotingRequest,
         allow_spent_inputs: bool,
         allow_missing_proposer: bool,
+        allow_execution_replacement: bool,
+        current_members: &BTreeSet<[u8; 32]>,
     ) -> Result<(), VotingExecutionError> {
         let stored = self.stored_vote(request_hash).await?;
-        require_approved_or_executing(&stored, &request.tx)?;
+        if allow_execution_replacement {
+            require_retryable(&stored)?;
+        } else {
+            require_approved_or_executing(&stored, &request.tx)?;
+        }
         if stored.proposer_public_key != Some(request.proposer_public_key)
             && !(allow_missing_proposer && stored.proposer_public_key.is_none())
         {
@@ -357,7 +392,7 @@ impl VotingExecution {
                 "voting proposer does not match the execution request".into(),
             ));
         }
-        let operation = decode_operation(&stored)?;
+        let operation = decode_operation(&stored, current_members)?;
         let storm_eye = self
             .assets
             .get(STORM_EYE_KIND)
@@ -396,6 +431,7 @@ impl VotingExecution {
                 &proof,
                 &prepared.operation,
                 signature,
+                index as u32,
             )?;
             prepared.transaction.inputs_mut()[index]
                 .program_input
@@ -460,6 +496,12 @@ impl VotingExecution {
                 if mempool
                     .iter()
                     .any(|known| known == &expected_txid.to_string())
+                    || client
+                        .call::<RawTransactionInfo>(
+                            "getrawtransaction",
+                            &[expected_txid.to_string().into(), true.into()],
+                        )
+                        .is_ok_and(|transaction| transaction.confirmations > 0)
                 {
                     Ok(())
                 } else {
@@ -469,22 +511,90 @@ impl VotingExecution {
         }
     }
 
-    pub(crate) async fn complete(
+    pub(crate) async fn record_broadcast(
         &self,
         request_hash: [u8; 32],
-        proposer_public_key: [u8; 32],
         txid: [u8; 32],
+        request: &ExecuteVotingRequest,
     ) -> Result<(), VotingExecutionError> {
+        let encoded = postcard::to_allocvec(request)?;
         self.votes
-            .complete_execution(request_hash, proposer_public_key, txid)
+            .record_broadcast(
+                request_hash,
+                request.proposer_public_key,
+                &request.tx,
+                &encoded,
+                txid,
+            )
             .await?;
         Ok(())
+    }
+
+    pub(crate) async fn confirm(
+        &self,
+        request_hash: [u8; 32],
+        txid: [u8; 32],
+    ) -> Result<(), VotingExecutionError> {
+        self.votes.confirm_execution(request_hash, txid).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn pending_broadcasts(
+        &self,
+    ) -> Result<Vec<([u8; 32], [u8; 32], ExecuteVotingRequest)>, VotingExecutionError> {
+        self.votes
+            .list()
+            .await?
+            .into_iter()
+            .filter(|vote| vote.execution_txid.is_some() && !vote.execution_confirmed)
+            .map(|vote| {
+                let txid = vote.execution_txid.ok_or_else(|| {
+                    VotingExecutionError::Invalid("broadcast voting txid is missing".into())
+                })?;
+                let request = vote
+                    .execution_request
+                    .as_deref()
+                    .ok_or_else(|| {
+                        VotingExecutionError::Invalid(
+                            "broadcast voting execution request is missing".into(),
+                        )
+                    })
+                    .and_then(|request| postcard::from_bytes(request).map_err(Into::into))?;
+                Ok((vote.message_hash, txid, request))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn unfinished_attempts(
+        &self,
+    ) -> Result<Vec<([u8; 32], [u8; 32])>, VotingExecutionError> {
+        self.votes
+            .list()
+            .await?
+            .into_iter()
+            .filter(|vote| vote.execution_started && vote.execution_txid.is_none())
+            .map(|vote| {
+                vote.proposer_public_key
+                    .map(|proposer| (vote.message_hash, proposer))
+                    .ok_or(VotingExecutionError::MissingProposer)
+            })
+            .collect()
+    }
+
+    pub(crate) fn is_confirmed(&self, txid: [u8; 32]) -> Result<bool, VotingExecutionError> {
+        let transaction: RawTransactionInfo = self.client()?.call(
+            "getrawtransaction",
+            &[Txid::from_byte_array(txid).to_string().into(), true.into()],
+        )?;
+        Ok(transaction.confirmations > 0)
     }
 
     pub(crate) async fn observe_broadcast(
         &self,
         request_hash: [u8; 32],
         request: &ExecuteVotingRequest,
+        current_members: &BTreeSet<[u8; 32]>,
+        block_height: u64,
     ) -> Result<[u8; 32], VotingExecutionError> {
         let final_bytes = request
             .final_tx
@@ -502,14 +612,31 @@ impl VotingExecution {
             ));
         }
 
-        self.validate_transaction(request_hash, request, true, true)
+        let txid = final_tx.txid().to_byte_array();
+        let stored = self.stored_vote(request_hash).await?;
+        if let Some(stored_txid) = stored.execution_txid {
+            let encoded = postcard::to_allocvec(request)?;
+            if stored_txid != txid || stored.execution_request.as_deref() != Some(&encoded) {
+                return Err(VotingExecutionError::Invalid(
+                    "finalized voting execution changed after broadcast".into(),
+                ));
+            }
+            self.broadcast(txid, request)?;
+            return Ok(txid);
+        }
+
+        self.validate_transaction(request_hash, request, true, true, true, current_members)
             .await?;
 
-        let txid = final_tx.txid().to_byte_array();
+        if stored.execution_started
+            && stored.execution_transaction.as_deref() != Some(request.tx.as_slice())
+        {
+            self.cancel(request_hash, request.proposer_public_key, block_height)
+                .await?;
+        }
+
+        self.record_broadcast(request_hash, txid, request).await?;
         self.broadcast(txid, request)?;
-        self.votes
-            .complete_execution(request_hash, request.proposer_public_key, txid)
-            .await?;
         Ok(txid)
     }
 
@@ -569,11 +696,11 @@ impl VotingExecution {
     }
 }
 
-fn require_approved(stored: &StoredVotingRequest) -> Result<(), VotingExecutionError> {
-    if stored.execution_txid.is_some() {
+fn require_retryable(stored: &StoredVotingRequest) -> Result<(), VotingExecutionError> {
+    if stored.execution_confirmed {
         return Err(VotingExecutionError::AlreadyExecuted);
     }
-    if stored.execution_started {
+    if stored.execution_txid.is_some() {
         return Err(VotingExecutionError::AlreadyExecuting);
     }
     if stored.approved_at_block_height.is_none() {
@@ -586,8 +713,11 @@ fn require_approved_or_executing(
     stored: &StoredVotingRequest,
     transaction: &[u8],
 ) -> Result<(), VotingExecutionError> {
-    if stored.execution_txid.is_some() {
+    if stored.execution_confirmed {
         return Err(VotingExecutionError::AlreadyExecuted);
+    }
+    if stored.execution_txid.is_some() {
+        return Err(VotingExecutionError::AlreadyExecuting);
     }
     if stored.approved_at_block_height.is_none() {
         return Err(VotingExecutionError::NotApproved);
@@ -600,6 +730,7 @@ fn require_approved_or_executing(
 
 fn decode_operation(
     stored: &StoredVotingRequest,
+    current_members: &BTreeSet<[u8; 32]>,
 ) -> Result<ReshapeOperation, VotingExecutionError> {
     let message: NodeMessage = postcard::from_bytes(&stored.message)?;
     let request: crate::NetworkVoteRequest = message.decode_payload()?;
@@ -628,7 +759,27 @@ fn decode_operation(
             Ok(ReshapeOperation::Split(split.utxo_to_split, count))
         }
         Some(NetworkVoteKind::UpdateNetworkMembers) => {
-            Err(VotingExecutionError::NetworkMembersUnimplemented)
+            let update: UpdateNetworkMembers = postcard::from_bytes(&request.payload)?;
+            let mut members = current_members.clone();
+            for member in update.to_remove {
+                if !members.remove(&member) {
+                    return Err(VotingExecutionError::Invalid(
+                        "member update removes a non-member".into(),
+                    ));
+                }
+            }
+            for member in update.to_accept {
+                if !members.insert(member) {
+                    return Err(VotingExecutionError::Invalid(
+                        "member update accepts an existing member".into(),
+                    ));
+                }
+            }
+            let members = members.into_iter().collect::<Vec<_>>();
+            let new_root = StormTree::new(members.clone())
+                .map_err(super::signing::SigningError::from)?
+                .root();
+            Ok(ReshapeOperation::UpdateMembers { members, new_root })
         }
         None => Err(VotingExecutionError::Invalid("unknown voting kind".into())),
     }
@@ -638,12 +789,13 @@ fn storm_eye_reservations(
     votes: &[StoredVotingRequest],
 ) -> Result<BTreeMap<StormEyeUtxo, StormEyeReservation>, VotingExecutionError> {
     let mut reservations = BTreeMap::new();
-    for vote in votes.iter().filter(|vote| vote.execution_txid.is_none()) {
-        let operation = match decode_operation(vote) {
-            Ok(operation) => operation,
-            Err(VotingExecutionError::NetworkMembersUnimplemented) => continue,
-            Err(error) => return Err(error),
-        };
+    for vote in votes.iter().filter(|vote| !vote.execution_confirmed) {
+        let message: NodeMessage = postcard::from_bytes(&vote.message)?;
+        let request: crate::NetworkVoteRequest = message.decode_payload()?;
+        if NetworkVoteKind::from_id(request.kind) == Some(NetworkVoteKind::UpdateNetworkMembers) {
+            continue;
+        }
+        let operation = decode_operation(vote, &BTreeSet::new())?;
         let state = if vote.execution_started {
             StormEyeState::Executing
         } else {
@@ -652,6 +804,7 @@ fn storm_eye_reservations(
         let outpoints = match operation {
             ReshapeOperation::Merge(outpoints) => outpoints,
             ReshapeOperation::Split(outpoint, _) => vec![outpoint],
+            ReshapeOperation::UpdateMembers { .. } => unreachable!("handled above"),
         };
         for outpoint in outpoints {
             let reservation = reservations
@@ -686,14 +839,24 @@ struct ScannedUtxo {
     height: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct RawTransactionInfo {
+    #[serde(default)]
+    confirmations: u64,
+}
+
 fn operation_utxos(
     client: &Client,
     storm_eye: &NetworkAsset,
     operation: &ReshapeOperation,
 ) -> Result<Vec<UTXO>, VotingExecutionError> {
+    if matches!(operation, ReshapeOperation::UpdateMembers { .. }) {
+        return scan_storm_eye_utxos(client, storm_eye);
+    }
     let outpoints = match operation {
         ReshapeOperation::Merge(outpoints) => outpoints.as_slice(),
         ReshapeOperation::Split(outpoint, _) => std::slice::from_ref(outpoint),
+        ReshapeOperation::UpdateMembers { .. } => unreachable!("handled above"),
     };
     let expected_asset = asset_id(storm_eye.asset_id)?;
     outpoints
@@ -714,6 +877,42 @@ fn operation_utxos(
             Ok(utxo)
         })
         .collect()
+}
+
+fn scan_storm_eye_utxos(
+    client: &Client,
+    storm_eye: &NetworkAsset,
+) -> Result<Vec<UTXO>, VotingExecutionError> {
+    let descriptor = format!("raw({})", hex::encode(&storm_eye.contract_script));
+    let scan: ScanResult = client.call(
+        "scantxoutset",
+        &["start".into(), serde_json::json!([descriptor])],
+    )?;
+    let expected_asset = asset_id(storm_eye.asset_id)?;
+    let mut utxos = scan
+        .unspents
+        .into_iter()
+        .map(|unspent| {
+            let txid = Txid::from_str(&unspent.txid)
+                .map_err(|_| VotingExecutionError::Invalid("invalid Storm Eye txid".into()))?;
+            let utxo = get_explicit_outpoint(client, txid, unspent.vout)?;
+            if utxo.asset() != expected_asset
+                || utxo.txout.script_pubkey.as_bytes() != storm_eye.contract_script
+            {
+                return Err(VotingExecutionError::Invalid(
+                    "Storm Eye scan returned an invalid UTXO".into(),
+                ));
+            }
+            Ok(utxo)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    utxos.sort_unstable_by_key(|utxo| (utxo.outpoint.txid.to_byte_array(), utxo.outpoint.vout));
+    if utxos.is_empty() {
+        return Err(VotingExecutionError::Invalid(
+            "network has no live Storm Eye UTXOs to migrate".into(),
+        ));
+    }
+    Ok(utxos)
 }
 
 fn live_treasury_utxo(
@@ -771,12 +970,16 @@ fn build_transaction(
         .ok_or_else(|| VotingExecutionError::Invalid("Treasury cannot cover the fee".into()))?;
 
     let mut transaction = FinalTransaction::new();
-    for utxo in &storm_eye_utxos {
+    for (output_index, utxo) in storm_eye_utxos.iter().enumerate() {
         transaction.add_program_input(
             PartialInput::new(utxo.clone()),
             ProgramInput::new(
                 Box::new(auth_program.as_ref().clone()),
-                Box::new(placeholder_witness(&contract_data, &operation)),
+                Box::new(placeholder_witness(
+                    &contract_data,
+                    &operation,
+                    output_index as u32,
+                )),
             ),
             RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
         );
@@ -800,27 +1003,42 @@ fn build_transaction(
 
     let storm_eye_asset = asset_id(storm_eye.asset_id)?;
     let storm_eye_script = Script::from(storm_eye.contract_script.clone());
-    match operation {
+    match &operation {
         ReshapeOperation::Merge(_) => transaction.add_output(PartialOutput::new(
             storm_eye_script,
             storm_eye_amount,
             storm_eye_asset,
         )),
         ReshapeOperation::Split(_, count) => {
-            if storm_eye_amount < u64::from(count) {
+            if storm_eye_amount < u64::from(*count) {
                 return Err(VotingExecutionError::Invalid(
                     "Storm Eye amount is too small for the requested split".into(),
                 ));
             }
-            let base = storm_eye_amount / u64::from(count);
-            let remainder = storm_eye_amount % u64::from(count);
-            for index in 0..count {
+            let base = storm_eye_amount / u64::from(*count);
+            let remainder = storm_eye_amount % u64::from(*count);
+            for index in 0..*count {
                 transaction.add_output(PartialOutput::new(
                     storm_eye_script.clone(),
                     base + u64::from(index < remainder as u8),
                     storm_eye_asset,
                 ));
             }
+        }
+        ReshapeOperation::UpdateMembers { members, new_root } => {
+            let destination_script = migrated_storm_eye_script(&storm_eye, *new_root, &network)?;
+            for utxo in &storm_eye_utxos {
+                transaction.add_output(PartialOutput::new(
+                    destination_script.clone(),
+                    utxo.amount(),
+                    storm_eye_asset,
+                ));
+            }
+            transaction.add_output(PartialOutput::new(
+                migrated_members_script(members, proposer)?,
+                0,
+                network.policy_asset(),
+            ));
         }
     }
 
@@ -832,7 +1050,9 @@ fn build_transaction(
             policy_asset,
         ));
     }
-    transaction.add_output(PartialOutput::new(member_script(proposer), 0, policy_asset));
+    if !matches!(operation, ReshapeOperation::UpdateMembers { .. }) {
+        transaction.add_output(PartialOutput::new(member_script(proposer), 0, policy_asset));
+    }
     transaction.add_output(PartialOutput::new(
         Script::new(),
         transaction_fee_sats,
@@ -878,11 +1098,65 @@ fn validate_layout(
     indexed_treasury: &[TreasuryUtxo],
     allow_spent_inputs: bool,
 ) -> Result<(), VotingExecutionError> {
+    let scanned_update_utxos = if matches!(operation, ReshapeOperation::UpdateMembers { .. }) {
+        match scan_storm_eye_utxos(client, storm_eye) {
+            Ok(utxos) => Some(utxos),
+            Err(VotingExecutionError::Invalid(message))
+                if allow_spent_inputs
+                    && message == "network has no live Storm Eye UTXOs to migrate" =>
+            {
+                Some(Vec::new())
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    let update_outpoints = scanned_update_utxos
+        .as_ref()
+        .map(|utxos| {
+            utxos
+                .iter()
+                .map(|utxo| StormEyeUtxo {
+                    txid: utxo.outpoint.txid.to_byte_array(),
+                    output_index: utxo.outpoint.vout,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let transaction_update_outpoints =
+        if allow_spent_inputs && matches!(operation, ReshapeOperation::UpdateMembers { .. }) {
+            pset.inputs()
+                .iter()
+                .take_while(|input| {
+                    input.witness_utxo.as_ref().is_some_and(|output| {
+                        output.script_pubkey.as_bytes() == storm_eye.contract_script
+                    })
+                })
+                .map(|input| StormEyeUtxo {
+                    txid: input.previous_txid.to_byte_array(),
+                    output_index: input.previous_output_index,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
     let expected_outpoints = match operation {
         ReshapeOperation::Merge(outpoints) => outpoints.as_slice(),
         ReshapeOperation::Split(outpoint, _) => std::slice::from_ref(outpoint),
+        ReshapeOperation::UpdateMembers { .. }
+            if allow_spent_inputs && update_outpoints.is_empty() =>
+        {
+            transaction_update_outpoints.as_slice()
+        }
+        ReshapeOperation::UpdateMembers { .. } => update_outpoints.as_slice(),
     };
     let storm_count = expected_outpoints.len();
+    if storm_count == 0 {
+        return Err(VotingExecutionError::Invalid(
+            "voting transaction has no Storm Eye input".into(),
+        ));
+    }
     if pset.inputs().len() <= storm_count {
         return Err(VotingExecutionError::Invalid(
             "voting transaction has no Treasury fee input".into(),
@@ -964,6 +1238,7 @@ fn validate_layout(
     let split_count = match operation {
         ReshapeOperation::Merge(_) => 1,
         ReshapeOperation::Split(_, count) => usize::from(*count),
+        ReshapeOperation::UpdateMembers { .. } => storm_count,
     };
     if pset.outputs().len() < split_count + 2 {
         return Err(VotingExecutionError::Invalid(
@@ -972,13 +1247,31 @@ fn validate_layout(
     }
     let expected_base = storm_total / split_count as u64;
     let expected_remainder = storm_total % split_count as u64;
-    for index in 0..split_count {
-        let output = &pset.outputs()[index];
-        let expected = expected_base + u64::from(index < expected_remainder as usize);
+    let destination_script = match operation {
+        ReshapeOperation::UpdateMembers { new_root, .. } => {
+            migrated_storm_eye_script(storm_eye, *new_root, network)?
+        }
+        _ => Script::from(storm_eye.contract_script.clone()),
+    };
+    for (index, output) in pset.outputs().iter().take(split_count).enumerate() {
+        let expected = match operation {
+            ReshapeOperation::UpdateMembers { .. } => voting_input(
+                client,
+                Txid::from_byte_array(expected_outpoints[index].txid),
+                expected_outpoints[index].output_index,
+                allow_spent_inputs,
+            )?
+            .value
+            .explicit()
+            .ok_or_else(|| {
+                VotingExecutionError::Invalid("Storm Eye input value must be explicit".into())
+            })?,
+            _ => expected_base + u64::from(index < expected_remainder as usize),
+        };
         if !is_fully_explicit_output(output)
             || output.asset != Some(storm_asset)
             || output.amount != Some(expected)
-            || output.script_pubkey.as_bytes() != storm_eye.contract_script
+            || output.script_pubkey != destination_script
         {
             return Err(VotingExecutionError::Invalid(
                 "Storm Eye outputs do not match the approved reshape".into(),
@@ -987,6 +1280,7 @@ fn validate_layout(
     }
 
     let mut marker_count = 0usize;
+    let mut members_marker_count = 0usize;
     let mut fee_count = 0usize;
     let mut treasury_return = 0u64;
     for output in pset.outputs().iter().skip(split_count) {
@@ -1004,6 +1298,18 @@ fn validate_layout(
                 .ok_or_else(|| VotingExecutionError::Invalid("Treasury change overflow".into()))?;
         } else if output.script_pubkey == member_script(proposer) && amount == 0 {
             marker_count += 1;
+        } else if matches!(operation, ReshapeOperation::UpdateMembers { .. })
+            && amount == 0
+            && migrated_members_script(
+                match operation {
+                    ReshapeOperation::UpdateMembers { members, .. } => members,
+                    _ => unreachable!(),
+                },
+                proposer,
+            )? == output.script_pubkey
+        {
+            marker_count += 1;
+            members_marker_count += 1;
         } else if output.script_pubkey.is_empty() && amount == transaction_fee_sats {
             fee_count += 1;
         } else {
@@ -1012,7 +1318,10 @@ fn validate_layout(
             ));
         }
     }
+    let expected_members_markers =
+        usize::from(matches!(operation, ReshapeOperation::UpdateMembers { .. }));
     if marker_count != 1
+        || members_marker_count != expected_members_markers
         || fee_count != 1
         || treasury_total.checked_sub(treasury_return) != Some(transaction_fee_sats)
     {
@@ -1060,10 +1369,19 @@ fn voting_input(
         })
 }
 
-fn placeholder_witness(data: &StormEyeContractData, operation: &ReshapeOperation) -> AuthWitness {
-    let reshape = match operation {
-        ReshapeOperation::Split(_, count) => Either::Left(*count),
-        ReshapeOperation::Merge(outpoints) => Either::Right(outpoints.len() as u8),
+fn placeholder_witness(
+    data: &StormEyeContractData,
+    operation: &ReshapeOperation,
+    output_index: u32,
+) -> AuthWitness {
+    let kind = match operation {
+        ReshapeOperation::Split(_, count) => Either::Right(Either::Right(Either::Left(*count))),
+        ReshapeOperation::Merge(outpoints) => {
+            Either::Right(Either::Right(Either::Right(outpoints.len() as u8)))
+        }
+        ReshapeOperation::UpdateMembers { new_root, .. } => {
+            Either::Right(Either::Left(Either::Left((*new_root, output_index))))
+        }
     };
     AuthWitness {
         path: Either::Left((
@@ -1073,7 +1391,7 @@ fn placeholder_witness(data: &StormEyeContractData, operation: &ReshapeOperation
                 data.storm_tree_root,
                 std::array::from_fn(|_| Either::Left(())),
             ),
-            Either::Right(Either::Right(reshape)),
+            kind,
         )),
     }
 }
@@ -1138,10 +1456,16 @@ fn reshape_witness(
     proof: &StormTreeProof,
     operation: &ReshapeOperation,
     signature: [u8; 64],
+    output_index: u32,
 ) -> Result<AuthWitness, VotingExecutionError> {
-    let reshape = match operation {
-        ReshapeOperation::Split(_, count) => Either::Left(*count),
-        ReshapeOperation::Merge(outpoints) => Either::Right(outpoints.len() as u8),
+    let kind = match operation {
+        ReshapeOperation::Split(_, count) => Either::Right(Either::Right(Either::Left(*count))),
+        ReshapeOperation::Merge(outpoints) => {
+            Either::Right(Either::Right(Either::Right(outpoints.len() as u8)))
+        }
+        ReshapeOperation::UpdateMembers { new_root, .. } => {
+            Either::Right(Either::Left(Either::Left((*new_root, output_index))))
+        }
     };
     Ok(AuthWitness {
         path: Either::Left((
@@ -1151,9 +1475,34 @@ fn reshape_witness(
                 signing.signing_storm_tree_branch,
                 pack_proof(proof)?,
             ),
-            Either::Right(Either::Right(reshape)),
+            kind,
         )),
     })
+}
+
+fn migrated_storm_eye_script(
+    storm_eye: &NetworkAsset,
+    new_root: [u8; 32],
+    network: &SimplicityNetwork,
+) -> Result<Script, VotingExecutionError> {
+    Ok(Script::from(
+        migrated_storm_eye(storm_eye, new_root, network)?.contract_script,
+    ))
+}
+
+fn migrated_storm_eye(
+    storm_eye: &NetworkAsset,
+    new_root: [u8; 32],
+    network: &SimplicityNetwork,
+) -> Result<NetworkAsset, VotingExecutionError> {
+    let mut migrated = storm_eye.clone();
+    let mut data = contract_data(storm_eye)?;
+    data.storm_tree_root = new_root;
+    migrated.contract_data = Some(postcard::to_stdvec(&data)?);
+    migrated.contract_script = storm_eye_program(&migrated)?
+        .get_script_pubkey(network)
+        .into_bytes();
+    Ok(migrated)
 }
 
 fn contract_data(storm_eye: &NetworkAsset) -> Result<StormEyeContractData, VotingExecutionError> {
@@ -1216,7 +1565,10 @@ fn network(client: &Client) -> Result<SimplicityNetwork, VotingExecutionError> {
 mod inventory_tests {
     use super::*;
     use crate::NodeMessageKind;
-    use simplex::simplicityhl::elements::{LockTime, Transaction, TxIn, confidential};
+    use secp256k1::{PublicKey, SecretKey};
+    use simplex::simplicityhl::elements::{
+        BlockHash, LockTime, OutPoint, Transaction, TxIn, confidential,
+    };
 
     #[test]
     fn executing_votes_override_proposed_reservations() {
@@ -1226,13 +1578,31 @@ mod inventory_tests {
         };
         let proposed = stored_reshape([3; 32], shared, false, None);
         let executing = stored_reshape([4; 32], shared, true, None);
-        let executed = stored_reshape([5; 32], shared, false, Some([6; 32]));
+        let broadcast = stored_reshape([5; 32], shared, true, Some([6; 32]));
+        let executed = stored_reshape([7; 32], shared, false, Some([8; 32]));
 
-        let reservations = storm_eye_reservations(&[proposed, executing, executed]).unwrap();
+        let reservations =
+            storm_eye_reservations(&[proposed, executing, broadcast, executed]).unwrap();
         let reservation = reservations.get(&shared).unwrap();
 
         assert_eq!(reservation.state, StormEyeState::Executing);
-        assert_eq!(reservation.voting_request_hashes, vec![[3; 32], [4; 32]]);
+        assert_eq!(
+            reservation.voting_request_hashes,
+            vec![[3; 32], [4; 32], [5; 32]]
+        );
+    }
+
+    #[test]
+    fn interrupted_execution_remains_retryable() {
+        let mut executing = stored_member_update([8; 32], [9; 32]);
+        executing.execution_started = true;
+        executing.execution_transaction = Some(vec![1, 2, 3]);
+
+        assert!(require_retryable(&executing).is_ok());
+        assert!(matches!(
+            require_approved_or_executing(&executing, &[4, 5, 6]),
+            Err(VotingExecutionError::AlreadyExecuting)
+        ));
     }
 
     #[test]
@@ -1275,6 +1645,152 @@ mod inventory_tests {
         assert!(!has_signature_per_input(2, 1, 2));
     }
 
+    #[test]
+    fn member_update_derives_target_root_and_root_update_witness() {
+        let member = |byte| {
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes([byte; 32]).unwrap())
+                .x_only_public_key()
+                .0
+                .serialize()
+        };
+        let current = [member(1), member(2), member(3)]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let target = [member(1), member(3), member(4)]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let stored = stored_member_update(member(4), member(2));
+
+        let operation = decode_operation(&stored, &current).unwrap();
+        let expected_root = StormTree::new(target.clone()).unwrap().root();
+        assert!(matches!(
+            &operation,
+            ReshapeOperation::UpdateMembers { members, new_root }
+                if members == &target && *new_root == expected_root
+        ));
+
+        let witness = placeholder_witness(
+            &StormEyeContractData {
+                storm_tree_root: [8; 32],
+                rescue_height: 42,
+                rescue_output_script_hash: [9; 32],
+            },
+            &operation,
+            2,
+        );
+        assert!(matches!(
+            witness.path,
+            Either::Left((
+                (old_root, rescue_height),
+                _,
+                Either::Right(Either::Left(Either::Left((root, 2))))
+            )) if old_root == [8; 32] && rescue_height == 42 && root == expected_root
+        ));
+    }
+
+    #[test]
+    fn member_update_migrates_every_storm_eye_to_the_new_root() {
+        let member = |byte| {
+            PublicKey::from_secret_key(&SecretKey::from_secret_bytes([byte; 32]).unwrap())
+                .x_only_public_key()
+                .0
+                .serialize()
+        };
+        let members = [member(1), member(2), member(3)];
+        let new_root = StormTree::new(members.to_vec()).unwrap().root();
+        let network = SimplicityNetwork::ElementsCustom {
+            policy_asset: AssetId::from_byte_array([10; 32]),
+            genesis_hash: BlockHash::from_byte_array([11; 32]),
+        };
+        let mut storm_eye = NetworkAsset {
+            kind: STORM_EYE_KIND.to_string(),
+            name: "Storm Eye".to_string(),
+            asset_id: [12; 32],
+            reissuance_token_id: None,
+            entropy: None,
+            issuance_txid: [13; 32],
+            contract_script: Vec::new(),
+            contract_data: Some(
+                postcard::to_stdvec(&StormEyeContractData {
+                    storm_tree_root: [14; 32],
+                    rescue_height: 42,
+                    rescue_output_script_hash: [15; 32],
+                })
+                .unwrap(),
+            ),
+            supply: 10_000,
+            created_at_block: 1,
+        };
+        storm_eye.contract_script = storm_eye_program(&storm_eye)
+            .unwrap()
+            .get_script_pubkey(&network)
+            .into_bytes();
+        let storm_asset = AssetId::from_byte_array(storm_eye.asset_id);
+        let old_script = Script::from(storm_eye.contract_script.clone());
+        let storm_utxo = |byte, output_index, amount| UTXO {
+            outpoint: OutPoint::new(Txid::from_byte_array([byte; 32]), output_index),
+            txout: TxOut {
+                asset: confidential::Asset::Explicit(storm_asset),
+                value: confidential::Value::Explicit(amount),
+                script_pubkey: old_script.clone(),
+                ..Default::default()
+            },
+            secrets: None,
+        };
+        let treasury = TreasuryProgram::new(&TreasuryArguments {
+            storm_eye_asset_id: storm_eye.asset_id,
+        });
+        let treasury_utxo = UTXO {
+            outpoint: OutPoint::new(Txid::from_byte_array([16; 32]), 0),
+            txout: TxOut {
+                asset: confidential::Asset::Explicit(network.policy_asset()),
+                value: confidential::Value::Explicit(2_000),
+                script_pubkey: treasury.get_script_pubkey(&network),
+                ..Default::default()
+            },
+            secrets: None,
+        };
+
+        let prepared = build_transaction(
+            [17; 32],
+            ReshapeOperation::UpdateMembers {
+                members: members.to_vec(),
+                new_root,
+            },
+            storm_eye.clone(),
+            vec![storm_utxo(18, 0, 4_000), storm_utxo(19, 1, 6_000)],
+            vec![treasury_utxo],
+            network,
+            500,
+        )
+        .unwrap();
+        let destination = migrated_storm_eye_script(&storm_eye, new_root, &network).unwrap();
+
+        assert_eq!(prepared.storm_eye_inputs, 2);
+        assert_eq!(prepared.pset.outputs()[0].amount, Some(4_000));
+        assert_eq!(prepared.pset.outputs()[1].amount, Some(6_000));
+        assert_eq!(prepared.pset.outputs()[0].script_pubkey, destination);
+        assert_eq!(prepared.pset.outputs()[1].script_pubkey, destination);
+        assert_eq!(
+            prepared
+                .pset
+                .outputs()
+                .iter()
+                .filter(|output| {
+                    !output.script_pubkey.is_empty()
+                        && output.script_pubkey.is_provably_unspendable()
+                })
+                .count(),
+            1
+        );
+        assert!(prepared.pset.outputs().iter().any(|output| {
+            output.amount == Some(0)
+                && output.script_pubkey == migrated_members_script(&members, [17; 32]).unwrap()
+        }));
+    }
+
     fn stored_reshape(
         message_hash: [u8; 32],
         outpoint: StormEyeUtxo,
@@ -1300,7 +1816,36 @@ mod inventory_tests {
             approved_at_block_height: None,
             execution_started,
             execution_transaction: execution_started.then(Vec::new),
+            execution_request: None,
             execution_txid,
+            execution_confirmed: execution_txid.is_some() && !execution_started,
+            approvals: Vec::new(),
+        }
+    }
+
+    fn stored_member_update(accepted: [u8; 32], removed: [u8; 32]) -> StoredVotingRequest {
+        let request = crate::NetworkVoteRequest::new(
+            NetworkVoteKind::UpdateNetworkMembers,
+            &UpdateNetworkMembers {
+                to_accept: vec![accepted],
+                to_remove: vec![removed],
+            },
+        )
+        .unwrap();
+        let message =
+            NodeMessage::new(NodeMessageKind::NetworkVoteRequest, None, &request).unwrap();
+
+        StoredVotingRequest {
+            message_hash: [6; 32],
+            message: postcard::to_allocvec(&message).unwrap(),
+            proposer_public_key: Some([7; 32]),
+            block_height: 1,
+            approved_at_block_height: Some(2),
+            execution_started: false,
+            execution_transaction: None,
+            execution_request: None,
+            execution_txid: None,
+            execution_confirmed: false,
             approvals: Vec::new(),
         }
     }

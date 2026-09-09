@@ -66,16 +66,27 @@ pub enum VotingError {
 pub(crate) struct Voting {
     store: VotingStore,
     keypair: Keypair,
+    coordinator: [u8; 32],
     operations: Arc<Mutex<()>>,
 }
 
 impl Voting {
-    pub(crate) fn new(secret_key: [u8; 32], store: VotingStore) -> Self {
+    pub(crate) fn new(
+        secret_key: [u8; 32],
+        coordinator_public_key: [u8; 33],
+        store: VotingStore,
+    ) -> Self {
         let secret_key = SecretKey::from_secret_bytes(secret_key)
             .expect("the transport signer key was already validated");
+        let coordinator = PublicKey::from_slice(&coordinator_public_key)
+            .expect("the coordinator transport key was already validated")
+            .x_only_public_key()
+            .0
+            .serialize();
         Self {
             store,
             keypair: Keypair::from_secret_key(&secret_key),
+            coordinator,
             operations: Arc::new(Mutex::new(())),
         }
     }
@@ -86,13 +97,13 @@ impl Voting {
         request: NetworkVoteRequest,
         block_height: u64,
     ) -> Result<[u8; 32], VotingError> {
+        let _guard = self.operations.lock().await;
         let peers = storm.peers().await;
-        validate_request(&request, &peers)?;
+        validate_request(&request, &peers, self.coordinator)?;
         let message = NodeMessage::new(NodeMessageKind::NetworkVoteRequest, None, &request)?;
         let hash = message.hash()?;
         let encoded = postcard::to_stdvec(&message)?;
         let proposer = controlled_member_key(&peers)?;
-        let _guard = self.operations.lock().await;
         if !self
             .store
             .insert_request(hash, &encoded, proposer, block_height)
@@ -110,7 +121,6 @@ impl Voting {
         request_hash: [u8; 32],
         block_height: u64,
     ) -> Result<(), VotingError> {
-        let peers = storm.peers().await;
         let local_key = self.keypair.x_only_public_key().0.serialize();
         let approval = ApproveVotingRequest {
             public_key: local_key,
@@ -123,15 +133,31 @@ impl Voting {
             Some(request_hash),
             &approval,
         )?;
-        self.accept_approval(
-            message.clone(),
-            approval,
-            request_hash,
-            block_height,
-            &peers,
-        )
-        .await?;
-        send_from_storm(storm, message, &active_remote_peers(&peers)).await
+        let duplicate = match self
+            .accept_approval(message.clone(), approval, request_hash, block_height, storm)
+            .await
+        {
+            Ok(()) => None,
+            Err(VotingError::DuplicateApproval(public_key))
+                if public_key == hex::encode(local_key) =>
+            {
+                Some(public_key)
+            }
+            Err(error) => return Err(error),
+        };
+        let peers = storm.peers().await;
+        let broadcast = send_from_storm(storm, message, &active_remote_peers(&peers)).await;
+        let staging = self
+            .stage_member_migration_if_approved(storm, request_hash)
+            .await;
+
+        broadcast?;
+        staging?;
+        if let Some(public_key) = duplicate {
+            return Err(VotingError::DuplicateApproval(public_key));
+        }
+
+        Ok(())
     }
 
     pub(crate) async fn synchronize(&self, storm: &StormHandle) -> Result<(), VotingError> {
@@ -156,12 +182,13 @@ impl Voting {
             ));
         }
         let request: NetworkVoteRequest = message.decode_payload()?;
+        let _guard = self.operations.lock().await;
         let peers = context.storm_handle.peers().await;
-        validate_request(&request, &peers)?;
+        validate_request(&request, &peers, self.coordinator)?;
         let hash = message.hash()?;
         let encoded = postcard::to_stdvec(&message)?;
         let proposer = node_key(context.message_context.peer_public_key)?;
-        let _guard = self.operations.lock().await;
+        ensure_current_member(&peers, proposer, "voting request proposer")?;
         self.store
             .insert_request(hash, &encoded, proposer, block_height)
             .await?;
@@ -178,8 +205,15 @@ impl Voting {
             VotingError::InvalidApproval("approval does not link to a voting request".into())
         })?;
         let approval: ApproveVotingRequest = message.decode_payload()?;
-        let peers = context.storm_handle.peers().await;
-        self.accept_approval(message, approval, request_hash, block_height, &peers)
+        self.accept_approval(
+            message,
+            approval,
+            request_hash,
+            block_height,
+            &context.storm_handle,
+        )
+        .await?;
+        self.stage_member_migration_if_approved(&context.storm_handle, request_hash)
             .await
     }
 
@@ -198,7 +232,8 @@ impl Voting {
         if sync.is_response {
             self.accept_synchronized(
                 sync.requests,
-                &context.storm_handle.peers().await,
+                &context.storm_handle,
+                context.message_context.peer_public_key,
                 block_height,
             )
             .await
@@ -213,6 +248,7 @@ impl Voting {
                 .list()
                 .await?
                 .into_iter()
+                .filter(|request| !request.execution_confirmed)
                 .map(|request| VotingSyncRequest {
                     message_hash: request.message_hash,
                     message: request.message,
@@ -242,7 +278,8 @@ impl Voting {
     async fn accept_synchronized(
         &self,
         requests: Vec<VotingSyncRequest>,
-        peers: &[Peer],
+        storm: &StormHandle,
+        sender_public_key: [u8; 33],
         block_height: u64,
     ) -> Result<(), VotingError> {
         for synchronized in requests {
@@ -255,18 +292,26 @@ impl Voting {
                     "synchronized voting request metadata does not match its message".into(),
                 ));
             }
-            let request: NetworkVoteRequest = message.decode_payload()?;
-            validate_request(&request, peers)?;
             {
                 let _guard = self.operations.lock().await;
-                self.store
-                    .insert_synchronized_request(
-                        synchronized.message_hash,
-                        &synchronized.message,
-                        None,
-                        block_height,
-                    )
-                    .await?;
+                if self.store.get(synchronized.message_hash).await?.is_none() {
+                    let peers = storm.peers().await;
+                    ensure_current_member(
+                        &peers,
+                        node_key(sender_public_key)?,
+                        "voting synchronization sender",
+                    )?;
+                    let request: NetworkVoteRequest = message.decode_payload()?;
+                    validate_request(&request, &peers, self.coordinator)?;
+                    self.store
+                        .insert_synchronized_request(
+                            synchronized.message_hash,
+                            &synchronized.message,
+                            None,
+                            block_height,
+                        )
+                        .await?;
+                }
             }
 
             for synchronized_approval in synchronized.approvals {
@@ -286,7 +331,7 @@ impl Voting {
                         approval,
                         synchronized.message_hash,
                         block_height,
-                        peers,
+                        storm,
                     )
                     .await
                 {
@@ -294,8 +339,72 @@ impl Voting {
                     Err(error) => return Err(error),
                 }
             }
+            self.stage_member_migration_if_approved(storm, synchronized.message_hash)
+                .await?;
         }
         Ok(())
+    }
+
+    async fn stage_member_migration_if_approved(
+        &self,
+        storm: &StormHandle,
+        request_hash: [u8; 32],
+    ) -> Result<(), VotingError> {
+        let Some(request) = self.get(request_hash).await? else {
+            return Ok(());
+        };
+        if request.status != VotingStatus::Approved
+            || NetworkVoteKind::from_id(request.request.kind)
+                != Some(NetworkVoteKind::UpdateNetworkMembers)
+        {
+            return Ok(());
+        }
+
+        self.stage_member_migration(storm, &request)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn restore_member_migration(
+        &self,
+        storm: &StormHandle,
+    ) -> Result<(), VotingError> {
+        for request in self.list().await?.into_iter().filter(|request| {
+            matches!(
+                request.status,
+                VotingStatus::Approved | VotingStatus::Executing
+            ) && NetworkVoteKind::from_id(request.request.kind)
+                == Some(NetworkVoteKind::UpdateNetworkMembers)
+        }) {
+            if self.stage_member_migration(storm, &request).await? {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn stage_member_migration(
+        &self,
+        storm: &StormHandle,
+        request: &VotingRequest,
+    ) -> Result<bool, VotingError> {
+        let update: UpdateNetworkMembers = postcard::from_bytes(&request.request.payload)?;
+        let current_members = member_keys(&storm.peers().await)?;
+        let mut members = current_members.clone();
+        for member in update.to_remove {
+            members.remove(&member);
+        }
+        members.extend(update.to_accept);
+        if members == current_members {
+            return Ok(false);
+        }
+
+        match storm.begin_member_migration(members).await {
+            Ok(()) => Ok(true),
+            Err(storm::Error::MigrationAlreadyStaged) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn accept_approval(
@@ -304,11 +413,13 @@ impl Voting {
         approval: ApproveVotingRequest,
         request_hash: [u8; 32],
         block_height: u64,
-        peers: &[Peer],
+        storm: &StormHandle,
     ) -> Result<(), VotingError> {
+        let _guard = self.operations.lock().await;
+        let peers = storm.peers().await;
         let public_key = XOnlyPublicKey::from_byte_array(approval.public_key)
             .map_err(|error| VotingError::InvalidApproval(error.to_string()))?;
-        if !member_keys(peers)?.contains(&approval.public_key) {
+        if !member_keys(&peers)?.contains(&approval.public_key) {
             return Err(VotingError::InvalidApproval(format!(
                 "{} is not a network member",
                 hex::encode(approval.public_key)
@@ -328,7 +439,6 @@ impl Voting {
         schnorr::verify(&signature, &request_hash, &public_key)
             .map_err(|error| VotingError::InvalidApproval(error.to_string()))?;
 
-        let _guard = self.operations.lock().await;
         if self.store.get(request_hash).await?.is_none() {
             return Err(VotingError::UnknownRequest(hex::encode(request_hash)));
         }
@@ -352,6 +462,10 @@ impl Voting {
         Ok(())
     }
 
+    pub(crate) async fn lock_operations(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.operations.clone().lock_owned().await
+    }
+
     pub(crate) async fn get(&self, hash: [u8; 32]) -> Result<Option<VotingRequest>, VotingError> {
         self.store.get(hash).await?.map(decode_stored).transpose()
     }
@@ -373,7 +487,11 @@ impl Voting {
     }
 }
 
-fn validate_request(request: &NetworkVoteRequest, peers: &[Peer]) -> Result<(), VotingError> {
+fn validate_request(
+    request: &NetworkVoteRequest,
+    peers: &[Peer],
+    coordinator: [u8; 32],
+) -> Result<(), VotingError> {
     match NetworkVoteKind::from_id(request.kind) {
         Some(NetworkVoteKind::UpdateNetworkMembers) => {
             let update: UpdateNetworkMembers = postcard::from_bytes(&request.payload)?;
@@ -396,6 +514,12 @@ fn validate_request(request: &NetworkVoteRequest, peers: &[Peer]) -> Result<(), 
                     "removed key {} is not a member",
                     hex::encode(key)
                 )));
+            }
+            if removed.contains(&coordinator) {
+                return Err(VotingError::InvalidRequest(
+                    "member update cannot remove the coordinator without a replacement protocol"
+                        .into(),
+                ));
             }
             let resulting_count = current.len() + accepted.len() - removed.len();
             if resulting_count < 3 {
@@ -475,6 +599,21 @@ fn member_keys(peers: &[Peer]) -> Result<BTreeSet<[u8; 32]>, VotingError> {
         .collect()
 }
 
+fn ensure_current_member(
+    peers: &[Peer],
+    public_key: [u8; 32],
+    role: &str,
+) -> Result<(), VotingError> {
+    if !member_keys(peers)?.contains(&public_key) {
+        return Err(VotingError::InvalidRequest(format!(
+            "{role} {} is not a network member",
+            hex::encode(public_key)
+        )));
+    }
+
+    Ok(())
+}
+
 fn required_approvals(member_count: usize) -> usize {
     (member_count * 2).div_ceil(3)
 }
@@ -495,9 +634,9 @@ fn decode_stored(stored: StoredVotingRequest) -> Result<VotingRequest, VotingErr
         request,
         proposer_public_key: stored.proposer_public_key,
         block_height: stored.block_height,
-        status: if stored.execution_txid.is_some() {
+        status: if stored.execution_confirmed {
             VotingStatus::Executed
-        } else if stored.execution_started {
+        } else if stored.execution_started || stored.execution_txid.is_some() {
             VotingStatus::Executing
         } else if stored.approved_at_block_height.is_some() {
             VotingStatus::Approved
@@ -570,6 +709,48 @@ fn transport_keys(keys: &[[u8; 33]]) -> Result<Vec<TransportPublicKey>, VotingEr
 mod reshape_tests {
     use super::*;
     use crate::StormEyeUtxo;
+    use secp256k1_zkp::{Secp256k1, SecretKey};
+
+    #[test]
+    fn broadcast_vote_remains_executing_until_confirmed() {
+        let request = NetworkVoteRequest::new(
+            NetworkVoteKind::SplitStormEye,
+            &SplitStormEye {
+                utxo_to_split: StormEyeUtxo {
+                    txid: [9; 32],
+                    output_index: 0,
+                },
+                number_of_splits: 2,
+            },
+        )
+        .unwrap();
+        let message =
+            NodeMessage::new(NodeMessageKind::NetworkVoteRequest, None, &request).unwrap();
+        let mut stored = StoredVotingRequest {
+            message_hash: [1; 32],
+            message: postcard::to_allocvec(&message).unwrap(),
+            proposer_public_key: Some([2; 32]),
+            block_height: 3,
+            approved_at_block_height: Some(4),
+            execution_started: true,
+            execution_transaction: Some(vec![5]),
+            execution_request: Some(vec![6]),
+            execution_txid: Some([7; 32]),
+            execution_confirmed: false,
+            approvals: Vec::new(),
+        };
+
+        assert_eq!(
+            decode_stored(stored.clone()).unwrap().status,
+            VotingStatus::Executing
+        );
+
+        stored.execution_confirmed = true;
+        assert_eq!(
+            decode_stored(stored).unwrap().status,
+            VotingStatus::Executed
+        );
+    }
 
     #[test]
     fn accepts_two_or_three_reshape_outputs_only() {
@@ -581,7 +762,7 @@ mod reshape_tests {
                 },
             )
             .unwrap();
-            assert!(validate_request(&merge, &[]).is_ok());
+            assert!(validate_request(&merge, &[], [0; 32]).is_ok());
 
             let split = NetworkVoteRequest::new(
                 NetworkVoteKind::SplitStormEye,
@@ -591,7 +772,7 @@ mod reshape_tests {
                 },
             )
             .unwrap();
-            assert!(validate_request(&split, &[]).is_ok());
+            assert!(validate_request(&split, &[], [0; 32]).is_ok());
         }
 
         let merge = NetworkVoteRequest::new(
@@ -602,7 +783,7 @@ mod reshape_tests {
         )
         .unwrap();
         assert!(matches!(
-            validate_request(&merge, &[]),
+            validate_request(&merge, &[], [0; 32]),
             Err(VotingError::InvalidRequest(_))
         ));
 
@@ -615,8 +796,44 @@ mod reshape_tests {
         )
         .unwrap();
         assert!(matches!(
-            validate_request(&split, &[]),
+            validate_request(&split, &[], [0; 32]),
             Err(VotingError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn member_update_cannot_remove_the_fixed_coordinator() {
+        let secp = Secp256k1::new();
+        let peers = (1..=3)
+            .map(|byte| {
+                Peer::new(
+                    SecretKey::from_slice(&[byte; 32])
+                        .unwrap()
+                        .public_key(&secp)
+                        .serialize(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let coordinator = member_keys(&peers).unwrap().into_iter().next().unwrap();
+        let accepted = SecretKey::from_slice(&[4; 32])
+            .unwrap()
+            .public_key(&secp)
+            .x_only_public_key()
+            .0
+            .serialize();
+        let update = NetworkVoteRequest::new(
+            NetworkVoteKind::UpdateNetworkMembers,
+            &UpdateNetworkMembers {
+                to_accept: vec![accepted],
+                to_remove: vec![coordinator],
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            validate_request(&update, &peers, coordinator),
+            Err(VotingError::InvalidRequest(message))
+                if message.contains("cannot remove the coordinator")
         ));
     }
 

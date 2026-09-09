@@ -1,4 +1,4 @@
-use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{collections::BTreeSet, future::Future, net::SocketAddr, pin::Pin, sync::Arc};
 
 use secp256k1_zkp::{PublicKey, Secp256k1, SecretKey};
 use tokio::{sync::RwLock, task::JoinHandle};
@@ -17,6 +17,7 @@ pub struct Storm {
     pub(crate) inner: Arc<RwLock<StormState>>,
     pub(crate) listener_address: Option<SocketAddr>,
     pub(crate) listener_handle: Option<JoinHandle<()>>,
+    pub(crate) reconnect_handle: Option<JoinHandle<()>>,
 }
 
 /// A cloneable interface for operations that are safe inside message handlers.
@@ -129,12 +130,47 @@ impl Storm {
             inner: Arc::new(RwLock::new(state)),
             listener_address: None,
             listener_handle: None,
+            reconnect_handle: None,
         }
     }
 
     /// Returns a snapshot of the current peer table.
     pub async fn peers(&self) -> Vec<Peer> {
         self.inner.read().await.peers.clone()
+    }
+
+    /// Returns whether the local transport identity belongs to the active peer table.
+    pub async fn is_local_member(&self) -> bool {
+        self.handle().is_local_member().await
+    }
+
+    /// Stages a target member set while retaining the active peer table.
+    ///
+    /// Existing target peers retain their known addresses. New members are
+    /// admitted only after an authenticated handshake proves a matching
+    /// x-only identity.
+    pub async fn begin_member_migration(&self, members: BTreeSet<[u8; 32]>) -> Result<(), Error> {
+        self.handle().begin_member_migration(members).await
+    }
+
+    /// Returns whether every staged member has an authenticated connection.
+    pub async fn member_migration_ready(&self) -> bool {
+        self.handle().member_migration_ready().await
+    }
+
+    /// Returns whether this node may process migration execution messages.
+    pub async fn local_member_migration_ready(&self) -> bool {
+        self.handle().local_member_migration_ready().await
+    }
+
+    /// Activates the staged peer table after every target member is connected.
+    pub async fn activate_member_migration(&self) -> Result<Vec<Peer>, Error> {
+        self.handle().activate_member_migration().await
+    }
+
+    /// Discards a staged member set without changing the active network.
+    pub async fn cancel_member_migration(&self) {
+        self.handle().cancel_member_migration().await;
     }
 
     /// Installs the handler invoked for incoming [`CustomMsg`] values.

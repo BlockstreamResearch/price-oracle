@@ -130,6 +130,10 @@ impl Signing {
             .ok_or(SigningError::TooFewMembers)
     }
 
+    pub(crate) async fn refresh_members(&self, peers: &[Peer]) -> Result<(), SigningError> {
+        self.state.lock().await.refresh_members(peers)
+    }
+
     pub(crate) async fn storm_tree_proof(
         &self,
         branch: &StormTreeBranch,
