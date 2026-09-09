@@ -1,4 +1,4 @@
-use simplex::simplicityhl::elements::{AssetId, Script, Sequence};
+use simplex::simplicityhl::elements::{AssetId, LockTime, Script, Sequence};
 use simplex::transaction::{
     FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, utxo::UTXO,
 };
@@ -74,6 +74,55 @@ impl Auth {
             ),
             RequiredSignature::None,
         );
+
+        ft.set_locktime(
+            LockTime::from_height(self.storage.rescue_block_number)
+                .expect("rescue_block_number is a valid block height"),
+        );
+    }
+
+    /// # Panics
+    /// Panics if `new_storage` changes both fields, or neither.
+    #[must_use]
+    pub fn attach_storage_update(
+        &self,
+        ft: &mut FinalTransaction,
+        utxo: &UTXO,
+        new_storage: AuthStorage,
+        bloom: StormTreeBloom,
+    ) -> Self {
+        let root_changed = new_storage.merkle_root != self.storage.merkle_root;
+        let rescue_changed = new_storage.rescue_block_number != self.storage.rescue_block_number;
+        assert!(
+            root_changed ^ rescue_changed,
+            "a storage update rotates exactly one of merkle_root or rescue_block_number"
+        );
+
+        let output_index = ft.n_outputs() as u32;
+
+        let path = if root_changed {
+            AuthSpendPath::RootUpdate {
+                new_merkle_root: new_storage.merkle_root,
+                output_index,
+            }
+        } else {
+            AuthSpendPath::RescueBlockUpdate {
+                new_rescue_block_number: new_storage.rescue_block_number,
+                output_index,
+            }
+        };
+
+        self.attach_spend(ft, utxo, path, bloom);
+
+        let rotated = Self::new(self.params, new_storage);
+
+        ft.add_output(PartialOutput::new(
+            rotated.get_script_pubkey(),
+            utxo.explicit_amount(),
+            utxo.explicit_asset(),
+        ));
+
+        rotated
     }
 
     /// Adds an output that pays `amount` of `asset_id` to this Storm Eye.

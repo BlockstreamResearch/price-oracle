@@ -3,6 +3,7 @@ use simplex::provider::SimplicityNetwork;
 use crate::artifacts::auth::derived_auth::AuthArguments;
 
 /// Compilation parameters for the Storm Eye covenant.
+#[derive(Debug, Clone, Copy)]
 pub struct AuthParameters {
     pub max_split_utxos_count: u8,
     pub max_merge_utxos_count: u8,

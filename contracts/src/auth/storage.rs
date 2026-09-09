@@ -1,7 +1,7 @@
 use crate::artifacts::auth::AuthProgram;
 
 /// The Storm Eye covenant's two Taproot storage slots.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthStorage {
     pub merkle_root: [u8; 32],
     pub rescue_block_number: u32,

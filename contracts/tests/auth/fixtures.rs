@@ -1,6 +1,7 @@
 //! Shared setup for the Storm Eye covenant tests.
 
 use simplex::{
+    constants::DUMMY_SIGNATURE,
     provider::SimplicityNetwork,
     signer::SignerError,
     simplicityhl::elements::{AssetId, Script},
@@ -29,20 +30,6 @@ pub const UNUSED_RESCUE_OUTPUT_SCRIPT_HASH: [u8; 32] = [0u8; 32];
 pub const DEFAULT_RESCUE_NUMBER: u32 = 1234;
 
 /// Compiles the covenant with the given storage state, without funding it.
-pub fn auth_with_storage(
-    merkle_root: [u8; 32],
-    rescue_block_number: u32,
-    network: SimplicityNetwork,
-) -> Auth {
-    auth_with_rescue_output(
-        merkle_root,
-        rescue_block_number,
-        UNUSED_RESCUE_OUTPUT_SCRIPT_HASH,
-        network,
-    )
-}
-
-/// As [`auth_with_storage`], but naming where §1.4.6 is allowed to send the funds.
 pub fn auth_with_rescue_output(
     merkle_root: [u8; 32],
     rescue_block_number: u32,
@@ -144,9 +131,9 @@ impl StormEyeFixture {
     }
 
     /// Fixture's own signing combination's authorization proof
-    fn bloom(&self) -> StormTreeBloom {
+    pub fn bloom(&self) -> StormTreeBloom {
         StormTreeBloom {
-            signature: [0u8; 64],
+            signature: DUMMY_SIGNATURE,
             branch: self.signing_branch,
             proof: self.proof,
         }
