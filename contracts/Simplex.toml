@@ -6,7 +6,7 @@
 # out_dir = "./src/artifacts"
 
 [dependencies]
-std = { git = "https://github.com/BlockstreamResearch/simplicityhl-std.git", tag = "v0.1.0" } 
+std = { git = "https://github.com/BlockstreamResearch/simplicityhl-std.git", tag = "v0.1.0" }
 
 # [regtest]
 # mnemonic = "exist carry drive collect lend cereal occur much tiger just involve mean"

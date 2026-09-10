@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SIMPLEX_COMMIT: c1e9d8b06231973d81fbaa677cf3f03787104b81
+  SIMPLEX_VERSION: 0.0.11
 
 jobs:
   ci:
@@ -28,21 +28,9 @@ jobs:
           rustup component add rustfmt clippy
 
       - name: Install pinned Simplex CLI
-        shell: bash
-        run: |
-          set -euo pipefail
-          SIMPLEX_DIR="${SIMPLEX_DIR:-${XDG_CONFIG_HOME:-$HOME}/.simplex}"
-          mkdir -p "$SIMPLEX_DIR/bin"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
-            "https://raw.githubusercontent.com/BlockstreamResearch/smplx/$SIMPLEX_COMMIT/simplexup/simplexup" \
-            -o "$SIMPLEX_DIR/bin/simplexup"
-          grep -Fq 'curl -#o "$2" -L "$1"' "$SIMPLEX_DIR/bin/simplexup"
-          sed -i 's/curl -#o "$2" -L "$1"/curl -#fL --retry 5 --retry-all-errors --retry-delay 2 -o "$2" "$1"/' \
-            "$SIMPLEX_DIR/bin/simplexup"
-          chmod +x "$SIMPLEX_DIR/bin/simplexup"
-          echo "$SIMPLEX_DIR/bin" >> "$GITHUB_PATH"
-          "$SIMPLEX_DIR/bin/simplexup" -C "$SIMPLEX_COMMIT"
-          "$SIMPLEX_DIR/bin/simplex" --version
+        uses: BlockstreamResearch/simplicityhl-toolchain@v0.0.2
+        with:
+          components: simplex@${{ env.SIMPLEX_VERSION }}
 
       - name: Generate contract artifacts
         working-directory: contracts
