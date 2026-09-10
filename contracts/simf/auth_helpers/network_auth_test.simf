@@ -1,4 +1,4 @@
-use crate::network::{StormTreeBloom, assert_network_authorization};
+use crate::auth_helpers::network::{StormTreeBloom, assert_network_authorization};
 
 fn main() {
     let merkle_root: u256 = witness::MERKLE_ROOT;
