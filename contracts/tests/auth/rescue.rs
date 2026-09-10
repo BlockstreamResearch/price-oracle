@@ -1,8 +1,10 @@
 //! 6. Inclusion in a transaction upon reaching the rescue block number (spec §1.4.6).
 
-use simplex::simplicityhl::elements::{LockTime, Script};
-use simplex::transaction::{FinalTransaction, PartialOutput};
-use simplex::utils::hash_script;
+use simplex::{
+    simplicityhl::elements::{LockTime, Script},
+    transaction::{FinalTransaction, PartialOutput},
+    utils::hash_script,
+};
 
 use super::fixtures::{StormEyeFixture, assert_covenant_rejects};
 
@@ -93,7 +95,7 @@ fn rejects_rescue_before_the_rescue_block_number(
 fn rejects_rescue_to_another_script(context: simplex::TestContext) -> anyhow::Result<()> {
     let fixture = RescueFixture::new(&context)?;
 
-    let elsewhere = fixture.storm_eye.script_pubkey(&context);
+    let elsewhere = fixture.storm_eye.script_pubkey();
     assert_ne!(elsewhere, fixture.rescue_script_pubkey);
 
     let tx = fixture.rescue_transaction(&context, elsewhere, fixture.storm_eye.rescue_number)?;

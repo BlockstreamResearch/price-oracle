@@ -2,7 +2,9 @@
 
 use simplex::transaction::FinalTransaction;
 
-use super::fixtures::{MAX_SPLIT_UTXOS_COUNT, StormEyeFixture, assert_covenant_rejects, kind};
+use contracts::auth::AuthSpendPath;
+
+use super::fixtures::{MAX_SPLIT_UTXOS_COUNT, StormEyeFixture, assert_covenant_rejects};
 
 /// One Storm Eye input declaring `declared_count`, and one covenant output per entry in `amounts`.
 fn split_transaction(
@@ -14,8 +16,14 @@ fn split_transaction(
     let utxo = fixture.utxos(context)?[0].clone();
     let mut tx = FinalTransaction::new();
 
-    fixture.add_storm_eye_input(&mut tx, &utxo, kind::split(declared_count));
-    fixture.add_storm_eye_outputs(context, &mut tx, amounts);
+    fixture.add_storm_eye_input(
+        &mut tx,
+        &utxo,
+        AuthSpendPath::Split {
+            split_utxos_count: declared_count,
+        },
+    );
+    fixture.add_storm_eye_outputs(&mut tx, amounts);
 
     Ok(tx)
 }

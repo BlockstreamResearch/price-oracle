@@ -1,20 +1,21 @@
 //! Shared setup for the Storm Eye covenant tests.
 
-use simplex::either::Either;
-use simplex::signer::SignerError;
-use simplex::simplicityhl::elements::{AssetId, Script, Sequence};
-use simplex::transaction::partial_input::IssuanceInput;
-use simplex::transaction::utxo::UTXO;
-use simplex::transaction::{
-    FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
+use simplex::{
+    constants::DUMMY_SIGNATURE,
+    provider::SimplicityNetwork,
+    signer::SignerError,
+    simplicityhl::elements::{AssetId, Script},
+    transaction::{
+        FinalTransaction, PartialInput, RequiredSignature, partial_input::IssuanceInput, utxo::UTXO,
+    },
 };
-
-use contracts::artifacts::auth::AuthProgram;
-use contracts::artifacts::auth::derived_auth::{AuthArguments, AuthWitness};
 
 use storm_tree::smt::MerkleTree;
 
-use super::covenant::{Branch, WITNESS_DEPTH, WitnessStep, build_tree, witness_proof};
+use contracts::auth::{
+    Auth, AuthParameters, AuthSpendPath, AuthStorage, Branch, StormTreeBloom, WITNESS_DEPTH,
+    WitnessStep, build_tree, witness_proof,
+};
 
 pub const STORM_EYE_SUPPLY: u64 = 10_000;
 
@@ -23,83 +24,29 @@ pub const STORM_EYE_SUPPLY: u64 = 10_000;
 pub const MAX_SPLIT_UTXOS_COUNT: u8 = 6;
 pub const MAX_MERGE_UTXOS_COUNT: u8 = 4;
 
-/// The witness arm selecting a spending path, mirroring `AuthKind` in `auth.simf`.
-pub type AuthKind = Either<u32, Either<Either<([u8; 32], u32), (u32, u32)>, Either<u8, u8>>>;
-
-/// One constructor per spending path, in the order `auth.simf` declares them.
-pub mod kind {
-    use super::{AuthKind, Either};
-
-    pub fn inclusion(output_index: u32) -> AuthKind {
-        Either::Left(output_index)
-    }
-
-    pub fn root_update(new_merkle_root: [u8; 32], output_index: u32) -> AuthKind {
-        Either::Right(Either::Left(Either::Left((new_merkle_root, output_index))))
-    }
-
-    pub fn rescue_update(new_rescue_block_number: u32, output_index: u32) -> AuthKind {
-        Either::Right(Either::Left(Either::Right((
-            new_rescue_block_number,
-            output_index,
-        ))))
-    }
-
-    pub fn split(count: u8) -> AuthKind {
-        Either::Right(Either::Right(Either::Left(count)))
-    }
-
-    pub fn merge(count: u8) -> AuthKind {
-        Either::Right(Either::Right(Either::Right(count)))
-    }
-}
-
-/// Storage slot 1.
-pub fn rescue_block_slot_value(rescue_block_number: u32) -> [u8; 32] {
-    let mut slot = [0u8; 32];
-    slot[28..32].copy_from_slice(&rescue_block_number.to_be_bytes());
-
-    slot
-}
-
 /// Only for point 6. 1-5 tests never used it
 pub const UNUSED_RESCUE_OUTPUT_SCRIPT_HASH: [u8; 32] = [0u8; 32];
 
 pub const DEFAULT_RESCUE_NUMBER: u32 = 1234;
 
 /// Compiles the covenant with the given storage state, without funding it.
-pub fn program_with_storage(merkle_root: [u8; 32], rescue_block_number: u32) -> AuthProgram {
-    program_with_rescue_output(
-        merkle_root,
-        rescue_block_number,
-        UNUSED_RESCUE_OUTPUT_SCRIPT_HASH,
-    )
-}
-
-/// As [`program_with_storage`], but naming where §1.4.6 is allowed to send the funds.
-#[allow(unused_must_use)]
-pub fn program_with_rescue_output(
+pub fn auth_with_rescue_output(
     merkle_root: [u8; 32],
     rescue_block_number: u32,
     rescue_output_script_hash: [u8; 32],
-) -> AuthProgram {
-    let mut program = AuthProgram::new(&AuthArguments {
-        max_merge_utxos_count: MAX_MERGE_UTXOS_COUNT,
-        max_split_utxos_count: MAX_SPLIT_UTXOS_COUNT,
-        rescue_output_script_hash,
-    })
-    .with_storage_capacity(2);
-
-    program.set_storage_at(0, merkle_root);
-    program.set_storage_at(1, rescue_block_slot_value(rescue_block_number));
-
-    program
+    network: SimplicityNetwork,
+) -> Auth {
+    Auth::new(
+        AuthParameters::new(MAX_SPLIT_UTXOS_COUNT, MAX_MERGE_UTXOS_COUNT, network)
+            .with_rescue_output(rescue_output_script_hash),
+        AuthStorage {
+            merkle_root,
+            rescue_block_number,
+        },
+    )
 }
 
-fn issue_storm_eye_asset(
-    context: &simplex::TestContext,
-    program: &AuthProgram,
-) -> anyhow::Result<AssetId> {
+fn issue_storm_eye_asset(context: &simplex::TestContext, auth: &Auth) -> anyhow::Result<AssetId> {
     let signer = context.get_default_signer();
     let funding_utxo = signer.get_utxos_asset(context.get_network().policy_asset())?[0].clone();
 
@@ -110,11 +57,7 @@ fn issue_storm_eye_asset(
         IssuanceInput::new_issuance(STORM_EYE_SUPPLY, 0, [1u8; 32]),
         RequiredSignature::NativeEcdsa,
     );
-    final_utxo.add_output(PartialOutput::new(
-        program.get_script_pubkey(context.get_network()),
-        STORM_EYE_SUPPLY,
-        issuance.asset_id,
-    ));
+    auth.attach_storm_eye_output(&mut final_utxo, STORM_EYE_SUPPLY, issuance.asset_id);
 
     signer.broadcast(&final_utxo)?.wait()?;
 
@@ -123,7 +66,7 @@ fn issue_storm_eye_asset(
 
 /// A compiled, funded Storm Eye covenant and the material every witness needs.
 pub struct StormEyeFixture {
-    pub program: AuthProgram,
+    pub auth: Auth,
     pub storm_tree: MerkleTree,
     pub signing_branch: Branch,
     pub proof: [WitnessStep; WITNESS_DEPTH],
@@ -156,14 +99,19 @@ impl StormEyeFixture {
 
         // The other combinations the network could have signed with.
         let storm_tree = build_tree(&[signing_branch]);
-        let proof = witness_proof(&storm_tree, &signing_branch);
+        let proof =
+            witness_proof(&storm_tree, &signing_branch).expect("proof fits the covenant depth");
 
-        let program =
-            program_with_rescue_output(storm_tree.root(), rescue_number, rescue_output_script_hash);
-        let asset = issue_storm_eye_asset(context, &program)?;
+        let auth = auth_with_rescue_output(
+            storm_tree.root(),
+            rescue_number,
+            rescue_output_script_hash,
+            *context.get_network(),
+        );
+        let asset = issue_storm_eye_asset(context, &auth)?;
 
         Ok(Self {
-            program,
+            auth,
             storm_tree,
             signing_branch,
             proof,
@@ -172,78 +120,41 @@ impl StormEyeFixture {
         })
     }
 
-    pub fn script_pubkey(&self, context: &simplex::TestContext) -> Script {
-        self.program.get_script_pubkey(context.get_network())
+    pub fn script_pubkey(&self) -> Script {
+        self.auth.get_script_pubkey()
     }
 
     pub fn utxos(&self, context: &simplex::TestContext) -> anyhow::Result<Vec<UTXO>> {
-        let script_pubkey = self.script_pubkey(context);
-
         Ok(context
             .get_default_provider()
-            .fetch_scripthash_utxos(&script_pubkey)?)
+            .fetch_scripthash_utxos(&self.script_pubkey())?)
+    }
+
+    /// Fixture's own signing combination's authorization proof
+    pub fn bloom(&self) -> StormTreeBloom {
+        StormTreeBloom {
+            signature: DUMMY_SIGNATURE,
+            branch: self.signing_branch,
+            proof: self.proof,
+        }
     }
 
     /// Spends `utxo` through the covenant along the given spending path.
-    pub fn add_storm_eye_input(&self, tx: &mut FinalTransaction, utxo: &UTXO, kind: AuthKind) {
-        tx.add_program_input(
-            PartialInput::new(utxo.clone()),
-            ProgramInput::new(
-                Box::new(self.program.as_ref().clone()),
-                Box::new(AuthWitness {
-                    path: Either::Left((
-                        (self.storm_tree.root(), self.rescue_number),
-                        ([0u8; 64], self.signing_branch, self.proof),
-                        kind,
-                    )),
-                }),
-            ),
-            RequiredSignature::witness_tagged(
-                "PATH",
-                vec!["Left".to_string(), "1".to_string(), "0".to_string()],
-                "OracleNetworkV1/StormEye",
-            ),
-        );
+    pub fn add_storm_eye_input(&self, tx: &mut FinalTransaction, utxo: &UTXO, path: AuthSpendPath) {
+        self.auth.attach_spend(tx, utxo, path, self.bloom());
     }
 
-    /// Spends `utxo` through §1.4.6, the rescue path — the `Either::Right` witness arm,
-    /// with no signature and no Merkle proof.
+    /// Spends `utxo` through the rescue path with no signature and no Merkle proof.
     ///
-    /// The sequence matters: at the default `Sequence::MAX` the transaction is *final*,
-    /// which switches off nLockTime enforcement entirely, and `jet::check_lock_height`
-    /// then fails no matter how the locktime is set. The caller still has to call
-    /// `set_locktime` on the transaction.
+    /// The caller has to call `set_locktime` on the transaction.
     pub fn add_rescue_input(&self, tx: &mut FinalTransaction, utxo: &UTXO, output_index: u32) {
-        tx.add_program_input(
-            PartialInput::new(utxo.clone()).with_sequence(Sequence::ENABLE_LOCKTIME_NO_RBF),
-            ProgramInput::new(
-                Box::new(self.program.as_ref().clone()),
-                Box::new(AuthWitness {
-                    path: Either::Right((
-                        (self.storm_tree.root(), self.rescue_number),
-                        output_index,
-                    )),
-                }),
-            ),
-            RequiredSignature::None,
-        );
+        self.auth.attach_rescue_spend(tx, utxo, output_index);
     }
 
     /// Adds one covenant-owned output per entry in `amounts`.
-    pub fn add_storm_eye_outputs(
-        &self,
-        context: &simplex::TestContext,
-        tx: &mut FinalTransaction,
-        amounts: &[u64],
-    ) {
-        let script_pubkey = self.script_pubkey(context);
-
+    pub fn add_storm_eye_outputs(&self, tx: &mut FinalTransaction, amounts: &[u64]) {
         for amount in amounts {
-            tx.add_output(PartialOutput::new(
-                script_pubkey.clone(),
-                *amount,
-                self.asset,
-            ));
+            self.auth.attach_storm_eye_output(tx, *amount, self.asset);
         }
     }
 
@@ -258,8 +169,14 @@ impl StormEyeFixture {
 
         let mut tx = FinalTransaction::new();
 
-        self.add_storm_eye_input(&mut tx, &utxo, kind::split(amounts.len() as u8));
-        self.add_storm_eye_outputs(context, &mut tx, amounts);
+        self.add_storm_eye_input(
+            &mut tx,
+            &utxo,
+            AuthSpendPath::Split {
+                split_utxos_count: amounts.len() as u8,
+            },
+        );
+        self.add_storm_eye_outputs(&mut tx, amounts);
 
         context.get_default_signer().broadcast(&tx)?.wait()?;
 

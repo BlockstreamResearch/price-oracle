@@ -1,17 +1,20 @@
 //! Exercises `assert_network_authorization` on its own, before the full flow.
 
-use simplex::simplicityhl::elements::AssetId;
-use simplex::transaction::partial_input::IssuanceInput;
-use simplex::transaction::{
-    FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
+use simplex::{
+    simplicityhl::elements::AssetId,
+    transaction::{
+        FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
+        partial_input::IssuanceInput,
+    },
 };
 
-use contracts::artifacts::auth_helpers::network_auth_test::NetworkAuthTestProgram;
-use contracts::artifacts::auth_helpers::network_auth_test::derived_network_auth_test::{
-    NetworkAuthTestArguments, NetworkAuthTestWitness,
+use contracts::{
+    artifacts::auth_helpers::network_auth_test::{
+        NetworkAuthTestProgram,
+        derived_network_auth_test::{NetworkAuthTestArguments, NetworkAuthTestWitness},
+    },
+    auth::{Branch, WITNESS_DEPTH, WitnessStep, build_tree, witness_proof},
 };
-
-use super::covenant::{Branch, WITNESS_DEPTH, WitnessStep, build_tree, witness_proof};
 
 const SUPPLY: u64 = 500_000;
 
@@ -49,7 +52,8 @@ fn accepts_a_valid_inclusion_proof(context: simplex::TestContext) -> anyhow::Res
     let signing_branch: Branch = signer.get_schnorr_public_key().serialize();
     let branches = vec![signing_branch, [1u8; 32], [2u8; 32]];
     let storm_tree = build_tree(&branches);
-    let proof: [WitnessStep; WITNESS_DEPTH] = witness_proof(&storm_tree, &signing_branch);
+    let proof: [WitnessStep; WITNESS_DEPTH] =
+        witness_proof(&storm_tree, &signing_branch).expect("proof fits the covenant depth");
 
     let program = NetworkAuthTestProgram::new(&NetworkAuthTestArguments {});
     let script_pubkey = program.get_script_pubkey(context.get_network());
