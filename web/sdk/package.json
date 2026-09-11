@@ -1,0 +1,25 @@
+{
+  "name": "@price-oracle/sdk",
+  "version": "0.1.0",
+  "description": "Browser SDK for Price Oracle accounts and Tick UTXOs",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "bun test",
+    "check": "bun run build && bun test"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.9.7",
+    "@noble/hashes": "^1.8.0"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.3"
+  }
+}

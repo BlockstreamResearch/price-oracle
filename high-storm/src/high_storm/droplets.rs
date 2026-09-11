@@ -78,6 +78,15 @@ pub enum DropletsError {
     Pset(String),
 }
 
+impl DropletsError {
+    pub(crate) fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Signing(SigningError::NoAvailableBranch | SigningError::SigningFailed)
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ValidatedExchange {
     pub(crate) member: [u8; 32],
@@ -266,7 +275,7 @@ impl Droplets {
             &client,
             &storm_eye.contract_script,
             Some(storm_eye.asset_id),
-            StormEyePool::NetworkLeader,
+            StormEyePool::NetworkLeader(0),
         )?;
         let contract_data: StormEyeContractData =
             postcard::from_bytes(storm_eye.contract_data.as_deref().ok_or_else(|| {
@@ -880,6 +889,17 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn retries_temporary_signer_branch_failures() {
+        assert!(DropletsError::Signing(SigningError::NoAvailableBranch).is_retryable());
+        assert!(DropletsError::Signing(SigningError::SigningFailed).is_retryable());
+    }
+
+    #[test]
+    fn does_not_retry_invalid_exchange_requests() {
+        assert!(!DropletsError::Invalid("invalid transaction".into()).is_retryable());
+    }
 
     fn exchange_fixture() -> (
         PartiallySignedTransaction,

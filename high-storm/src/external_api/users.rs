@@ -5,12 +5,18 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
+use contracts::artifacts::account::{AccountProgram, derived_account::AccountArguments};
+use contracts::voucher::{Voucher, VoucherAuthMethod, VoucherParameters};
 use secp256k1::{XOnlyPublicKey, schnorr};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use simplex::simplicityhl::elements::AssetId;
 
 use super::{ApiError, ExternalApiState};
-use crate::db::user_request::{FeeUtxo, InsertPendingResult};
+use crate::db::{
+    network_asset::{STORM_EYE_KIND, TICK_ASSET_KIND},
+    user_request::{FeeUtxo, InsertPendingResult},
+};
 
 const USER_REQUEST_TAG: &str = "OracleNetworkV1/NetworkUserRequests";
 const MAX_REQUESTS_PER_BATCH: usize = 100;
@@ -19,8 +25,65 @@ const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
 pub(super) fn router() -> axum::Router<ExternalApiState> {
     axum::Router::new()
+        .route("/account/{public_key}", axum::routing::get(get_account))
         .route("/requests", axum::routing::post(create_request))
         .route("/requests/{hash}", axum::routing::get(get_request))
+}
+
+#[derive(Serialize)]
+struct OracleAccount {
+    address: String,
+    script_pubkey: String,
+    storm_eye_asset_id: String,
+    tick_asset_id: String,
+    tick_script_pubkey: String,
+    network: super::operators::auth::AuthNetwork,
+}
+
+async fn get_account(
+    State(state): State<ExternalApiState>,
+    Path(public_key): Path<String>,
+) -> Result<Json<OracleAccount>, ApiError> {
+    let owner = parse_hex_array::<32>(&public_key, "user public key")?;
+    let owner = XOnlyPublicKey::from_byte_array(owner)
+        .map_err(|_| ApiError::bad_request("invalid user public key"))?;
+    let storm_eye = state
+        .node
+        .network_asset(STORM_EYE_KIND)
+        .await
+        .map_err(ApiError::unavailable)?
+        .ok_or_else(|| ApiError::unavailable("Storm Eye asset is not active"))?;
+    let network = state.auth.network();
+    let program = AccountProgram::new(&AccountArguments {
+        storm_eye_asset_id: storm_eye.asset_id,
+        account_owner_pubkey: owner.serialize(),
+    });
+    let simplicity_network = network.simplicity_network();
+    let tick = state
+        .node
+        .network_asset(TICK_ASSET_KIND)
+        .await
+        .map_err(ApiError::unavailable)?
+        .ok_or_else(|| ApiError::unavailable("Tick asset is not active"))?;
+    let voucher = Voucher::new(VoucherParameters {
+        storm_eye_asset_id: AssetId::from_byte_array(storm_eye.asset_id),
+        auth_method: VoucherAuthMethod::Signature {
+            auth_pubkey: owner.serialize(),
+        },
+        network: simplicity_network,
+    });
+
+    Ok(Json(OracleAccount {
+        address: program
+            .as_ref()
+            .get_tr_address(&simplicity_network)
+            .to_string(),
+        script_pubkey: hex::encode(program.get_script_pubkey(&simplicity_network).into_bytes()),
+        storm_eye_asset_id: AssetId::from_byte_array(storm_eye.asset_id).to_string(),
+        tick_asset_id: AssetId::from_byte_array(tick.asset_id).to_string(),
+        tick_script_pubkey: hex::encode(voucher.get_script_pubkey().into_bytes()),
+        network,
+    }))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

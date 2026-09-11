@@ -57,9 +57,7 @@ services:
       - -dnsseed=0
       - -fixedseeds=0
       - -validatepegin=0
-      - -initialfreecoins=2100000000000000
-      - -con_connect_genesis_outputs=1
-      - -con_blocksubsidy=0
+      - -con_blocksubsidy=5000000000
       - -anyonecanspendaremine=1
       - -blindedaddresses=0
       - -fallbackfee=0.0001
@@ -67,11 +65,22 @@ services:
       - -datacarriersize=7400
     volumes:
       - elements-1-data:/home/elements/.elements
-    ports:
-      - "127.0.0.1:18884:18884"
     networks:
       storm:
         ipv4_address: ${STORM_NETWORK_PREFIX:-172.28.0}.21
+
+  elements-rpc:
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+    depends_on:
+      elements-1:
+        condition: service_healthy
+    volumes:
+      - ./docker/elements/rpc-gateway.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "127.0.0.1:18884:80"
+    networks:
+      storm:
 
   elements-2:
     <<: *elements-node
@@ -90,9 +99,7 @@ services:
       - -dnsseed=0
       - -fixedseeds=0
       - -validatepegin=0
-      - -initialfreecoins=2100000000000000
-      - -con_connect_genesis_outputs=1
-      - -con_blocksubsidy=0
+      - -con_blocksubsidy=5000000000
       - -anyonecanspendaremine=0
       - -blindedaddresses=0
       - -fallbackfee=0.0001
@@ -123,9 +130,7 @@ services:
       - -dnsseed=0
       - -fixedseeds=0
       - -validatepegin=0
-      - -initialfreecoins=2100000000000000
-      - -con_connect_genesis_outputs=1
-      - -con_blocksubsidy=0
+      - -con_blocksubsidy=5000000000
       - -anyonecanspendaremine=0
       - -blindedaddresses=0
       - -fallbackfee=0.0001
@@ -157,10 +162,10 @@ services:
       ELEMENTS_RPC_USER: high-storm
       ELEMENTS_RPC_PASSWORD: high-storm
       BLOCK_INTERVAL_SECONDS: 60
-      FUNDED_PRIVATE_KEY: "0101010101010101010101010101010101010101010101010101010101010101"
     entrypoint: ["/bin/bash", "/opt/elements/bootstrap.sh"]
     volumes:
       - ./docker/elements/bootstrap.sh:/opt/elements/bootstrap.sh:ro
+      - ./docker/funded-private-key.txt:/docker/funded-private-key.txt:ro
     healthcheck:
       test: ["CMD", "test", "-f", "/tmp/bootstrap-ready"]
       interval: 1s
@@ -169,6 +174,62 @@ services:
     networks:
       storm:
         ipv4_address: ${STORM_NETWORK_PREFIX:-172.28.0}.24
+
+  elements-explorer-api:
+    image: ghcr.io/vulpemventures/electrs-liquid:latest
+    restart: unless-stopped
+    depends_on:
+      elements-1:
+        condition: service_healthy
+    command:
+      - -vv
+      - --network
+      - liquidregtest
+      - --parent-network
+      - regtest
+      - --daemon-dir
+      - /config
+      - --daemon-rpc-addr
+      - elements-1:18884
+      - --cookie
+      - high-storm:high-storm
+      - --http-addr
+      - 0.0.0.0:3000
+      - --cors
+      - "*"
+      - --jsonrpc-import
+      - --address-search
+      - --db-dir
+      - /data
+    volumes:
+      - elements-explorer-data:/data
+    ports:
+      - "127.0.0.1:3001:3000"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3000"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    networks:
+      storm:
+
+  elements-explorer:
+    image: ghcr.io/vulpemventures/esplora:latest
+    restart: unless-stopped
+    depends_on:
+      elements-explorer-api:
+        condition: service_healthy
+    environment:
+      API_URL: http://127.0.0.1:3001
+    ports:
+      - "127.0.0.1:5001:5000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:5000', response => process.exit(response.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    networks:
+      storm:
 
   postgres:
     image: postgres:17-bookworm
@@ -316,6 +377,7 @@ volumes:
   elements-1-data:
   elements-2-data:
   elements-3-data:
+  elements-explorer-data:
 
 networks:
   storm:
