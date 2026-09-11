@@ -7,3 +7,5 @@ high-storm/.devenv-nodes/
 # SimplicityHL
 contracts/deps
 contracts/src/artifacts
+
+node_modules/

@@ -322,7 +322,7 @@ case "${1:-}" in
     rebuild)
         ensure_storm_network
         compose up --detach --build --force-recreate \
-            elements-1 elements-2 elements-3 elements-bootstrap \
+            elements-1 elements-2 elements-3 elements-rpc elements-bootstrap \
             node-1 node-2 node-3 operator-1 operator-2 operator-3
         ;;
     down)

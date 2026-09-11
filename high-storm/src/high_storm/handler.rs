@@ -30,6 +30,8 @@ pub(crate) enum HandlerError {
     #[error(transparent)]
     Droplets(#[from] DropletsError),
     #[error(transparent)]
+    Indexer(#[from] super::indexer::IndexerError),
+    #[error(transparent)]
     Encoding(#[from] postcard::Error),
 }
 
@@ -241,16 +243,29 @@ async fn require_current_leader(
     state: &NetworkState,
     context: &StormContext,
     block_height: u64,
-) -> Result<[u8; 33], SigningError> {
-    if block_height != state.block_height() {
-        return Err(SigningError::UnauthorizedMessage(
-            "burn message does not target the currently indexed block".into(),
-        ));
-    }
+) -> Result<[u8; 33], HandlerError> {
     let expected = leader::leader_for_height(&context.storm_handle.peers().await, block_height)
         .ok_or_else(|| SigningError::UnauthorizedMessage("network has no leader".into()))?;
     authorize_leader_sender(expected, context.message_context.peer_public_key)?;
+    require_current_tip(block_height, state.indexer().tip()?)?;
+
+    state.indexer().sync().await?;
+    if let Some(cursor) = state.indexer().cursor().await? {
+        state.set_block_height(cursor.height);
+    }
+    require_current_tip(block_height, state.block_height())?;
+
     Ok(expected)
+}
+
+fn require_current_tip(block_height: u64, tip: u64) -> Result<(), SigningError> {
+    if block_height != tip {
+        return Err(SigningError::UnauthorizedMessage(
+            "leader message does not target the current block".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn authorize_leader_sender(expected: [u8; 33], sender: [u8; 33]) -> Result<(), SigningError> {
@@ -331,6 +346,14 @@ mod tests {
     fn non_leader_cannot_send_exchange_messages() {
         let error = authorize_leader_sender(COORDINATOR, MEMBER).unwrap_err();
 
+        assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
+    }
+
+    #[test]
+    fn leader_messages_must_target_the_current_tip() {
+        require_current_tip(42, 42).unwrap();
+
+        let error = require_current_tip(43, 42).unwrap_err();
         assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
     }
 }

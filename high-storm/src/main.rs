@@ -10,6 +10,52 @@ use high_storm::{
 use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tracing_subscriber::EnvFilter;
 
+const LIQUID_BLOCK_FINALIZATION_TIME: Duration = Duration::from_secs(60);
+const MAX_LIQUID_TRANSACTION_WEIGHT: u64 = 400_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockRoundSchedule {
+    storm_eye_count: usize,
+    coordinator_rounds: usize,
+    leader_rounds: usize,
+}
+
+impl BlockRoundSchedule {
+    fn new(storm_eye_count: usize) -> Option<Self> {
+        let coordinator_rounds = storm_eye_count / 2;
+        let leader_rounds = storm_eye_count - coordinator_rounds;
+        (storm_eye_count > 0).then_some(Self {
+            storm_eye_count,
+            coordinator_rounds,
+            leader_rounds,
+        })
+    }
+
+    fn issuance_offset(self, lane: usize) -> Option<Duration> {
+        (lane < self.coordinator_rounds).then(|| {
+            let interval =
+                LIQUID_BLOCK_FINALIZATION_TIME.as_secs() / self.coordinator_rounds as u64;
+            Duration::from_secs(interval * lane as u64)
+        })
+    }
+
+    fn burning_offset(self, lane: usize) -> Option<Duration> {
+        (lane < self.leader_rounds).then(|| {
+            let interval =
+                LIQUID_BLOCK_FINALIZATION_TIME.as_secs() / (self.leader_rounds + 1) as u64;
+            Duration::from_secs(interval * (lane + 1) as u64)
+        })
+    }
+
+    fn max_transaction_weight(self) -> u64 {
+        MAX_LIQUID_TRANSACTION_WEIGHT / self.storm_eye_count as u64
+    }
+}
+
+fn idle_round_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(365 * 24 * 60 * 60)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -137,17 +183,14 @@ async fn run_until_shutdown(
     );
     persist_runtime.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    let mut issuance_round = tokio::time::interval_at(
-        Instant::now() + Duration::from_secs(20),
-        Duration::from_secs(20),
-    );
-    issuance_round.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    let mut burning_round = tokio::time::interval_at(
-        Instant::now() + Duration::from_secs(15),
-        Duration::from_secs(15),
-    );
-    burning_round.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut round_schedule = None;
+    let mut round_started_at = Instant::now();
+    let mut issuance_lane = 0usize;
+    let mut burning_lane = 0usize;
+    let issuance_round = tokio::time::sleep_until(idle_round_deadline());
+    tokio::pin!(issuance_round);
+    let burning_round = tokio::time::sleep_until(idle_round_deadline());
+    tokio::pin!(burning_round);
 
     let mut reconcile_requests = tokio::time::interval_at(
         Instant::now() + Duration::from_secs(10),
@@ -195,7 +238,42 @@ async fn run_until_shutdown(
                         tracing::warn!(%error, "failed to index confirmed blocks");
                     }
                 }
-                if indexed.is_ok() {
+                if indexed.as_ref().is_ok_and(|block_count| *block_count > 0) {
+                    match storm.storm_eye_utxo_count().await {
+                        Ok(storm_eye_count) => {
+                            round_schedule = BlockRoundSchedule::new(storm_eye_count);
+                            round_started_at = Instant::now();
+                            issuance_lane = 0;
+                            burning_lane = 0;
+                            issuance_round.as_mut().reset(
+                                round_schedule
+                                    .and_then(|schedule| schedule.issuance_offset(0))
+                                    .map_or_else(idle_round_deadline, |offset| round_started_at + offset),
+                            );
+                            burning_round.as_mut().reset(
+                                round_schedule
+                                    .and_then(|schedule| schedule.burning_offset(0))
+                                    .map_or_else(idle_round_deadline, |offset| round_started_at + offset),
+                            );
+                            if let Some(schedule) = round_schedule {
+                                tracing::debug!(
+                                    storm_eye_count,
+                                    coordinator_rounds = schedule.coordinator_rounds,
+                                    leader_rounds = schedule.leader_rounds,
+                                    max_transaction_weight = schedule.max_transaction_weight(),
+                                    "scheduled Storm Eye rounds for indexed Liquid block"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            round_schedule = None;
+                            issuance_round.as_mut().reset(idle_round_deadline());
+                            burning_round.as_mut().reset(idle_round_deadline());
+                            tracing::warn!(%error, "failed to schedule Storm Eye rounds");
+                        }
+                    }
+                }
+                if indexed.as_ref().is_ok_and(|block_count| *block_count > 0) {
                     match storm.process_droplet_exchange_request().await {
                         Ok(Some(txid)) => {
                             tracing::info!(txid = %hex::encode(txid), "broadcast queued Droplets exchange");
@@ -213,25 +291,53 @@ async fn run_until_shutdown(
                     tracing::warn!(%error, "failed to persist current peer state");
                 }
             }
-            _ = issuance_round.tick() => {
-                match storm.process_user_requests().await {
+            _ = &mut issuance_round => {
+                let Some(schedule) = round_schedule else {
+                    issuance_round.as_mut().reset(idle_round_deadline());
+                    continue;
+                };
+                let lane = issuance_lane;
+                issuance_lane += 1;
+                issuance_round.as_mut().reset(
+                    schedule
+                        .issuance_offset(issuance_lane)
+                        .map_or_else(idle_round_deadline, |offset| round_started_at + offset),
+                );
+                match storm
+                    .process_user_requests(lane, schedule.max_transaction_weight() as usize)
+                    .await
+                {
                     Ok(0) => {}
                     Ok(request_count) => {
-                        tracing::info!(request_count, "broadcast Tick issuance transaction");
+                        tracing::info!(request_count, lane, "broadcast Tick issuance transaction");
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "user request issuance round failed");
+                        tracing::warn!(%error, lane, "user request issuance round failed");
                     }
                 }
             }
-            _ = burning_round.tick() => {
-                match storm.burn_expired_utxos().await {
+            _ = &mut burning_round => {
+                let Some(schedule) = round_schedule else {
+                    burning_round.as_mut().reset(idle_round_deadline());
+                    continue;
+                };
+                let lane = burning_lane;
+                burning_lane += 1;
+                burning_round.as_mut().reset(
+                    schedule
+                        .burning_offset(burning_lane)
+                        .map_or_else(idle_round_deadline, |offset| round_started_at + offset),
+                );
+                match storm
+                    .burn_expired_utxos(lane, schedule.max_transaction_weight() as usize)
+                    .await
+                {
                     Ok(0) => {}
                     Ok(utxo_count) => {
-                        tracing::info!(utxo_count, "broadcast expired Tick burn transaction");
+                        tracing::info!(utxo_count, lane, "broadcast expired Tick burn transaction");
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "expired Tick burning round failed");
+                        tracing::warn!(%error, lane, "expired Tick burning round failed");
                     }
                 }
             }
@@ -294,5 +400,49 @@ async fn shutdown_signal() {
             result.expect("Ctrl-C handler should remain available");
         }
         _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedules_six_storm_eyes_across_one_liquid_block() {
+        let schedule = BlockRoundSchedule::new(6).unwrap();
+
+        assert_eq!(schedule.coordinator_rounds, 3);
+        assert_eq!(schedule.leader_rounds, 3);
+        assert_eq!(schedule.issuance_offset(0), Some(Duration::from_secs(0)));
+        assert_eq!(schedule.issuance_offset(1), Some(Duration::from_secs(20)));
+        assert_eq!(schedule.issuance_offset(2), Some(Duration::from_secs(40)));
+        assert_eq!(schedule.issuance_offset(3), None);
+        assert_eq!(schedule.burning_offset(0), Some(Duration::from_secs(15)));
+        assert_eq!(schedule.burning_offset(1), Some(Duration::from_secs(30)));
+        assert_eq!(schedule.burning_offset(2), Some(Duration::from_secs(45)));
+        assert_eq!(schedule.burning_offset(3), None);
+        assert_eq!(schedule.max_transaction_weight(), 66_666);
+    }
+
+    #[test]
+    fn recalculates_rounds_when_storm_eye_count_changes() {
+        let schedule = BlockRoundSchedule::new(8).unwrap();
+
+        assert_eq!(schedule.coordinator_rounds, 4);
+        assert_eq!(schedule.leader_rounds, 4);
+        assert_eq!(schedule.issuance_offset(3), Some(Duration::from_secs(45)));
+        assert_eq!(schedule.burning_offset(3), Some(Duration::from_secs(48)));
+        assert_eq!(schedule.max_transaction_weight(), 50_000);
+    }
+
+    #[test]
+    fn assigns_an_odd_storm_eye_remainder_to_leader_rounds() {
+        let schedule = BlockRoundSchedule::new(7).unwrap();
+
+        assert_eq!(schedule.coordinator_rounds, 3);
+        assert_eq!(schedule.leader_rounds, 4);
+        assert_eq!(schedule.issuance_offset(2), Some(Duration::from_secs(40)));
+        assert_eq!(schedule.burning_offset(3), Some(Duration::from_secs(48)));
+        assert_eq!(schedule.max_transaction_weight(), 57_142);
     }
 }

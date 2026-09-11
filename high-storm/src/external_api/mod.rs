@@ -13,6 +13,7 @@ use axum::{
 };
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use serde::{Deserialize, Serialize};
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
     HighStormHandle, VotingError,
@@ -88,6 +89,12 @@ pub(crate) fn router(
         .nest("/users", users::router())
         .nest("/operators", operators::router())
         .with_state(state)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
 }
 
 #[derive(Debug, thiserror::Error)]

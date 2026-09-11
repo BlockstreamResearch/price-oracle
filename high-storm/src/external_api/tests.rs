@@ -8,10 +8,17 @@ use axum::{
 use bitcoin::{Address, Network, PrivateKey, secp256k1};
 use http_body_util::BodyExt;
 use secp256k1_zkp::{Secp256k1, SecretKey};
+use simplex::simplicityhl::elements::AssetId;
 use storm::{Peer, Storm};
 use tower::ServiceExt;
 
-use crate::{HighStorm, db::Database};
+use crate::{
+    HighStorm, NetworkAsset,
+    db::{
+        Database,
+        network_asset::{STORM_EYE_KIND, TICK_ASSET_KIND},
+    },
+};
 
 use super::{
     fee_utxo::FeeUtxoValidator,
@@ -19,6 +26,26 @@ use super::{
     router,
     users::{NetworkUserRequests, UserRequest, UserRequestHeader, signing_hash},
 };
+
+#[tokio::test]
+async fn permits_browser_preflight_requests() {
+    let (app, _, _) = setup().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/users/account/505f234a81fe3af88625ebda259dbaec44c72b181e2f64735f8b8ec8d7cf7377")
+                .header(header::ORIGIN, "http://127.0.0.1:5173")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+}
 
 #[tokio::test]
 async fn authenticates_operator_reads_with_a_real_bip322_signature() {
@@ -317,6 +344,50 @@ async fn registers_tick_requests_and_returns_pending_status() {
 }
 
 #[tokio::test]
+async fn derives_oracle_account_from_the_active_storm_eye() {
+    let (app, _, public_key) = setup().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/users/account/{public_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let account = response_json(response).await;
+    assert_eq!(account["network"], "elementsregtest");
+    let mut storm_eye_asset_id = [1; 32];
+    storm_eye_asset_id[0] = 2;
+    let mut tick_asset_id = [3; 32];
+    tick_asset_id[0] = 4;
+    assert_eq!(
+        account["storm_eye_asset_id"],
+        AssetId::from_byte_array(storm_eye_asset_id).to_string()
+    );
+    assert_eq!(
+        account["tick_asset_id"],
+        AssetId::from_byte_array(tick_asset_id).to_string()
+    );
+    assert!(
+        account["tick_script_pubkey"]
+            .as_str()
+            .unwrap()
+            .starts_with("5120")
+    );
+    assert!(account["address"].as_str().unwrap().starts_with("ert1p"));
+    assert!(
+        account["script_pubkey"]
+            .as_str()
+            .unwrap()
+            .starts_with("5120")
+    );
+}
+
+#[tokio::test]
 async fn rejects_unsupported_or_invalid_user_requests() {
     let (app, _, _) = setup().await;
 
@@ -356,6 +427,42 @@ async fn rejects_unsupported_or_invalid_user_requests() {
 async fn setup() -> (Router, PrivateKey, String) {
     let database = Database::connect("sqlite::memory:", 1).await.unwrap();
     let operators = database.node_operators();
+    let mut storm_eye_asset_id = [1; 32];
+    storm_eye_asset_id[0] = 2;
+    let mut tick_asset_id = [3; 32];
+    tick_asset_id[0] = 4;
+    database
+        .network_assets()
+        .insert_active(&NetworkAsset {
+            kind: STORM_EYE_KIND.to_string(),
+            name: "Storm Eye".to_string(),
+            asset_id: storm_eye_asset_id,
+            reissuance_token_id: None,
+            entropy: None,
+            issuance_txid: [2; 32],
+            contract_script: vec![0x51],
+            contract_data: None,
+            supply: 10_000,
+            created_at_block: 1,
+        })
+        .await
+        .unwrap();
+    database
+        .network_assets()
+        .insert_active(&NetworkAsset {
+            kind: TICK_ASSET_KIND.to_string(),
+            name: "Tick".to_string(),
+            asset_id: tick_asset_id,
+            reissuance_token_id: Some([4; 32]),
+            entropy: Some([5; 32]),
+            issuance_txid: [6; 32],
+            contract_script: vec![0x51],
+            contract_data: None,
+            supply: 1,
+            created_at_block: 1,
+        })
+        .await
+        .unwrap();
 
     let operator_secret = secp256k1::SecretKey::from_slice(&[42; 32]).unwrap();
     let operator_private_key = PrivateKey::new(operator_secret, Network::Regtest);

@@ -61,15 +61,17 @@ use super::{
 };
 
 const MAX_TICK_TIME_SKEW_SECS: u64 = 120;
+const MAX_MEMPOOL_TOKEN_CHAIN_LENGTH: usize = 100;
 pub(crate) const STORM_EYE_TAG: &str = "OracleNetworkV1/StormEye";
 const MAX_REQUESTS_PER_ROUND: u32 = 100;
+const STORM_EYE_AUTH_WITNESS_TEMPLATE: [usize; 4] = [512, 2_048, 32, 129];
 pub(crate) type PackedStormTreeProof =
     [Either<(), (bool, [u8; 32])>; storm_tree::TREE_DEPTH as usize];
 
 #[derive(Clone, Copy)]
 pub(crate) enum StormEyePool {
-    UserRequests,
-    NetworkLeader,
+    UserRequests(usize),
+    NetworkLeader(usize),
 }
 
 pub(crate) struct PreparedRound {
@@ -80,6 +82,7 @@ pub(crate) struct PreparedRound {
     request_results: Vec<PreparedRequestResult>,
     network: SimplicityNetwork,
     storm_eye: NetworkAsset,
+    max_transaction_weight: usize,
 }
 
 struct PreparedRequestResult {
@@ -185,8 +188,58 @@ impl UserRequestProcessor {
         validate_execute_request(request, &storm_eye, &tick_asset, &self.config, &network)
     }
 
-    pub(crate) async fn prepare_round(&self) -> Result<Option<PreparedRound>, UserRequestError> {
-        let pending = self.requests.list_pending(MAX_REQUESTS_PER_ROUND).await?;
+    pub(crate) async fn prepare_round(
+        &self,
+        storm_eye_lane: usize,
+        max_transaction_weight: usize,
+    ) -> Result<Option<PreparedRound>, UserRequestError> {
+        let mut lower_limit = 1u32;
+        let mut upper_limit = MAX_REQUESTS_PER_ROUND;
+        let mut request_limit = upper_limit;
+        let mut best = None;
+
+        while lower_limit <= upper_limit {
+            let Some(candidate) = self
+                .prepare_round_candidate(storm_eye_lane, request_limit, max_transaction_weight)
+                .await?
+            else {
+                return Ok(best);
+            };
+            let request_count = u32::try_from(candidate.request_results.len())
+                .map_err(|_| UserRequestError::Invalid("request count overflow".into()))?;
+            let weight = candidate.estimated_weight()?;
+            if weight <= max_transaction_weight {
+                best = Some(candidate);
+                if request_count < request_limit || request_limit == MAX_REQUESTS_PER_ROUND {
+                    break;
+                }
+                lower_limit = request_count + 1;
+            } else {
+                if request_count == 1 {
+                    let request_hash = candidate.request_results[0].request_hash;
+                    let reason = format!(
+                        "request transaction weight {weight} exceeds round limit {max_transaction_weight}"
+                    );
+                    self.requests
+                        .mark_failed(request_hash, reason.as_bytes())
+                        .await?;
+                    return Err(UserRequestError::Invalid(reason));
+                }
+                upper_limit = request_count - 1;
+            }
+            request_limit = lower_limit + (upper_limit - lower_limit) / 2;
+        }
+
+        Ok(best)
+    }
+
+    async fn prepare_round_candidate(
+        &self,
+        storm_eye_lane: usize,
+        request_limit: u32,
+        max_transaction_weight: usize,
+    ) -> Result<Option<PreparedRound>, UserRequestError> {
+        let pending = self.requests.list_pending(request_limit).await?;
         if pending.is_empty() {
             return Ok(None);
         }
@@ -206,7 +259,7 @@ impl UserRequestProcessor {
             &rpc,
             &storm_eye.contract_script,
             Some(storm_eye.asset_id),
-            StormEyePool::UserRequests,
+            StormEyePool::UserRequests(storm_eye_lane),
         )?;
         let token_utxo = find_token_utxo(&rpc, &tick_asset)?;
         let token_secrets = token_utxo
@@ -541,7 +594,24 @@ impl UserRequestProcessor {
             request_results,
             network,
             storm_eye,
+            max_transaction_weight,
         }))
+    }
+
+    pub(crate) async fn storm_eye_utxo_count(&self) -> Result<usize, UserRequestError> {
+        let storm_eye = self
+            .assets
+            .get(STORM_EYE_KIND)
+            .await?
+            .ok_or(UserRequestError::MissingAsset(STORM_EYE_KIND))?;
+        let client = self.client()?;
+
+        Ok(scan_contract_utxos(
+            &client,
+            &storm_eye.contract_script,
+            Some(storm_eye.asset_id),
+        )?
+        .len())
     }
 
     pub(crate) async fn finalize_and_broadcast(
@@ -633,6 +703,13 @@ impl UserRequestProcessor {
         let final_tx = pset
             .extract_tx()
             .map_err(|error| UserRequestError::Pset(error.to_string()))?;
+        if final_tx.weight() > prepared.max_transaction_weight {
+            return Err(UserRequestError::Invalid(format!(
+                "final issuance transaction weight {} exceeds round limit {}",
+                final_tx.weight(),
+                prepared.max_transaction_weight
+            )));
+        }
         verify_tx_amt_proofs(&final_tx, &prepared.spent_utxos).map_err(|error| {
             UserRequestError::Invalid(format!(
                 "failed to verify Tick issuance amounts and proofs: {error}"
@@ -736,6 +813,55 @@ impl UserRequestProcessor {
     }
 }
 
+impl PreparedRound {
+    fn estimated_weight(&self) -> Result<usize, UserRequestError> {
+        finalized_dummy_weight(&self.final_transaction, &self.pset, &self.network)
+    }
+}
+
+pub(crate) fn finalized_dummy_weight(
+    transaction: &FinalTransaction,
+    pset: &PartiallySignedTransaction,
+    network: &SimplicityNetwork,
+) -> Result<usize, UserRequestError> {
+    let mut pset = pset.clone();
+    let storm_eye_input = pset.inputs_mut().get_mut(0).ok_or_else(|| {
+        UserRequestError::Invalid("cannot estimate a transaction without inputs".into())
+    })?;
+    storm_eye_input.final_script_witness = Some(
+        STORM_EYE_AUTH_WITNESS_TEMPLATE
+            .map(|length| vec![0; length])
+            .to_vec(),
+    );
+    for (index, input) in transaction.inputs().iter().enumerate() {
+        let Some(program_input) = &input.program_input else {
+            continue;
+        };
+        if index == 0 {
+            continue;
+        }
+        let final_witness = program_input
+            .program
+            .finalize(
+                &pset,
+                &program_input.witness.build_witness(),
+                index,
+                network,
+            )
+            .map_err(|error| {
+                UserRequestError::Invalid(format!(
+                    "failed to estimate covenant input {index} weight: {error}"
+                ))
+            })?;
+        pset.inputs_mut()[index].final_script_witness = Some(final_witness);
+    }
+    let transaction = pset
+        .extract_tx()
+        .map_err(|error| UserRequestError::Pset(error.to_string()))?;
+
+    Ok(transaction.weight())
+}
+
 fn elements_regtest_network(
     policy_asset: &str,
     genesis_hash: &str,
@@ -754,44 +880,68 @@ pub(crate) fn find_contract_utxo(
     expected_asset: Option<[u8; 32]>,
     pool: StormEyePool,
 ) -> Result<UTXO, UserRequestError> {
+    let candidates = scan_contract_utxos(client, script, expected_asset)?;
+    let selected = storm_eye_pool_index(candidates.len(), pool)
+        .and_then(|index| candidates.get(index))
+        .ok_or_else(|| {
+            UserRequestError::Invalid("required Storm Eye pool is unavailable".into())
+        })?;
+
+    Ok(selected.clone())
+}
+
+fn scan_contract_utxos(
+    client: &Client,
+    script: &[u8],
+    expected_asset: Option<[u8; 32]>,
+) -> Result<Vec<UTXO>, UserRequestError> {
     let descriptor = format!("raw({})", hex::encode(script));
     let scan: ScanResult = client.call(
         "scantxoutset",
         &["start".into(), serde_json::json!([descriptor])],
     )?;
-    let mut candidates = Vec::new();
+    let mut candidates = Vec::with_capacity(scan.unspents.len());
     for unspent in scan.unspents {
-        let outpoint = FeeUtxo {
-            txid: decode_array(&unspent.txid)?,
-            output_index: unspent.vout,
+        if !matches_scanned_asset(unspent.asset.as_deref(), expected_asset) {
+            continue;
+        }
+        let txid = Txid::from_str(&unspent.txid)
+            .map_err(|_| UserRequestError::Invalid("invalid scanned UTXO txid".into()))?;
+        let Some(utxo) = get_optional_explicit_outpoint(client, txid, unspent.vout)? else {
+            continue;
         };
-        let utxo = get_outpoint(client, &outpoint)?;
-        let asset_matches = expected_asset
-            .is_none_or(|expected| utxo.asset() == AssetId::from_byte_array(expected));
-        if asset_matches {
+        if matches_expected_asset(utxo.asset(), expected_asset) {
             candidates.push(utxo);
         }
     }
 
     candidates
         .sort_unstable_by_key(|utxo| (utxo.outpoint.txid.to_byte_array(), utxo.outpoint.vout));
-    let selected =
-        storm_eye_pool_index(candidates.len(), pool).and_then(|index| candidates.get(index));
-    if let Some(utxo) = selected {
-        return Ok(utxo.clone());
-    }
 
-    Err(UserRequestError::Invalid(
-        "required Storm Eye pool is unavailable".into(),
-    ))
+    Ok(candidates)
+}
+
+fn matches_expected_asset(actual: AssetId, expected: Option<[u8; 32]>) -> bool {
+    expected.is_none_or(|expected| actual == AssetId::from_byte_array(expected))
+}
+
+fn matches_scanned_asset(actual: Option<&str>, expected: Option<[u8; 32]>) -> bool {
+    expected.is_none_or(|expected| {
+        actual.and_then(|asset| AssetId::from_str(asset).ok())
+            == Some(AssetId::from_byte_array(expected))
+    })
 }
 
 fn storm_eye_pool_index(candidate_count: usize, pool: StormEyePool) -> Option<usize> {
+    let coordinator_count = candidate_count / 2;
     let index = match pool {
-        StormEyePool::UserRequests => 0,
-        StormEyePool::NetworkLeader => candidate_count.div_ceil(2),
+        StormEyePool::UserRequests(lane) if lane < coordinator_count => lane,
+        StormEyePool::NetworkLeader(lane) if lane < candidate_count - coordinator_count => {
+            coordinator_count + lane
+        }
+        _ => return None,
     };
-    (index < candidate_count).then_some(index)
+    Some(index)
 }
 
 fn find_token_utxo(client: &Client, tick_asset: &NetworkAsset) -> Result<UTXO, UserRequestError> {
@@ -826,28 +976,107 @@ fn find_token_utxo(client: &Client, tick_asset: &NetworkAsset) -> Result<UTXO, U
         let Some(candidate) = transaction.output.get(unspent.vout as usize).cloned() else {
             continue;
         };
-        let Ok(candidate_secrets) =
-            candidate.unblind(&Secp256k1::new(), treasury_blinding_secret())
-        else {
-            continue;
-        };
-        if candidate_secrets.asset == secrets.asset
-            && candidate_secrets.value == secrets.value
-            && candidate.script_pubkey.as_bytes() == tick_asset.contract_script
-            && candidate.asset.is_confidential()
-            && candidate.value.is_confidential()
-        {
-            return Ok(UTXO {
-                outpoint: OutPoint::new(txid, unspent.vout),
-                txout: candidate,
-                secrets: Some(candidate_secrets),
-            });
+        if let Some(token) = token_candidate(
+            OutPoint::new(txid, unspent.vout),
+            candidate,
+            &secrets,
+            &tick_asset.contract_script,
+        ) {
+            return follow_mempool_token_chain(
+                client,
+                token,
+                &secrets,
+                &tick_asset.contract_script,
+            );
         }
     }
 
     Err(UserRequestError::Invalid(
         "confidential Tick token UTXO is unavailable".into(),
     ))
+}
+
+fn follow_mempool_token_chain(
+    client: &Client,
+    mut token: UTXO,
+    expected: &TxOutSecrets,
+    expected_script: &[u8],
+) -> Result<UTXO, UserRequestError> {
+    for _ in 0..MAX_MEMPOOL_TOKEN_CHAIN_LENGTH {
+        let results: Vec<SpendingPrevout> = client.call(
+            "gettxspendingprevout",
+            &[serde_json::json!([{
+                "txid": token.outpoint.txid.to_string(),
+                "vout": token.outpoint.vout,
+            }])],
+        )?;
+        let Some(spending_txid) = results
+            .into_iter()
+            .next()
+            .and_then(|result| result.spending_txid)
+        else {
+            return Ok(token);
+        };
+        let spending_txid = Txid::from_str(&spending_txid)
+            .map_err(|_| UserRequestError::Invalid("invalid token spender txid".into()))?;
+        let transaction = get_raw_transaction(client, spending_txid, None)?;
+        if !transaction
+            .input
+            .iter()
+            .any(|input| input.previous_output == token.outpoint)
+        {
+            return Err(UserRequestError::Invalid(
+                "reported token transaction does not spend the current token".into(),
+            ));
+        }
+        token = transaction
+            .output
+            .into_iter()
+            .enumerate()
+            .find_map(|(vout, candidate)| {
+                let vout = u32::try_from(vout).ok()?;
+                token_candidate(
+                    OutPoint::new(spending_txid, vout),
+                    candidate,
+                    expected,
+                    expected_script,
+                )
+            })
+            .ok_or_else(|| {
+                UserRequestError::Invalid(
+                    "token spender does not preserve the confidential token".into(),
+                )
+            })?;
+    }
+
+    Err(UserRequestError::Invalid(format!(
+        "unconfirmed token chain exceeds {MAX_MEMPOOL_TOKEN_CHAIN_LENGTH} transactions"
+    )))
+}
+
+fn token_candidate(
+    outpoint: OutPoint,
+    candidate: TxOut,
+    expected: &TxOutSecrets,
+    expected_script: &[u8],
+) -> Option<UTXO> {
+    let candidate_secrets = candidate
+        .unblind(&Secp256k1::new(), treasury_blinding_secret())
+        .ok()?;
+    if candidate_secrets.asset != expected.asset
+        || candidate_secrets.value != expected.value
+        || candidate.script_pubkey.as_bytes() != expected_script
+        || !candidate.asset.is_confidential()
+        || !candidate.value.is_confidential()
+    {
+        return None;
+    }
+
+    Some(UTXO {
+        outpoint,
+        txout: candidate,
+        secrets: Some(candidate_secrets),
+    })
 }
 
 fn tick_token_txout(tick_asset: &NetworkAsset) -> Result<TxOut, UserRequestError> {
@@ -866,12 +1095,6 @@ fn tick_token_txout(tick_asset: &NetworkAsset) -> Result<TxOut, UserRequestError
         .get(contract_data.token_output_index as usize)
         .cloned()
         .ok_or_else(|| UserRequestError::Invalid("invalid Tick token output index".into()))
-}
-
-fn get_outpoint(client: &Client, outpoint: &FeeUtxo) -> Result<UTXO, UserRequestError> {
-    let txid = Txid::from_str(&hex::encode(outpoint.txid))
-        .map_err(|_| UserRequestError::Invalid("invalid UTXO txid".into()))?;
-    get_explicit_outpoint(client, txid, outpoint.output_index)
 }
 
 #[derive(Deserialize)]
@@ -1570,7 +1793,14 @@ struct ScanResult {
 struct ScannedUtxo {
     txid: String,
     vout: u32,
+    asset: Option<String>,
     height: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct SpendingPrevout {
+    #[serde(rename = "spendingtxid")]
+    spending_txid: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1584,13 +1814,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reserves_three_of_six_storm_eyes_for_network_leader_operations() {
-        assert_eq!(storm_eye_pool_index(6, StormEyePool::UserRequests), Some(0));
+    fn excludes_foreign_assets_from_contract_lanes() {
+        let expected = [1; 32];
+        let expected_asset = AssetId::from_byte_array(expected);
+
+        assert!(matches_expected_asset(expected_asset, Some(expected)));
+        assert!(!matches_expected_asset(
+            AssetId::from_byte_array([2; 32]),
+            Some(expected)
+        ));
+        assert!(matches_scanned_asset(
+            Some(&expected_asset.to_string()),
+            Some(expected)
+        ));
+        assert!(!matches_scanned_asset(None, Some(expected)));
+    }
+
+    #[test]
+    fn maps_every_storm_eye_lane_into_its_pool() {
         assert_eq!(
-            storm_eye_pool_index(6, StormEyePool::NetworkLeader),
+            storm_eye_pool_index(6, StormEyePool::UserRequests(0)),
+            Some(0)
+        );
+        assert_eq!(
+            storm_eye_pool_index(6, StormEyePool::UserRequests(2)),
+            Some(2)
+        );
+        assert_eq!(storm_eye_pool_index(6, StormEyePool::UserRequests(3)), None);
+        assert_eq!(
+            storm_eye_pool_index(6, StormEyePool::NetworkLeader(0)),
             Some(3)
         );
-        assert_eq!(storm_eye_pool_index(1, StormEyePool::NetworkLeader), None);
+        assert_eq!(
+            storm_eye_pool_index(6, StormEyePool::NetworkLeader(2)),
+            Some(5)
+        );
+        assert_eq!(
+            storm_eye_pool_index(6, StormEyePool::NetworkLeader(3)),
+            None
+        );
+
+        assert_eq!(
+            storm_eye_pool_index(5, StormEyePool::UserRequests(1)),
+            Some(1)
+        );
+        assert_eq!(
+            storm_eye_pool_index(5, StormEyePool::NetworkLeader(0)),
+            Some(2)
+        );
+        assert_eq!(
+            storm_eye_pool_index(5, StormEyePool::NetworkLeader(2)),
+            Some(4)
+        );
     }
 
     fn config() -> ProtocolConfig {
@@ -1620,11 +1895,11 @@ mod tests {
     }
 
     #[test]
-    fn uses_custom_regtest_genesis_for_simplicity_environment() {
+    fn uses_stock_regtest_genesis_for_simplicity_environment() {
         let policy_asset = SimplicityNetwork::default_regtest()
             .policy_asset()
             .to_string();
-        let genesis_hash = "209577bda6bf4b5804bd46f8621580dd6d4e8bfa2d190e1c50e932492baca07d";
+        let genesis_hash = "cd179c84c35f51825f20a3b91a18d45f0c53b5ceb744a5b6ef8f0babe809396f";
 
         let network = elements_regtest_network(&policy_asset, genesis_hash).unwrap();
 

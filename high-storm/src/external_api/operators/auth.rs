@@ -8,6 +8,7 @@ use axum::{Json, extract::State, http::HeaderMap};
 use bitcoin::{Address, Network, secp256k1::XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use simplex::provider::SimplicityNetwork;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -104,6 +105,14 @@ impl AuthNetwork {
             Self::ElementsRegtest => Network::Regtest,
         }
     }
+
+    pub(crate) fn simplicity_network(self) -> SimplicityNetwork {
+        match self {
+            Self::LiquidV1 => SimplicityNetwork::Liquid,
+            Self::LiquidTestnet => SimplicityNetwork::LiquidTestnet,
+            Self::ElementsRegtest => SimplicityNetwork::default_regtest(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -132,6 +141,10 @@ impl AuthService {
             network,
             state: Arc::new(Mutex::new(AuthState::default())),
         }
+    }
+
+    pub(crate) fn network(&self) -> AuthNetwork {
+        self.network
     }
 
     pub async fn issue_challenge(&self, public_key: &str) -> Result<Challenge, AuthError> {

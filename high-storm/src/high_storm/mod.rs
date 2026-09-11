@@ -279,6 +279,7 @@ impl HighStorm {
                     .await?;
                 Ok(Some(txid))
             }
+            Err(error) if error.is_retryable() => Err(error),
             Err(error) => {
                 self.state
                     .droplets()
@@ -439,12 +440,21 @@ impl HighStorm {
         self.state.assets().get(kind).await
     }
 
-    pub async fn process_user_requests(&self) -> Result<usize, user_requests::UserRequestError> {
+    pub async fn process_user_requests(
+        &self,
+        storm_eye_lane: usize,
+        max_transaction_weight: usize,
+    ) -> Result<usize, user_requests::UserRequestError> {
         if !self.is_coordinator().await {
             return Ok(0);
         }
 
-        let prepared = match self.state.user_requests().prepare_round().await? {
+        let prepared = match self
+            .state
+            .user_requests()
+            .prepare_round(storm_eye_lane, max_transaction_weight)
+            .await?
+        {
             Some(prepared) => prepared,
             None => return Ok(0),
         };
@@ -476,7 +486,11 @@ impl HighStorm {
             .await
     }
 
-    pub async fn burn_expired_utxos(&self) -> Result<usize, BurningError> {
+    pub async fn burn_expired_utxos(
+        &self,
+        storm_eye_lane: usize,
+        max_transaction_weight: usize,
+    ) -> Result<usize, BurningError> {
         let block_height = self.state.block_height();
         let reconciled = self.state.burning().reconcile_mempool(block_height).await?;
         if reconciled > 0 {
@@ -491,7 +505,12 @@ impl HighStorm {
             return Ok(0);
         }
 
-        let prepared = match self.state.burning().prepare_round(block_height).await? {
+        let prepared = match self
+            .state
+            .burning()
+            .prepare_round(block_height, storm_eye_lane, max_transaction_weight)
+            .await?
+        {
             Some(prepared) => prepared,
             None => return Ok(0),
         };
@@ -555,6 +574,10 @@ impl HighStorm {
         }
 
         self.state.user_requests().reconcile_confirmations().await
+    }
+
+    pub async fn storm_eye_utxo_count(&self) -> Result<usize, user_requests::UserRequestError> {
+        self.state.user_requests().storm_eye_utxo_count().await
     }
 
     pub async fn reconcile_voting_executions(&self) -> Result<usize, VotingExecutionError> {

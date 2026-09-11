@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use contracts::artifacts::account::{AccountProgram, derived_account::AccountArguments};
@@ -11,6 +11,7 @@ use simplex::{
         simplicity::hashes::Hash,
     },
 };
+use tokio::sync::Mutex;
 
 use crate::{
     config::{ElementsRpcConfig, ProtocolConfig},
@@ -69,6 +70,7 @@ pub(crate) struct Indexer {
     elements_rpc: ElementsRpcConfig,
     tick_lifetime_blocks: u64,
     initial_members: Vec<[u8; 32]>,
+    sync_lock: Arc<Mutex<()>>,
 }
 
 impl Indexer {
@@ -87,10 +89,12 @@ impl Indexer {
             elements_rpc,
             tick_lifetime_blocks: protocol.tick_lifetime_blocks,
             initial_members,
+            sync_lock: Arc::new(Mutex::new(())),
         }
     }
 
     pub(crate) async fn sync(&self) -> Result<u64, IndexerError> {
+        let _guard = self.sync_lock.lock().await;
         let storm_eye = self
             .assets
             .get(STORM_EYE_KIND)
@@ -175,6 +179,10 @@ impl Indexer {
 
     pub(crate) async fn cursor(&self) -> Result<Option<IndexedBlock>, IndexerError> {
         Ok(self.store.cursor(ISSUED_UTXO_RULE_SET).await?)
+    }
+
+    pub(crate) fn tip(&self) -> Result<u64, IndexerError> {
+        Ok(self.client()?.call("getblockcount", &[])?)
     }
 
     pub(crate) async fn recover_droplet_exchanges(

@@ -42,17 +42,19 @@ PostgreSQL is exposed on `5432`. Follow the node logs with:
 docker compose -f high-storm/compose.yml logs -f node-1 node-2 node-3
 ```
 
-Elements RPC is exposed on host ports `18884`, `18885`, and `18886`. Every High
+Elements RPC is exposed on host ports `18884`, `18885`, and `18886`. Port `18884`
+uses a localhost-only CORS gateway so browser clients can call node 1 directly. Every High
 Storm node uses its matching Elements daemon through `service.elements_rpc`.
 Elements `29.4.1rc1` is built from its release tag and verified against commit
 `a4d4c96ac7a7a9171b6f777e287ee4df18d779e1` and the checked-in source archive
 checksum.
 
-The bootstrap service claims the development chain's initial free coins and sends
-exactly 50 LBTC to node 1's development key. It then mines one block immediately
-and one block every 60 seconds. The coordinator waits for this funding to complete.
-The bootstrap is idempotent, so restarting it does not fund the key again. Inspect
-the funded wallet with:
+The Elements nodes use the stock `29.4.1rc1` regtest genesis and a development-only
+50 LBTC block subsidy. On a fresh chain, the bootstrap service mines 102 blocks so
+100 LBTC matures, then sends exactly 50 LBTC to node 1's development key. It mines
+one additional block every 60 seconds. The coordinator waits for this funding to
+complete. The bootstrap is idempotent, so restarting it does not fund the key again.
+Inspect the funded wallet with:
 
 ```sh
 docker compose -f high-storm/compose.yml exec -T elements-1 \
@@ -231,12 +233,20 @@ order. Encode the 64-byte Schnorr signature as hex in `header.signature`.
 Accepted submissions return `201` and a `request_hash`; submitting the same
 request, or another request using one of its reserved fee UTXOs, returns `409`.
 `GET /users/requests/{request_hash}` initially returns
-`{"status":"pending","payload":null}`. Every 20 seconds the coordinator batches
-pending requests, reissues timestamp-valued Tick outputs, collects a two-thirds
-Storm Tree signature, and broadcasts the covenant transaction. The status becomes
-`processing` after broadcast and `executed` after confirmation. A node that is not
-the current coordinator returns `503` for both user routes. `signed-price-data`
-returns `422` until price request processing is implemented.
+`{"status":"pending","payload":null}`. After each newly indexed Liquid block, the
+coordinator divides the first half of the live Storm Eye UTXOs into issuance rounds
+across the next 60 seconds. With six Storm Eyes, issuance runs at offsets 0, 20, and
+40 seconds; burning uses the other half at offsets 15, 30, and 45 seconds. The
+schedule is recalculated whenever the confirmed Storm Eye count changes. Each
+issuance round takes the oldest pending requests and packs the largest FIFO prefix
+whose conservative weight estimate does not exceed `400000 / storm_eye_count`.
+The exact finalized weight is checked again after signing and before broadcast.
+Consecutive issuance rounds chain through the Tick reissuance token in the mempool.
+The coordinator collects a two-thirds Storm Tree signature and broadcasts the
+covenant transaction. The status becomes `processing` after broadcast and
+`executed` after confirmation. A node that is not the current coordinator returns
+`503` for both user routes. `signed-price-data` returns `422` until price request
+processing is implemented.
 
 Each node indexes confirmed Tick outputs and their dedicated Account burn
 reserves. A Tick expires after 60 blocks, or one hour at the target one-minute

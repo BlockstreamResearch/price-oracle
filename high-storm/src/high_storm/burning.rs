@@ -47,9 +47,10 @@ use super::{
     message::{BurnExpiredUtxos, ExpiredUtxosBurned, StormEyeUtxo},
     signing::SigningError,
     user_requests::{
-        STORM_EYE_TAG, StormEyePool, UserRequestError, asset_id, find_contract_utxo,
-        get_explicit_outpoint, get_optional_explicit_outpoint, output_from_utxo, pack_proof,
-        require_explicit_utxo, require_preserved_output, witness_utxo,
+        STORM_EYE_TAG, StormEyePool, UserRequestError, asset_id, finalized_dummy_weight,
+        find_contract_utxo, get_explicit_outpoint, get_optional_explicit_outpoint,
+        output_from_utxo, pack_proof, require_explicit_utxo, require_preserved_output,
+        witness_utxo,
     },
 };
 
@@ -91,6 +92,8 @@ pub(crate) struct PreparedBurn {
     selected: Vec<([u8; 32], u32)>,
     network: SimplicityNetwork,
     storm_eye: NetworkAsset,
+    group_count: usize,
+    max_transaction_weight: usize,
 }
 
 #[derive(Clone)]
@@ -126,9 +129,57 @@ impl Burning {
     pub(crate) async fn prepare_round(
         &self,
         block_height: u64,
+        storm_eye_lane: usize,
+        max_transaction_weight: usize,
+    ) -> Result<Option<PreparedBurn>, BurningError> {
+        let mut lower_limit = 1usize;
+        let mut upper_limit = MAX_TICKS_PER_BURN;
+        let mut group_limit = upper_limit;
+        let mut best = None;
+
+        while lower_limit <= upper_limit {
+            let Some(candidate) = self
+                .prepare_round_candidate(
+                    block_height,
+                    storm_eye_lane,
+                    group_limit,
+                    max_transaction_weight,
+                )
+                .await?
+            else {
+                return Ok(best);
+            };
+            let weight = candidate.estimated_weight()?;
+            if weight <= max_transaction_weight {
+                let group_count = candidate.group_count;
+                best = Some(candidate);
+                if group_count < group_limit || group_limit == MAX_TICKS_PER_BURN {
+                    break;
+                }
+                lower_limit = group_count + 1;
+            } else {
+                if candidate.group_count == 1 {
+                    return Err(BurningError::Invalid(format!(
+                        "one burn group transaction weight {weight} exceeds round limit {max_transaction_weight}"
+                    )));
+                }
+                upper_limit = candidate.group_count - 1;
+            }
+            group_limit = lower_limit + (upper_limit - lower_limit) / 2;
+        }
+
+        Ok(best)
+    }
+
+    async fn prepare_round_candidate(
+        &self,
+        block_height: u64,
+        storm_eye_lane: usize,
+        group_limit: usize,
+        max_transaction_weight: usize,
     ) -> Result<Option<PreparedBurn>, BurningError> {
         let expired = self.store.list_expired(u32::MAX).await?;
-        let groups = select_groups(expired)?;
+        let groups = select_groups(expired, group_limit)?;
         if groups.is_empty() {
             return Ok(None);
         }
@@ -206,7 +257,7 @@ impl Burning {
             &client,
             &storm_eye.contract_script,
             Some(storm_eye.asset_id),
-            StormEyePool::NetworkLeader,
+            StormEyePool::NetworkLeader(storm_eye_lane),
         )?;
         let auth_program = storm_eye_program(&storm_eye)?;
         let contract_data: StormEyeContractData =
@@ -337,6 +388,8 @@ impl Burning {
             selected,
             network,
             storm_eye,
+            group_count: burnable_groups.len(),
+            max_transaction_weight,
         }))
     }
 
@@ -556,6 +609,13 @@ impl Burning {
         let final_tx = pset
             .extract_tx()
             .map_err(|error| BurningError::Pset(error.to_string()))?;
+        if final_tx.weight() > prepared.max_transaction_weight {
+            return Err(BurningError::Invalid(format!(
+                "final burn transaction weight {} exceeds round limit {}",
+                final_tx.weight(),
+                prepared.max_transaction_weight
+            )));
+        }
         final_tx
             .verify_tx_amt_proofs(&Secp256k1::new(), &prepared.spent_utxos)
             .map_err(|error| {
@@ -649,6 +709,13 @@ impl Burning {
     }
 }
 
+impl PreparedBurn {
+    fn estimated_weight(&self) -> Result<usize, BurningError> {
+        finalized_dummy_weight(&self.final_transaction, &self.pset, &self.network)
+            .map_err(BurningError::TransactionHelper)
+    }
+}
+
 fn raw_transaction(client: &Client, txid: Txid) -> Result<Transaction, BurningError> {
     let encoded: String = client.call(
         "getrawtransaction",
@@ -688,7 +755,10 @@ fn mempool_spender(
     Ok(None)
 }
 
-fn select_groups(expired: Vec<MonitoredUtxo>) -> Result<Vec<BurnGroup>, BurningError> {
+fn select_groups(
+    expired: Vec<MonitoredUtxo>,
+    max_groups: usize,
+) -> Result<Vec<BurnGroup>, BurningError> {
     let mut grouped = BTreeMap::<([u8; 32], u32), BurnGroup>::new();
     for tick in expired {
         let reserve = (tick.burning_fee_txid, tick.burning_fee_output_index);
@@ -708,7 +778,7 @@ fn select_groups(expired: Vec<MonitoredUtxo>) -> Result<Vec<BurnGroup>, BurningE
     let mut selected = Vec::new();
     let mut tick_count = 0usize;
     for group in grouped.into_values() {
-        if tick_count + group.ticks.len() > MAX_TICKS_PER_BURN {
+        if selected.len() == max_groups || tick_count + group.ticks.len() > MAX_TICKS_PER_BURN {
             break;
         }
         tick_count += group.ticks.len();
@@ -848,7 +918,7 @@ fn validate_layout(
         ));
     }
 
-    let groups = select_groups(ticks)?;
+    let groups = select_groups(ticks, MAX_TICKS_PER_BURN)?;
     if pset.inputs().len()
         != 1 + groups.iter().map(|group| group.ticks.len()).sum::<usize>() + groups.len()
         || pset.outputs().len() != 3 + groups.len()
@@ -960,8 +1030,11 @@ mod tests {
 
     #[test]
     fn selects_ticks_from_different_users_in_deterministic_order() {
-        let groups =
-            select_groups(vec![tick(3, 1, 2, 4), tick(1, 1, 1, 3), tick(2, 1, 2, 4)]).unwrap();
+        let groups = select_groups(
+            vec![tick(3, 1, 2, 4), tick(1, 1, 1, 3), tick(2, 1, 2, 4)],
+            MAX_TICKS_PER_BURN,
+        )
+        .unwrap();
 
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].reserve, ([1; 32], 7));
@@ -1003,7 +1076,8 @@ mod tests {
 
     #[test]
     fn rejects_conflicting_owners_for_one_reserve() {
-        let error = select_groups(vec![tick(1, 1, 3, 4), tick(2, 1, 3, 5)]).unwrap_err();
+        let error = select_groups(vec![tick(1, 1, 3, 4), tick(2, 1, 3, 5)], MAX_TICKS_PER_BURN)
+            .unwrap_err();
 
         assert!(matches!(error, BurningError::Invalid(_)));
     }

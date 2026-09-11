@@ -92,6 +92,8 @@ print("empty" if amount == 0 else "funded" if amount > 0 else "unexpected")
 PY
 )" in
 	empty)
+		mining_address="$(wallet_rpc bootstrap getnewaddress "" bech32)"
+		rpc generatetoaddress 102 "${mining_address}" >/dev/null
 		wallet_rpc bootstrap sendtoaddress "${funded_address}" 50 >/dev/null
 		;;
 	funded)
