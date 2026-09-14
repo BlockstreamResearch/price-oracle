@@ -386,6 +386,6 @@ mod tests {
             assert!(states.get(feed.id).is_some());
         }
         assert!(!states.get(cross.id).unwrap().is_available());
-        assert!(states.get(7).is_none());
+        assert!(states.get(8).is_none());
     }
 }

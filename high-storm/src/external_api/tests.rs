@@ -491,6 +491,7 @@ async fn setup() -> (Router, PrivateKey, String) {
             database.monitored_utxos(),
             database.droplets(),
             database.user_requests(),
+            database.price_attestations(),
             crate::config::ElementsRpcConfig {
                 url: "http://127.0.0.1:18884".to_string(),
                 username: "unused".to_string(),

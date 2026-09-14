@@ -28,6 +28,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 url.workspace = true
 
 contracts.workspace = true
+price-feed = { path = "../price-feed" }
 simplex.workspace = true
 storm.workspace = true
 storm-tree = { path = "../storm-tree" }

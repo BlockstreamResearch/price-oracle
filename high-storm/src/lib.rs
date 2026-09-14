@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+mod crypto;
 pub mod db;
 pub mod external_api;
 pub mod high_storm;
@@ -14,12 +15,13 @@ use storm::{Peer, Storm};
 use crate::config::Config;
 use crate::high_storm::HighStormDependencies;
 pub use high_storm::{
-    ApproveVotingRequest, AssetError, DropletsError, ExchangeRewards, ExecuteUserRequests,
-    ExecuteVotingRequest, ExternalRequests, HighStorm, HighStormHandle, MergeStormEyes,
-    NetworkAsset, NetworkAssets, NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind,
-    SigningError, SigningResult, SplitStormEye, StormEyeInventoryItem, StormEyeState, StormEyeUtxo,
-    UpdateNetworkMembers, UserRequestError, VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError,
-    VotingExecutionError, VotingRequest, VotingStatus,
+    ApproveVotingRequest, AssetError, AttestPriceMsg, DropletsError, ExchangeRewards,
+    ExecuteUserRequests, ExecuteVotingRequest, ExternalRequests, HighStorm, HighStormHandle,
+    MergeStormEyes, NetworkAsset, NetworkAssets, NetworkVoteKind, NetworkVoteRequest, NodeMessage,
+    NodeMessageKind, PriceAttestation, PriceError, SigningError, SigningResult, SplitStormEye,
+    StormEyeInventoryItem, StormEyeState, StormEyeUtxo, UpdateNetworkMembers, UserRequestError,
+    VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError, VotingExecutionError, VotingRequest,
+    VotingStatus,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -141,6 +143,7 @@ pub async fn start_initialized(config: &Config, store: &NetworkStore) -> Result<
             store.monitored_utxos(),
             store.droplets(),
             store.user_requests(),
+            store.price_attestations(),
             config.service.elements_rpc.clone(),
             config.service.protocol.clone(),
         ),
@@ -189,6 +192,7 @@ async fn initialize(
                     store.monitored_utxos(),
                     store.droplets(),
                     store.user_requests(),
+                    store.price_attestations(),
                     config.service.elements_rpc.clone(),
                     config.service.protocol.clone(),
                 ),
