@@ -17,6 +17,9 @@ pub enum Asset {
 
     // Decentralized Pix
     DePix,
+
+    // USD Coin
+    Usdc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,7 +52,7 @@ impl FeedDefinition {
     }
 }
 
-const SUPPORTED_FEEDS: [FeedDefinition; 7] = [
+const SUPPORTED_FEEDS: [FeedDefinition; 8] = [
     FeedDefinition::new(0, Asset::Lbtc, Asset::Usd, FeedKind::Direct),
     FeedDefinition::new(1, Asset::Usdt, Asset::Usd, FeedKind::Direct),
     FeedDefinition::new(2, Asset::Eurx, Asset::Usd, FeedKind::Direct),
@@ -57,6 +60,7 @@ const SUPPORTED_FEEDS: [FeedDefinition; 7] = [
     FeedDefinition::new(4, Asset::Lbtc, Asset::Usdt, FeedKind::Cross),
     FeedDefinition::new(5, Asset::Eurx, Asset::Usdt, FeedKind::Cross),
     FeedDefinition::new(6, Asset::DePix, Asset::Usdt, FeedKind::Cross),
+    FeedDefinition::new(7, Asset::Usdc, Asset::Usd, FeedKind::Direct),
 ];
 
 /// Ordered by feed id, so every node enumerates feeds alike.
@@ -130,6 +134,7 @@ mod tests {
                 (4, Asset::Lbtc, Asset::Usdt, FeedKind::Cross),
                 (5, Asset::Eurx, Asset::Usdt, FeedKind::Cross),
                 (6, Asset::DePix, Asset::Usdt, FeedKind::Cross),
+                (7, Asset::Usdc, Asset::Usd, FeedKind::Direct),
             ]
         );
     }
