@@ -1,47 +1,44 @@
 use price_feed::{
     Clock, ConnectionError, FeedAvailability, FeedId, FeedRegistry, FeedState, FeedStates,
-    PriceFeedData, PriceSource, SourceObservation, SourceState, constants::MAX_POLLING_ERROR_NUM,
+    PriceFeedData, PriceSource, RejectionReason, SourceObservation, SourceState,
+    constants::{MAX_POLLING_ERROR_NUM, VALIDITY_WINDOW},
 };
 
 const NOW: u64 = 1_700_000_000;
 const LBTC_USD: FeedId = 0;
 
 enum Exchange {
+    /// Answers every poll with the same observation.
     Quotes(u64),
     Unreachable,
-    /// Answers every time, but never with anything it has not published before.
-    Stuck(u64),
 }
 
 impl PriceSource for Exchange {
     async fn poll(&self, _feed: FeedId) -> Result<SourceObservation, ConnectionError> {
         match self {
             Self::Quotes(price) => Ok(SourceObservation::new(*price, 8, NOW, NOW)),
-            Self::Stuck(price) => Ok(SourceObservation::new(*price, 8, NOW - 1, NOW)),
             Self::Unreachable => Err(ConnectionError::RequestFailure),
-        }
-    }
-
-    fn last_observed_at(&self, _feed: FeedId) -> Option<u64> {
-        match self {
-            Self::Stuck(_) => Some(NOW - 1),
-            _ => None,
         }
     }
 }
 
 /// One polling cycle over `sources`, the way a node runs it: poll what is
-/// pollable, validate the answer, and record either outcome.
+/// pollable, validate the answer, and record either outcome. An answer the
+/// source already published is neither recorded nor a failure.
 async fn poll_once(state: &mut FeedState, sources: &[Exchange]) {
     for (index, source) in sources.iter().enumerate() {
         if !state.is_pollable(index) {
             continue;
         }
         match source.poll(LBTC_USD).await {
-            Ok(observation) if source.validate(LBTC_USD, &observation).is_ok() => {
-                state.record_poll_success(index, observation)
+            Ok(observation) => {
+                match Exchange::validate(&observation, state.last_observed_at(index)) {
+                    Ok(()) => state.record_poll_success(index, observation),
+                    Err(RejectionReason::StaleObservation) => {}
+                    Err(_) => state.record_poll_failure(index),
+                }
             }
-            _ => state.record_poll_failure(index),
+            Err(_) => state.record_poll_failure(index),
         }
     }
 }
@@ -96,18 +93,21 @@ async fn stays_unavailable_while_no_source_answers() {
 }
 
 #[tokio::test]
-async fn drops_a_source_that_keeps_republishing_the_same_observation() {
+async fn keeps_polling_a_source_that_republishes_while_its_observation_expires() {
     let registry = FeedRegistry::default();
-    let mut states = FeedStates::new(&registry, Clock::Fixed(NOW));
-    let sources = [Exchange::Quotes(100), Exchange::Stuck(300)];
+    // A window after the source's only observation was received.
+    let mut states = FeedStates::new(&registry, Clock::Fixed(NOW + VALIDITY_WINDOW + 1));
+    let sources = [Exchange::Quotes(100)];
     let state = states.get_mut(LBTC_USD).unwrap();
 
-    // A rejection is a failed poll, so a stuck source is dropped like an
-    // unreachable one rather than polled forever.
-    for _ in 0..MAX_POLLING_ERROR_NUM {
+    // Publishing nothing new is not a failed poll, so a stuck source is never
+    // dropped: it stays in the cycle and costs a request on every one.
+    for _ in 0..=MAX_POLLING_ERROR_NUM {
         poll_once(state, &sources).await;
     }
+    assert_eq!(state.state(0), SourceState::Active);
+    assert!(state.is_pollable(0));
 
-    assert_eq!(state.state(1), SourceState::Dropped);
-    assert_eq!(state.value().unwrap().price, 100);
+    // Its observation expires regardless, and the feed goes unavailable.
+    assert!(!state.is_available());
 }
