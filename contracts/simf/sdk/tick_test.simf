@@ -1,0 +1,9 @@
+use std::lib::asserts::assert_eq_64;
+
+use crate::sdk::voucher::verify_tick;
+
+fn main() {
+    let time: u64 = verify_tick(witness::TICK_INPUT_INDEX, param::TICK_ASSET_ID);
+
+    assert_eq_64(time, param::EXPECTED_TIME);
+}
