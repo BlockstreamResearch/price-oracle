@@ -58,6 +58,26 @@ impl Voucher {
         );
     }
 
+    /// The script a user-path spend of the voucher at `voucher_input_index` must burn into.
+    #[must_use]
+    pub fn get_burn_script(voucher_input_index: u32) -> Script {
+        Script::new_op_return(&voucher_input_index.to_be_bytes())
+    }
+
+    /// Adds the burn output for a user-path spend of `voucher_utxo` at `voucher_input_index`.
+    pub fn attach_burn_output(
+        &self,
+        ft: &mut FinalTransaction,
+        voucher_utxo: &UTXO,
+        voucher_input_index: u32,
+    ) {
+        ft.add_output(PartialOutput::new(
+            Self::get_burn_script(voucher_input_index),
+            voucher_utxo.explicit_amount(),
+            voucher_utxo.explicit_asset(),
+        ));
+    }
+
     /// Adds an output that pays `amount` of `asset_id` to this Voucher.
     pub fn attach_voucher_output(&self, ft: &mut FinalTransaction, amount: u64, asset_id: AssetId) {
         ft.add_output(PartialOutput::new(

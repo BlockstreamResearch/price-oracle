@@ -19,8 +19,14 @@ const AUTH_ASSET_SUPPLY: u64 = 10_000;
 /// Timestamp encoded in amount.
 const VOUCHER_TIMESTAMP: u64 = 1_700_000_000;
 
+/// An untagged OP_RETURN, as the network's aggregated burn uses.
 fn op_return_output(amount: u64, asset: AssetId) -> PartialOutput {
     PartialOutput::new(Script::new_op_return(&[]), amount, asset)
+}
+
+/// The burn a user-path spend of the voucher at `voucher_input_index` must pay into.
+fn burn_output(voucher_input_index: u32, amount: u64, asset: AssetId) -> PartialOutput {
+    PartialOutput::new(Voucher::get_burn_script(voucher_input_index), amount, asset)
 }
 
 struct VoucherFixture {
@@ -215,8 +221,129 @@ fn rejects_burn_that_does_not_preserve_the_amount(
             auth_input_index: 1,
             voucher_output_index: 0,
         },
-        op_return_output(VOUCHER_TIMESTAMP - 1, fixture.voucher_asset),
+        burn_output(0, VOUCHER_TIMESTAMP - 1, fixture.voucher_asset),
     )?;
+
+    assert_covenant_rejects(&context, &ft);
+
+    Ok(())
+}
+
+/// A plain OP_RETURN no longer counts: the burn must be tagged with the voucher's input.
+#[simplex::test]
+fn rejects_an_untagged_burn(context: simplex::TestContext) -> anyhow::Result<()> {
+    let fixture = VoucherFixture::new(&context, AuthMethodKind::Asset)?;
+    let auth_utxo = fixture.auth_utxo(&context)?;
+
+    let ft = fixture.burn_transaction(
+        &context,
+        &auth_utxo,
+        VoucherSpendPath::AssetAuth {
+            auth_input_index: 1,
+            voucher_output_index: 0,
+        },
+        op_return_output(VOUCHER_TIMESTAMP, fixture.voucher_asset),
+    )?;
+
+    assert_covenant_rejects(&context, &ft);
+
+    Ok(())
+}
+
+#[simplex::test]
+fn rejects_a_burn_tagged_for_another_input(context: simplex::TestContext) -> anyhow::Result<()> {
+    let fixture = VoucherFixture::new(&context, AuthMethodKind::Asset)?;
+    let auth_utxo = fixture.auth_utxo(&context)?;
+
+    let ft = fixture.burn_transaction(
+        &context,
+        &auth_utxo,
+        VoucherSpendPath::AssetAuth {
+            auth_input_index: 1,
+            voucher_output_index: 0,
+        },
+        burn_output(1, VOUCHER_TIMESTAMP, fixture.voucher_asset),
+    )?;
+
+    assert_covenant_rejects(&context, &ft);
+
+    Ok(())
+}
+
+/// The tag, not the position, links a voucher to its burn: each voucher may name any output.
+#[simplex::test]
+fn burns_two_vouchers_to_their_own_tagged_outputs(
+    context: simplex::TestContext,
+) -> anyhow::Result<()> {
+    let fixture = VoucherFixture::new(&context, AuthMethodKind::Asset)?;
+    let auth_utxo = fixture.auth_utxo(&context)?;
+    let voucher_utxos = fixture.voucher_utxos(&context)?;
+    assert_eq!(voucher_utxos.len(), 2);
+
+    // Input 0 names output 2; output 0 is input 2's burn, tagged 2.
+    let mut ft = fixture.burn_transaction(
+        &context,
+        &auth_utxo,
+        VoucherSpendPath::AssetAuth {
+            auth_input_index: 1,
+            voucher_output_index: 2,
+        },
+        burn_output(2, VOUCHER_TIMESTAMP, fixture.voucher_asset),
+    )?;
+    // Input 2 names output 0; output 2 is input 0's burn, tagged 0.
+    fixture.voucher.attach_spend(
+        &mut ft,
+        &voucher_utxos[1],
+        VoucherSpendPath::AssetAuth {
+            auth_input_index: 1,
+            voucher_output_index: 0,
+        },
+    );
+    fixture
+        .voucher
+        .attach_burn_output(&mut ft, &voucher_utxos[1], 0);
+
+    context.get_default_signer().broadcast(&ft)?.wait()?;
+
+    Ok(())
+}
+
+/// Each voucher checks the output its own witness names. Before burns were tagged, two
+/// equal-amount vouchers could both name one OP_RETURN and let the second amount escape to a
+/// spendable output.
+#[simplex::test]
+fn rejects_two_vouchers_sharing_one_burn_output(
+    context: simplex::TestContext,
+) -> anyhow::Result<()> {
+    let fixture = VoucherFixture::new(&context, AuthMethodKind::Asset)?;
+    let auth_utxo = fixture.auth_utxo(&context)?;
+    let voucher_utxos = fixture.voucher_utxos(&context)?;
+    assert_eq!(voucher_utxos.len(), 2);
+
+    let shared_burn = VoucherSpendPath::AssetAuth {
+        auth_input_index: 1,
+        voucher_output_index: 0,
+    };
+
+    // Normal burn
+    let mut ft = fixture.burn_transaction(
+        &context,
+        &auth_utxo,
+        shared_burn,
+        burn_output(0, VOUCHER_TIMESTAMP, fixture.voucher_asset),
+    )?;
+
+    // The second voucher names the same output 0 ...
+    fixture
+        .voucher
+        .attach_spend(&mut ft, &voucher_utxos[1], shared_burn);
+
+    // ... so its amount can leave through a spendable output.
+    ft.add_output(PartialOutput::new(
+        context.get_default_signer().get_address().script_pubkey(),
+        VOUCHER_TIMESTAMP,
+        fixture.voucher_asset,
+    ));
 
     assert_covenant_rejects(&context, &ft);
 
@@ -262,7 +389,7 @@ fn rejects_spending_through_another_auth_method(
             auth_input_index: 1,
             voucher_output_index: 0,
         },
-        op_return_output(VOUCHER_TIMESTAMP, fixture.voucher_asset),
+        burn_output(0, VOUCHER_TIMESTAMP, fixture.voucher_asset),
     )?;
 
     assert_covenant_rejects(&context, &ft);
@@ -283,7 +410,7 @@ fn burns_voucher_utxo_via_asset_auth(context: simplex::TestContext) -> anyhow::R
             auth_input_index: 1,
             voucher_output_index: 0,
         },
-        op_return_output(VOUCHER_TIMESTAMP, fixture.voucher_asset),
+        burn_output(0, VOUCHER_TIMESTAMP, fixture.voucher_asset),
     )?;
 
     context.get_default_signer().broadcast(&ft)?.wait()?;
@@ -304,7 +431,7 @@ fn burns_voucher_utxo_via_script_auth(context: simplex::TestContext) -> anyhow::
             auth_input_index: 1,
             voucher_output_index: 0,
         },
-        op_return_output(VOUCHER_TIMESTAMP, fixture.voucher_asset),
+        burn_output(0, VOUCHER_TIMESTAMP, fixture.voucher_asset),
     )?;
 
     context.get_default_signer().broadcast(&ft)?.wait()?;
@@ -324,7 +451,7 @@ fn burns_voucher_utxo_via_signature_auth(context: simplex::TestContext) -> anyho
         VoucherSpendPath::SignatureAuth {
             voucher_output_index: 0,
         },
-        op_return_output(VOUCHER_TIMESTAMP, fixture.voucher_asset),
+        burn_output(0, VOUCHER_TIMESTAMP, fixture.voucher_asset),
     )?;
 
     context.get_default_signer().broadcast(&ft)?.wait()?;
