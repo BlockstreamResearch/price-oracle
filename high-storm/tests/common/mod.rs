@@ -63,6 +63,7 @@ impl TestNode {
                     database: "unused".to_string(),
                     max_connections: 1,
                 },
+                price_sources: Default::default(),
             },
         };
 
