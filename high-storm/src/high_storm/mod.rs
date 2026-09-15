@@ -32,7 +32,7 @@ pub use message::{
     NetworkAssets, NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind,
     PriceAttestation, SplitStormEye, StormEyeUtxo, UpdateNetworkMembers,
 };
-pub use prices::PriceError;
+pub use prices::{PollOutcome, PriceError};
 pub use signing::{SigningError, SigningResult};
 use state::NetworkState;
 pub use user_requests::UserRequestError;
@@ -614,6 +614,15 @@ impl HighStormHandle {
 
     pub async fn record_price_failure(&self, feed: price_feed::FeedId, source: usize) {
         self.state.prices().record_failure(feed, source).await
+    }
+
+    pub async fn poll_price_source<S: price_feed::PriceSource>(
+        &self,
+        feed: price_feed::FeedId,
+        index: usize,
+        source: &S,
+    ) -> PollOutcome {
+        self.state.prices().poll(feed, index, source).await
     }
 
     pub async fn price_attestations(
