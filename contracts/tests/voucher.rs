@@ -223,6 +223,47 @@ fn rejects_burn_that_does_not_preserve_the_amount(
     Ok(())
 }
 
+/// Each voucher only checks the output its own witness names, so two equal-amount vouchers
+/// can both name one OP_RETURN and let the second amount escape to a spendable output.
+#[simplex::test]
+fn rejects_two_vouchers_sharing_one_burn_output(
+    context: simplex::TestContext,
+) -> anyhow::Result<()> {
+    let fixture = VoucherFixture::new(&context, AuthMethodKind::Asset)?;
+    let auth_utxo = fixture.auth_utxo(&context)?;
+    let voucher_utxos = fixture.voucher_utxos(&context)?;
+    assert_eq!(voucher_utxos.len(), 2);
+
+    let shared_burn = VoucherSpendPath::AssetAuth {
+        auth_input_index: 1,
+        voucher_output_index: 0,
+    };
+
+    // Normal burn
+    let mut ft = fixture.burn_transaction(
+        &context,
+        &auth_utxo,
+        shared_burn,
+        op_return_output(VOUCHER_TIMESTAMP, fixture.voucher_asset),
+    )?;
+
+    // The second voucher names the same output 0 ...
+    fixture
+        .voucher
+        .attach_spend(&mut ft, &voucher_utxos[1], shared_burn);
+
+    // ... so its amount can leave through a spendable output.
+    ft.add_output(PartialOutput::new(
+        context.get_default_signer().get_address().script_pubkey(),
+        VOUCHER_TIMESTAMP,
+        fixture.voucher_asset,
+    ));
+
+    assert_covenant_rejects(&context, &ft);
+
+    Ok(())
+}
+
 #[simplex::test]
 fn network_authorization_does_not_constrain_voucher_outputs(
     context: simplex::TestContext,
