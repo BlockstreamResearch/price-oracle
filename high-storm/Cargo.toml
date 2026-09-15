@@ -13,6 +13,8 @@ getrandom.workspace = true
 hex.workspace = true
 log.workspace = true
 postcard = { workspace = true, features = ["use-std"] }
+reqwest.workspace = true
+rustls.workspace = true
 secp256k1 = { workspace = true, features = ["rand"] }
 secp256k1-zkp.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -26,6 +28,7 @@ tower-http = { workspace = true, features = ["cors"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 url.workspace = true
+webpki-roots.workspace = true
 
 contracts.workspace = true
 price-feed = { path = "../price-feed" }
