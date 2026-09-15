@@ -57,6 +57,14 @@ impl FeedState {
             .map_or(SourceState::Active, |record| record.state)
     }
 
+    /// What `StaleObservation` compares the source's next observation against.
+    pub fn last_observed_at(&self, source: usize) -> Option<u64> {
+        self.sources
+            .get(&source)?
+            .observation
+            .map(|observation| observation.observed_at)
+    }
+
     /// Whether this cycle polls the source: active ones always, dropped ones
     /// once `POLLING_RETRY_TIME` has elapsed, frozen ones never.
     pub fn is_pollable(&self, source: usize) -> bool {

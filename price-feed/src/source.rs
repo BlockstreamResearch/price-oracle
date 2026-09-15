@@ -72,10 +72,11 @@ pub trait PriceSource {
         feed: FeedId,
     ) -> impl Future<Output = Result<SourceObservation, ConnectionError>> + Send;
 
-    /// The `observed_at` this source last published for `feed`.
-    fn last_observed_at(&self, feed: FeedId) -> Option<u64>;
-
-    fn validate(&self, feed: FeedId, obs: &SourceObservation) -> Result<(), RejectionReason> {
+    /// `last_observed_at` is the `observed_at` last recorded for this source.
+    fn validate(
+        obs: &SourceObservation,
+        last_observed_at: Option<u64>,
+    ) -> Result<(), RejectionReason> {
         let behind = obs.received_at.saturating_sub(obs.observed_at);
         let ahead = obs.observed_at.saturating_sub(obs.received_at);
 
@@ -88,10 +89,7 @@ pub trait PriceSource {
         if ahead > MAX_CLOCK_SKEW {
             return Err(RejectionReason::ClockSkewExceeded);
         }
-        if self
-            .last_observed_at(feed)
-            .is_some_and(|last| obs.observed_at <= last)
-        {
+        if last_observed_at.is_some_and(|last| obs.observed_at <= last) {
             return Err(RejectionReason::StaleObservation);
         }
         Ok(())
@@ -104,22 +102,12 @@ mod tests {
 
     const NOW: u64 = 1_700_000_000;
 
-    const FEED: FeedId = 0;
-
-    struct Source(Option<u64>);
+    struct Source;
 
     impl PriceSource for Source {
         async fn poll(&self, _feed: FeedId) -> Result<SourceObservation, ConnectionError> {
             unreachable!("validation never polls")
         }
-
-        fn last_observed_at(&self, _feed: FeedId) -> Option<u64> {
-            self.0
-        }
-    }
-
-    fn fresh() -> Source {
-        Source(None)
     }
 
     fn observation() -> SourceObservation {
@@ -137,7 +125,7 @@ mod tests {
 
     #[test]
     fn accepts_a_fresh_observation() {
-        assert_eq!(fresh().validate(FEED, &observation()), Ok(()));
+        assert_eq!(Source::validate(&observation(), None), Ok(()));
     }
 
     #[test]
@@ -145,7 +133,7 @@ mod tests {
         let observation = SourceObservation::new(0, 8, NOW, NOW);
 
         assert_eq!(
-            fresh().validate(FEED, &observation),
+            Source::validate(&observation, None),
             Err(RejectionReason::InvalidPrice)
         );
     }
@@ -155,11 +143,11 @@ mod tests {
         let stamped = NOW - SOURCE_DATA_VALIDITY_DURATION - 1;
 
         assert_eq!(
-            fresh().validate(FEED, &SourceObservation::new(100, 8, stamped, NOW)),
+            Source::validate(&SourceObservation::new(100, 8, stamped, NOW), None),
             Err(RejectionReason::Expired)
         );
         assert_eq!(
-            fresh().validate(FEED, &SourceObservation::new(100, 8, stamped + 1, NOW)),
+            Source::validate(&SourceObservation::new(100, 8, stamped + 1, NOW), None),
             Ok(())
         );
     }
@@ -170,17 +158,14 @@ mod tests {
 
         // Equal and older both mean the source published nothing new.
         assert_eq!(
-            Source(Some(obs.observed_at)).validate(FEED, &obs),
+            Source::validate(&obs, Some(obs.observed_at)),
             Err(RejectionReason::StaleObservation)
         );
         assert_eq!(
-            Source(Some(obs.observed_at + 1)).validate(FEED, &obs),
+            Source::validate(&obs, Some(obs.observed_at + 1)),
             Err(RejectionReason::StaleObservation)
         );
-        assert_eq!(
-            Source(Some(obs.observed_at - 1)).validate(FEED, &obs),
-            Ok(())
-        );
+        assert_eq!(Source::validate(&obs, Some(obs.observed_at - 1)), Ok(()));
     }
 
     #[test]
@@ -188,11 +173,11 @@ mod tests {
         let ahead = NOW + MAX_CLOCK_SKEW;
 
         assert_eq!(
-            fresh().validate(FEED, &SourceObservation::new(100, 8, ahead + 1, NOW)),
+            Source::validate(&SourceObservation::new(100, 8, ahead + 1, NOW), None),
             Err(RejectionReason::ClockSkewExceeded)
         );
         assert_eq!(
-            fresh().validate(FEED, &SourceObservation::new(100, 8, ahead, NOW)),
+            Source::validate(&SourceObservation::new(100, 8, ahead, NOW), None),
             Ok(())
         );
     }

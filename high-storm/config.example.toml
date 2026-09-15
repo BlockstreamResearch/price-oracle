@@ -35,6 +35,11 @@ exchange_transaction_fee_sats = 500
 # Tick lifetime measured in blocks. The default 60 blocks is one hour at the target interval.
 tick_lifetime_blocks = 60
 
+# Leave this section out to poll no price source; such a node attests no prices.
+[service.price_sources.coingecko]
+# Optional CoinGecko Demo API key. Without one, the public per-IP rate limit applies.
+# api_key = ""
+
 [service.db]
 # PostgreSQL host and optional port, without a URL scheme.
 url = "localhost:5432"

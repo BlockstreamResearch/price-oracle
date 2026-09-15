@@ -7,6 +7,7 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY contracts ./contracts
 COPY high-storm ./high-storm
+COPY price-feed ./price-feed
 COPY storm ./storm
 COPY storm-operator ./storm-operator
 COPY storm-tree ./storm-tree
