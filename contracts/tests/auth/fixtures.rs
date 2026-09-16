@@ -57,7 +57,7 @@ fn issue_storm_eye_asset(context: &simplex::TestContext, auth: &Auth) -> anyhow:
         IssuanceInput::new_issuance(STORM_EYE_SUPPLY, 0, [1u8; 32]),
         RequiredSignature::NativeEcdsa,
     );
-    auth.attach_storm_eye_output(&mut final_utxo, STORM_EYE_SUPPLY, issuance.asset_id);
+    auth.attach_storm_eye_creation(&mut final_utxo, STORM_EYE_SUPPLY, issuance.asset_id);
 
     signer.broadcast(&final_utxo)?.wait()?;
 
@@ -154,7 +154,7 @@ impl StormEyeFixture {
     /// Adds one covenant-owned output per entry in `amounts`.
     pub fn add_storm_eye_outputs(&self, tx: &mut FinalTransaction, amounts: &[u64]) {
         for amount in amounts {
-            self.auth.attach_storm_eye_output(tx, *amount, self.asset);
+            self.auth.attach_storm_eye_creation(tx, *amount, self.asset);
         }
     }
 

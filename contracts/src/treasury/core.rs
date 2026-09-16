@@ -60,7 +60,7 @@ impl Treasury {
     }
 
     /// Adds an output that pays `amount` of `asset_id` to this Treasury.
-    pub fn attach_treasury_output(
+    pub fn attach_treasury_creation(
         &self,
         ft: &mut FinalTransaction,
         amount: u64,
