@@ -33,6 +33,8 @@ pub struct ServiceConfig {
     #[serde(alias = "user_requests")]
     pub protocol: ProtocolConfig,
     pub db: DbConfig,
+    #[serde(default)]
+    pub price_sources: PriceSourcesConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -95,6 +97,18 @@ pub struct DbConfig {
     pub password: String,
     pub database: String,
     pub max_connections: u32,
+}
+
+/// A source left out is not polled, so a node with none attests no prices.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct PriceSourcesConfig {
+    pub coingecko: Option<CoinGeckoConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CoinGeckoConfig {
+    /// A Demo API key, which lifts the public API's per-IP rate limit.
+    pub api_key: Option<String>,
 }
 
 impl Config {

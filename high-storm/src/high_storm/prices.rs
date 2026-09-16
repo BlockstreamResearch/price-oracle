@@ -1,7 +1,8 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use price_feed::{
-    Clock, FeedAvailability, FeedId, FeedRegistry, FeedStates, PriceFeedData, SourceObservation,
+    Clock, FeedAvailability, FeedId, FeedRegistry, FeedStates, PriceFeedData, PriceSource,
+    RejectionReason, SourceObservation,
 };
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, schnorr};
 use secp256k1_zkp::PublicKey as TransportPublicKey;
@@ -42,6 +43,18 @@ pub enum PriceError {
     NotAMember(String),
 }
 
+/// What one poll of a source did to its feed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollOutcome {
+    /// Dropped and not yet due its retry, or frozen, so not polled.
+    Skipped,
+    Observed,
+    /// The source published nothing new, which is not a failed poll.
+    Unchanged,
+    /// Unreachable, unreadable or rejected, counting towards a drop.
+    Failed,
+}
+
 #[derive(Clone)]
 pub(crate) struct Prices {
     store: PriceAttestationStore,
@@ -79,6 +92,51 @@ impl Prices {
         let mut feeds = self.feeds.lock().await;
         if let Some(state) = feeds.get_mut(feed) {
             state.record_poll_failure(source);
+        }
+    }
+
+    /// Polls `source`, the one at `index` in the feed's state, if that state
+    /// allows it, and records what it answered.
+    pub(crate) async fn poll<S: PriceSource>(
+        &self,
+        feed: FeedId,
+        index: usize,
+        source: &S,
+    ) -> PollOutcome {
+        let pollable = self
+            .feeds
+            .lock()
+            .await
+            .get(feed)
+            .is_some_and(|state| state.is_pollable(index));
+        if !pollable {
+            return PollOutcome::Skipped;
+        }
+        // Not locked while the source answers, so a slow one never holds the feeds.
+        let answer = source.poll(feed).await;
+
+        let mut feeds = self.feeds.lock().await;
+        let Some(state) = feeds.get_mut(feed) else {
+            return PollOutcome::Skipped;
+        };
+        match answer {
+            Ok(observation) => match S::validate(&observation, state.last_observed_at(index)) {
+                Ok(()) => {
+                    state.record_poll_success(index, observation);
+                    PollOutcome::Observed
+                }
+                Err(RejectionReason::StaleObservation) => PollOutcome::Unchanged,
+                Err(reason) => {
+                    tracing::debug!(feed, source = index, %reason, "rejected a price observation");
+                    state.record_poll_failure(index);
+                    PollOutcome::Failed
+                }
+            },
+            Err(error) => {
+                tracing::debug!(feed, source = index, %error, "failed to poll a price source");
+                state.record_poll_failure(index);
+                PollOutcome::Failed
+            }
         }
     }
 
@@ -235,7 +293,10 @@ fn price_hash(feed: &PriceFeedData) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+    use price_feed::{ConnectionError, SourceState, constants::MAX_POLLING_ERROR_NUM};
     use sha2::{Digest, Sha256};
 
     const NOW: u64 = 1_700_000_000;
@@ -372,5 +433,90 @@ mod tests {
             verify(&attestation),
             Err(PriceError::InvalidSignature(0))
         ));
+    }
+
+    const LBTC_USD: FeedId = 0;
+
+    /// Answers every poll alike, and counts them.
+    struct Fake {
+        answer: Result<SourceObservation, ConnectionError>,
+        polls: AtomicUsize,
+    }
+
+    impl Fake {
+        fn answering(answer: Result<SourceObservation, ConnectionError>) -> Self {
+            Self {
+                answer,
+                polls: AtomicUsize::new(0),
+            }
+        }
+
+        fn polls(&self) -> usize {
+            self.polls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl PriceSource for Fake {
+        async fn poll(&self, _feed: FeedId) -> Result<SourceObservation, ConnectionError> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            self.answer
+        }
+    }
+
+    async fn prices() -> Prices {
+        let store = crate::db::Database::connect("sqlite::memory:", 1)
+            .await
+            .unwrap()
+            .price_attestations();
+        Prices::new([7; 32], store, Clock::Fixed(NOW))
+    }
+
+    #[tokio::test]
+    async fn drops_a_source_whose_polls_keep_failing_and_stops_polling_it() {
+        let prices = prices().await;
+        let unreachable = Fake::answering(Err(ConnectionError::RequestFailure));
+        let rejected = Fake::answering(Ok(SourceObservation::new(0, 8, NOW, NOW)));
+
+        for _ in 0..MAX_POLLING_ERROR_NUM {
+            assert_eq!(
+                prices.poll(LBTC_USD, 0, &unreachable).await,
+                PollOutcome::Failed
+            );
+            assert_eq!(
+                prices.poll(LBTC_USD, 1, &rejected).await,
+                PollOutcome::Failed
+            );
+        }
+
+        // Both are dropped, so neither is polled until `POLLING_RETRY_TIME`.
+        assert_eq!(
+            prices.poll(LBTC_USD, 0, &unreachable).await,
+            PollOutcome::Skipped
+        );
+        assert_eq!(
+            prices.poll(LBTC_USD, 1, &rejected).await,
+            PollOutcome::Skipped
+        );
+        assert_eq!(unreachable.polls(), MAX_POLLING_ERROR_NUM as usize);
+    }
+
+    #[tokio::test]
+    async fn never_drops_a_source_that_keeps_republishing() {
+        let prices = prices().await;
+        let stuck = Fake::answering(Ok(SourceObservation::new(100, 8, NOW, NOW)));
+
+        assert_eq!(
+            prices.poll(LBTC_USD, 0, &stuck).await,
+            PollOutcome::Observed
+        );
+        for _ in 0..=MAX_POLLING_ERROR_NUM {
+            assert_eq!(
+                prices.poll(LBTC_USD, 0, &stuck).await,
+                PollOutcome::Unchanged
+            );
+        }
+
+        let feeds = prices.feeds.lock().await;
+        assert_eq!(feeds.get(LBTC_USD).unwrap().state(0), SourceState::Active);
     }
 }

@@ -6,9 +6,12 @@ use high_storm::{
     db::{Database, network::NetworkStore},
     external_api::ExternalApiServer,
     ipc::IpcServer,
+    sources,
 };
-use price_feed::constants::POLLING_INTERVAL;
-use tokio::time::{Duration, Instant, MissedTickBehavior};
+use tokio::{
+    sync::Notify,
+    time::{Duration, Instant, MissedTickBehavior},
+};
 use tracing_subscriber::EnvFilter;
 
 const LIQUID_BLOCK_FINALIZATION_TIME: Duration = Duration::from_secs(60);
@@ -144,7 +147,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(address = %external_api.local_addr()?, "external API is listening");
 
     let ipc = IpcServer::bind(&config.service.ipc_path, database.node_operators()).await?;
-    run_until_shutdown(storm, &store, ipc, external_api).await?;
+    let price_observed = sources::spawn(&config.service.price_sources, storm.handle())?;
+    run_until_shutdown(storm, &store, ipc, external_api, &price_observed).await?;
 
     Ok(())
 }
@@ -170,6 +174,7 @@ async fn run_until_shutdown(
     store: &NetworkStore,
     ipc: IpcServer,
     external_api: ExternalApiServer,
+    price_observed: &Notify,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reconnect = tokio::time::interval(Duration::from_secs(3));
     reconnect.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -198,14 +203,6 @@ async fn run_until_shutdown(
         Duration::from_secs(10),
     );
     reconcile_requests.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    // One attestation round per polling cycle, which is what keeps a price
-    // current on its peers.
-    let mut price_round = tokio::time::interval_at(
-        Instant::now() + Duration::from_secs(5),
-        Duration::from_secs(POLLING_INTERVAL),
-    );
-    price_round.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -393,7 +390,8 @@ async fn run_until_shutdown(
                     }
                 }
             }
-            _ = price_round.tick() => {
+            // A node attests on every new observation.
+            _ = price_observed.notified() => {
                 match storm.attest_prices().await {
                     Ok(0) => {}
                     Ok(feed_count) => {
