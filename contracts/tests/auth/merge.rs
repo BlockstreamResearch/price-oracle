@@ -4,6 +4,7 @@ use simplex::transaction::{FinalTransaction, PartialOutput, utxo::UTXO};
 
 use contracts::auth::AuthSpendPath;
 
+use super::common::wait_for_confirmation;
 use super::fixtures::{MAX_MERGE_UTXOS_COUNT, StormEyeFixture, assert_covenant_rejects};
 
 fn merge_transaction(
@@ -42,7 +43,7 @@ fn merges_multiple_utxos_into_single_storm_eye(
     let utxos = fixture.split_into(&context, &[5_000, 3_000, 2_000])?;
 
     let tx = merge_transaction(&fixture, &utxos, utxos.len() as u8, total(&utxos));
-    context.get_default_signer().broadcast(&tx)?.wait()?;
+    wait_for_confirmation(&context.get_default_signer().broadcast(&tx)?)?;
 
     Ok(())
 }

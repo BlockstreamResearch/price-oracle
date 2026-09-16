@@ -17,6 +17,8 @@ use contracts::auth::{
     WitnessStep, build_tree, witness_proof,
 };
 
+use super::common::wait_for_confirmation;
+
 pub const STORM_EYE_SUPPLY: u64 = 10_000;
 
 /// The upper bounds compiled into every test program. Spec §1.4.4 and §1.4.5 accept
@@ -59,7 +61,7 @@ fn issue_storm_eye_asset(context: &simplex::TestContext, auth: &Auth) -> anyhow:
     );
     auth.attach_storm_eye_creation(&mut final_utxo, STORM_EYE_SUPPLY, issuance.asset_id);
 
-    signer.broadcast(&final_utxo)?.wait()?;
+    wait_for_confirmation(&signer.broadcast(&final_utxo)?)?;
 
     Ok(issuance.asset_id)
 }
@@ -178,7 +180,7 @@ impl StormEyeFixture {
         );
         self.add_storm_eye_outputs(&mut tx, amounts);
 
-        context.get_default_signer().broadcast(&tx)?.wait()?;
+        wait_for_confirmation(&context.get_default_signer().broadcast(&tx)?)?;
 
         let utxos = self.utxos(context)?;
         assert_eq!(utxos.len(), amounts.len());
