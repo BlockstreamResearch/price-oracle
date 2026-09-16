@@ -35,7 +35,7 @@ const STORM_EYE_ISSUANCE_FEE_SATS: u64 = 1_000;
 const TICK_ISSUANCE_FEE_SATS: u64 = 1_000;
 const MAX_MERGE_UTXOS_COUNT: u8 = 4;
 const MAX_SPLIT_UTXOS_COUNT: u8 = 4;
-const RESCUE_BLOCKS: u64 = 1_576_800;
+pub(crate) const RESCUE_BLOCKS: u64 = 1_576_800;
 const STORM_EYE_RPC_AMOUNT: f64 = 0.000_100_00;
 const TREASURY_BLINDING_SECRET: [u8; 32] = [0x42; 32];
 const INITIAL_MEMBERS_MAGIC: [u8; 2] = *b"OM";
@@ -54,6 +54,37 @@ pub(crate) struct StormEyeContractData {
 pub(crate) struct TickAssetContractData {
     pub(crate) issuance_tx: Vec<u8>,
     pub(crate) token_output_index: u32,
+}
+
+pub(crate) fn storm_eye_contract_data(
+    storm_eye: &NetworkAsset,
+) -> Result<StormEyeContractData, AssetError> {
+    postcard::from_bytes(
+        storm_eye
+            .contract_data
+            .as_deref()
+            .ok_or(AssetError::InvalidRpcResponse("Storm Eye contract data"))?,
+    )
+    .map_err(Into::into)
+}
+
+pub(crate) fn renewed_storm_eye(
+    storm_eye: &NetworkAsset,
+    network: &SimplicityNetwork,
+) -> Result<NetworkAsset, AssetError> {
+    let mut renewed = storm_eye.clone();
+    let mut data = storm_eye_contract_data(storm_eye)?;
+    data.rescue_height = next_storm_eye_rescue_height(data.rescue_height)?;
+    renewed.contract_data = Some(postcard::to_stdvec(&data)?);
+    renewed.contract_script = storm_eye_program(&renewed)?
+        .get_script_pubkey(network)
+        .into_bytes();
+    Ok(renewed)
+}
+
+pub(crate) fn next_storm_eye_rescue_height(current: u32) -> Result<u32, AssetError> {
+    u32::try_from(u64::from(current).saturating_add(RESCUE_BLOCKS))
+        .map_err(|_| AssetError::RescueHeight)
 }
 
 pub(crate) fn initial_members_script(members: &[[u8; 32]]) -> Result<Script, AssetError> {
@@ -483,8 +514,8 @@ impl ElementsAssetIssuer {
         };
         let sidechain: SidechainInfo = client.call("getsidechaininfo", &[])?;
         let block_height: u64 = client.call("getblockcount", &[])?;
-        let rescue_height =
-            u32::try_from(block_height + RESCUE_BLOCKS).map_err(|_| AssetError::RescueHeight)?;
+        let rescue_height = u32::try_from(block_height.saturating_add(RESCUE_BLOCKS))
+            .map_err(|_| AssetError::RescueHeight)?;
 
         let funding = client
             .call::<Vec<WalletUtxo>>("listunspent", &[0.into(), 9_999_999.into()])?

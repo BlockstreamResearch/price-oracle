@@ -11,6 +11,15 @@ pub struct PendingNetworkAsset {
     pub issuance_tx: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingStormEyeRenewal {
+    pub txid: [u8; 32],
+    pub request: Vec<u8>,
+    pub contract_script: Vec<u8>,
+    pub contract_data: Vec<u8>,
+    pub block_height: u64,
+}
+
 #[derive(Clone)]
 pub struct NetworkAssetStore {
     pool: AnyPool,
@@ -88,6 +97,108 @@ impl NetworkAssetStore {
         .await?;
 
         Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn record_storm_eye_renewal(
+        &self,
+        renewal: &PendingStormEyeRenewal,
+    ) -> Result<bool, Error> {
+        let result = sqlx::query(
+            "INSERT INTO storm_eye_renewals (
+                id, txid, request, contract_script, contract_data, block_height
+             ) VALUES (1, $1, $2, $3, $4, $5)
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(renewal.txid.to_vec())
+        .bind(&renewal.request)
+        .bind(&renewal.contract_script)
+        .bind(&renewal.contract_data)
+        .bind(i64::try_from(renewal.block_height).map_err(|error| Error::Encode(Box::new(error)))?)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn pending_storm_eye_renewal(&self) -> Result<Option<PendingStormEyeRenewal>, Error> {
+        sqlx::query(
+            "SELECT txid, request, contract_script, contract_data, block_height
+             FROM storm_eye_renewals WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| {
+            Ok(PendingStormEyeRenewal {
+                txid: decode_array(row.try_get("txid")?)?,
+                request: row.try_get("request")?,
+                contract_script: row.try_get("contract_script")?,
+                contract_data: row.try_get("contract_data")?,
+                block_height: u64::try_from(row.try_get::<i64, _>("block_height")?)
+                    .map_err(|error| Error::Decode(Box::new(error)))?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn confirm_storm_eye_renewal(&self, txid: [u8; 32]) -> Result<bool, Error> {
+        let mut transaction = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE network_assets
+             SET contract_script = renewal.contract_script,
+                 contract_data = renewal.contract_data
+             FROM storm_eye_renewals AS renewal
+             WHERE network_assets.kind = 'storm-eye'
+               AND network_assets.status = 'active'
+               AND renewal.id = 1 AND renewal.txid = $1",
+        )
+        .bind(txid.to_vec())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM storm_eye_renewals WHERE id = 1 AND txid = $1")
+            .bind(txid.to_vec())
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+
+        Ok(true)
+    }
+
+    pub async fn index_storm_eye_renewal(
+        &self,
+        current: &NetworkAsset,
+        renewed: &NetworkAsset,
+    ) -> Result<bool, Error> {
+        let mut transaction = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE network_assets
+             SET contract_script = $1, contract_data = $2
+             WHERE kind = 'storm-eye' AND status = 'active'
+                             AND contract_script = $3
+                             AND ((contract_data IS NULL AND $4 IS NULL) OR contract_data = $5)",
+        )
+        .bind(&renewed.contract_script)
+        .bind(&renewed.contract_data)
+        .bind(&current.contract_script)
+        .bind(&current.contract_data)
+        .bind(&current.contract_data)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM storm_eye_renewals")
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+
+        Ok(true)
     }
 
     pub async fn get(&self, kind: &str) -> Result<Option<NetworkAsset>, Error> {
@@ -273,5 +384,89 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(store.pending_for_peer(&[8; 33]).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn confirms_one_pending_storm_eye_renewal_atomically() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.network_assets();
+        let pending = pending_asset();
+        store.insert_active(&pending.asset).await.unwrap();
+        let renewal = PendingStormEyeRenewal {
+            txid: [4; 32],
+            request: vec![5; 64],
+            contract_script: vec![0x52],
+            contract_data: vec![6; 64],
+            block_height: 43_200,
+        };
+
+        assert!(store.record_storm_eye_renewal(&renewal).await.unwrap());
+        assert!(!store.record_storm_eye_renewal(&renewal).await.unwrap());
+        assert_eq!(
+            store.pending_storm_eye_renewal().await.unwrap(),
+            Some(renewal)
+        );
+        assert!(!store.confirm_storm_eye_renewal([7; 32]).await.unwrap());
+        assert!(store.confirm_storm_eye_renewal([4; 32]).await.unwrap());
+        assert!(store.pending_storm_eye_renewal().await.unwrap().is_none());
+
+        let active = store.get(STORM_EYE_KIND).await.unwrap().unwrap();
+        assert_eq!(active.contract_script, vec![0x52]);
+        assert_eq!(active.contract_data, Some(vec![6; 64]));
+    }
+
+    #[tokio::test]
+    async fn indexes_storm_eye_renewal_without_pending_announcement() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.network_assets();
+        let current = pending_asset().asset;
+        let mut renewed = current.clone();
+        renewed.contract_script = vec![0x52];
+        renewed.contract_data = Some(vec![6; 64]);
+        store.insert_active(&current).await.unwrap();
+
+        assert!(
+            store
+                .index_storm_eye_renewal(&current, &renewed)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .index_storm_eye_renewal(&current, &renewed)
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.get(STORM_EYE_KIND).await.unwrap(), Some(renewed));
+    }
+
+    #[tokio::test]
+    async fn indexed_storm_eye_renewal_clears_pending_announcement() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.network_assets();
+        let current = pending_asset().asset;
+        let mut renewed = current.clone();
+        renewed.contract_script = vec![0x52];
+        renewed.contract_data = Some(vec![6; 64]);
+        store.insert_active(&current).await.unwrap();
+        store
+            .record_storm_eye_renewal(&PendingStormEyeRenewal {
+                txid: [4; 32],
+                request: vec![5; 64],
+                contract_script: renewed.contract_script.clone(),
+                contract_data: renewed.contract_data.clone().unwrap(),
+                block_height: 43_200,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .index_storm_eye_renewal(&current, &renewed)
+                .await
+                .unwrap()
+        );
+        assert!(store.pending_storm_eye_renewal().await.unwrap().is_none());
+        assert_eq!(store.get(STORM_EYE_KIND).await.unwrap(), Some(renewed));
     }
 }

@@ -15,6 +15,7 @@ mod issuance;
 mod leader;
 mod message;
 mod prices;
+mod renewal;
 mod signing;
 mod state;
 mod user_requests;
@@ -30,9 +31,10 @@ pub use message::{
     ApproveVotingRequest, AttestPriceMsg, BurnExpiredUtxos, ExchangeRewards, ExecuteUserRequests,
     ExecuteVotingRequest, ExpiredUtxosBurned, ExternalRequests, MergeStormEyes, NetworkAsset,
     NetworkAssets, NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind,
-    PriceAttestation, SplitStormEye, StormEyeUtxo, UpdateNetworkMembers,
+    PriceAttestation, RenewStormUtxos, SplitStormEye, StormEyeUtxo, UpdateNetworkMembers,
 };
 pub use prices::{PollOutcome, PriceError};
+pub use renewal::RenewalError;
 pub use signing::{SigningError, SigningResult};
 use state::NetworkState;
 pub use user_requests::UserRequestError;
@@ -378,6 +380,50 @@ impl HighStorm {
                 .await?;
         }
         Ok(indexed)
+    }
+
+    pub async fn reconcile_storm_eye_renewal(&self) -> Result<bool, RenewalError> {
+        let confirmed = self.state.renewal().reconcile().await?;
+        if !confirmed
+            && self.is_coordinator().await
+            && let Some(request) = self.state.renewal().pending_request().await?
+        {
+            renewal::announce(&self.storm.handle(), &request).await?;
+        }
+        Ok(confirmed)
+    }
+
+    pub async fn renew_storm_eye_timelock(&self) -> Result<Option<[u8; 32]>, RenewalError> {
+        if !self.is_coordinator().await {
+            return Ok(None);
+        }
+        let block_height = self.state.block_height();
+        let Some(prepared) = self.state.renewal().prepare(block_height).await? else {
+            return Ok(None);
+        };
+        let request = prepared.request.clone();
+        self.state.renewal().validate_request(&request).await?;
+        let signing = self
+            .state
+            .signing()
+            .sign_renew_storm_utxos(&self.storm.handle(), &request)
+            .await?;
+        let proof = self
+            .state
+            .signing()
+            .storm_tree_proof(&signing.signing_storm_tree_branch)
+            .await?;
+        let notification = self.state.renewal().finalize(prepared, signing, proof)?;
+        let txid = self
+            .state
+            .renewal()
+            .record_and_broadcast(&notification)
+            .await?;
+        if let Err(error) = renewal::announce(&self.storm.handle(), &notification).await {
+            tracing::warn!(%error, "failed to announce Storm Eye timelock renewal");
+        }
+
+        Ok(Some(txid))
     }
 
     pub async fn announce_network_assets(&self) -> Result<(), AssetError> {
