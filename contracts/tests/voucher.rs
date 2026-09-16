@@ -86,13 +86,6 @@ impl VoucherFixture {
             .clone())
     }
 
-    fn voucher_utxo(&self, context: &simplex::TestContext) -> anyhow::Result<UTXO> {
-        self.voucher_utxos(context)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("the covenant holds no Voucher UTXO"))
-    }
-
     fn voucher_utxos(&self, context: &simplex::TestContext) -> anyhow::Result<Vec<UTXO>> {
         Ok(context
             .get_default_provider()
@@ -106,21 +99,21 @@ impl VoucherFixture {
             .clone())
     }
 
-    /// Spends the Voucher UTXO with `auth_utxo` at input 1 and `burn_output` at output 0.
+    /// Spends `voucher_utxo` at input 0 with `auth_utxo` at input 1 and `burn_output` at output 0.
     fn burn_transaction(
         &self,
         context: &simplex::TestContext,
+        voucher_utxo: &UTXO,
         auth_utxo: &UTXO,
         path: VoucherSpendPath,
         burn_output: PartialOutput,
     ) -> anyhow::Result<FinalTransaction> {
         let signer = context.get_default_signer();
-        let voucher_utxo = self.voucher_utxo(context)?;
 
         let mut ft = FinalTransaction::new();
 
         // Input 0: the Voucher UTXO under the covenant.
-        self.voucher.attach_spend(&mut ft, &voucher_utxo, path);
+        self.voucher.attach_spend(&mut ft, voucher_utxo, path);
         // Input 1: whatever is meant to authorise the spend.
         ft.add_input(
             PartialInput::new(auth_utxo.clone()),
@@ -171,6 +164,7 @@ fn rejects_network_burn_without_storm_eye(context: simplex::TestContext) -> anyh
 
     let ft = fixture.burn_transaction(
         &context,
+        &fixture.voucher_utxos(&context)?[0],
         &decoy_utxo,
         VoucherSpendPath::NetworkAuth {
             storm_eye_input_index: 1,
@@ -190,6 +184,7 @@ fn rejects_burn_to_a_spendable_output(context: simplex::TestContext) -> anyhow::
 
     let ft = fixture.burn_transaction(
         &context,
+        &fixture.voucher_utxos(&context)?[0],
         &auth_utxo,
         VoucherSpendPath::AssetAuth {
             auth_input_index: 1,
@@ -216,6 +211,7 @@ fn rejects_burn_that_does_not_preserve_the_amount(
 
     let ft = fixture.burn_transaction(
         &context,
+        &fixture.voucher_utxos(&context)?[0],
         &auth_utxo,
         VoucherSpendPath::AssetAuth {
             auth_input_index: 1,
@@ -237,6 +233,7 @@ fn rejects_an_untagged_burn(context: simplex::TestContext) -> anyhow::Result<()>
 
     let ft = fixture.burn_transaction(
         &context,
+        &fixture.voucher_utxos(&context)?[0],
         &auth_utxo,
         VoucherSpendPath::AssetAuth {
             auth_input_index: 1,
@@ -257,6 +254,7 @@ fn rejects_a_burn_tagged_for_another_input(context: simplex::TestContext) -> any
 
     let ft = fixture.burn_transaction(
         &context,
+        &fixture.voucher_utxos(&context)?[0],
         &auth_utxo,
         VoucherSpendPath::AssetAuth {
             auth_input_index: 1,
@@ -283,6 +281,7 @@ fn burns_two_vouchers_to_their_own_tagged_outputs(
     // Input 0 names output 2; output 0 is input 2's burn, tagged 2.
     let mut ft = fixture.burn_transaction(
         &context,
+        &voucher_utxos[0],
         &auth_utxo,
         VoucherSpendPath::AssetAuth {
             auth_input_index: 1,
@@ -328,6 +327,7 @@ fn rejects_two_vouchers_sharing_one_burn_output(
     // Normal burn
     let mut ft = fixture.burn_transaction(
         &context,
+        &voucher_utxos[0],
         &auth_utxo,
         shared_burn,
         burn_output(0, VOUCHER_TIMESTAMP, fixture.voucher_asset),
@@ -359,6 +359,7 @@ fn network_authorization_does_not_constrain_voucher_outputs(
 
     let ft = fixture.burn_transaction(
         &context,
+        &fixture.voucher_utxos(&context)?[0],
         &storm_eye_utxo,
         VoucherSpendPath::NetworkAuth {
             storm_eye_input_index: 1,
@@ -384,6 +385,7 @@ fn rejects_spending_through_another_auth_method(
 
     let ft = fixture.burn_transaction(
         &context,
+        &fixture.voucher_utxos(&context)?[0],
         &storm_eye_utxo,
         VoucherSpendPath::ScriptAuth {
             auth_input_index: 1,
@@ -405,6 +407,7 @@ fn burns_voucher_utxo_via_asset_auth(context: simplex::TestContext) -> anyhow::R
 
     let ft = fixture.burn_transaction(
         &context,
+        &fixture.voucher_utxos(&context)?[0],
         &auth_utxo,
         VoucherSpendPath::AssetAuth {
             auth_input_index: 1,
@@ -426,6 +429,7 @@ fn burns_voucher_utxo_via_script_auth(context: simplex::TestContext) -> anyhow::
 
     let ft = fixture.burn_transaction(
         &context,
+        &fixture.voucher_utxos(&context)?[0],
         &auth_utxo,
         VoucherSpendPath::ScriptAuth {
             auth_input_index: 1,
@@ -447,6 +451,7 @@ fn burns_voucher_utxo_via_signature_auth(context: simplex::TestContext) -> anyho
 
     let ft = fixture.burn_transaction(
         &context,
+        &fixture.voucher_utxos(&context)?[0],
         &auth_utxo,
         VoucherSpendPath::SignatureAuth {
             voucher_output_index: 0,
@@ -469,6 +474,7 @@ fn burns_voucher_utxo_when_storm_eye_is_present(
 
     let ft = fixture.burn_transaction(
         &context,
+        &fixture.voucher_utxos(&context)?[0],
         &storm_eye_utxo,
         VoucherSpendPath::NetworkAuth {
             storm_eye_input_index: 1,
