@@ -19,26 +19,12 @@ fn padding_96_tail() -> u256 {
     0x8000000000000000000000000000000000000000000000000000000000000300
 }
 
-fn u32_to_le(value: u32) -> u32 {
-    let (b0, b1, b2, b3): (u8, u8, u8, u8) = <u32>::into(value);
-    <(u8, u8, u8, u8)>::into((b3, b2, b1, b0))
-}
-
-fn u64_to_le(value: u64) -> u64 {
-    let (b0, b1, b2, b3, b4, b5, b6, b7): (u8, u8, u8, u8, u8, u8, u8, u8) = <u64>::into(value);
-    <(u8, u8, u8, u8, u8, u8, u8, u8)>::into((b7, b6, b5, b4, b3, b2, b1, b0))
-}
-
-fn encode_price_feed_data(data: PriceFeedData) -> u256 {
+pub fn encode_price_feed_data(data: PriceFeedData) -> u256 {
     let (feed_id, price, decimals, received_at, valid_until): PriceFeedData = data;
 
-    // `price` straddles the two 64-bit halves of the first 128 bits.
-    let (price_head, price_tail): (u32, u32) = <u64>::into(u64_to_le(price));
-    let bytes_0_8: u64 = <(u32, u32)>::into((u32_to_le(feed_id), price_head));
-    let bytes_8_16: u64 = <(u32, u32)>::into((price_tail, u32_to_le(decimals)));
-
-    let head: u128 = <(u64, u64)>::into((bytes_0_8, bytes_8_16));
-    let tail: u128 = <(u64, u64)>::into((u64_to_le(received_at), u64_to_le(valid_until)));
+    let ids: u64 = <(u32, u32)>::into((feed_id, decimals));
+    let head: u128 = <(u64, u64)>::into((ids, price));
+    let tail: u128 = <(u64, u64)>::into((received_at, valid_until));
 
     <(u128, u128)>::into((head, tail))
 }

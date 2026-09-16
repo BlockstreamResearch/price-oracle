@@ -97,14 +97,4 @@ impl Voucher {
             asset_id,
         ));
     }
-
-    /// Adds the OP_RETURN a spend of `voucher_utxo` burns into. Every user path requires it at
-    /// the index the spend names.
-    pub fn attach_burn_output(&self, ft: &mut FinalTransaction, voucher_utxo: &UTXO) {
-        ft.add_output(PartialOutput::new(
-            Script::new_op_return(&[]),
-            voucher_utxo.explicit_amount(),
-            voucher_utxo.explicit_asset(),
-        ));
-    }
 }

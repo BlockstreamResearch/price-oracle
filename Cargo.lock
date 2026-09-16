@@ -654,6 +654,7 @@ name = "contracts"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "price-feed",
  "smplx-std",
  "storm-tree",
  "thiserror",

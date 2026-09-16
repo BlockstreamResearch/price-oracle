@@ -149,6 +149,8 @@ impl Consumer {
         let mut ft = self.spend(context, witness)?;
 
         for (offset, voucher) in vouchers.iter().enumerate() {
+            // The consumer holds input and output 0, so each voucher's slot is `1 + offset`.
+            let index = u32::try_from(1 + offset)?;
             let voucher_utxo =
                 provider.fetch_scripthash_utxos(&voucher.get_script_pubkey())?[0].clone();
             voucher.attach_spend(
@@ -156,10 +158,10 @@ impl Consumer {
                 &voucher_utxo,
                 VoucherSpendPath::AssetAuth {
                     auth_input_index,
-                    voucher_output_index: u32::try_from(1 + offset)?,
+                    voucher_output_index: index,
                 },
             );
-            voucher.attach_burn_output(&mut ft, &voucher_utxo);
+            voucher.attach_voucher_output(&mut ft, &voucher_utxo, index);
         }
 
         let auth_utxo = signer.get_utxos_asset(auth_asset)?[0].clone();
@@ -215,7 +217,7 @@ impl VoucherIssuer {
         amount: u64,
     ) -> anyhow::Result<AssetId> {
         issue(context, amount, |ft, amount, asset| {
-            voucher.attach_voucher_output(ft, amount, asset);
+            voucher.attach_voucher_creation(ft, amount, asset);
         })
     }
 
