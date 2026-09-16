@@ -124,6 +124,16 @@ pub struct StormEyeUtxo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenewStormUtxos {
+    pub tx: Vec<u8>,
+    pub final_tx: Option<Vec<u8>>,
+    pub signing_hashes: Vec<[u8; 32]>,
+    pub signing_storm_tree_branch: StormTreeBranch,
+    pub block_height: u64,
+    pub new_rescue_height: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkAsset {
     pub kind: String,
     pub name: String,
@@ -247,7 +257,10 @@ impl NodeMessageKind {
     }
 
     pub(crate) fn requires_coordinator(self) -> bool {
-        matches!(self, Self::ExecuteUserRequests | Self::NetworkAssets)
+        matches!(
+            self,
+            Self::ExecuteUserRequests | Self::NetworkAssets | Self::RenewStormUtxos
+        )
     }
 }
 

@@ -26,6 +26,7 @@ pub(crate) struct NetworkState {
     voting_execution: VotingExecution,
     prices: Prices,
     assets: Assets,
+    renewal: super::renewal::Renewal,
     burning: Burning,
     droplets: Droplets,
     indexer: Indexer,
@@ -123,6 +124,17 @@ impl NetworkState {
             ),
             prices: Prices::new(secret_key, price_attestations, price_feed::Clock::System),
             assets: Assets::new(network_assets.clone()),
+            renewal: super::renewal::Renewal::new(
+                network_assets.clone(),
+                droplets.clone(),
+                elements_rpc.clone(),
+                protocol_config.burn_transaction_fee_sats,
+                PublicKey::from_slice(&coordinator_public_key)
+                    .expect("coordinator contains a validated public key")
+                    .x_only_public_key()
+                    .0
+                    .serialize(),
+            ),
             burning: Burning::new(
                 monitored_utxos.clone(),
                 network_assets.clone(),
@@ -174,6 +186,10 @@ impl NetworkState {
 
     pub(crate) fn voting_execution(&self) -> &VotingExecution {
         &self.voting_execution
+    }
+
+    pub(crate) fn renewal(&self) -> &super::renewal::Renewal {
+        &self.renewal
     }
 
     pub(crate) fn begin_voting_execution(

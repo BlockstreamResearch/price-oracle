@@ -7,6 +7,7 @@ use super::{
     leader,
     message::{
         BurnExpiredUtxos, ExecuteVotingRequest, ExpiredUtxosBurned, NodeMessage, NodeMessageKind,
+        RenewStormUtxos,
     },
     signing::SigningError,
     state::NetworkState,
@@ -33,6 +34,8 @@ pub(crate) enum HandlerError {
     Indexer(#[from] super::indexer::IndexerError),
     #[error(transparent)]
     Price(#[from] super::prices::PriceError),
+    #[error(transparent)]
+    Renewal(#[from] super::renewal::RenewalError),
     #[error(transparent)]
     Encoding(#[from] postcard::Error),
 }
@@ -210,6 +213,19 @@ pub(crate) async fn handle(
                 .await?;
             Ok(())
         }
+        NodeMessageKind::RenewStormUtxos => {
+            let request: RenewStormUtxos = message.decode_payload()?;
+            if request.final_tx.is_some() {
+                state.renewal().observe_broadcast(&request).await?;
+                return Ok(());
+            }
+            state.renewal().validate_request(&request).await?;
+            state
+                .signing()
+                .handle_renew_storm_utxos(message, &context)
+                .await?;
+            Ok(())
+        }
         NodeMessageKind::SigningNonces => {
             state
                 .signing()
@@ -222,10 +238,6 @@ pub(crate) async fn handle(
                 .signing()
                 .handle_partial_signatures(message, &context)
                 .await?;
-            Ok(())
-        }
-        _ => {
-            tracing::debug!(?kind, "NodeMessage kind has no high-storm handler yet");
             Ok(())
         }
     }
@@ -334,6 +346,15 @@ mod tests {
             authorize_sender(NodeMessageKind::NetworkAssets, COORDINATOR, MEMBER).unwrap_err();
 
         assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
+    }
+
+    #[test]
+    fn only_coordinator_can_renew_storm_eyes() {
+        let error =
+            authorize_sender(NodeMessageKind::RenewStormUtxos, COORDINATOR, MEMBER).unwrap_err();
+
+        assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
+        authorize_sender(NodeMessageKind::RenewStormUtxos, COORDINATOR, COORDINATOR).unwrap();
     }
 
     #[test]

@@ -1130,7 +1130,24 @@ pub(crate) fn get_optional_explicit_outpoint(
     txid: Txid,
     output_index: u32,
 ) -> Result<Option<UTXO>, UserRequestError> {
-    let Some(output) = get_txout_optional(client, txid, output_index)? else {
+    get_optional_explicit_outpoint_with_mempool(client, txid, output_index, true)
+}
+
+pub(crate) fn get_optional_explicit_outpoint_ignoring_mempool(
+    client: &Client,
+    txid: Txid,
+    output_index: u32,
+) -> Result<Option<UTXO>, UserRequestError> {
+    get_optional_explicit_outpoint_with_mempool(client, txid, output_index, false)
+}
+
+fn get_optional_explicit_outpoint_with_mempool(
+    client: &Client,
+    txid: Txid,
+    output_index: u32,
+    include_mempool: bool,
+) -> Result<Option<UTXO>, UserRequestError> {
+    let Some(output) = get_txout_optional(client, txid, output_index, include_mempool)? else {
         return Ok(None);
     };
 
@@ -1177,7 +1194,7 @@ fn get_confirmed_fee_outpoint(
 ) -> Result<Option<UTXO>, UserRequestError> {
     let txid = Txid::from_str(&hex::encode(outpoint.txid))
         .map_err(|_| UserRequestError::Invalid("invalid UTXO txid".into()))?;
-    let Some(output) = get_txout_optional(client, txid, outpoint.output_index)? else {
+    let Some(output) = get_txout_optional(client, txid, outpoint.output_index, true)? else {
         return Ok(None);
     };
     if output.confirmations < MIN_FEE_UTXO_CONFIRMATIONS {
@@ -1191,10 +1208,15 @@ fn get_txout_optional(
     client: &Client,
     txid: Txid,
     output_index: u32,
+    include_mempool: bool,
 ) -> Result<Option<GetTxOut>, UserRequestError> {
     Ok(client.call::<Option<GetTxOut>>(
         "gettxout",
-        &[txid.to_string().into(), output_index.into(), true.into()],
+        &[
+            txid.to_string().into(),
+            output_index.into(),
+            include_mempool.into(),
+        ],
     )?)
 }
 

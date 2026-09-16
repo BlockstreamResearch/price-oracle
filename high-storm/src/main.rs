@@ -247,6 +247,26 @@ async fn run_until_shutdown(
                         tracing::warn!(%error, "failed to index confirmed blocks");
                     }
                 }
+                if indexed.is_ok() {
+                    match storm.reconcile_storm_eye_renewal().await {
+                        Ok(true) => {
+                            tracing::info!("confirmed Storm Eye timelock renewal");
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to reconcile Storm Eye timelock renewal");
+                        }
+                    }
+                    match storm.renew_storm_eye_timelock().await {
+                        Ok(Some(txid)) => {
+                            tracing::info!(txid = %hex::encode(txid), "broadcast Storm Eye timelock renewal");
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "Storm Eye timelock renewal failed");
+                        }
+                    }
+                }
                 if indexed.as_ref().is_ok_and(|block_count| *block_count > 0) {
                     match storm.storm_eye_utxo_count().await {
                         Ok(storm_eye_count) => {

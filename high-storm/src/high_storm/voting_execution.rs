@@ -879,9 +879,24 @@ fn operation_utxos(
         .collect()
 }
 
-fn scan_storm_eye_utxos(
+pub(crate) fn scan_storm_eye_utxos(
     client: &Client,
     storm_eye: &NetworkAsset,
+) -> Result<Vec<UTXO>, VotingExecutionError> {
+    scan_storm_eye_utxos_with_mempool(client, storm_eye, true)
+}
+
+pub(crate) fn scan_storm_eye_utxos_ignoring_mempool(
+    client: &Client,
+    storm_eye: &NetworkAsset,
+) -> Result<Vec<UTXO>, VotingExecutionError> {
+    scan_storm_eye_utxos_with_mempool(client, storm_eye, false)
+}
+
+fn scan_storm_eye_utxos_with_mempool(
+    client: &Client,
+    storm_eye: &NetworkAsset,
+    include_mempool: bool,
 ) -> Result<Vec<UTXO>, VotingExecutionError> {
     let descriptor = format!("raw({})", hex::encode(&storm_eye.contract_script));
     let scan: ScanResult = client.call(
@@ -895,7 +910,18 @@ fn scan_storm_eye_utxos(
         .map(|unspent| {
             let txid = Txid::from_str(&unspent.txid)
                 .map_err(|_| VotingExecutionError::Invalid("invalid Storm Eye txid".into()))?;
-            let utxo = get_explicit_outpoint(client, txid, unspent.vout)?;
+            let utxo = if include_mempool {
+                get_explicit_outpoint(client, txid, unspent.vout)?
+            } else {
+                super::user_requests::get_optional_explicit_outpoint_ignoring_mempool(
+                    client,
+                    txid,
+                    unspent.vout,
+                )?
+                .ok_or_else(|| {
+                    VotingExecutionError::Invalid("required Storm Eye UTXO is unavailable".into())
+                })?
+            };
             if utxo.asset() != expected_asset
                 || utxo.txout.script_pubkey.as_bytes() != storm_eye.contract_script
             {
@@ -926,7 +952,7 @@ fn live_treasury_utxo(
     )?)
 }
 
-fn verify_voting_amounts(
+pub(crate) fn verify_voting_amounts(
     transaction: &simplex::simplicityhl::elements::Transaction,
     spent_utxos: &[TxOut],
 ) -> Result<(), VotingExecutionError> {
@@ -1337,7 +1363,7 @@ fn validate_layout(
     Ok(())
 }
 
-fn voting_input(
+pub(crate) fn voting_input(
     client: &Client,
     txid: Txid,
     output_index: u32,
@@ -1512,7 +1538,7 @@ fn contract_data(storm_eye: &NetworkAsset) -> Result<StormEyeContractData, Votin
     .map_err(Into::into)
 }
 
-fn signing_hashes(
+pub(crate) fn signing_hashes(
     pset: &PartiallySignedTransaction,
     storm_eye: &NetworkAsset,
     network: &SimplicityNetwork,
@@ -1528,7 +1554,7 @@ fn signing_hashes(
         .collect()
 }
 
-fn network(client: &Client) -> Result<SimplicityNetwork, VotingExecutionError> {
+pub(crate) fn network(client: &Client) -> Result<SimplicityNetwork, VotingExecutionError> {
     #[derive(serde::Deserialize)]
     struct ChainInfo {
         chain: String,
