@@ -1,7 +1,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{assert_covenant_rejects, issue_asset};
+use common::{assert_covenant_rejects, issue_asset, wait_for_confirmation};
 
 use simplex::transaction::utxo::UTXO;
 use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, RequiredSignature};
@@ -30,7 +30,7 @@ fn fund_account(
 
     account.attach_account_creation(&mut ft, amount, context.get_network().policy_asset());
 
-    signer.broadcast(&ft)?.wait()?;
+    wait_for_confirmation(&signer.broadcast(&ft)?)?;
 
     context
         .get_default_provider()
@@ -85,7 +85,7 @@ fn spends_account_when_storm_eye_is_present(context: simplex::TestContext) -> an
     let storm_eye_utxo = signer.get_utxos_asset(storm_eye_asset)?[0].clone();
 
     let ft = spend_transaction(&context, &account, &account_utxo, &storm_eye_utxo);
-    signer.broadcast(&ft)?.wait()?;
+    wait_for_confirmation(&signer.broadcast(&ft)?)?;
 
     Ok(())
 }

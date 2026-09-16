@@ -3,7 +3,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{assert_covenant_rejects, issue_asset};
+use common::{assert_covenant_rejects, issue_asset, wait_for_confirmation};
 
 use simplex::simplicityhl::elements::{AssetId, Script};
 use simplex::transaction::partial_input::IssuanceInput;
@@ -149,7 +149,7 @@ fn issue_voucher(context: &simplex::TestContext, voucher: &Voucher) -> anyhow::R
         voucher.attach_voucher_creation(&mut ft, VOUCHER_TIMESTAMP, issuance.asset_id);
     }
 
-    signer.broadcast(&ft)?.wait()?;
+    wait_for_confirmation(&signer.broadcast(&ft)?)?;
 
     Ok(issuance.asset_id)
 }
@@ -371,7 +371,7 @@ fn network_authorization_does_not_constrain_voucher_outputs(
         ),
     )?;
 
-    context.get_default_signer().broadcast(&ft)?.wait()?;
+    wait_for_confirmation(&context.get_default_signer().broadcast(&ft)?)?;
 
     Ok(())
 }
@@ -416,7 +416,7 @@ fn burns_voucher_utxo_via_asset_auth(context: simplex::TestContext) -> anyhow::R
         burn_output(0, VOUCHER_TIMESTAMP, fixture.voucher_asset),
     )?;
 
-    context.get_default_signer().broadcast(&ft)?.wait()?;
+    wait_for_confirmation(&context.get_default_signer().broadcast(&ft)?)?;
 
     Ok(())
 }
@@ -438,7 +438,7 @@ fn burns_voucher_utxo_via_script_auth(context: simplex::TestContext) -> anyhow::
         burn_output(0, VOUCHER_TIMESTAMP, fixture.voucher_asset),
     )?;
 
-    context.get_default_signer().broadcast(&ft)?.wait()?;
+    wait_for_confirmation(&context.get_default_signer().broadcast(&ft)?)?;
 
     Ok(())
 }
@@ -459,7 +459,7 @@ fn burns_voucher_utxo_via_signature_auth(context: simplex::TestContext) -> anyho
         burn_output(0, VOUCHER_TIMESTAMP, fixture.voucher_asset),
     )?;
 
-    context.get_default_signer().broadcast(&ft)?.wait()?;
+    wait_for_confirmation(&context.get_default_signer().broadcast(&ft)?)?;
 
     Ok(())
 }
@@ -482,7 +482,7 @@ fn burns_voucher_utxo_when_storm_eye_is_present(
         op_return_output(VOUCHER_TIMESTAMP, fixture.voucher_asset),
     )?;
 
-    context.get_default_signer().broadcast(&ft)?.wait()?;
+    wait_for_confirmation(&context.get_default_signer().broadcast(&ft)?)?;
 
     Ok(())
 }
@@ -520,10 +520,7 @@ fn burns_multiple_voucher_utxos_to_one_empty_op_return(
         storm_eye_utxo.explicit_asset(),
     ));
 
-    context
-        .get_default_signer()
-        .broadcast(&transaction)?
-        .wait()?;
+    wait_for_confirmation(&context.get_default_signer().broadcast(&transaction)?)?;
 
     Ok(())
 }

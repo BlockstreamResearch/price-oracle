@@ -16,6 +16,8 @@ use contracts::{
     auth::{Branch, WITNESS_DEPTH, WitnessStep, build_tree, witness_proof},
 };
 
+use super::common::wait_for_confirmation;
+
 const SUPPLY: u64 = 500_000;
 
 fn issue_asset_to(
@@ -38,7 +40,7 @@ fn issue_asset_to(
         issuance.asset_id,
     ));
 
-    signer.broadcast(&final_utxo)?.wait()?;
+    wait_for_confirmation(&signer.broadcast(&final_utxo)?)?;
 
     Ok(issuance.asset_id)
 }
@@ -85,7 +87,7 @@ fn accepts_a_valid_inclusion_proof(context: simplex::TestContext) -> anyhow::Res
         utxo.explicit_asset(),
     ));
 
-    signer.broadcast(&final_utxo)?.wait()?;
+    wait_for_confirmation(&signer.broadcast(&final_utxo)?)?;
 
     Ok(())
 }

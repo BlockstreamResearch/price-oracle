@@ -2,6 +2,7 @@ use simplex::transaction::FinalTransaction;
 
 use contracts::auth::{AuthSpendPath, AuthStorage, build_tree};
 
+use super::common::wait_for_confirmation;
 use super::fixtures::StormEyeFixture;
 
 /// 1. Authorized inclusion in a transaction without storage updating.
@@ -19,10 +20,7 @@ fn spends_storm_eye_without_updating_storage(context: simplex::TestContext) -> a
     );
     fixture.add_storm_eye_outputs(&mut final_utxo, &[storm_eye_utxo.explicit_amount()]);
 
-    context
-        .get_default_signer()
-        .broadcast(&final_utxo)?
-        .wait()?;
+    wait_for_confirmation(&context.get_default_signer().broadcast(&final_utxo)?)?;
 
     Ok(())
 }
@@ -50,10 +48,7 @@ fn spends_storm_eye_with_update_storm_tree_root(
         fixture.bloom(),
     );
 
-    context
-        .get_default_signer()
-        .broadcast(&final_utxo)?
-        .wait()?;
+    wait_for_confirmation(&context.get_default_signer().broadcast(&final_utxo)?)?;
 
     Ok(())
 }
@@ -81,10 +76,7 @@ fn spends_storm_eye_with_update_rescue_block_number(
         fixture.bloom(),
     );
 
-    context
-        .get_default_signer()
-        .broadcast(&final_utxo)?
-        .wait()?;
+    wait_for_confirmation(&context.get_default_signer().broadcast(&final_utxo)?)?;
 
     Ok(())
 }

@@ -1,8 +1,25 @@
 #![allow(dead_code)]
+use simplex::provider::ProviderError;
 use simplex::signer::SignerError;
 use simplex::simplicityhl::elements::AssetId;
 use simplex::transaction::partial_input::IssuanceInput;
-use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, RequiredSignature};
+use simplex::transaction::{
+    FinalTransaction, PartialInput, PartialOutput, RequiredSignature, TxReceipt,
+};
+
+const CONFIRMATION_ATTEMPTS: usize = 5;
+
+pub fn wait_for_confirmation(receipt: &TxReceipt<'_>) -> Result<(), ProviderError> {
+    for attempt in 1..=CONFIRMATION_ATTEMPTS {
+        match receipt.wait() {
+            Ok(()) => return Ok(()),
+            Err(ProviderError::Confirmation()) if attempt < CONFIRMATION_ATTEMPTS => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("confirmation attempts are non-zero")
+}
 
 pub fn issue_asset(context: &simplex::TestContext, amount: u64) -> anyhow::Result<AssetId> {
     let signer = context.get_default_signer();
@@ -21,7 +38,7 @@ pub fn issue_asset(context: &simplex::TestContext, amount: u64) -> anyhow::Resul
         issuance.asset_id,
     ));
 
-    signer.broadcast(&ft)?.wait()?;
+    wait_for_confirmation(&signer.broadcast(&ft)?)?;
 
     Ok(issuance.asset_id)
 }

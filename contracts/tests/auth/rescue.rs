@@ -6,6 +6,7 @@ use simplex::{
     utils::hash_script,
 };
 
+use super::common::wait_for_confirmation;
 use super::fixtures::{StormEyeFixture, assert_covenant_rejects};
 
 /// How far below the chain tip to put the rescue height.
@@ -70,7 +71,7 @@ fn rescues_storm_eye_after_the_rescue_block_number(
         fixture.rescue_script_pubkey.clone(),
         fixture.storm_eye.rescue_number,
     )?;
-    context.get_default_signer().broadcast(&tx)?.wait()?;
+    wait_for_confirmation(&context.get_default_signer().broadcast(&tx)?)?;
 
     Ok(())
 }

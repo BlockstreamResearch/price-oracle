@@ -4,6 +4,7 @@ use simplex::transaction::FinalTransaction;
 
 use contracts::auth::AuthSpendPath;
 
+use super::common::wait_for_confirmation;
 use super::fixtures::{MAX_SPLIT_UTXOS_COUNT, StormEyeFixture, assert_covenant_rejects};
 
 /// One Storm Eye input declaring `declared_count`, and one covenant output per entry in `amounts`.
@@ -35,7 +36,7 @@ fn splits_storm_eye_into_multiple_utxos(context: simplex::TestContext) -> anyhow
     let amounts = [5_000u64, 3_000, 2_000];
 
     let tx = split_transaction(&fixture, &context, amounts.len() as u8, &amounts)?;
-    context.get_default_signer().broadcast(&tx)?.wait()?;
+    wait_for_confirmation(&context.get_default_signer().broadcast(&tx)?)?;
 
     Ok(())
 }
