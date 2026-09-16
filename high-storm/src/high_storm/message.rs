@@ -102,12 +102,51 @@ pub struct NetworkVoteRequest {
     pub payload: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct VotingProposal {
+    request: NetworkVoteRequest,
+    created_at_block_height: u64,
+}
+
 impl NetworkVoteRequest {
     pub fn new<T: Serialize>(kind: NetworkVoteKind, payload: &T) -> Result<Self, postcard::Error> {
         Ok(Self {
             kind: kind as u16,
             payload: postcard::to_stdvec(payload)?,
         })
+    }
+
+    pub(crate) fn canonical_hash(&self) -> Result<[u8; 32], postcard::Error> {
+        Ok(Sha256::digest(postcard::to_stdvec(self)?).into())
+    }
+}
+
+impl NodeMessage {
+    pub(crate) fn new_voting_request(
+        request: NetworkVoteRequest,
+        block_height: u64,
+    ) -> Result<Self, postcard::Error> {
+        Self::new(
+            NodeMessageKind::NetworkVoteRequest,
+            None,
+            &VotingProposal {
+                request,
+                created_at_block_height: block_height,
+            },
+        )
+    }
+
+    pub(crate) fn decode_voting_proposal(
+        &self,
+    ) -> Result<(NetworkVoteRequest, Option<u64>), postcard::Error> {
+        match self.decode_payload::<VotingProposal>() {
+            Ok(proposal) => Ok((proposal.request, Some(proposal.created_at_block_height))),
+            Err(_) => self.decode_payload().map(|request| (request, None)),
+        }
+    }
+
+    pub(crate) fn decode_voting_request(&self) -> Result<NetworkVoteRequest, postcard::Error> {
+        self.decode_voting_proposal().map(|(request, _)| request)
     }
 }
 

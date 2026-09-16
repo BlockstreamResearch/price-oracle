@@ -10,6 +10,7 @@ use high_storm::{
 };
 use secp256k1::{Keypair, PublicKey, SecretKey, schnorr};
 use secp256k1_zkp::PublicKey as TransportPublicKey;
+use serde::Serialize;
 use storm::PeerStatus;
 use tokio::time::timeout;
 
@@ -170,18 +171,92 @@ async fn rejects_every_structurally_invalid_voting_request() {
     }
     assert!(network.nodes[0].voting_requests().await.unwrap().is_empty());
 
+    network.shutdown().await;
+}
+
+#[tokio::test]
+async fn deduplicates_height_variant_proposals_by_canonical_request() {
+    #[derive(Serialize)]
+    struct WireVotingProposal {
+        request: NetworkVoteRequest,
+        created_at_block_height: u64,
+    }
+
+    let mut network = TestNetwork::start().await;
     let valid = split_request(2);
     let hash = network.nodes[0]
         .create_voting_request(valid.clone(), START_HEIGHT)
         .await
         .unwrap();
     wait_for_request_on_all(&network.nodes, hash).await;
+
+    let replay = NodeMessage::new(
+        NodeMessageKind::NetworkVoteRequest,
+        None,
+        &WireVotingProposal {
+            request: valid.clone(),
+            created_at_block_height: START_HEIGHT + 1,
+        },
+    )
+    .unwrap();
+    let replay_hash = replay.hash().unwrap();
+    send_direct(
+        &network.nodes[0],
+        transport_key(&network.definitions[1].public_key),
+        replay,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        network.nodes[1]
+            .voting_request(replay_hash)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
     assert!(matches!(
         network.nodes[0]
-            .create_voting_request(valid, START_HEIGHT + 1)
+            .create_voting_request(valid.clone(), START_HEIGHT + 1)
             .await,
         Err(VotingError::DuplicateRequest(_))
     ));
+
+    let repeated_height = START_HEIGHT + VOTING_TIMEOUT_BLOCKS;
+    for node in &network.nodes {
+        node.set_block_height(repeated_height);
+    }
+    let repeated_hash = network.nodes[0]
+        .create_voting_request(valid, repeated_height)
+        .await
+        .unwrap();
+    wait_for_request_on_all(&network.nodes, repeated_hash).await;
+    assert_ne!(repeated_hash, hash);
+
+    let future = NodeMessage::new(
+        NodeMessageKind::NetworkVoteRequest,
+        None,
+        &WireVotingProposal {
+            request: split_request(3),
+            created_at_block_height: repeated_height + 2,
+        },
+    )
+    .unwrap();
+    let future_hash = future.hash().unwrap();
+    send_direct(
+        &network.nodes[0],
+        transport_key(&network.definitions[1].public_key),
+        future,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        network.nodes[1]
+            .voting_request(future_hash)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     network.shutdown().await;
 }

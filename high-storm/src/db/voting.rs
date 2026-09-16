@@ -167,6 +167,28 @@ impl VotingStore {
         Ok(requests)
     }
 
+    pub async fn unconfirmed_request_messages(
+        &self,
+    ) -> Result<Vec<(Vec<u8>, u64, Option<u64>)>, Error> {
+        sqlx::query(
+            "SELECT message, block_height, approved_at_block_height FROM voting_requests \
+             WHERE execution_confirmed = 0",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get("message")?,
+                i64_to_height(row.try_get("block_height")?)?,
+                row.try_get::<Option<i64>, _>("approved_at_block_height")?
+                    .map(i64_to_height)
+                    .transpose()?,
+            ))
+        })
+        .collect()
+    }
+
     pub async fn start_execution(
         &self,
         message_hash: [u8; 32],
