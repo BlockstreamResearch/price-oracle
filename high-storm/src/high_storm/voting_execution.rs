@@ -733,7 +733,7 @@ fn decode_operation(
     current_members: &BTreeSet<[u8; 32]>,
 ) -> Result<ReshapeOperation, VotingExecutionError> {
     let message: NodeMessage = postcard::from_bytes(&stored.message)?;
-    let request: crate::NetworkVoteRequest = message.decode_payload()?;
+    let request = message.decode_voting_request()?;
     match NetworkVoteKind::from_id(request.kind) {
         Some(NetworkVoteKind::MergeStormEyes) => {
             let merge: MergeStormEyes = postcard::from_bytes(&request.payload)?;
@@ -791,7 +791,7 @@ fn storm_eye_reservations(
     let mut reservations = BTreeMap::new();
     for vote in votes.iter().filter(|vote| !vote.execution_confirmed) {
         let message: NodeMessage = postcard::from_bytes(&vote.message)?;
-        let request: crate::NetworkVoteRequest = message.decode_payload()?;
+        let request = message.decode_voting_request()?;
         if NetworkVoteKind::from_id(request.kind) == Some(NetworkVoteKind::UpdateNetworkMembers) {
             continue;
         }

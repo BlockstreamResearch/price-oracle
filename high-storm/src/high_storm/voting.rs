@@ -14,6 +14,7 @@ use super::message::{
 };
 
 pub const VOTING_TIMEOUT_BLOCKS: u64 = 10_080;
+const MAX_PROPOSAL_FUTURE_BLOCKS: u64 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VotingStatus {
@@ -100,7 +101,9 @@ impl Voting {
         let _guard = self.operations.lock().await;
         let peers = storm.peers().await;
         validate_request(&request, &peers, self.coordinator)?;
-        let message = NodeMessage::new(NodeMessageKind::NetworkVoteRequest, None, &request)?;
+        self.ensure_unique_active_request(&request, block_height)
+            .await?;
+        let message = NodeMessage::new_voting_request(request, block_height)?;
         let hash = message.hash()?;
         let encoded = postcard::to_stdvec(&message)?;
         let proposer = controlled_member_key(&peers)?;
@@ -181,10 +184,13 @@ impl Voting {
                 "a voting request cannot link to another message".into(),
             ));
         }
-        let request: NetworkVoteRequest = message.decode_payload()?;
+        let (request, created_at_block_height) = message.decode_voting_proposal()?;
+        validate_proposal_height(created_at_block_height, block_height)?;
         let _guard = self.operations.lock().await;
         let peers = context.storm_handle.peers().await;
         validate_request(&request, &peers, self.coordinator)?;
+        self.ensure_unique_active_request(&request, block_height)
+            .await?;
         let hash = message.hash()?;
         let encoded = postcard::to_stdvec(&message)?;
         let proposer = node_key(context.message_context.peer_public_key)?;
@@ -301,8 +307,11 @@ impl Voting {
                         node_key(sender_public_key)?,
                         "voting synchronization sender",
                     )?;
-                    let request: NetworkVoteRequest = message.decode_payload()?;
-                    validate_request(&request, &peers, self.coordinator)?;
+                    let (request, created_at_block_height) = message.decode_voting_proposal()?;
+                    validate_proposal_height(created_at_block_height, block_height)?;
+                    validate_synchronized_request(&request, &peers, self.coordinator)?;
+                    self.ensure_unique_active_request(&request, block_height)
+                        .await?;
                     self.store
                         .insert_synchronized_request(
                             synchronized.message_hash,
@@ -485,6 +494,48 @@ impl Voting {
             .delete_expired(block_height, VOTING_TIMEOUT_BLOCKS)
             .await?)
     }
+
+    async fn ensure_unique_active_request(
+        &self,
+        request: &NetworkVoteRequest,
+        block_height: u64,
+    ) -> Result<(), VotingError> {
+        let canonical_hash = request.canonical_hash()?;
+        for (message, created_at, approved_at) in self.store.unconfirmed_request_messages().await? {
+            let timeout_start = approved_at.unwrap_or(created_at);
+            if timeout_start.saturating_add(VOTING_TIMEOUT_BLOCKS) <= block_height {
+                continue;
+            }
+
+            let message: NodeMessage = postcard::from_bytes(&message)?;
+            if message.decode_voting_request()?.canonical_hash()? == canonical_hash {
+                return Err(VotingError::DuplicateRequest(hex::encode(canonical_hash)));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_proposal_height(
+    created_at_block_height: Option<u64>,
+    observed_block_height: u64,
+) -> Result<(), VotingError> {
+    let Some(created_at_block_height) = created_at_block_height else {
+        return Ok(());
+    };
+    if created_at_block_height > observed_block_height.saturating_add(MAX_PROPOSAL_FUTURE_BLOCKS) {
+        return Err(VotingError::InvalidRequest(
+            "voting proposal was created too far in the future".into(),
+        ));
+    }
+    if created_at_block_height.saturating_add(VOTING_TIMEOUT_BLOCKS) <= observed_block_height {
+        return Err(VotingError::InvalidRequest(
+            "voting proposal has expired".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_request(
@@ -492,10 +543,68 @@ fn validate_request(
     peers: &[Peer],
     coordinator: [u8; 32],
 ) -> Result<(), VotingError> {
+    validate_request_structure(request)?;
+
+    if NetworkVoteKind::from_id(request.kind) != Some(NetworkVoteKind::UpdateNetworkMembers) {
+        return Ok(());
+    }
+
+    let update: UpdateNetworkMembers = postcard::from_bytes(&request.payload)?;
+    let current = member_keys(peers)?;
+    let accepted = update.to_accept.into_iter().collect::<BTreeSet<_>>();
+    let removed = update.to_remove.into_iter().collect::<BTreeSet<_>>();
+    if let Some(key) = accepted.intersection(&current).next() {
+        return Err(VotingError::InvalidRequest(format!(
+            "accepted key {} is already a member",
+            hex::encode(key)
+        )));
+    }
+    if let Some(key) = removed.difference(&current).next() {
+        return Err(VotingError::InvalidRequest(format!(
+            "removed key {} is not a member",
+            hex::encode(key)
+        )));
+    }
+    if removed.contains(&coordinator) {
+        return Err(VotingError::InvalidRequest(
+            "member update cannot remove the coordinator without a replacement protocol".into(),
+        ));
+    }
+    let resulting_count = current.len() + accepted.len() - removed.len();
+    if resulting_count < 3 {
+        return Err(VotingError::InvalidRequest(
+            "member update must leave at least three members".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_synchronized_request(
+    request: &NetworkVoteRequest,
+    peers: &[Peer],
+    coordinator: [u8; 32],
+) -> Result<(), VotingError> {
+    validate_request_structure(request)?;
+
+    if NetworkVoteKind::from_id(request.kind) == Some(NetworkVoteKind::UpdateNetworkMembers) {
+        let update: UpdateNetworkMembers = postcard::from_bytes(&request.payload)?;
+        let current = member_keys(peers)?;
+        let accepted = update.to_accept.into_iter().collect::<BTreeSet<_>>();
+        let removed = update.to_remove.into_iter().collect::<BTreeSet<_>>();
+        let already_applied = accepted.is_subset(&current) && removed.is_disjoint(&current);
+        if already_applied && !removed.contains(&coordinator) {
+            return Ok(());
+        }
+    }
+
+    validate_request(request, peers, coordinator)
+}
+
+fn validate_request_structure(request: &NetworkVoteRequest) -> Result<(), VotingError> {
     match NetworkVoteKind::from_id(request.kind) {
         Some(NetworkVoteKind::UpdateNetworkMembers) => {
             let update: UpdateNetworkMembers = postcard::from_bytes(&request.payload)?;
-            let current = member_keys(peers)?;
             let accepted = checked_unique_keys(&update.to_accept, "accepted")?;
             let removed = checked_unique_keys(&update.to_remove, "removed")?;
             if accepted.is_empty() && removed.is_empty() {
@@ -503,29 +612,11 @@ fn validate_request(
                     "member update does not change the network".into(),
                 ));
             }
-            if let Some(key) = accepted.intersection(&current).next() {
+            if let Some(key) = accepted.intersection(&removed).next() {
                 return Err(VotingError::InvalidRequest(format!(
-                    "accepted key {} is already a member",
+                    "member key {} cannot be both accepted and removed",
                     hex::encode(key)
                 )));
-            }
-            if let Some(key) = removed.difference(&current).next() {
-                return Err(VotingError::InvalidRequest(format!(
-                    "removed key {} is not a member",
-                    hex::encode(key)
-                )));
-            }
-            if removed.contains(&coordinator) {
-                return Err(VotingError::InvalidRequest(
-                    "member update cannot remove the coordinator without a replacement protocol"
-                        .into(),
-                ));
-            }
-            let resulting_count = current.len() + accepted.len() - removed.len();
-            if resulting_count < 3 {
-                return Err(VotingError::InvalidRequest(
-                    "member update must leave at least three members".into(),
-                ));
             }
         }
         Some(NetworkVoteKind::MergeStormEyes) => {
@@ -628,7 +719,7 @@ pub(super) fn active_remote_peers(peers: &[Peer]) -> Vec<[u8; 33]> {
 
 fn decode_stored(stored: StoredVotingRequest) -> Result<VotingRequest, VotingError> {
     let message: NodeMessage = postcard::from_bytes(&stored.message)?;
-    let request = message.decode_payload()?;
+    let request = message.decode_voting_request()?;
     Ok(VotingRequest {
         message_hash: stored.message_hash,
         request,
@@ -710,6 +801,15 @@ mod reshape_tests {
     use super::*;
     use crate::StormEyeUtxo;
     use secp256k1_zkp::{Secp256k1, SecretKey};
+
+    #[test]
+    fn proposal_heights_are_bounded_by_the_voting_window() {
+        assert!(validate_proposal_height(Some(100), 100).is_ok());
+        assert!(validate_proposal_height(Some(101), 100).is_ok());
+        assert!(validate_proposal_height(Some(102), 100).is_err());
+        assert!(validate_proposal_height(Some(100), 100 + VOTING_TIMEOUT_BLOCKS - 1).is_ok());
+        assert!(validate_proposal_height(Some(100), 100 + VOTING_TIMEOUT_BLOCKS).is_err());
+    }
 
     #[test]
     fn broadcast_vote_remains_executing_until_confirmed() {
@@ -834,6 +934,56 @@ mod reshape_tests {
             validate_request(&update, &peers, coordinator),
             Err(VotingError::InvalidRequest(message))
                 if message.contains("cannot remove the coordinator")
+        ));
+    }
+
+    #[test]
+    fn historical_member_updates_synchronize_after_membership_changes() {
+        let secp = Secp256k1::new();
+        let peers = (1..=4)
+            .map(|byte| {
+                Peer::new(
+                    SecretKey::from_slice(&[byte; 32])
+                        .unwrap()
+                        .public_key(&secp)
+                        .serialize(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let changed_member = PublicKey::from_slice(&peers[3].compressed_public_key)
+            .unwrap()
+            .x_only_public_key()
+            .0
+            .serialize();
+        let update = NetworkVoteRequest::new(
+            NetworkVoteKind::UpdateNetworkMembers,
+            &UpdateNetworkMembers {
+                to_accept: vec![changed_member],
+                to_remove: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(validate_synchronized_request(&update, &peers, [0; 32]).is_ok());
+        assert!(matches!(
+            validate_request(&update, &peers, [0; 32]),
+            Err(VotingError::InvalidRequest(message)) if message.contains("already a member")
+        ));
+
+        let remaining_peers = peers[..3].to_vec();
+        let update = NetworkVoteRequest::new(
+            NetworkVoteKind::UpdateNetworkMembers,
+            &UpdateNetworkMembers {
+                to_accept: Vec::new(),
+                to_remove: vec![changed_member],
+            },
+        )
+        .unwrap();
+
+        assert!(validate_synchronized_request(&update, &remaining_peers, [0; 32]).is_ok());
+        assert!(matches!(
+            validate_request(&update, &remaining_peers, [0; 32]),
+            Err(VotingError::InvalidRequest(message)) if message.contains("is not a member")
         ));
     }
 
