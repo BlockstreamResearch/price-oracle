@@ -1,4 +1,4 @@
-FROM oven/bun:1.3.14 AS builder
+FROM --platform=$BUILDPLATFORM oven/bun:1.3.14 AS builder
 
 WORKDIR /app
 COPY web/operator/package.json web/operator/bun.lock ./
