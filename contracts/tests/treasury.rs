@@ -28,7 +28,7 @@ fn fund_treasury(
         RequiredSignature::NativeEcdsa,
     );
 
-    treasury.attach_treasury_output(&mut ft, amount, context.get_network().policy_asset());
+    treasury.attach_treasury_creation(&mut ft, amount, context.get_network().policy_asset());
 
     signer.broadcast(&ft)?.wait()?;
 
@@ -55,7 +55,7 @@ fn spend_transaction(
         RequiredSignature::NativeEcdsa,
     );
 
-    treasury.attach_treasury_output(
+    treasury.attach_treasury_creation(
         &mut ft,
         treasury_utxo.explicit_amount(),
         treasury_utxo.explicit_asset(),

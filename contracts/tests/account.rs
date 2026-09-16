@@ -28,7 +28,7 @@ fn fund_account(
         RequiredSignature::NativeEcdsa,
     );
 
-    account.attach_account_output(&mut ft, amount, context.get_network().policy_asset());
+    account.attach_account_creation(&mut ft, amount, context.get_network().policy_asset());
 
     signer.broadcast(&ft)?.wait()?;
 
@@ -56,7 +56,7 @@ fn spend_transaction(
         RequiredSignature::NativeEcdsa,
     );
 
-    account.attach_account_output(
+    account.attach_account_creation(
         &mut ft,
         account_utxo.explicit_amount(),
         account_utxo.explicit_asset(),

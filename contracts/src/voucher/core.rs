@@ -65,7 +65,7 @@ impl Voucher {
     }
 
     /// Adds the burn output for a user-path spend of `voucher_utxo` at `voucher_input_index`.
-    pub fn attach_burn_output(
+    pub fn attach_voucher_output(
         &self,
         ft: &mut FinalTransaction,
         voucher_utxo: &UTXO,
@@ -79,7 +79,12 @@ impl Voucher {
     }
 
     /// Adds an output that pays `amount` of `asset_id` to this Voucher.
-    pub fn attach_voucher_output(&self, ft: &mut FinalTransaction, amount: u64, asset_id: AssetId) {
+    pub fn attach_voucher_creation(
+        &self,
+        ft: &mut FinalTransaction,
+        amount: u64,
+        asset_id: AssetId,
+    ) {
         ft.add_output(PartialOutput::new(
             self.get_script_pubkey(),
             amount,

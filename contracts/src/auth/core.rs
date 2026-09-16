@@ -126,7 +126,7 @@ impl Auth {
     }
 
     /// Adds an output that pays `amount` of `asset_id` to this Storm Eye.
-    pub fn attach_storm_eye_output(
+    pub fn attach_storm_eye_creation(
         &self,
         ft: &mut FinalTransaction,
         amount: u64,

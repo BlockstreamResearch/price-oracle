@@ -1,11 +1,6 @@
 use std::lib::asserts::{assert_eq_32, assert_eq_256};
 
-use crate::helper::{
-    get_input_asset,
-    get_input_script_hash,
-    get_output_script_hash,
-    assert_output_preserves_utxo
-};
+use crate::helper::{get_input_asset, get_input_script_hash, assert_output_preserves_utxo};
 
 /// 1. asset_auth_utxo_input_index, voucher_utxo_output_index
 type AssetAuthWit = (u32, u32);
@@ -19,10 +14,9 @@ type NetworkAuthWit = u32;
 type AuthKindLeft = Either<AssetAuthWit, ScriptAuthWit>;
 type AuthKindRight = Either<SignAuthWit, NetworkAuthWit>;
 
-/// Hash of `OP_RETURN <voucher_input_index>`, the index pushed as 4 big-endian bytes.
-fn get_burn_script_hash(voucher_input_index: u32) -> u256 {
+/// SHA-256 of `voucher_input_index` as 4 big-endian bytes
+fn get_burn_tag_hash(voucher_input_index: u32) -> u256 {
     let hash_ctx: Ctx8 = jet::sha_256_ctx_8_init();
-    let hash_ctx: Ctx8 = jet::sha_256_ctx_8_add_2(hash_ctx, 0x6a04); // OP_RETURN
     let hash_ctx: Ctx8 = jet::sha_256_ctx_8_add_4(hash_ctx, voucher_input_index);
 
     jet::sha_256_ctx_8_finalize(hash_ctx)
@@ -30,10 +24,13 @@ fn get_burn_script_hash(voucher_input_index: u32) -> u256 {
 
 fn assert_voucher_utxo_burned(voucher_utxo_output_index: u32) {
     assert_output_preserves_utxo(voucher_utxo_output_index);
-    assert_eq_256(
-        get_output_script_hash(voucher_utxo_output_index),
-        get_burn_script_hash(jet::current_index())
+
+    let tag: Either<(u2, u256), Either<u1, u4>> = unwrap(
+        unwrap(jet::output_null_datum(voucher_utxo_output_index, 0))
     );
+    let (_, tag_hash): (u2, u256) = unwrap_left::<Either<u1, u4>>(tag);
+
+    assert_eq_256(tag_hash, get_burn_tag_hash(jet::current_index()));
 }
 
 /// 1. User spending via the Asset authorization method.

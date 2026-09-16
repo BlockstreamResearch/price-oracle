@@ -153,7 +153,7 @@ fn issue_voucher(context: &simplex::TestContext, voucher: &Voucher) -> anyhow::R
         RequiredSignature::NativeEcdsa,
     );
     for _ in 0..2 {
-        voucher.attach_voucher_output(&mut ft, VOUCHER_TIMESTAMP, issuance.asset_id);
+        voucher.attach_voucher_creation(&mut ft, VOUCHER_TIMESTAMP, issuance.asset_id);
     }
 
     signer.broadcast(&ft)?.wait()?;
@@ -301,7 +301,7 @@ fn burns_two_vouchers_to_their_own_tagged_outputs(
     );
     fixture
         .voucher
-        .attach_burn_output(&mut ft, &voucher_utxos[1], 0);
+        .attach_voucher_output(&mut ft, &voucher_utxos[1], 0);
 
     context.get_default_signer().broadcast(&ft)?.wait()?;
 
