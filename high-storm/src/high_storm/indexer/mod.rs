@@ -7,7 +7,7 @@ use secp256k1_zkp::Secp256k1;
 use simplex::{
     provider::SimplicityNetwork,
     simplicityhl::{
-        elements::{AssetId, Block, BlockHash, Transaction, TxOut, encode},
+        elements::{AssetId, Block, BlockHash, Transaction, TxOut, Txid, encode},
         simplicity::hashes::Hash,
     },
 };
@@ -24,7 +24,7 @@ use crate::{
 
 use super::{
     assets::{
-        initial_members_from_script, migrated_members_proposer_from_script,
+        initial_members_from_script, migrated_members_proposer_from_script, renewed_storm_eye,
         treasury_blinding_secret,
     },
     droplets::member_from_script,
@@ -95,7 +95,7 @@ impl Indexer {
 
     pub(crate) async fn sync(&self) -> Result<u64, IndexerError> {
         let _guard = self.sync_lock.lock().await;
-        let storm_eye = self
+        let mut storm_eye = self
             .assets
             .get(STORM_EYE_KIND)
             .await?
@@ -137,6 +137,21 @@ impl Indexer {
             let hash = block_hash(&client, height)?;
             let block = get_block(&client, hash)?;
             let indexed_block = IndexedBlock { height, hash };
+            if let Some((txid, renewed)) =
+                indexed_storm_eye_renewal(&client, &block.txdata, &storm_eye, &network)?
+            {
+                if !self
+                    .assets
+                    .index_storm_eye_renewal(&storm_eye, &renewed)
+                    .await?
+                {
+                    return Err(IndexerError::Invalid(
+                        "indexed Storm Eye renewal does not match active state".into(),
+                    ));
+                }
+                tracing::info!(%txid, height, "indexed Storm Eye timelock renewal");
+                storm_eye = renewed;
+            }
             if height >= issued_height {
                 let issued = issued_tick_utxos(
                     &client,
@@ -224,6 +239,63 @@ impl Indexer {
             ),
         )?)
     }
+}
+
+fn indexed_storm_eye_renewal(
+    client: &Client,
+    transactions: &[Transaction],
+    current: &crate::NetworkAsset,
+    network: &SimplicityNetwork,
+) -> Result<Option<(Txid, crate::NetworkAsset)>, IndexerError> {
+    let renewed = renewed_storm_eye(current, network)
+        .map_err(|error| IndexerError::Invalid(error.to_string()))?;
+    let mut matched = None;
+    for transaction in transactions {
+        if !matches_storm_eye_supply(&transaction.output, &renewed)? {
+            continue;
+        }
+        let spent = transaction
+            .input
+            .iter()
+            .map(|input| previous_output(client, input.previous_output))
+            .collect::<Result<Vec<_>, _>>()?;
+        if !matches_storm_eye_supply(&spent, current)? {
+            continue;
+        }
+        if matched.is_some() {
+            return Err(IndexerError::Invalid(
+                "block contains multiple Storm Eye renewal transactions".into(),
+            ));
+        }
+        matched = Some((transaction.txid(), renewed.clone()));
+    }
+    Ok(matched)
+}
+
+fn matches_storm_eye_supply(
+    outputs: &[TxOut],
+    storm_eye: &crate::NetworkAsset,
+) -> Result<bool, IndexerError> {
+    let asset =
+        asset_id(storm_eye.asset_id).map_err(|error| IndexerError::Invalid(error.to_string()))?;
+    let mut amount = 0u64;
+    let mut found = false;
+    for output in outputs {
+        if output.asset.explicit() != Some(asset) {
+            continue;
+        }
+        found = true;
+        if output.script_pubkey.as_bytes() != storm_eye.contract_script {
+            return Ok(false);
+        }
+        let Some(output_amount) = output.value.explicit() else {
+            return Ok(false);
+        };
+        amount = amount
+            .checked_add(output_amount)
+            .ok_or_else(|| IndexerError::Invalid("Storm Eye amount overflow".into()))?;
+    }
+    Ok(found && amount == storm_eye.supply)
 }
 
 fn exchange_recovery(
@@ -701,6 +773,39 @@ mod tests {
             spent_monitored_outpoints(&[transaction]),
             vec![([1; 32], 7, spending_txid)]
         );
+    }
+
+    #[test]
+    fn recognizes_only_the_complete_storm_eye_supply_at_one_script() {
+        let asset_bytes = [7; 32];
+        let asset = AssetId::from_byte_array(asset_bytes);
+        let storm_eye = crate::NetworkAsset {
+            kind: STORM_EYE_KIND.into(),
+            name: "Storm Eye".into(),
+            asset_id: asset_bytes,
+            reissuance_token_id: None,
+            entropy: None,
+            issuance_txid: [2; 32],
+            contract_script: vec![0x51],
+            contract_data: None,
+            supply: 10_000,
+            created_at_block: 1,
+        };
+        let complete = vec![
+            explicit_output(asset, 4_000, Script::from(vec![0x51])),
+            explicit_output(asset, 6_000, Script::from(vec![0x51])),
+        ];
+
+        assert!(matches_storm_eye_supply(&complete, &storm_eye).unwrap());
+
+        let partial = vec![explicit_output(asset, 9_999, Script::from(vec![0x51]))];
+        assert!(!matches_storm_eye_supply(&partial, &storm_eye).unwrap());
+
+        let split_scripts = vec![
+            explicit_output(asset, 4_000, Script::from(vec![0x51])),
+            explicit_output(asset, 6_000, Script::from(vec![0x52])),
+        ];
+        assert!(!matches_storm_eye_supply(&split_scripts, &storm_eye).unwrap());
     }
 
     #[test]

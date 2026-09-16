@@ -21,7 +21,7 @@ use tokio::{
 
 use super::message::{
     BurnExpiredUtxos, ExchangeRewards, ExecuteUserRequests, ExecuteVotingRequest, ExternalRequests,
-    NodeMessage, NodeMessageKind, PartialSignaturesMessage, SigningNoncesMessage,
+    NodeMessage, NodeMessageKind, PartialSignaturesMessage, RenewStormUtxos, SigningNoncesMessage,
 };
 
 const SIGNING_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -281,6 +281,25 @@ impl Signing {
         .await
     }
 
+    pub(crate) async fn sign_renew_storm_utxos(
+        &self,
+        storm: &StormHandle,
+        request: &RenewStormUtxos,
+    ) -> Result<SigningResult, SigningError> {
+        let template = request.clone();
+        self.sign_with_message(
+            storm,
+            request.signing_hashes.clone(),
+            SIGNING_SESSION_TIMEOUT,
+            move |branch| {
+                let mut request = template.clone();
+                request.signing_storm_tree_branch = branch;
+                NodeMessage::new(NodeMessageKind::RenewStormUtxos, None, &request)
+            },
+        )
+        .await
+    }
+
     async fn sign_with_message<F>(
         &self,
         storm: &StormHandle,
@@ -528,6 +547,46 @@ impl Signing {
         if request.tx.is_empty() || request.final_tx.is_some() {
             return Err(SigningError::InvalidMessage(
                 "invalid voting execution transaction".into(),
+            ));
+        }
+        let request_hash = message.hash()?;
+        let peers = context.storm_handle.peers().await;
+        let sender = node_key(&context.message_context.peer_public_key)?;
+        let outbound = {
+            let mut state = self.state.lock().await;
+            state.refresh_members(&peers)?;
+            state.remove_expired_sessions();
+            state.start_session(
+                request_hash,
+                sender,
+                SigningRequest {
+                    signing_storm_tree_branch: request.signing_storm_tree_branch,
+                    message_hashes: request.signing_hashes,
+                },
+                None,
+            )?
+        };
+        if let Some(outbound) = outbound {
+            send_from_handle(
+                &context.storm_handle,
+                outbound,
+                self.session_recipients(request_hash).await?,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn handle_renew_storm_utxos(
+        &self,
+        message: NodeMessage,
+        context: &StormContext,
+    ) -> Result<(), SigningError> {
+        let request: RenewStormUtxos = message.decode_payload()?;
+        if request.tx.is_empty() || request.signing_hashes.is_empty() || request.final_tx.is_some()
+        {
+            return Err(SigningError::InvalidMessage(
+                "invalid Storm Eye renewal transaction".into(),
             ));
         }
         let request_hash = message.hash()?;
