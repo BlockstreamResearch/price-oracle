@@ -1,5 +1,7 @@
 use std::lib::asserts::assert_eq_256;
 
+use crate::lib::sha256::{padding_head, padding_64_tail, padding_96_tail};
+
 /// One level of the fold: path bit (is_right = true) with sibling node hash
 type StormTreeProofStep = Either<(), (bool, u256)>;
 
@@ -7,28 +9,7 @@ type StormTreeProofStep = Either<(), (bool, u256)>;
 /// combination's MuSig2 key, and its inclusion proof under the stored root.
 pub type StormTreeBloom = (Signature, Pubkey, [StormTreeProofStep; 17]);
 
-// SHA-256 padding blocks. Every message here has a length known at compile time, so its
-// padding is constant and `sha_256_block` can replace a `Ctx8`. Only the trailing bit
-// count varies.
-
-fn padding_head() -> u256 {
-    0x8000000000000000000000000000000000000000000000000000000000000000
-}
-
-/// 64-byte message: 512 bits.
-fn padding_64_tail() -> u256 {
-    0x0000000000000000000000000000000000000000000000000000000000000200
-}
-
-/// 96-byte message: 768 bits. Its padding fits beside the last 32 bytes of data, so this
-/// is a whole half-block and takes no [`padding_head`].
-fn padding_96_tail() -> u256 {
-    0x8000000000000000000000000000000000000000000000000000000000000300
-}
-
-/// The second half of a leaf's only block: the `0x01` domain separator, then the padding
-/// for a 33-byte message (264 bits). Data and padding share one block, so a leaf costs a
-/// single compression.
+/// Used for more optimized hashing in one block.
 fn leaf_tail() -> u256 {
     0x0180000000000000000000000000000000000000000000000000000000000108
 }

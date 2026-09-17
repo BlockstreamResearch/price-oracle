@@ -1,6 +1,6 @@
 use std::lib::asserts::{assert_eq_32, assert_eq_256};
 
-use crate::helper::{get_input_asset, get_input_script_hash, assert_output_preserves_utxo};
+use crate::lib::tx::{get_input_asset, get_input_script_hash, assert_output_preserves_utxo};
 
 /// 1. asset_auth_utxo_input_index, voucher_utxo_output_index
 type AssetAuthWit = (u32, u32);
