@@ -77,6 +77,18 @@ impl TestNetwork {
             node.shutdown().await;
         }
     }
+
+    /// Stops the first node and starts it again from its store, a round later.
+    async fn restart_first(&mut self) {
+        self.nodes[0].shutdown().await;
+        wait_for_peer_status(&self.nodes[1], xonly_key(31), PeerStatus::Inactive).await;
+        self.nodes[0] = start_initialized(&self.definitions[0].config, &self.definitions[0].store)
+            .await
+            .unwrap();
+        self.nodes[0].start(None).await.unwrap();
+        wait_for_all_connections(&self.nodes).await;
+        next_round().await;
+    }
 }
 
 #[tokio::test]
@@ -173,17 +185,7 @@ async fn does_not_reattest_the_same_observation_after_restart() {
     assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 1);
     wait_for_attestation(&network.nodes[1]).await;
 
-    network.nodes[0].shutdown().await;
-    wait_for_peer_status(&network.nodes[1], xonly_key(31), PeerStatus::Inactive).await;
-    network.nodes[0] = start_initialized(
-        &network.definitions[0].config,
-        &network.definitions[0].store,
-    )
-    .await
-    .unwrap();
-    network.nodes[0].start(None).await.unwrap();
-    wait_for_all_connections(&network.nodes).await;
-    next_round().await;
+    network.restart_first().await;
 
     // The observation it already attested is not attested again.
     network.nodes[0]
@@ -223,6 +225,40 @@ async fn attests_a_cross_pair_once_both_its_legs_are_observed() {
     // While neither leg moves, it is not recomputed or attested again.
     next_round().await;
     assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 0);
+
+    network.shutdown().await;
+}
+
+#[tokio::test]
+async fn does_not_reattest_a_cross_pair_rebuilt_after_restart() {
+    let mut network = TestNetwork::start().await;
+    let legs = [
+        (LBTC_USD, observation(6_000_000_000_000)),
+        (USDT_USD, observation(80_000_000)),
+    ];
+
+    for (feed, leg) in legs {
+        let node = network.nodes[0].handle();
+        node.record_price_observation(feed, 0, leg).await;
+    }
+    assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 3);
+    wait_for_feed(&network.nodes[1], LBTC_USDT).await;
+
+    network.restart_first().await;
+
+    // The same legs rebuild the same pair, no newer than they are.
+    for (feed, leg) in legs {
+        let node = network.nodes[0].handle();
+        node.record_price_observation(feed, 0, leg).await;
+    }
+    assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 0);
+
+    // A newer leg releases the pair along with itself.
+    network.nodes[0]
+        .handle()
+        .record_price_observation(USDT_USD, 0, observation_at(75_000_000, now() + 1))
+        .await;
+    assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 2);
 
     network.shutdown().await;
 }

@@ -95,12 +95,12 @@ fn extend(
 }
 
 /// Prices a Cross pair at its own decimals from the values of its route's
-/// legs, in i128, valid until its stalest leg is. `None` when the price does
-/// not fit in a `u64`.
+/// legs, in i128. It is as new as its freshest leg and valid until its stalest
+/// one, so the same legs always give the same value. `None` when the price
+/// rounds to zero or does not fit in a `u64`.
 pub fn compute(
     pair: &FeedDefinition,
     legs: &[(ComputationPath, PriceFeedData)],
-    received_at: u64,
 ) -> Option<PriceFeedData> {
     let (mut numerator, mut denominator) = (1i128, 1i128);
     let mut exponent = i64::from(pair.decimals);
@@ -129,7 +129,7 @@ pub fn compute(
         feed_id: pair.id,
         price,
         decimals: pair.decimals,
-        received_at,
+        received_at: legs.iter().map(|(_, value)| value.received_at).max()?,
         valid_until: legs.iter().map(|(_, value)| value.valid_until).min()?,
     })
 }
@@ -223,18 +223,25 @@ mod tests {
     fn prices_the_pair_at_its_own_decimals() {
         let legs = [
             (leg(0, false), value(0, 6_000_000_000_000, NOW + 50)),
-            (leg(1, true), value(1, 80_000_000, NOW + 30)),
+            (
+                leg(1, true),
+                PriceFeedData {
+                    received_at: NOW - 5,
+                    ..value(1, 80_000_000, NOW + 30)
+                },
+            ),
         ];
 
-        let price = compute(&pair(), &legs, NOW).unwrap();
+        let price = compute(&pair(), &legs).unwrap();
 
+        // As new as its freshest leg, valid while its stalest is.
         assert_eq!(
             price,
             PriceFeedData {
                 feed_id: 9,
                 price: 7_500_000_000_000,
                 decimals: 8,
-                received_at: NOW,
+                received_at: NOW - 5,
                 valid_until: NOW + 30,
             }
         );
@@ -247,7 +254,7 @@ mod tests {
             (leg(1, true), value(1, 300_000_000, NOW + 60)),
         ];
 
-        let price = compute(&pair(), &legs, NOW).unwrap();
+        let price = compute(&pair(), &legs).unwrap();
 
         assert_eq!(price.price, 66_666_667);
     }
@@ -259,7 +266,7 @@ mod tests {
             (leg(1, false), value(1, 200_000_000, NOW + 60)),
         ];
 
-        let price = compute(&pair(), &legs, NOW).unwrap();
+        let price = compute(&pair(), &legs).unwrap();
 
         assert_eq!(price.price, 600_000_000);
     }
@@ -284,9 +291,9 @@ mod tests {
             (leg(1, false), at_whole(u64::MAX)),
         ];
 
-        assert_eq!(compute(&whole, &below_half, NOW), None);
-        assert_eq!(compute(&whole, &too_large, NOW), None);
-        assert_eq!(compute(&whole, &overflowing, NOW), None);
+        assert_eq!(compute(&whole, &below_half), None);
+        assert_eq!(compute(&whole, &too_large), None);
+        assert_eq!(compute(&whole, &overflowing), None);
     }
 
     #[test]

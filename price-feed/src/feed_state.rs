@@ -152,21 +152,12 @@ impl FeedAvailability for FeedState {
 pub struct FeedStates {
     states: BTreeMap<FeedId, FeedState>,
     cross_pairs: BTreeMap<FeedId, CrossPair>,
-    clock: Clock,
 }
 
 #[derive(Clone, Debug)]
 struct CrossPair {
     definition: FeedDefinition,
     routes: Vec<Vec<ComputationPath>>,
-    computation: Option<Computation>,
-}
-
-/// The leg values a Cross pair was last computed from, and what that gave.
-#[derive(Clone, Debug)]
-struct Computation {
-    legs: Vec<PriceFeedData>,
-    value: Option<PriceFeedData>,
 }
 
 impl FeedStates {
@@ -182,7 +173,6 @@ impl FeedStates {
                     let pair = CrossPair {
                         definition: *definition,
                         routes,
-                        computation: None,
                     };
                     (definition.id, pair)
                 })
@@ -201,7 +191,6 @@ impl FeedStates {
                 })
                 .collect(),
             cross_pairs,
-            clock,
         })
     }
 
@@ -215,34 +204,19 @@ impl FeedStates {
     }
 
     /// The feed's value, or `None` while it is unavailable. A Cross pair is
-    /// priced from the first route whose every leg is available, stamped with
-    /// the node clock, and computed again only once those legs change.
-    pub fn value(&mut self, feed: FeedId) -> Option<PriceFeedData> {
-        let Some(pair) = self.cross_pairs.get_mut(&feed) else {
+    /// priced from the first route whose every leg is available, and from
+    /// nothing else, so a restarted node rebuilds it exactly.
+    pub fn value(&self, feed: FeedId) -> Option<PriceFeedData> {
+        let Some(pair) = self.cross_pairs.get(&feed) else {
             return self.states.get(&feed)?.value();
         };
-        let Some(legs) = pair.routes.iter().find_map(|route| {
+        let legs = pair.routes.iter().find_map(|route| {
             route
                 .iter()
                 .map(|leg| Some((*leg, self.states.get(&leg.feed)?.value()?)))
                 .collect::<Option<Vec<_>>>()
-        }) else {
-            pair.computation = None;
-            return None;
-        };
-
-        let values: Vec<PriceFeedData> = legs.iter().map(|(_, value)| *value).collect();
-        if let Some(last) = &pair.computation
-            && last.legs == values
-        {
-            return last.value;
-        }
-        let value = cross::compute(&pair.definition, &legs, self.clock.now());
-        pair.computation = Some(Computation {
-            legs: values,
-            value,
-        });
-        value
+        })?;
+        cross::compute(&pair.definition, &legs)
     }
 }
 
@@ -258,7 +232,6 @@ impl FeedState {
 #[cfg(test)]
 impl FeedStates {
     fn set_clock(&mut self, clock: Clock) {
-        self.clock = clock;
         for state in self.states.values_mut() {
             state.set_clock(clock);
         }
@@ -475,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn prices_a_cross_pair_from_its_legs_at_the_node_clock() {
+    fn prices_a_cross_pair_from_its_legs() {
         let mut states = feed_states(Clock::Fixed(NOW));
         observe(&mut states, LBTC_USD, 6_000_000_000_000, NOW - 20);
         observe(&mut states, USDT_USD, 80_000_000, NOW - 10);
@@ -485,12 +458,12 @@ mod tests {
         assert_eq!(value.feed_id, LBTC_USDT);
         assert_eq!(value.price, 7_500_000_000_000);
         assert_eq!(value.decimals, 8);
-        assert_eq!(value.received_at, NOW);
+        assert_eq!(value.received_at, NOW - 10);
         assert_eq!(value.valid_until, NOW - 20 + VALIDITY_WINDOW);
     }
 
     #[test]
-    fn recomputes_a_cross_pair_only_when_a_leg_changes() {
+    fn keeps_a_cross_pair_value_until_a_leg_changes() {
         let mut states = feed_states(Clock::Fixed(NOW));
         observe(&mut states, LBTC_USD, 6_000_000_000_000, NOW);
         observe(&mut states, USDT_USD, 80_000_000, NOW);
@@ -504,6 +477,20 @@ mod tests {
 
         assert_eq!(second.price, 8_000_000_000_000);
         assert_eq!(second.received_at, NOW + 10);
+    }
+
+    #[test]
+    fn prices_a_rebuilt_cross_pair_as_it_was_before_a_restart() {
+        let mut before = feed_states(Clock::Fixed(NOW));
+        let mut after = feed_states(Clock::Fixed(NOW + 30));
+        for states in [&mut before, &mut after] {
+            observe(states, LBTC_USD, 6_000_000_000_000, NOW - 20);
+            observe(states, USDT_USD, 80_000_000, NOW - 10);
+        }
+
+        // Only the legs may tell two values apart, or a restarted node attests
+        // an unchanged pair again.
+        assert_eq!(after.value(LBTC_USDT), before.value(LBTC_USDT));
     }
 
     #[test]

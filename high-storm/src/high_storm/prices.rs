@@ -145,10 +145,10 @@ impl Prices {
 
     /// Only the feeds that produced a new observation, so an unchanged price is
     /// not rebroadcast and a restarted node stays quiet until its data moves.
-    /// A Cross pair's is new when a leg's change recomputed it.
+    /// A Cross pair is as new as its freshest leg.
     pub(crate) async fn attest(&self, storm: &StormHandle) -> Result<usize, PriceError> {
         let values: Vec<PriceFeedData> = {
-            let mut feeds = self.feeds.lock().await;
+            let feeds = self.feeds.lock().await;
             self.registry
                 .feeds()
                 .filter_map(|definition| feeds.value(definition.id))
