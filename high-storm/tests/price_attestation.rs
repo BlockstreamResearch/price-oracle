@@ -13,6 +13,8 @@ use tokio::time::timeout;
 use common::TestNode;
 
 const LBTC_USD: FeedId = 0;
+const USDT_USD: FeedId = 1;
+const LBTC_USDT: FeedId = 4;
 static PRICE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct TestNetwork {
@@ -123,8 +125,8 @@ async fn does_not_reattest_an_unchanged_price() {
     assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 1);
     wait_for_attestation(&network.nodes[1]).await;
 
-    // Requirement 3: a round carries only the feeds that produced a new
-    // observation, so a round with none broadcasts nothing.
+    // A round carries only the feeds that produced a new observation, so a
+    // round with none broadcasts nothing.
     next_round().await;
     assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 0);
 
@@ -183,7 +185,7 @@ async fn does_not_reattest_the_same_observation_after_restart() {
     wait_for_all_connections(&network.nodes).await;
     next_round().await;
 
-    // Requirement 6: the observation it already attested is not attested again.
+    // The observation it already attested is not attested again.
     network.nodes[0]
         .handle()
         .record_price_observation(LBTC_USD, 0, observation)
@@ -196,6 +198,31 @@ async fn does_not_reattest_the_same_observation_after_restart() {
         .record_price_observation(LBTC_USD, 0, observation_at(400, now() + 1))
         .await;
     assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 1);
+
+    network.shutdown().await;
+}
+
+#[tokio::test]
+async fn attests_a_cross_pair_once_both_its_legs_are_observed() {
+    let mut network = TestNetwork::start().await;
+    let node = network.nodes[0].handle();
+
+    // LBTC at $60,000 alone leaves LBTC/USDt unavailable.
+    node.record_price_observation(LBTC_USD, 0, observation(6_000_000_000_000))
+        .await;
+    assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 1);
+
+    node.record_price_observation(USDT_USD, 0, observation(80_000_000))
+        .await;
+    assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 2);
+    let held = wait_for_feed(&network.nodes[1], LBTC_USDT).await;
+    assert_eq!(held[0].public_key, xonly_key(31));
+    assert_eq!(held[0].feed.price, 7_500_000_000_000);
+    assert_eq!(held[0].feed.decimals, 8);
+
+    // While neither leg moves, it is not recomputed or attested again.
+    next_round().await;
+    assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 0);
 
     network.shutdown().await;
 }
@@ -240,9 +267,13 @@ fn xonly_key(key_byte: u8) -> [u8; 32] {
 }
 
 async fn wait_for_attestation(node: &HighStorm) -> Vec<PriceAttestation> {
+    wait_for_feed(node, LBTC_USD).await
+}
+
+async fn wait_for_feed(node: &HighStorm, feed: FeedId) -> Vec<PriceAttestation> {
     timeout(Duration::from_secs(5), async {
         loop {
-            let held = attestations(node).await;
+            let held = node.handle().price_attestations(feed).await.unwrap();
             if !held.is_empty() {
                 return held;
             }

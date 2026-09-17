@@ -46,7 +46,7 @@ async fn poll_once(state: &mut FeedState, sources: &[Exchange]) {
 #[tokio::test]
 async fn reduces_a_polling_cycle_to_a_signable_price() {
     let registry = FeedRegistry::default();
-    let mut states = FeedStates::new(&registry, Clock::Fixed(NOW));
+    let mut states = FeedStates::new(&registry, Clock::Fixed(NOW)).unwrap();
     let sources = [Exchange::Quotes(100), Exchange::Quotes(300)];
 
     poll_once(states.get_mut(LBTC_USD).unwrap(), &sources).await;
@@ -64,7 +64,7 @@ async fn reduces_a_polling_cycle_to_a_signable_price() {
 #[tokio::test]
 async fn serves_the_surviving_source_once_the_unreachable_one_is_dropped() {
     let registry = FeedRegistry::default();
-    let mut states = FeedStates::new(&registry, Clock::Fixed(NOW));
+    let mut states = FeedStates::new(&registry, Clock::Fixed(NOW)).unwrap();
     let sources = [Exchange::Quotes(100), Exchange::Unreachable];
     let state = states.get_mut(LBTC_USD).unwrap();
 
@@ -80,7 +80,7 @@ async fn serves_the_surviving_source_once_the_unreachable_one_is_dropped() {
 #[tokio::test]
 async fn stays_unavailable_while_no_source_answers() {
     let registry = FeedRegistry::default();
-    let mut states = FeedStates::new(&registry, Clock::Fixed(NOW));
+    let mut states = FeedStates::new(&registry, Clock::Fixed(NOW)).unwrap();
     let sources = [Exchange::Unreachable, Exchange::Unreachable];
     let state = states.get_mut(LBTC_USD).unwrap();
 
@@ -96,7 +96,7 @@ async fn stays_unavailable_while_no_source_answers() {
 async fn keeps_polling_a_source_that_republishes_while_its_observation_expires() {
     let registry = FeedRegistry::default();
     // A window after the source's only observation was received.
-    let mut states = FeedStates::new(&registry, Clock::Fixed(NOW + VALIDITY_WINDOW + 1));
+    let mut states = FeedStates::new(&registry, Clock::Fixed(NOW + VALIDITY_WINDOW + 1)).unwrap();
     let sources = [Exchange::Quotes(100)];
     let state = states.get_mut(LBTC_USD).unwrap();
 

@@ -69,7 +69,10 @@ impl Prices {
             .expect("the transport signer key was already validated");
         let registry = FeedRegistry::default();
         Self {
-            feeds: Arc::new(Mutex::new(FeedStates::new(&registry, clock))),
+            feeds: Arc::new(Mutex::new(
+                FeedStates::new(&registry, clock)
+                    .expect("the built-in registry routes every Cross pair"),
+            )),
             store,
             registry,
             keypair: Keypair::from_secret_key(&secret_key),
@@ -142,12 +145,13 @@ impl Prices {
 
     /// Only the feeds that produced a new observation, so an unchanged price is
     /// not rebroadcast and a restarted node stays quiet until its data moves.
+    /// A Cross pair's is new when a leg's change recomputed it.
     pub(crate) async fn attest(&self, storm: &StormHandle) -> Result<usize, PriceError> {
         let values: Vec<PriceFeedData> = {
-            let feeds = self.feeds.lock().await;
+            let mut feeds = self.feeds.lock().await;
             self.registry
                 .feeds()
-                .filter_map(|definition| feeds.get(definition.id)?.value())
+                .filter_map(|definition| feeds.value(definition.id))
                 .collect()
         };
 

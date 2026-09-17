@@ -41,7 +41,7 @@ pub struct FeedDefinition {
 }
 
 impl FeedDefinition {
-    const fn new(id: FeedId, base: Asset, quote: Asset, kind: FeedKind) -> Self {
+    pub(crate) const fn new(id: FeedId, base: Asset, quote: Asset, kind: FeedKind) -> Self {
         Self {
             id,
             base,
