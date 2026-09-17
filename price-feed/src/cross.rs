@@ -115,15 +115,7 @@ pub fn compute(
     }
 
     // N · 10^(decimals + dD − dN) / D
-    let scale = 10i128.checked_pow(u32::try_from(exponent.unsigned_abs()).ok()?)?;
-    let (numerator, denominator) = if exponent >= 0 {
-        (numerator.checked_mul(scale)?, denominator)
-    } else {
-        (numerator, denominator.checked_mul(scale)?)
-    };
-    let price = u64::try_from(round_half_even(numerator, denominator)?)
-        .ok()
-        .filter(|price| *price != 0)?;
+    let price = scaled_price(numerator, denominator, exponent).filter(|price| *price != 0)?;
 
     Some(PriceFeedData {
         feed_id: pair.id,
@@ -134,16 +126,38 @@ pub fn compute(
     })
 }
 
-/// `numerator / denominator` to the nearest whole number, an exact half to the
-/// even one. Both are non-negative.
-fn round_half_even(numerator: i128, denominator: i128) -> Option<i128> {
-    let quotient = numerator.checked_div(denominator)?;
-    let remainder = numerator % denominator;
-    Some(match remainder.cmp(&(denominator - remainder)) {
+/// `numerator · 10^exponent / denominator` to the nearest whole number, an
+/// exact half to the even one, when it fits in a `u64`. A positive exponent is
+/// applied a digit at a time, so a long route's scale never has to fit in an
+/// i128 of its own. All three are non-negative.
+fn scaled_price(numerator: i128, denominator: i128, exponent: i64) -> Option<u64> {
+    let denominator = if exponent < 0 {
+        let scale = 10i128.checked_pow(u32::try_from(exponent.unsigned_abs()).ok()?)?;
+        denominator.checked_mul(scale)?
+    } else {
+        denominator
+    };
+    let mut quotient = numerator.checked_div(denominator)?;
+    let mut remainder = numerator % denominator;
+
+    for _ in 0..exponent.max(0) {
+        let carried = remainder.checked_mul(10)?;
+        quotient = quotient
+            .checked_mul(10)?
+            .checked_add(carried / denominator)?;
+        remainder = carried % denominator;
+        // Growing tenfold a digit at a time, it never comes back into range.
+        if quotient > i128::from(u64::MAX) {
+            return None;
+        }
+    }
+
+    let rounded = match remainder.cmp(&(denominator - remainder)) {
         Ordering::Less => quotient,
-        Ordering::Greater => quotient + 1,
-        Ordering::Equal => quotient + quotient % 2,
-    })
+        Ordering::Greater => quotient.checked_add(1)?,
+        Ordering::Equal => quotient.checked_add(quotient % 2)?,
+    };
+    u64::try_from(rounded).ok()
 }
 
 #[cfg(test)]
@@ -297,11 +311,23 @@ mod tests {
     }
 
     #[test]
+    fn prices_a_route_whose_scale_exceeds_an_i128() {
+        // Four legs at 1.0, each inverted, ask for 10^40 in one piece.
+        let legs: Vec<_> = (0..4)
+            .map(|feed| (leg(feed, true), value(feed, 100_000_000, NOW + 60)))
+            .collect();
+
+        let price = compute(&pair(), &legs).unwrap();
+
+        assert_eq!(price.price, 100_000_000);
+    }
+
+    #[test]
     fn resolves_an_exact_half_to_the_even_neighbour() {
-        assert_eq!(round_half_even(5, 2), Some(2));
-        assert_eq!(round_half_even(7, 2), Some(4));
-        assert_eq!(round_half_even(5, 4), Some(1));
-        assert_eq!(round_half_even(7, 4), Some(2));
-        assert_eq!(round_half_even(7, 0), None);
+        assert_eq!(scaled_price(5, 2, 0), Some(2));
+        assert_eq!(scaled_price(7, 2, 0), Some(4));
+        assert_eq!(scaled_price(5, 4, 0), Some(1));
+        assert_eq!(scaled_price(7, 4, 0), Some(2));
+        assert_eq!(scaled_price(7, 0, 0), None);
     }
 }

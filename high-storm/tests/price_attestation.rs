@@ -123,7 +123,7 @@ async fn keeps_one_attestation_per_node_across_rounds() {
     network.nodes[0].attest_prices().await.unwrap();
 
     // The second round replaces the first rather than accumulating.
-    let held = wait_for_price(&network.nodes[1], 400).await;
+    let held = wait_for_price(&network.nodes[1], LBTC_USD, 400).await;
     assert_eq!(held.len(), 1);
 
     network.shutdown().await;
@@ -263,6 +263,54 @@ async fn does_not_reattest_a_cross_pair_rebuilt_after_restart() {
     network.shutdown().await;
 }
 
+#[tokio::test]
+async fn attests_a_cross_pair_whose_legs_change_within_one_second() {
+    let mut network = TestNetwork::start().await;
+    let node = network.nodes[0].handle();
+    node.record_price_observation(LBTC_USD, 0, observation(6_000_000_000_000))
+        .await;
+    node.record_price_observation(USDT_USD, 0, observation(80_000_000))
+        .await;
+    assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 3);
+
+    // Both legs move within a second, and each attests on its own.
+    let at = now() + 1;
+    node.record_price_observation(LBTC_USD, 0, observation_at(6_400_000_000_000, at))
+        .await;
+    assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 2);
+    node.record_price_observation(USDT_USD, 0, observation_at(100_000_000, at))
+        .await;
+    assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 2);
+
+    // Peers replace the pair priced from one new leg with the one from both.
+    let held = wait_for_price(&network.nodes[1], LBTC_USDT, 6_400_000_000_000).await;
+    assert_eq!(held[0].feed.received_at, at + 1);
+
+    network.shutdown().await;
+}
+
+#[tokio::test]
+async fn attests_a_feed_whose_second_source_reports_in_the_same_second() {
+    let mut network = TestNetwork::start().await;
+    let node = network.nodes[0].handle();
+    let at = now() + 1;
+
+    node.record_price_observation(LBTC_USD, 0, observation_at(100, at))
+        .await;
+    assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 1);
+
+    // A feed is stamped from its earliest observation, so a second source
+    // reporting in the same second moves the median but not the stamp.
+    node.record_price_observation(LBTC_USD, 1, observation_at(300, at))
+        .await;
+    assert_eq!(network.nodes[0].attest_prices().await.unwrap(), 1);
+
+    let held = wait_for_price(&network.nodes[1], LBTC_USD, 200).await;
+    assert_eq!(held[0].feed.received_at, at + 1);
+
+    network.shutdown().await;
+}
+
 /// A node attests once per `POLLING_INTERVAL`, so consecutive rounds never
 /// share a `received_at`. One second is enough to reproduce that here.
 async fn next_round() {
@@ -320,10 +368,10 @@ async fn wait_for_feed(node: &HighStorm, feed: FeedId) -> Vec<PriceAttestation> 
     .expect("attestation did not propagate")
 }
 
-async fn wait_for_price(node: &HighStorm, price: u64) -> Vec<PriceAttestation> {
+async fn wait_for_price(node: &HighStorm, feed: FeedId, price: u64) -> Vec<PriceAttestation> {
     timeout(Duration::from_secs(5), async {
         loop {
-            let held = attestations(node).await;
+            let held = node.handle().price_attestations(feed).await.unwrap();
             if held.iter().any(|held| held.feed.price == price) {
                 return held;
             }

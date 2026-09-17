@@ -1,7 +1,7 @@
 use price_feed::{FeedId, PriceFeedData};
 
 use crate::high_storm::PriceAttestation;
-use sqlx::{AnyPool, Row};
+use sqlx::{AnyPool, Row, any::AnyRow};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -23,21 +23,21 @@ impl PriceAttestationStore {
         Self { pool }
     }
 
-    /// The `received_at` `attester` last attested for `feed`.
+    /// What `attester` last attested for `feed`.
     pub async fn last_attested(
         &self,
         attester: [u8; 32],
         feed: FeedId,
-    ) -> Result<Option<u64>, Error> {
-        let stamp: Option<i64> = sqlx::query_scalar(
-            "SELECT received_at FROM price_attestations \
+    ) -> Result<Option<PriceFeedData>, Error> {
+        let row = sqlx::query(
+            "SELECT price, decimals, received_at, valid_until FROM price_attestations \
              WHERE public_key = $1 AND feed_id = $2",
         )
         .bind(attester.to_vec())
         .bind(i64::from(feed))
         .fetch_optional(&self.pool)
         .await?;
-        Ok(stamp.map(|stamp| stamp as u64))
+        Ok(row.map(|row| feed_data(feed, &row)).transpose()?)
     }
 
     /// False when `received_at` is not strictly greater than the one held.
@@ -79,18 +79,22 @@ impl PriceAttestationStore {
                     public_key: public_key
                         .try_into()
                         .map_err(|_| Error::MalformedPublicKey)?,
-                    feed: PriceFeedData {
-                        feed_id: feed,
-                        price: row.try_get::<i64, _>("price")? as u64,
-                        decimals: row.try_get::<i64, _>("decimals")? as u32,
-                        received_at: row.try_get::<i64, _>("received_at")? as u64,
-                        valid_until: row.try_get::<i64, _>("valid_until")? as u64,
-                    },
+                    feed: feed_data(feed, &row)?,
                     signature: row.try_get("signature")?,
                 })
             })
             .collect()
     }
+}
+
+fn feed_data(feed: FeedId, row: &AnyRow) -> Result<PriceFeedData, sqlx::Error> {
+    Ok(PriceFeedData {
+        feed_id: feed,
+        price: row.try_get::<i64, _>("price")? as u64,
+        decimals: row.try_get::<i64, _>("decimals")? as u32,
+        received_at: row.try_get::<i64, _>("received_at")? as u64,
+        valid_until: row.try_get::<i64, _>("valid_until")? as u64,
+    })
 }
 
 fn to_i64(value: u64) -> Result<i64, Error> {
@@ -175,7 +179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_back_the_stamp_a_node_last_attested() {
+    async fn reads_back_what_a_node_last_attested() {
         let store = store().await;
         let own = [1; 32];
 
@@ -183,27 +187,29 @@ mod tests {
 
         // A node holds its own attestation like any other, and reads it back on
         // restart to decide whether an observation is new.
-        store.store_latest(&attestation(1, 100, NOW)).await.unwrap();
+        let attested = attestation(1, 100, NOW);
+        store.store_latest(&attested).await.unwrap();
 
-        assert_eq!(store.last_attested(own, LBTC_USD).await.unwrap(), Some(NOW));
+        assert_eq!(
+            store.last_attested(own, LBTC_USD).await.unwrap(),
+            Some(attested.feed)
+        );
     }
 
     #[tokio::test]
-    async fn reads_back_only_its_own_attested_stamp() {
+    async fn reads_back_only_its_own_attestation() {
         let store = store().await;
-        store.store_latest(&attestation(1, 100, NOW)).await.unwrap();
-        store
-            .store_latest(&attestation(2, 300, NOW + 5))
-            .await
-            .unwrap();
+        let (first, second) = (attestation(1, 100, NOW), attestation(2, 300, NOW + 5));
+        store.store_latest(&first).await.unwrap();
+        store.store_latest(&second).await.unwrap();
 
         assert_eq!(
             store.last_attested([1; 32], LBTC_USD).await.unwrap(),
-            Some(NOW)
+            Some(first.feed)
         );
         assert_eq!(
             store.last_attested([2; 32], LBTC_USD).await.unwrap(),
-            Some(NOW + 5)
+            Some(second.feed)
         );
         assert_eq!(store.last_attested([3; 32], LBTC_USD).await.unwrap(), None);
     }
