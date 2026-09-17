@@ -1,8 +1,8 @@
 use simplex::transaction::FinalTransaction;
 use simplex::utils::{hash_script, tr_unspendable_key};
 
-use contracts::artifacts::sdk::voucher_script_test::VoucherScriptTestProgram;
-use contracts::artifacts::sdk::voucher_script_test::derived_voucher_script_test::{
+use contracts::artifacts::tests::sdk::voucher_script_test::VoucherScriptTestProgram;
+use contracts::artifacts::tests::sdk::voucher_script_test::derived_voucher_script_test::{
     VoucherScriptTestArguments, VoucherScriptTestWitness,
 };
 use contracts::voucher::Voucher;

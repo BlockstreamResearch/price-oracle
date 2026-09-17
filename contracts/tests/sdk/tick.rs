@@ -1,8 +1,10 @@
 use simplex::simplicityhl::elements::AssetId;
 use simplex::transaction::FinalTransaction;
 
-use contracts::artifacts::sdk::tick_test::TickTestProgram;
-use contracts::artifacts::sdk::tick_test::derived_tick_test::{TickTestArguments, TickTestWitness};
+use contracts::artifacts::tests::sdk::tick_test::TickTestProgram;
+use contracts::artifacts::tests::sdk::tick_test::derived_tick_test::{
+    TickTestArguments, TickTestWitness,
+};
 use contracts::voucher::Voucher;
 
 use super::fixtures::{

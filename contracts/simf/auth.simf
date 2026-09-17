@@ -4,7 +4,7 @@ use std::lib::u8::convert::u8_to_u32;
 use std::lib::u32::math::{safe_add_32, gt_32};
 use std::lib::u64::math::safe_add_64;
 
-use crate::helper::{
+use crate::lib::tx::{
     get_explicit_current_amount,
     get_explicit_output_amount,
     get_explicit_input_amount,
@@ -13,8 +13,8 @@ use crate::helper::{
     get_current_asset,
     assert_output_preserves_utxo
 };
-use crate::storage::{get_script_hash_for_storage};
-use crate::auth_helpers::network::{StormTreeBloom, assert_network_authorization};
+use crate::storm_eye::storage::{get_script_hash_for_storage};
+use crate::storm_eye::storm_tree::{StormTreeBloom, assert_network_authorization};
 
 /// Taproot storage: Storm Tree root, rescue block number.
 type Storage = (u256, Height);

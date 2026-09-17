@@ -1,6 +1,8 @@
 use std::lib::asserts::{assert_eq_64, assert_eq_256};
 
-use crate::helper::{get_explicit_input_amount, get_input_script_hash};
+use crate::lib::sha256::padding_96_tail;
+use crate::lib::taproot::get_p2tr_script_hash;
+use crate::lib::tx::{get_explicit_input_amount, get_input_script_hash};
 
 /// `feed_id`, `price`, `decimals`, `received_at`, `valid_until`.
 pub type PriceFeedData = (u32, u64, u32, u64, u64);
@@ -12,11 +14,6 @@ pub type PriceFeedData = (u32, u64, u32, u64, u64);
 ///            = 0x1178623bda0a9a3973fd78bd9c43b12aef626196b8c7bef4e1a911ac33315d2b
 fn price_midstate() -> u256 {
     0x8af552810209fa371d86431baca6eba01583cc76358485deccea9f5dc6a63190
-}
-
-/// 96-byte message: 768 bits. Its padding fits beside the last 32 bytes of data.
-fn padding_96_tail() -> u256 {
-    0x8000000000000000000000000000000000000000000000000000000000000300
 }
 
 pub fn encode_price_feed_data(data: PriceFeedData) -> u256 {
@@ -33,14 +30,9 @@ pub fn get_price_message(data: PriceFeedData) -> u256 {
     jet::sha_256_block(price_midstate(), encode_price_feed_data(data), padding_96_tail())
 }
 
+/// A voucher has no storage, so its tap tree is the single program leaf.
 pub fn get_voucher_script_hash(internal_key: Pubkey, tapleaf_hash: u256) -> u256 {
-    let tweaked_key: u256 = jet::build_taptweak(internal_key, tapleaf_hash);
-
-    let hash_ctx: Ctx8 = jet::sha_256_ctx_8_init();
-    let hash_ctx: Ctx8 = jet::sha_256_ctx_8_add_2(hash_ctx, 0x5120); // Segwit v1, length 32
-    let hash_ctx: Ctx8 = jet::sha_256_ctx_8_add_32(hash_ctx, tweaked_key);
-
-    jet::sha_256_ctx_8_finalize(hash_ctx)
+    get_p2tr_script_hash(internal_key, tapleaf_hash)
 }
 
 /// Checks the input is a Tick and returns the time it carries.

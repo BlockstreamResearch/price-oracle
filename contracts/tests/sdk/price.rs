@@ -2,8 +2,8 @@ use simplex::either::Either;
 use simplex::simplicityhl::elements::secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey};
 use simplex::transaction::FinalTransaction;
 
-use contracts::artifacts::sdk::voucher_test::VoucherTestProgram;
-use contracts::artifacts::sdk::voucher_test::derived_voucher_test::{
+use contracts::artifacts::tests::sdk::voucher_test::VoucherTestProgram;
+use contracts::artifacts::tests::sdk::voucher_test::derived_voucher_test::{
     VoucherTestArguments, VoucherTestWitness,
 };
 use contracts::auth::{StormTreeBloom, WITNESS_DEPTH};

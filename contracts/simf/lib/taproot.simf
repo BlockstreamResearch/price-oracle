@@ -1,0 +1,10 @@
+/// Script hash of the Taproot output `OP_1 <taptweak(internal_key, tap_root)>`.
+pub fn get_p2tr_script_hash(internal_key: Pubkey, tap_root: u256) -> u256 {
+    let tweaked_key: u256 = jet::build_taptweak(internal_key, tap_root);
+
+    let hash_ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let hash_ctx: Ctx8 = jet::sha_256_ctx_8_add_2(hash_ctx, 0x5120); // Segwit v1, length 32
+    let hash_ctx: Ctx8 = jet::sha_256_ctx_8_add_32(hash_ctx, tweaked_key);
+
+    jet::sha_256_ctx_8_finalize(hash_ctx)
+}

@@ -1,0 +1,14 @@
+pub fn padding_head() -> u256 {
+    0x8000000000000000000000000000000000000000000000000000000000000000
+}
+
+/// 64-byte message: 512 bits.
+pub fn padding_64_tail() -> u256 {
+    0x0000000000000000000000000000000000000000000000000000000000000200
+}
+
+/// 96-byte message: 768 bits. Its padding fits beside the last 32 bytes of data, so this
+/// is a whole half-block and takes no [`padding_head`].
+pub fn padding_96_tail() -> u256 {
+    0x8000000000000000000000000000000000000000000000000000000000000300
+}
