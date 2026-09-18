@@ -9,7 +9,7 @@ use simplex::{
 };
 
 use contracts::{
-    artifacts::auth_helpers::network_auth_test::{
+    artifacts::tests::storm_eye::network_auth_test::{
         NetworkAuthTestProgram,
         derived_network_auth_test::{NetworkAuthTestArguments, NetworkAuthTestWitness},
     },
