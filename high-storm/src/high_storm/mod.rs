@@ -646,6 +646,8 @@ impl HighStorm {
 }
 
 impl HighStormHandle {
+    /// Only a Direct feed has sources. Named with a Cross pair, this and the
+    /// two below do nothing, since it is priced from the feeds it joins.
     pub async fn record_price_observation(
         &self,
         feed: price_feed::FeedId,

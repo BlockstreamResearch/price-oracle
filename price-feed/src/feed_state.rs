@@ -3,9 +3,10 @@ use std::collections::BTreeMap;
 use crate::{
     clock::Clock,
     constants::{MAX_POLLING_ERROR_NUM, POLLING_RETRY_TIME},
+    cross::{self, ComputationPath, CrossPairError},
     price_data::PriceFeedData,
     reduce::{MedianReducer, Reducer},
-    registry::{FeedDefinition, FeedId, FeedRegistry},
+    registry::{FeedDefinition, FeedId, FeedKind, FeedRegistry},
     source::{SourceObservation, SourceState},
 };
 
@@ -32,7 +33,7 @@ struct SourceRecord {
     retry_at: Option<u64>,
 }
 
-/// A Cross pair holds no observations of its own, so it stays unavailable.
+/// A Direct feed's sources and what they observed.
 #[derive(Clone, Debug)]
 pub struct FeedState {
     definition: FeedDefinition,
@@ -150,14 +151,38 @@ impl FeedAvailability for FeedState {
 #[derive(Clone, Debug)]
 pub struct FeedStates {
     states: BTreeMap<FeedId, FeedState>,
+    cross_pairs: BTreeMap<FeedId, CrossPair>,
+}
+
+#[derive(Clone, Debug)]
+struct CrossPair {
+    definition: FeedDefinition,
+    routes: Vec<Vec<ComputationPath>>,
 }
 
 impl FeedStates {
-    pub fn new(registry: &FeedRegistry, clock: Clock) -> Self {
+    /// Fails for a Cross pair no route of Direct feeds can price, so a node
+    /// with such a registry does not start.
+    pub fn new(registry: &FeedRegistry, clock: Clock) -> Result<Self, CrossPairError> {
         let reducer = MedianReducer::new(registry.clone());
-        Self {
+        let cross_pairs = registry
+            .feeds()
+            .filter(|definition| definition.kind == FeedKind::Cross)
+            .map(|definition| {
+                cross::candidates(registry, definition).map(|routes| {
+                    let pair = CrossPair {
+                        definition: *definition,
+                        routes,
+                    };
+                    (definition.id, pair)
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        Ok(Self {
             states: registry
                 .feeds()
+                .filter(|definition| definition.kind == FeedKind::Direct)
                 .map(|definition| {
                     (
                         definition.id,
@@ -165,15 +190,33 @@ impl FeedStates {
                     )
                 })
                 .collect(),
-        }
+            cross_pairs,
+        })
     }
 
+    /// A Direct feed's state; a Cross pair has none.
     pub fn get(&self, feed: FeedId) -> Option<&FeedState> {
         self.states.get(&feed)
     }
 
     pub fn get_mut(&mut self, feed: FeedId) -> Option<&mut FeedState> {
         self.states.get_mut(&feed)
+    }
+
+    /// The feed's value, or `None` while it is unavailable. A Cross pair is
+    /// priced from the first route whose every leg is available, and from
+    /// nothing else, so a restarted node rebuilds it exactly.
+    pub fn value(&self, feed: FeedId) -> Option<PriceFeedData> {
+        let Some(pair) = self.cross_pairs.get(&feed) else {
+            return self.states.get(&feed)?.value();
+        };
+        let legs = pair.routes.iter().find_map(|route| {
+            route
+                .iter()
+                .map(|leg| Some((*leg, self.states.get(&leg.feed)?.value()?)))
+                .collect::<Option<Vec<_>>>()
+        })?;
+        cross::compute(&pair.definition, &legs)
     }
 }
 
@@ -187,11 +230,23 @@ impl FeedState {
 }
 
 #[cfg(test)]
+impl FeedStates {
+    fn set_clock(&mut self, clock: Clock) {
+        for state in self.states.values_mut() {
+            state.set_clock(clock);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{constants::VALIDITY_WINDOW, registry::FeedKind};
+    use crate::{constants::VALIDITY_WINDOW, registry::Asset};
 
     const NOW: u64 = 1_700_000_000;
+    const LBTC_USD: FeedId = 0;
+    const USDT_USD: FeedId = 1;
+    const LBTC_USDT: FeedId = 4;
 
     fn feed_state(clock: Clock) -> FeedState {
         let registry = FeedRegistry::default();
@@ -381,19 +436,98 @@ mod tests {
         assert_eq!(state.state(0), SourceState::Active);
     }
 
+    fn feed_states(clock: Clock) -> FeedStates {
+        FeedStates::new(&FeedRegistry::default(), clock).unwrap()
+    }
+
+    fn observe(states: &mut FeedStates, feed: FeedId, price: u64, received_at: u64) {
+        states
+            .get_mut(feed)
+            .unwrap()
+            .record_poll_success(0, observation(price, received_at));
+    }
+
     #[test]
-    fn holds_a_state_for_every_registered_feed() {
+    fn prices_a_cross_pair_from_its_legs() {
+        let mut states = feed_states(Clock::Fixed(NOW));
+        observe(&mut states, LBTC_USD, 6_000_000_000_000, NOW - 20);
+        observe(&mut states, USDT_USD, 80_000_000, NOW - 10);
+
+        let value = states.value(LBTC_USDT).unwrap();
+
+        assert_eq!(value.feed_id, LBTC_USDT);
+        assert_eq!(value.price, 7_500_000_000_000);
+        assert_eq!(value.decimals, 8);
+        assert_eq!(value.received_at, NOW - 10);
+        assert_eq!(value.valid_until, NOW - 20 + VALIDITY_WINDOW);
+    }
+
+    #[test]
+    fn keeps_a_cross_pair_value_until_a_leg_changes() {
+        let mut states = feed_states(Clock::Fixed(NOW));
+        observe(&mut states, LBTC_USD, 6_000_000_000_000, NOW);
+        observe(&mut states, USDT_USD, 80_000_000, NOW);
+        let first = states.value(LBTC_USDT).unwrap();
+
+        states.set_clock(Clock::Fixed(NOW + 10));
+        assert_eq!(states.value(LBTC_USDT), Some(first));
+
+        observe(&mut states, USDT_USD, 75_000_000, NOW + 10);
+        let second = states.value(LBTC_USDT).unwrap();
+
+        assert_eq!(second.price, 8_000_000_000_000);
+        assert_eq!(second.received_at, NOW + 10);
+    }
+
+    #[test]
+    fn prices_a_rebuilt_cross_pair_as_it_was_before_a_restart() {
+        let mut before = feed_states(Clock::Fixed(NOW));
+        let mut after = feed_states(Clock::Fixed(NOW + 30));
+        for states in [&mut before, &mut after] {
+            observe(states, LBTC_USD, 6_000_000_000_000, NOW - 20);
+            observe(states, USDT_USD, 80_000_000, NOW - 10);
+        }
+
+        // Only the legs may tell two values apart, or a restarted node attests
+        // an unchanged pair again.
+        assert_eq!(after.value(LBTC_USDT), before.value(LBTC_USDT));
+    }
+
+    #[test]
+    fn a_cross_pair_is_unavailable_while_a_leg_is() {
+        let mut states = feed_states(Clock::Fixed(NOW));
+        observe(&mut states, LBTC_USD, 6_000_000_000_000, NOW);
+
+        assert_eq!(states.value(LBTC_USDT), None);
+
+        observe(&mut states, USDT_USD, 80_000_000, NOW);
+        assert!(states.value(LBTC_USDT).is_some());
+
+        states.set_clock(Clock::Fixed(NOW + VALIDITY_WINDOW + 1));
+        assert_eq!(states.value(LBTC_USDT), None);
+    }
+
+    #[test]
+    fn refuses_a_registry_with_a_cross_pair_it_cannot_price() {
+        let registry = FeedRegistry::new([
+            FeedDefinition::new(0, Asset::Lbtc, Asset::Usd, FeedKind::Direct),
+            FeedDefinition::new(1, Asset::DePix, Asset::Usdt, FeedKind::Cross),
+        ]);
+
+        assert_eq!(
+            FeedStates::new(&registry, Clock::Fixed(NOW)).err(),
+            Some(CrossPairError::NoRoute(1))
+        );
+    }
+
+    #[test]
+    fn holds_a_state_for_every_direct_feed_only() {
         let registry = FeedRegistry::default();
-        let states = FeedStates::new(&registry, Clock::Fixed(NOW));
-        let cross = registry
-            .feeds()
-            .find(|feed| feed.kind == FeedKind::Cross)
-            .unwrap();
+        let states = FeedStates::new(&registry, Clock::Fixed(NOW)).unwrap();
 
         for feed in registry.feeds() {
-            assert!(states.get(feed.id).is_some());
+            assert_eq!(states.get(feed.id).is_some(), feed.kind == FeedKind::Direct);
         }
-        assert!(!states.get(cross.id).unwrap().is_available());
         assert!(states.get(8).is_none());
     }
 }

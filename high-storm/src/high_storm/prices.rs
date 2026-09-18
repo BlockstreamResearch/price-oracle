@@ -69,7 +69,10 @@ impl Prices {
             .expect("the transport signer key was already validated");
         let registry = FeedRegistry::default();
         Self {
-            feeds: Arc::new(Mutex::new(FeedStates::new(&registry, clock))),
+            feeds: Arc::new(Mutex::new(
+                FeedStates::new(&registry, clock)
+                    .expect("the built-in registry routes every Cross pair"),
+            )),
             store,
             registry,
             keypair: Keypair::from_secret_key(&secret_key),
@@ -142,21 +145,32 @@ impl Prices {
 
     /// Only the feeds that produced a new observation, so an unchanged price is
     /// not rebroadcast and a restarted node stays quiet until its data moves.
+    /// A Cross pair is as new as its freshest leg. A value that changed within
+    /// the second it was last attested in is stamped a second later, since a
+    /// peer keeps only a strictly newer one.
     pub(crate) async fn attest(&self, storm: &StormHandle) -> Result<usize, PriceError> {
         let values: Vec<PriceFeedData> = {
             let feeds = self.feeds.lock().await;
             self.registry
                 .feeds()
-                .filter_map(|definition| feeds.get(definition.id)?.value())
+                .filter_map(|definition| feeds.value(definition.id))
                 .collect()
         };
 
         let attester = self.keypair.x_only_public_key().0.serialize();
         let mut attestations = Vec::new();
-        for feed in values {
-            let last = self.store.last_attested(attester, feed.feed_id).await?;
-            if last.is_some_and(|last| feed.received_at <= last) {
-                continue;
+        for mut feed in values {
+            if let Some(last) = self.store.last_attested(attester, feed.feed_id).await?
+                && feed.received_at <= last.received_at
+            {
+                let unchanged = PriceFeedData {
+                    received_at: last.received_at,
+                    ..feed
+                } == last;
+                if unchanged {
+                    continue;
+                }
+                feed.received_at = last.received_at + 1;
             }
             attestations.push(self.sign(feed));
         }
