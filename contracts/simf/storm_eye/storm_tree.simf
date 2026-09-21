@@ -1,6 +1,6 @@
 use std::lib::asserts::assert_eq_256;
 
-use crate::lib::sha256::{padding_head, padding_64_tail, padding_96_tail};
+use crate::lib::sha256_paddings::{padding_head, padding_64_tail, padding_96_tail};
 
 /// One level of the fold: path bit (is_right = true) with sibling node hash
 type StormTreeProofStep = Either<(), (bool, u256)>;

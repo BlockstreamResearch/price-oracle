@@ -1,6 +1,6 @@
 use std::lib::asserts::{assert_eq_64, assert_eq_256};
 
-use crate::lib::sha256::padding_96_tail;
+use crate::lib::sha256_paddings::padding_96_tail;
 use crate::lib::taproot::get_p2tr_script_hash;
 use crate::lib::tx::{get_explicit_input_amount, get_input_script_hash};
 
