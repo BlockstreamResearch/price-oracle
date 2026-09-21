@@ -8,188 +8,184 @@ This contract is central to the network's authorization process. It enables the 
 
 ## 1.2. Compilation parameters
 
-1. *MAX\_SPLIT\_UTXOS\_COUNT* \- the maximum number of UTXOs into which Storm Eye can be split.  
-2. *MAX\_MERGE\_UTXOS\_COUNT* \- the maximum number of Storm Eye UTXOs that can be merged.  
-3. *RESCUE\_OUTPUT\_SCRIPT\_HASH* \- the output script hash, where tokens should be sent after rescue block number is reached
+1. `MAX_SPLIT_UTXOS_COUNT` - the exclusive upper bound on the number of UTXOs a Storm Eye can be split into.
+2. `MAX_MERGE_UTXOS_COUNT` - the exclusive upper bound on the number of Storm Eye UTXOs that can be merged.
+3. `RESCUE_OUTPUT_SCRIPT_HASH` - the output script hash where the Storm Eye must be sent once the rescue block number is reached.
 
 ## 1.3. Taproot storage slots
 
-1. Storm Tree root  
+1. Storm Tree root
 2. Rescue block number
+
+The storage is not a witness the spender can choose freely: every path rebuilds the covenant's script hash from the claimed storage and requires it to equal `jet::current_script_hash()`.
+
+### 1.3.1. Script hash for a storage state
+
+`get_script_hash_for_storage(merkle_root, rescue_block_number)` computes:
+
+1. `slot(v)` - the TapData-tagged SHA-256 of a 32-byte value `v`.
+    - Slot 0 is `merkle_root` as is.
+    - Slot 1 is `rescue_block_number` widened to 32 bytes: 28 zero bytes, then the height as a big-endian `u32`.
+2. `tap_root = tapbranch(tapbranch(jet::tapleaf_hash(), slot(merkle_root)), slot(rescue_block_number))`
+3. `output_key = taptweak(NUMS, tap_root)`, where `NUMS` is the BIP-341 unspendable internal key `0x50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0`.
+4. The result is `sha256(0x5120 || output_key)`: the script hash of the Taproot output.
 
 ## 1.4. Spending paths
 
-The Storm Eye contract has next spending paths:
+The Storm Eye contract has the following spending paths:
 
-1. Authorized inclusion in a transaction **without** storage updating.  
-2. Authorized inclusion in a transaction **with** an update to the Storm Tree root using the network signature.  
-3. Authorized inclusion in a transaction **with** an update to the rescue block number using a network signature.  
-4. Authorized splitting of a Storm Eye UTXO into multiple UTXOs with the same Storm Tree root.  
-5. Authorized merging of multiple Storm Eyes into a single Storm Eye UTXO with the same Storm Tree root.  
-6. Inclusion in a transaction upon reaching the rescue block number, with the option to spend to output with the *RESCUE\_OUTPUT\_SCRIPT\_HASH* script hash.
+1. Authorized inclusion in a transaction **without** storage updating.
+2. Authorized inclusion in a transaction **with** an update to the Storm Tree root using the network signature.
+3. Authorized inclusion in a transaction **with** an update to the rescue block number using a network signature.
+4. Authorized splitting of a Storm Eye UTXO into multiple UTXOs with the same Storm Tree root.
+5. Authorized merging of multiple Storm Eyes into a single Storm Eye UTXO with the same Storm Tree root.
+6. Inclusion in a transaction upon reaching the rescue block number, spending to an output with the `RESCUE_OUTPUT_SCRIPT_HASH` script hash.
+
+### 1.4.0. Witness and network authorization
+
+The witness is a single value:
+
+```
+PATH: Either<
+    (storage, bloom, path_witness),   // paths 1-5, network-authorized
+    (storage, output_index)           // path 6, rescue
+>
+
+storage = (merkle_root: u256, rescue_block_number: u32)
+bloom   = (signature: Signature, branch: Pubkey, proof: [Either<(), (is_right: bool, sibling: u256)>; 17])
+```
+
+For paths 1-5, the network authorization is checked **once, before the paths diverge**:
+
+1. `leaf = sha256(branch || 0x01)`
+2. For each proof step: `Left(())` leaves the node unchanged (an unused level); `Right((is_right, sibling))` replaces it with `sha256(sibling || node)` if `is_right`, else `sha256(node || sibling)`.
+3. `assert(folded_root == merkle_root)`, where `merkle_root` is the **current** root from `storage`.
+4. `message = sha256(tag || tag || jet::sig_all_hash())` with `tag = sha256("OracleNetworkV1/StormEye")`, i.e. the BIP-340 tagged hash.
+5. `bip_0340_verify((branch, message), signature)`
+
+`branch` is the MuSig2 key of the signing combination. The per-path witnesses below list only the fields specific to each path.
 
 ### 1.4.1. Authorized inclusion in a transaction without updating the Storm Tree root
 
-In this scenario, the Storm Eye UTXO must be spent in its entirety without changing the *script\_pubkey*. To spend it, the network must provide a signature and a Storm Tree Proof.
+In this scenario, the Storm Eye UTXO must be spent in its entirety without changing the `script_pubkey`.
 
 The following witness parameters are accepted for spending:
 
-1. *merkle\_root* \- Storm Tree root, which is required to build Taproot storage  
-2. *rescue\_block\_number* \- the block number after which the rescue spending path is available  
-3. *output\_index* \- the output index that contains the Storm Eye UTXO  
-4. *signature* \- the network signature  
-5. *merkle\_proof* \- Storm Merkle proof for getting and verifying a Storm Merkle bloom  
-6. *storm\_tree\_bloom* \- Storm Merkle tree leaf to prove
+1. `output_index` - the output index that contains the Storm Eye UTXO
 
 This spending path will include the following checks:
 
-1. expected\_script\_hash \= get\_script\_hash\_for\_storage(*merkle\_root, rescue\_block\_number*)  
-2. assert(jet::current\_script\_hash() \== expected\_script\_hash)  
-3. assert(jet::output\_script\_hash(*output\_index*) \== expected\_script\_hash)  
-4. assert(jet::output\_asset(*output\_index*) \== jet::current\_asset())  
-5. assert(jet::output\_amount(*output\_index*) \== jet::current\_amount())  
-6. verify\_merkle\_proof(*merkle\_root*, *merkle\_proof, storm\_tree\_bloom*)  
-7. bip\_0340\_verify(storm\_tree\_bloom, *signature*, jet::sig\_all\_hash())
+1. `assert(jet::current_script_hash() == get_script_hash_for_storage(merkle_root, rescue_block_number))`
+2. `assert(jet::output_script_hash(output_index) == jet::current_script_hash())`
+3. `assert(jet::output_asset(output_index) == jet::current_asset())`
+4. `assert(jet::output_amount(output_index) == jet::current_amount())`
 
 ### 1.4.2. Authorized inclusion in a transaction with an update to the Storm Tree root using the network signature
 
-In this scenario, the Storm Eye UTXO must be spent in its entirety with the changing of the *script\_pubkey* to migrate to the new Storm Tree root. To spend it, the network must provide a signature and a Storm Tree Proof.
+In this scenario, the Storm Eye UTXO must be spent in its entirety, changing the `script_pubkey` to migrate to the new Storm Tree root. The network authorization (1.4.0) is checked against the **current** root.
 
 The following witness parameters are accepted for spending:
 
-1. *current\_merkle\_root* \- the current Storm Tree root, which is required to build the current Taproot storage  
-2. new\_merkle\_root \- the new Storm Tree root, which is required to build the new Storm Eye UTXO *script\_pubkey*  
-3. *rescue\_block\_number* \- the block number after which the rescue spending path is available  
-4. *output\_index* \- the output index that contains the Storm Eye UTXO  
-5. *signature* \- the network signature  
-6. *merkle\_proof* \- Storm Merkle proof for getting and verifying a Storm Merkle bloom  
-7. *storm\_tree\_bloom* \- Storm Merkle tree leaf to proof
+1. `new_merkle_root` - the new Storm Tree root
+2. `output_index` - the output index that contains the Storm Eye UTXO
 
 This spending path will include the following checks:
 
-1. expected\_current\_script\_hash \= get\_script\_hash\_for\_storage(*current\_merkle\_root, rescue\_block\_number*)  
-2. expected\_new\_script\_hash \= get\_script\_hash\_for\_storage(*new\_merkle\_root, rescue\_block\_number*)  
-3. assert(jet::current\_script\_hash() \== expected\_current\_script\_hash)  
-4. assert(jet::output\_script\_hash(*output\_index*) \== expected\_new\_script\_hash)  
-5. assert(jet::output\_asset(*output\_index*) \== jet::current\_asset())  
-6. assert(jet::output\_amount(*output\_index*) \== jet::current\_amount())  
-7. assert(*storm\_tree\_bloom* \== verify\_merkle\_proof(*merkle\_root*, *merkle\_proof*))  
-8. bip\_0340\_verify(storm\_tree\_bloom, *signature*, jet::sig\_all\_hash())
+1. `assert(jet::current_script_hash() == get_script_hash_for_storage(merkle_root, rescue_block_number))`
+2. `assert(jet::output_script_hash(output_index) == get_script_hash_for_storage(new_merkle_root, rescue_block_number))`
+3. `assert(jet::output_asset(output_index) == jet::current_asset())`
+4. `assert(jet::output_amount(output_index) == jet::current_amount())`
 
 ### 1.4.3. Authorized inclusion in a transaction with an update to the rescue block number using a network signature
 
-In this scenario, the Storm Eye UTXO must be spent in its entirety with the changing of the *script\_pubkey* to migrate to the new rescue block number. To spend it, the network must provide a signature and a Storm Tree Proof.
+In this scenario, the Storm Eye UTXO must be spent in its entirety, changing the `script_pubkey` to migrate to the new rescue block number.
 
 The following witness parameters are accepted for spending:
 
-1. *merkle\_root* \- Storm Tree root, which is required to build Taproot storage  
-2. *current\_rescue\_block\_number* \- the current block number after which the rescue spending path is available  
-3. new\_rescue\_block\_number \- the new block number after which the rescue spending path is available  
-4. *output\_index* \- the output index that contains the Storm Eye UTXO  
-5. *signature* \- the network signature  
-6. *merkle\_proof* \- Storm Merkle proof for getting and verifying a Storm Merkle bloom  
-7. *storm\_tree\_bloom* \- Storm Merkle tree leaf to proof
+1. `new_rescue_block_number` - the new block number after which the rescue spending path is available
+2. `output_index` - the output index that contains the Storm Eye UTXO
 
 This spending path will include the following checks:
 
-1. expected\_new\_rescue\_block\_number \= *current\_rescue\_block\_number* \+ 1 576 800 // minutes in 3 years  
-2. assert(new\_rescue\_block\_number \== expected\_new\_rescue\_block\_number)  
-3. expected\_current\_script\_hash \= get\_script\_hash\_for\_storage(*merkle\_root, current\_rescue\_block\_number*)  
-4. expected\_new\_script\_hash \= get\_script\_hash\_for\_storage(*merkle\_root, new\_rescue\_block\_number*)  
-5. assert(jet::current\_script\_hash() \== expected\_current\_script\_hash)  
-6. assert(jet::output\_script\_hash(*output\_index*) \== expected\_new\_script\_hash)  
-7. assert(jet::output\_asset(*output\_index*) \== jet::current\_asset())  
-8. assert(jet::output\_amount(*output\_index*) \== jet::current\_amount())  
-9. assert(*storm\_tree\_bloom* \== verify\_merkle\_proof(*merkle\_root*, *merkle\_proof*))  
-10. bip\_0340\_verify(storm\_tree\_bloom, *signature*, jet::sig\_all\_hash())
+1. `assert(new_rescue_block_number == safe_add(rescue_block_number, 1_576_800))` - minutes in 3 years; an overflow fails the spend.
+2. `assert(jet::current_script_hash() == get_script_hash_for_storage(merkle_root, rescue_block_number))`
+3. `assert(jet::output_script_hash(output_index) == get_script_hash_for_storage(merkle_root, new_rescue_block_number))`
+4. `assert(jet::output_asset(output_index) == jet::current_asset())`
+5. `assert(jet::output_amount(output_index) == jet::current_amount())`
+
+The new height is 3 years after the **current rescue height**, not after the current block. The covenant does not limit when a renewal may happen; renewing only within the last month before expiry is node policy.
 
 ### 1.4.4. Authorized splitting of a Storm Eye UTXO into multiple UTXOs with the same Storm Tree root
 
-In this scenario, Storm Eye is split into N UTXOs, where N is greater than 1 and less than *MAX\_SPLIT\_UTXOS\_COUNT*. The amounts among these N UTXOs are distributed in any way, while retaining the same *script\_pubkey*. To spend it, the network must provide a signature and a Storm Tree Proof.
+In this scenario, Storm Eye is split into N UTXOs, where `1 < N < MAX_SPLIT_UTXOS_COUNT`. The amounts among these N UTXOs are distributed in any way, while retaining the same `script_pubkey`.
 
 The following witness parameters are accepted for spending:
 
-1. *merkle\_root* \- Storm Tree root, which is required to build Taproot storage  
-2. *rescue\_block\_number* \- the block number after which the rescue spending path is available  
-3. *split\_utxos\_count* \- the number of UTXOs into which Storm Eye should be split  
-4. *signature* \- the network signature  
-5. *merkle\_proof* \- Storm Merkle proof for getting and verifying a Storm Merkle bloom  
-6. *storm\_tree\_bloom* \- Storm Merkle tree leaf to proof
+1. `split_utxos_count` - the number of UTXOs into which Storm Eye should be split (`u8`)
 
 This spending path will include the following checks:
 
-1. assert(jet::current\_index() \== 0\)  
-2. expected\_current\_script\_hash \= get\_script\_hash\_for\_storage(*merkle\_root, rescue\_block\_number*)  
-3. assert(jet::current\_script\_hash() \== expected\_script\_hash)  
-4. assert(*storm\_tree\_bloom* \== verify\_merkle\_proof(*merkle\_root*, *merkle\_proof*))  
-5. bip\_0340\_verify(storm\_tree\_bloom, *signature*, jet::sig\_all\_hash())  
-6. assert(*split\_utxos\_count \> 1 && split\_utxos\_count \<* param::MAX\_SPLIT\_UTXOS\_COUNT)  
-7. for i in 0..*split\_utxos\_count*  
-   1. *total\_outputs\_amount \+= jet::output\_amount(i)*  
-   2. assert(jet::output\_script\_hash(i) \== expected\_current\_script\_hash)  
-   3. assert(jet::output\_asset(i) \== jet::current\_asset())  
-8. assert(jet::current\_amount() \== *total\_outputs\_amount*)
+1. `assert(jet::current_index() == 0)`
+2. `assert(jet::current_script_hash() == get_script_hash_for_storage(merkle_root, rescue_block_number))`
+3. `assert(split_utxos_count > 1 && split_utxos_count < param::MAX_SPLIT_UTXOS_COUNT)`
+4. for `i in 0..split_utxos_count`:
+    1. `total_outputs_amount += jet::output_amount(i)`
+    2. `assert(jet::output_script_hash(i) == jet::current_script_hash())`
+    3. `assert(jet::output_asset(i) == jet::current_asset())`
+5. `assert(jet::current_amount() == total_outputs_amount)`
 
 ### 1.4.5. Authorized merging of multiple Storm Eyes into a single Storm Eye UTXO with the same Storm Tree root
 
-In this scenario, N Storm Eye UTXOs are merged into a single Storm Eye UTXO with the same Storm Merkle Tree, where N is greater than 1 and less than *MAX\_MERGE\_UTXOS\_COUNT*. To spend it, the network must provide a signature and a Storm Tree Proof.
+In this scenario, N Storm Eye UTXOs at inputs `0..N` are merged into a single Storm Eye UTXO at output 0 with the same Storm Tree root, where `1 < N < MAX_MERGE_UTXOS_COUNT`.
 
 The following witness parameters are accepted for spending:
 
-1. *merkle\_root* \- Storm Tree root, which is required to build Taproot storage  
-2. *rescue\_block\_number* \- the block number after which the rescue spending path is available  
-3. *utxos\_to\_merge* \- the number of Storm Eye UTXOs that must be merged into a single UTXO  
-4. *signature* \- the network signature  
-5. *merkle\_proof* \- Storm Merkle proof for getting and verifying a Storm Merkle bloom  
-6. *storm\_tree\_bloom* \- Storm Merkle tree leaf to proof
+1. `utxos_to_merge` - the number of Storm Eye UTXOs that must be merged into a single UTXO (`u8`)
 
 This spending path will include the following checks:
 
-1. expected\_current\_script\_hash \= get\_script\_hash\_for\_storage(*merkle\_root, rescue\_block\_number*)  
-2. assert(jet::current\_script\_hash() \== expected\_script\_hash)  
-3. assert(*storm\_tree\_bloom* \== verify\_merkle\_proof(*merkle\_root*, *merkle\_proof*))  
-4. bip\_0340\_verify(storm\_tree\_bloom, *signature*, jet::sig\_all\_hash())  
-5. assert(*utxos\_to\_merge \> 1 && utxos\_to\_merge \<* param::MAX\_MERGE\_UTXOS\_COUNT)  
-6. for i in 0..*utxos\_to\_merge*  
-   1. *total\_inputs\_amount \+= jet::input\_amount(i)*  
-   2. assert(jet::input\_script\_hash(i) \== expected\_current\_script\_hash)  
-   3. assert(jet::input\_asset(i) \== jet::current\_asset())  
-7. assert(jet::output\_amount(0) \== *total\_inputs\_amount*)  
-8. assert(jet::output\_asset(0) \== jet::current\_asset())  
-9. assert(jet::output\_script\_hash(0) \== expected\_current\_script\_hash)
+1. `assert(jet::current_script_hash() == get_script_hash_for_storage(merkle_root, rescue_block_number))`
+2. `assert(jet::output_script_hash(0) == jet::current_script_hash())`
+3. `assert(utxos_to_merge > 1 && utxos_to_merge < param::MAX_MERGE_UTXOS_COUNT)`
+4. `assert(jet::current_index() < utxos_to_merge)` - the current input must be one of the merged inputs.
+5. for `i in 0..utxos_to_merge`:
+    1. `total_inputs_amount += jet::input_amount(i)`
+    2. `assert(jet::input_script_hash(i) == jet::current_script_hash())`
+    3. `assert(jet::input_asset(i) == jet::current_asset())`
+6. `assert(jet::output_amount(0) == total_inputs_amount)`
+7. `assert(jet::output_asset(0) == jet::current_asset())`
 
 ### 1.4.6. Inclusion in a transaction upon reaching the rescue block number
 
-In this scenario, anyone can rescue the StormEye UTXO after the rescue block number is reached and spend it on an output with the param::RESCUE\_OUTPUT\_SCRIPT\_HASH script hash.
+In this scenario, anyone can rescue the Storm Eye UTXO once the rescue block number is reached, spending it to an output with the `param::RESCUE_OUTPUT_SCRIPT_HASH` script hash. No signature and no proof are required.
 
 The following witness parameters are accepted for spending:
 
-1. *merkle\_root* \- Storm Tree root, which is required to build Taproot storage  
-2. *rescue\_block\_number* \- the block number after which the rescue spending path is available  
-3. *output\_index* \- the output index that contains the Storm Eye UTXO
+1. `storage` - `(merkle_root, rescue_block_number)`
+2. `output_index` - the output index that receives the Storm Eye
 
 This spending path will include the following checks:
 
-1. expected\_script\_hash \= get\_script\_hash\_for\_storage(*merkle\_root, rescue\_block\_number*)  
-2. assert(jet::current\_script\_hash() \== expected\_script\_hash)  
-3. jet::check\_lock\_height(*rescue\_block\_number*)  
-4. assert(jet::output\_script\_hash(*output\_index*) \== param::RESCUE\_OUTPUT\_SCRIPT\_HASH)  
-5. assert(jet::output\_asset(*output\_index*) \== jet::current\_asset())  
-6. assert(jet::output\_amount(*output\_index*) \== jet::current\_amount())
+1. `assert(jet::current_script_hash() == get_script_hash_for_storage(merkle_root, rescue_block_number))`
+2. `jet::check_lock_height(rescue_block_number)`
+3. `assert(jet::output_script_hash(output_index) == param::RESCUE_OUTPUT_SCRIPT_HASH)`
+4. `assert(jet::output_asset(output_index) == jet::current_asset())`
+5. `assert(jet::output_amount(output_index) == jet::current_amount())`
 
 ## 1.5. Contract creation transaction
 
-In the transaction to create Storm Eye, the maximum number of new assets must be issued without reissuing tokens with the corresponding covenant. These conditions must be verified by the network before Storm Eye can be used.
+In the transaction to create Storm Eye, the whole supply is issued at once, with no reissuance token, straight into the covenant. These conditions must be verified by the network before Storm Eye can be used.
 
 Inputs:
 
-1. A policy asset UTXO with the issuance\_amount set to *10000* and inflation\_amount set to 0
+1. A policy asset UTXO carrying the issuance: `issuance_amount = 10000`, `inflation_amount = 0`
 
 Outputs:
 
-1. A Storm Eye UTXO with the amount of *10000* and the corresponding covenant  
-2. Change from the input policy asset UTXO  
-3. Transaction fee
+1. Six Storm Eye UTXOs splitting the supply of 10000 between them, each under the covenant with the initial storage (the initial Storm Tree root and rescue block number). All of them are explicit (unblinded).
+2. An `OP_RETURN` recording the public keys of the initial network members.
+3. Change from the input policy asset UTXO
+4. Transaction fee
 
 # 2\. Treasury contract
 
