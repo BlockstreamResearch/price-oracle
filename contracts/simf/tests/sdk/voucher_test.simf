@@ -1,4 +1,4 @@
-use crate::sdk::voucher::{PriceFeedData, verify_price, verify_tick};
+use crate::sdk::voucher_verifier::{PriceFeedData, verify_price, verify_tick};
 
 fn main() {
     let now: u64 = verify_tick(witness::TICK_INPUT_INDEX, param::TICK_ASSET_ID);

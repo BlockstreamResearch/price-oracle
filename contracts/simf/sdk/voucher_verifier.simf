@@ -78,3 +78,27 @@ pub fn verify_price(
 
     data
 }
+
+pub fn verify_tick_with_price(
+    tick_input_index: u32,
+    tick_asset_id: u256,
+    verifier_input_index: u32,
+    verifier_asset_id: u256,
+    tapleaf_hash: u256,
+    signer: Pubkey,
+    signature: Signature,
+    data: PriceFeedData
+) -> (u64, PriceFeedData) {
+    let time: u64 = verify_tick(tick_input_index, tick_asset_id);
+    let price: PriceFeedData = verify_price(
+        verifier_input_index,
+        verifier_asset_id,
+        tapleaf_hash,
+        signer,
+        signature,
+        data,
+        time
+    );
+
+    (time, price)
+}

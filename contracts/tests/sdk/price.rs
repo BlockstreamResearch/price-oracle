@@ -1,19 +1,17 @@
-use simplex::either::Either;
-use simplex::simplicityhl::elements::secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey};
+use simplex::simplicityhl::elements::secp256k1_zkp::XOnlyPublicKey;
 use simplex::transaction::FinalTransaction;
 
 use contracts::artifacts::tests::sdk::voucher_test::VoucherTestProgram;
 use contracts::artifacts::tests::sdk::voucher_test::derived_voucher_test::{
     VoucherTestArguments, VoucherTestWitness,
 };
-use contracts::auth::{StormTreeBloom, WITNESS_DEPTH};
 use contracts::sdk::{SignedPrice, SignedPriceError};
 use contracts::voucher::Voucher;
 use price_feed::PriceFeedData;
 
 use super::fixtures::{
     Consumer, ORACLE_SECRET, OTHER_SECRET, TICK_TIME, VoucherIssuer, assert_covenant_rejects,
-    asset_bytes, keypair, x_only,
+    asset_bytes, network_signed_price, x_only,
 };
 
 const PRICE: PriceFeedData = PriceFeedData {
@@ -27,30 +25,6 @@ const PRICE: PriceFeedData = PriceFeedData {
 // Input layout of `PriceFixture::spend`: the consumer, then the Tick, then the Verifier.
 const TICK_INDEX: u32 = 1;
 const VERIFIER_INDEX: u32 = 2;
-
-/// Signs `price` as the network would, and returns it the way a `signed-price-data` response
-/// carries it: inside a Bloom, whose proof consumers ignore.
-fn network_signed_price(
-    signer: XOnlyPublicKey,
-    signing_secret: [u8; 32],
-    price: PriceFeedData,
-) -> SignedPrice {
-    let signature = Secp256k1::new()
-        .sign_schnorr_no_aux_rand(
-            &Message::from_digest(SignedPrice::message_for(&price)),
-            &keypair(signing_secret),
-        )
-        .serialize();
-
-    SignedPrice::from_bloom(
-        price,
-        &StormTreeBloom {
-            signature,
-            branch: signer.serialize(),
-            proof: [Either::Left(()); WITNESS_DEPTH],
-        },
-    )
-}
 
 /// A Tick, a Verifier committed to `verifier_key`, and the consumer that checks both.
 struct PriceFixture {

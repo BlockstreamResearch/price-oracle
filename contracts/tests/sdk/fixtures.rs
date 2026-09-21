@@ -1,7 +1,8 @@
+use simplex::either::Either;
 use simplex::program::{Program, WitnessTrait};
 use simplex::provider::SimplicityNetwork;
 use simplex::simplicityhl::elements::secp256k1_zkp::{
-    Keypair, Secp256k1, SecretKey, XOnlyPublicKey,
+    Keypair, Message, Secp256k1, SecretKey, XOnlyPublicKey,
 };
 use simplex::simplicityhl::elements::{AssetId, Script};
 use simplex::transaction::partial_input::IssuanceInput;
@@ -10,7 +11,10 @@ use simplex::transaction::{
     FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
 };
 
+use contracts::auth::{StormTreeBloom, WITNESS_DEPTH};
+use contracts::sdk::SignedPrice;
 use contracts::voucher::{Voucher, VoucherAuthMethod, VoucherParameters, VoucherSpendPath};
+use price_feed::PriceFeedData;
 
 pub use super::common::{assert_covenant_rejects, issue_asset};
 
@@ -35,6 +39,30 @@ pub fn x_only(secret: [u8; 32]) -> XOnlyPublicKey {
 
 pub fn asset_bytes(asset: AssetId) -> [u8; 32] {
     asset.into_inner().to_byte_array()
+}
+
+/// Signs `price` as the network would, and returns it the way a `signed-price-data` response
+/// carries it: inside a Bloom, whose proof consumers ignore.
+pub fn network_signed_price(
+    signer: XOnlyPublicKey,
+    signing_secret: [u8; 32],
+    price: PriceFeedData,
+) -> SignedPrice {
+    let signature = Secp256k1::new()
+        .sign_schnorr_no_aux_rand(
+            &Message::from_digest(SignedPrice::message_for(&price)),
+            &keypair(signing_secret),
+        )
+        .serialize();
+
+    SignedPrice::from_bloom(
+        price,
+        &StormTreeBloom {
+            signature,
+            branch: signer.serialize(),
+            proof: [Either::Left(()); WITNESS_DEPTH],
+        },
+    )
 }
 
 /// Issues `amount` of a new asset, paid out by `attach_output`.
