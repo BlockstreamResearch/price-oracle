@@ -1,0 +1,104 @@
+use std::lib::asserts::{assert_eq_64, assert_eq_256};
+
+use crate::lib::sha256_paddings::padding_96_tail;
+use crate::lib::taproot::get_p2tr_script_hash;
+use crate::lib::tx::{get_explicit_input_amount, get_input_script_hash};
+
+/// `feed_id`, `price`, `decimals`, `received_at`, `valid_until`.
+pub type PriceFeedData = (u32, u64, u32, u64, u64);
+
+/// BIP-340 midstate for `OracleNetworkV1/Price`:
+///
+///     sha_256_block(sha_256_iv(), h, h)
+///     with h = sha256("OracleNetworkV1/Price")
+///            = 0x1178623bda0a9a3973fd78bd9c43b12aef626196b8c7bef4e1a911ac33315d2b
+fn price_midstate() -> u256 {
+    0x8af552810209fa371d86431baca6eba01583cc76358485deccea9f5dc6a63190
+}
+
+pub fn encode_price_feed_data(data: PriceFeedData) -> u256 {
+    let (feed_id, price, decimals, received_at, valid_until): PriceFeedData = data;
+
+    let ids: u64 = <(u32, u32)>::into((feed_id, decimals));
+    let head: u128 = <(u64, u64)>::into((ids, price));
+    let tail: u128 = <(u64, u64)>::into((received_at, valid_until));
+
+    <(u128, u128)>::into((head, tail))
+}
+
+pub fn get_price_message(data: PriceFeedData) -> u256 {
+    jet::sha_256_block(price_midstate(), encode_price_feed_data(data), padding_96_tail())
+}
+
+/// A voucher has no storage, so its tap tree is the single program leaf.
+pub fn get_voucher_script_hash(internal_key: Pubkey, tapleaf_hash: u256) -> u256 {
+    get_p2tr_script_hash(internal_key, tapleaf_hash)
+}
+
+/// Checks the input is a Tick and returns the time it carries.
+pub fn verify_tick(tick_input_index: u32, tick_asset_id: u256) -> u64 {
+    let (asset, amount): (u256, u64) = get_explicit_input_amount(tick_input_index);
+    assert_eq_256(asset, tick_asset_id);
+
+    amount
+}
+
+/// Checks the input is a Verifier committed to `signer`.
+pub fn verify_verifier_utxo(
+    verifier_input_index: u32,
+    verifier_asset_id: u256,
+    tapleaf_hash: u256,
+    signer: Pubkey
+) {
+    let (asset, amount): (u256, u64) = get_explicit_input_amount(verifier_input_index);
+    assert_eq_256(asset, verifier_asset_id);
+    assert_eq_64(amount, 1);
+
+    assert_eq_256(
+        get_input_script_hash(verifier_input_index),
+        get_voucher_script_hash(signer, tapleaf_hash)
+    );
+}
+
+/// Checks a signed price against the Verifier at `verifier_input_index` and returns the price.
+pub fn verify_price(
+    verifier_input_index: u32,
+    verifier_asset_id: u256,
+    tapleaf_hash: u256,
+    signer: Pubkey,
+    signature: Signature,
+    data: PriceFeedData,
+    now: u64
+) -> PriceFeedData {
+    verify_verifier_utxo(verifier_input_index, verifier_asset_id, tapleaf_hash, signer);
+    jet::bip_0340_verify((signer, get_price_message(data)), signature);
+
+    let (_, _, _, _, valid_until): PriceFeedData = data;
+    assert!(jet::lt_64(now, valid_until));
+
+    data
+}
+
+pub fn verify_tick_with_price(
+    tick_input_index: u32,
+    tick_asset_id: u256,
+    verifier_input_index: u32,
+    verifier_asset_id: u256,
+    tapleaf_hash: u256,
+    signer: Pubkey,
+    signature: Signature,
+    data: PriceFeedData
+) -> (u64, PriceFeedData) {
+    let time: u64 = verify_tick(tick_input_index, tick_asset_id);
+    let price: PriceFeedData = verify_price(
+        verifier_input_index,
+        verifier_asset_id,
+        tapleaf_hash,
+        signer,
+        signature,
+        data,
+        time
+    );
+
+    (time, price)
+}

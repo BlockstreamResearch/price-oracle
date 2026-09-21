@@ -34,6 +34,12 @@ impl Voucher {
         self.program.get_script_pubkey(&self.params.network)
     }
 
+    /// The leaf a consumer passes to `sdk::voucher::verify_price` to rebuild this script.
+    #[must_use]
+    pub fn get_tapleaf_hash(&self) -> [u8; 32] {
+        self.program.get_tapleaf_hash()
+    }
+
     #[must_use]
     pub fn get_parameters(&self) -> &VoucherParameters {
         &self.params

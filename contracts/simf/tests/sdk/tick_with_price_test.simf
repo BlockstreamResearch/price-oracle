@@ -1,0 +1,18 @@
+use std::lib::asserts::assert_eq_64;
+
+use crate::sdk::voucher_verifier::{PriceFeedData, verify_tick_with_price};
+
+fn main() {
+    let (time, _): (u64, PriceFeedData) = verify_tick_with_price(
+        witness::TICK_INPUT_INDEX,
+        param::TICK_ASSET_ID,
+        witness::VERIFIER_INPUT_INDEX,
+        param::VERIFIER_ASSET_ID,
+        witness::VERIFIER_TAPLEAF_HASH,
+        witness::SIGNER,
+        witness::PRICE_SIGNATURE,
+        witness::PRICE_FEED_DATA
+    );
+
+    assert_eq_64(time, param::EXPECTED_TIME);
+}

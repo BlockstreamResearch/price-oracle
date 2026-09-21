@@ -1,0 +1,9 @@
+use std::lib::asserts::assert_eq_256;
+
+use crate::sdk::voucher_verifier::get_voucher_script_hash;
+
+fn main() {
+    let script_hash: u256 = get_voucher_script_hash(witness::INTERNAL_KEY, witness::TAPLEAF_HASH);
+
+    assert_eq_256(script_hash, param::EXPECTED_SCRIPT_HASH);
+}
