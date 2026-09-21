@@ -107,12 +107,9 @@ impl FeeUtxoValidator {
         owner: [u8; 32],
         request_count: usize,
     ) -> Result<(), FeeUtxoValidationError> {
-        for fee_utxo in fee_utxos {
-            if self
-                .monitored_utxos
-                .is_reserved_for_burning(fee_utxo.txid, fee_utxo.output_index)
-                .await?
-            {
+        let reservations = self.reserved_for_burning(fee_utxos).await?;
+        for (fee_utxo, reserved) in fee_utxos.iter().zip(reservations) {
+            if reserved {
                 return Err(FeeUtxoValidationError::ReservedForBurning(format!(
                     "{}:{}",
                     hex::encode(fee_utxo.txid),
@@ -128,6 +125,22 @@ impl FeeUtxoValidator {
             #[cfg(test)]
             FeeUtxoValidatorInner::AllowAll => Ok(()),
         }
+    }
+
+    pub(super) async fn reserved_for_burning(
+        &self,
+        fee_utxos: &[FeeUtxo],
+    ) -> Result<Vec<bool>, FeeUtxoValidationError> {
+        let mut reservations = Vec::with_capacity(fee_utxos.len());
+        for fee_utxo in fee_utxos {
+            reservations.push(
+                self.monitored_utxos
+                    .is_reserved_for_burning(fee_utxo.txid, fee_utxo.output_index)
+                    .await?,
+            );
+        }
+
+        Ok(reservations)
     }
 }
 

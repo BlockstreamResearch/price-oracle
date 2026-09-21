@@ -16,6 +16,7 @@ use crate::{
     HighStorm, NetworkAsset,
     db::{
         Database,
+        monitored_utxo::{IndexedBlock, MonitoredUtxo},
         network_asset::{STORM_EYE_KIND, TICK_ASSET_KIND},
     },
 };
@@ -344,6 +345,62 @@ async fn registers_tick_requests_and_returns_pending_status() {
 }
 
 #[tokio::test]
+async fn classifies_fee_utxos_reserved_for_burning() {
+    let (app, _, _, database) = setup_with_database().await;
+    database
+        .monitored_utxos()
+        .apply_block(
+            "burning-v1",
+            &IndexedBlock {
+                height: 10,
+                hash: [10; 32],
+            },
+            &[MonitoredUtxo {
+                txid: [1; 32],
+                output_index: 2,
+                asset_kind: TICK_ASSET_KIND.to_string(),
+                amount: 1,
+                script_pubkey: vec![0x51],
+                auth_method: "signature-auth".to_string(),
+                auth_data: vec![2; 32],
+                account_owner_pubkey: [3; 32],
+                burning_fee_txid: [4; 32],
+                burning_fee_output_index: 5,
+                block_height: 10,
+                status: "active".to_string(),
+                status_block_height: 10,
+                burn_txid: None,
+            }],
+            &[],
+            60,
+        )
+        .await
+        .unwrap();
+    let usable_first = format!("{}:1", hex::encode([6; 32]));
+    let reserved = format!("{}:5", hex::encode([4; 32]));
+    let usable_second = format!("{}:7", hex::encode([8; 32]));
+
+    let response = app
+        .oneshot(json_request(
+            "/users/check-fee-utxos",
+            serde_json::json!({
+                "fee_utxos": [&usable_first, &reserved, &usable_second],
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "reserved": [reserved],
+            "usable": [usable_first, usable_second],
+        })
+    );
+}
+
+#[tokio::test]
 async fn derives_oracle_account_from_the_active_storm_eye() {
     let (app, _, public_key) = setup().await;
 
@@ -425,6 +482,12 @@ async fn rejects_unsupported_or_invalid_user_requests() {
 }
 
 async fn setup() -> (Router, PrivateKey, String) {
+    let (app, private_key, public_key, _) = setup_with_database().await;
+
+    (app, private_key, public_key)
+}
+
+async fn setup_with_database() -> (Router, PrivateKey, String, Database) {
     let database = Database::connect("sqlite::memory:", 1).await.unwrap();
     let operators = database.node_operators();
     let mut storm_eye_asset_id = [1; 32];
@@ -510,16 +573,19 @@ async fn setup() -> (Router, PrivateKey, String) {
     )
     .await;
 
+    let app = router(
+        node.handle(),
+        operators,
+        database.user_requests(),
+        FeeUtxoValidator::allow_all(database.monitored_utxos()),
+        AuthNetwork::ElementsRegtest,
+    );
+
     (
-        router(
-            node.handle(),
-            operators,
-            database.user_requests(),
-            FeeUtxoValidator::allow_all(database.monitored_utxos()),
-            AuthNetwork::ElementsRegtest,
-        ),
+        app,
         operator_private_key,
         hex::encode(operator_public_key),
+        database,
     )
 }
 

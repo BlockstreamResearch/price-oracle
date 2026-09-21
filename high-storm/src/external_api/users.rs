@@ -27,6 +27,7 @@ const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 pub(super) fn router() -> axum::Router<ExternalApiState> {
     axum::Router::new()
         .route("/account/{public_key}", axum::routing::get(get_account))
+        .route("/check-fee-utxos", axum::routing::post(check_fee_utxos))
         .route("/requests", axum::routing::post(create_request))
         .route("/requests/{hash}", axum::routing::get(get_request))
 }
@@ -131,6 +132,43 @@ struct CreatedRequest {
 struct UserRequestStatus {
     status: String,
     payload: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckFeeUtxosRequest {
+    fee_utxos: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct CheckFeeUtxosResponse {
+    reserved: Vec<String>,
+    usable: Vec<String>,
+}
+
+async fn check_fee_utxos(
+    State(state): State<ExternalApiState>,
+    Json(request): Json<CheckFeeUtxosRequest>,
+) -> Result<Json<CheckFeeUtxosResponse>, ApiError> {
+    let fee_utxos = validate_fee_utxos(&request.fee_utxos)?;
+    let reservations = state
+        .fee_utxos
+        .reserved_for_burning(&fee_utxos)
+        .await
+        .map_err(ApiError::unavailable)?;
+    let mut response = CheckFeeUtxosResponse {
+        reserved: Vec::new(),
+        usable: Vec::new(),
+    };
+    for (fee_utxo, reserved) in request.fee_utxos.into_iter().zip(reservations) {
+        if reserved {
+            response.reserved.push(fee_utxo);
+        } else {
+            response.usable.push(fee_utxo);
+        }
+    }
+
+    Ok(Json(response))
 }
 
 async fn create_request(
