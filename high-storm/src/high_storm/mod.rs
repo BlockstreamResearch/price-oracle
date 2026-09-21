@@ -34,7 +34,7 @@ pub use message::{
     NodeMessageKind, PriceAttestation, RenewStormUtxos, SplitStormEye, StormEyeUtxo,
     UpdateNetworkMembers,
 };
-pub use prices::{PollOutcome, PriceError};
+pub use prices::{ExchangeRateInfo, FeedRate, PollOutcome, PriceError};
 pub use renewal::RenewalError;
 pub use signing::{SigningError, SigningResult};
 use state::NetworkState;
@@ -775,6 +775,23 @@ impl HighStormHandle {
         feed: price_feed::FeedId,
     ) -> Result<Vec<PriceAttestation>, PriceError> {
         self.state.prices().attestations_for(feed).await
+    }
+
+    /// Every feed this node prices, in id order.
+    pub fn price_feeds(&self) -> Vec<price_feed::FeedDefinition> {
+        self.state.prices().registry().feeds().copied().collect()
+    }
+
+    pub fn price_feed(&self, feed: price_feed::FeedId) -> Option<price_feed::FeedDefinition> {
+        self.state.prices().registry().get(feed).copied()
+    }
+
+    pub async fn exchange_rate(&self, feed: price_feed::FeedId) -> Result<FeedRate, PriceError> {
+        let peers = self.peers().await;
+        let members = voting::member_keys(&peers)
+            .map_err(|error| PriceError::InvalidPeerKey(error.to_string()))?;
+
+        self.state.prices().rate_for(feed, &members).await
     }
 
     pub fn coordinator_public_key(&self) -> [u8; 33] {

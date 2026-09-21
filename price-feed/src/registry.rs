@@ -22,6 +22,20 @@ pub enum Asset {
     Usdc,
 }
 
+impl Asset {
+    /// The ticker the price API names the asset by.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Lbtc => "LBTC",
+            Self::Usd => "USD",
+            Self::Usdt => "USDT",
+            Self::Eurx => "EURX",
+            Self::DePix => "DEPIX",
+            Self::Usdc => "USDC",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FeedKind {
     // The source prices this feed directly
@@ -115,6 +129,28 @@ mod tests {
         let registry = registry();
 
         assert_eq!(registry.get(3), None);
+    }
+
+    #[test]
+    fn names_each_feed_by_the_symbols_of_its_assets() {
+        let symbols: Vec<_> = FeedRegistry::default()
+            .feeds()
+            .map(|feed| format!("{}/{}", feed.base.symbol(), feed.quote.symbol()))
+            .collect();
+
+        assert_eq!(
+            symbols,
+            [
+                "LBTC/USD",
+                "USDT/USD",
+                "EURX/USD",
+                "DEPIX/USD",
+                "LBTC/USDT",
+                "EURX/USDT",
+                "DEPIX/USDT",
+                "USDC/USD",
+            ]
+        );
     }
 
     #[test]

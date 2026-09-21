@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use simplex::simplicityhl::elements::AssetId;
 
-use super::{ApiError, ExternalApiState};
+use super::{ApiError, ExternalApiState, require_coordinator};
 use crate::crypto::tagged_hash;
 use crate::db::{
     network_asset::{STORM_EYE_KIND, TICK_ASSET_KIND},
@@ -251,14 +251,6 @@ async fn get_request(
         status: request.status,
         payload,
     }))
-}
-
-async fn require_coordinator(state: &ExternalApiState) -> Result<(), ApiError> {
-    if state.node.is_coordinator().await {
-        Ok(())
-    } else {
-        Err(ApiError::unavailable("this node is not the coordinator"))
-    }
 }
 
 fn validate_request(request: &NetworkUserRequests) -> Result<Vec<FeeUtxo>, ApiError> {
