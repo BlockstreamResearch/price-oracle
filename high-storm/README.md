@@ -274,7 +274,7 @@ Each `signature` is a BIP-340 signature by `public_key` over
 `OracleNetworkV1/Price` and `feed` is its 32 canonical bytes: `feed_id` and
 `decimals` as 4-byte big-endian integers, `price`, `received_at`, and
 `valid_until` as 8-byte big-endian integers, laid out in the order `feed_id`,
-`price`, `decimals`, `received_at`, `valid_until`. A client can therefore check
+`decimals`, `price`, `received_at`, `valid_until`. A client can therefore check
 that the coordinator did not alter what a member signed.
 
 It cannot check what the coordinator left out or added: this API exposes no
