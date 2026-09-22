@@ -40,6 +40,8 @@ pub enum PriceError {
     RepeatedFeed(FeedId),
     #[error("attestation for feed {0} is stamped further ahead than a clock explains")]
     ImplausibleTimestamp(FeedId),
+    #[error("attestation for feed {0} is valid for longer than the validity window")]
+    StretchedValidity(FeedId),
     #[error("attestation for feed {0} is not quoted at the decimals of that feed")]
     WrongDecimals(FeedId),
     #[error("invalid peer public key: {0}")]
@@ -278,7 +280,11 @@ impl Prices {
         let mut attested_before = false;
         for attestation in self.attestations_for(feed).await? {
             let own = attestation.public_key == attester;
-            if now > attestation.feed.valid_until {
+            // Its own attestations never pass through `check`.
+            if now > attestation.feed.valid_until
+                || stamped_ahead(&attestation.feed, now)
+                || validity_stretched(&attestation.feed)
+            {
                 attested_before |= own;
                 continue;
             }
@@ -347,11 +353,11 @@ fn check(
         let Some(definition) = registry.get(attestation.feed.feed_id) else {
             return Err(PriceError::UnregisteredFeed(attestation.feed.feed_id));
         };
-        // Without a bound from above, one attestation is held forever.
-        if attestation.feed.received_at > now + MAX_CLOCK_SKEW
-            || attestation.feed.valid_until > now + VALIDITY_WINDOW + MAX_CLOCK_SKEW
-        {
+        if stamped_ahead(&attestation.feed, now) {
             return Err(PriceError::ImplausibleTimestamp(attestation.feed.feed_id));
+        }
+        if validity_stretched(&attestation.feed) {
+            return Err(PriceError::StretchedValidity(attestation.feed.feed_id));
         }
         // Other decimals put a client reading the price off by that power.
         if attestation.feed.decimals != definition.decimals {
@@ -364,6 +370,17 @@ fn check(
         verify(attestation)?;
     }
     Ok(())
+}
+
+/// No member's clock runs more than `MAX_CLOCK_SKEW` ahead of this one.
+fn stamped_ahead(feed: &PriceFeedData, now: u64) -> bool {
+    feed.received_at > now.saturating_add(MAX_CLOCK_SKEW)
+}
+
+/// A price is valid for `VALIDITY_WINDOW` from when it was received, or an old
+/// one beside a fresh `valid_until` reads as current.
+fn validity_stretched(feed: &PriceFeedData) -> bool {
+    feed.valid_until > feed.received_at.saturating_add(VALIDITY_WINDOW)
 }
 
 fn verify(attestation: &PriceAttestation) -> Result<(), PriceError> {
@@ -510,23 +527,88 @@ mod tests {
         ));
     }
 
+    fn checked(feed: PriceFeedData) -> Result<(), PriceError> {
+        check(
+            &[attest(&keypair(1), feed)],
+            &members([1, 2]),
+            &FeedRegistry::default(),
+            NOW,
+        )
+    }
+
+    #[test]
+    fn accepts_the_stamps_a_feed_carries() {
+        // A Direct feed of one source is valid for exactly the window.
+        let whole_window = PriceFeedData {
+            received_at: NOW - 10,
+            valid_until: NOW - 10 + VALIDITY_WINDOW,
+            ..feed()
+        };
+        // A Cross pair expires with its stalest leg, before its own window.
+        let part_of_one = PriceFeedData {
+            received_at: NOW,
+            valid_until: NOW + 5,
+            ..feed()
+        };
+
+        assert!(checked(whole_window).is_ok());
+        assert!(checked(part_of_one).is_ok());
+    }
+
     #[test]
     fn rejects_an_attestation_stamped_further_ahead_than_a_clock_explains() {
+        let ahead = PriceFeedData {
+            received_at: NOW + MAX_CLOCK_SKEW + 1,
+            ..feed()
+        };
+
+        assert!(matches!(
+            checked(ahead),
+            Err(PriceError::ImplausibleTimestamp(0))
+        ));
+    }
+
+    #[test]
+    fn rejects_an_attestation_valid_for_longer_than_the_window() {
         let forever = PriceFeedData {
             valid_until: u64::MAX,
             ..feed()
         };
-        let attestations = [attest(&keypair(1), forever)];
+        // An old price cannot be given a fresh validity.
+        let stretched = PriceFeedData {
+            received_at: NOW - VALIDITY_WINDOW - 1,
+            valid_until: NOW + VALIDITY_WINDOW,
+            ..feed()
+        };
 
         assert!(matches!(
-            check(
-                &attestations,
-                &members([1, 2]),
-                &FeedRegistry::default(),
-                NOW
-            ),
-            Err(PriceError::ImplausibleTimestamp(0))
+            checked(forever),
+            Err(PriceError::StretchedValidity(0))
         ));
+        assert!(matches!(
+            checked(stretched),
+            Err(PriceError::StretchedValidity(0))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reads_no_rate_from_a_price_stretched_beyond_its_validity() {
+        let prices = prices().await;
+        let stretched = PriceFeedData {
+            received_at: NOW - VALIDITY_WINDOW - 1,
+            valid_until: NOW + VALIDITY_WINDOW,
+            ..feed()
+        };
+        let own = attest(&keypair(OWN_KEY), stretched);
+        prices.store.store_latest(&own).await.unwrap();
+
+        assert_eq!(
+            prices
+                .rate_for(LBTC_USD, &members([OWN_KEY, 9]))
+                .await
+                .unwrap(),
+            FeedRate::Expired
+        );
     }
 
     #[test]
