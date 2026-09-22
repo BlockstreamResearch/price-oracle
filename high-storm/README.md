@@ -218,11 +218,19 @@ unspent, explicit policy asset, and locked by the requester's Account covenant.
 Their combined value must cover the configured operational fee and Tick burn
 reserve for every requested output, plus one issuance transaction fee. Accepted
 fee UTXOs are reserved atomically, cannot be reused by another request, and remain
-reserved until the issuance transaction confirms. Only `tick-utxo` requests are
-accepted at this stage. Its `payload` is a JSON-encoded string with this shape:
+reserved until the issuance transaction confirms. The accepted request kinds are
+`tick-utxo` and `signed-price-data`. Each `payload` is a JSON-encoded string
+with this shape:
 
 ```json
 {"utxo_auth_method":{"kind":"signature-auth","auth_data":"<64-character x-only public key>"}}
+```
+
+A `signed-price-data` request adds the feed it is issued at, and a `tick-utxo`
+request must not name one:
+
+```json
+{"utxo_auth_method":{"kind":"signature-auth","auth_data":"<key>"},"feed_id":4}
 ```
 
 The supported UTXO authentication kinds are `asset-id-auth`,
@@ -247,8 +255,23 @@ Consecutive issuance rounds chain through the Tick reissuance token in the mempo
 The coordinator collects a two-thirds Storm Tree signature and broadcasts the
 covenant transaction. The status becomes `processing` after broadcast and
 `executed` after confirmation. A node that is not the current coordinator returns
-`503` for both user routes. `signed-price-data` returns `422` until price request
-processing is implemented.
+`503` for both user routes.
+
+One batch names at most one feed, and one issuance round is issued at one feed:
+the first pending batch that names one sets the round's feed, batches naming
+another wait for a round of their own, and plain `tick-utxo` requests ride along
+with either. The coordinator takes its own current value for that feed, encodes
+it as the 32-byte `PriceFeedData`, and carries it beside every batch issued at
+it; a request whose feed the coordinator cannot price yet waits for a later
+round, since a feed is unavailable after a restart and between polls. Before
+signing, each member checks the instructed rate against the value it holds
+itself and rejects the whole message on the first failure: an unregistered feed,
+no valid local price, a rate the node clock has passed, one stamped ahead of its
+clock or valid for longer than `VALIDITY_WINDOW` from when it was received, one
+quoted at other decimals than its feed, or one that differs from its own by
+`MAX_ACCEPT_DEVIATION_FEED` (one percent) or more. The rate is agreed and signed
+for, but the issued Tick UTXO is the same one a `tick-utxo` request produces —
+recording the rate on-chain needs a covenant field that does not exist yet.
 
 `GET /price-feeds` lists the registry every node shares: each feed with its id
 and symbols, in id order. `GET /price-feeds/{id}` returns the current rate for

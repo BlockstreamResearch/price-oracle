@@ -2,8 +2,9 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use price_feed::{
     Clock, FeedAvailability, FeedId, FeedRegistry, FeedStates, PriceFeedData, PriceSource,
-    RejectionReason, SourceObservation,
+    RejectionReason, SourceObservation, ValidationError,
     constants::{MAX_CLOCK_SKEW, VALIDITY_WINDOW},
+    instruction,
 };
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, schnorr};
 use secp256k1_zkp::PublicKey as TransportPublicKey;
@@ -262,6 +263,22 @@ impl Prices {
 
     pub(crate) fn registry(&self) -> &FeedRegistry {
         &self.registry
+    }
+
+    /// The value it would attest next, `None` while the feed is unavailable.
+    pub(crate) async fn value(&self, feed: FeedId) -> Option<PriceFeedData> {
+        self.feeds.lock().await.value(feed)
+    }
+
+    /// An instructed rate is judged by what its sources say now, not by what
+    /// it last attested.
+    pub(crate) async fn validate_instruction(
+        &self,
+        instructed: &PriceFeedData,
+    ) -> Result<(), ValidationError> {
+        let own = self.value(instructed.feed_id).await;
+
+        instruction::validate(instructed, &self.registry, own, self.clock.now())
     }
 
     /// Only a current member's attestation is read, this node's own included,
