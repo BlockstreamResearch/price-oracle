@@ -51,5 +51,6 @@ jobs:
           cargo build --workspace --all-targets --all-features --locked
 
       - name: Run non-contract tests
+        timeout-minutes: 20
         run: >
           cargo test --workspace --exclude contracts --all-targets --all-features --locked
