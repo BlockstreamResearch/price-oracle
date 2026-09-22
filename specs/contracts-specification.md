@@ -199,7 +199,7 @@ This contract is intended for storing UTXOs owned by the Oracle network. These U
 
 ## 2.3. Spending paths
 
-The Treasury contract has next spending paths:
+The Treasury contract has the following spending paths:
 
 1. Network authorized spending
 
@@ -215,19 +215,19 @@ This spending path will include the following checks:
 
 1. assert(jet::input\_asset(*storm\_eye\_input\_index*) \== param::STORM\_EYE\_ASSET\_ID)
 
-# 3\. Tick asset contract
+# 3\. Voucher contract (Tick and Verifier)
 
 ## 3.1. Description
 
-This contract is designed for Tick asset UTXOs, which will store a timestamp in their amount. These UTXOs will be issued to users and burned after being used by the user or by the network.
+This contract is designed for Tick asset UTXOs, which will store a timestamp in their amount. The same covenant is used for Verifier asset UTXOs, which carry the public key used to verify price data in their Taproot internal key and have an amount of 1. On-chain, only the asset ID tells a Tick from a Verifier. These UTXOs will be issued to users and burned after being used by the user or by the network.
 
 ## 3.2. Auth mechanisms
 
-This covenant will support three authorization options that the user can specify in the request to create a Tick UTXO. The following authorization options are available:
+This covenant will support three authorization options that the user can specify in the request to create a voucher. The following authorization options are available:
 
-1. Asset auth \- this method allows you to spend a Tick UTXO if an input with the desired Asset ID is added to the transaction.  
-2. Script auth \- this method allows you to spend a Tick UTXO if an input with the desired script hash is added to the transaction.  
-3. Signature auth \- this method allows you to spend a Tick UTXO if a valid signature for the *jet::sig\_all\_hash* message is provided in the transaction witness.
+1. Asset auth \- this method allows you to spend a voucher if an input with the desired Asset ID is added to the transaction.  
+2. Script auth \- this method allows you to spend a voucher if an input with the desired script hash is added to the transaction.  
+3. Signature auth \- this method allows you to spend a voucher if a valid signature for the *jet::sig\_all\_hash* message is provided in the transaction witness.
 
 The contract supports only one auth method at a time. The network must set the compilation parameters that do not apply to the user-selected auth method to their default values.
 
@@ -235,73 +235,75 @@ The contract supports only one auth method at a time. The network must set the c
 
 1. STORM\_EYE\_ASSET\_ID \- the Storm Eye asset ID that will be used for the network burning process.  
 2. AUTH\_METHOD \- the index of the auth method.  
-3. AUTH\_ASSET\_ID \- the auth asset ID that the user provided in the Tick UTXO request  
-4. AUTH\_SCRIPT\_HASH \- the auth script hash that the user provided in the Tick UTXO request  
-5. AUTH\_PUBKEY \- the auth schnorr pubkey that the user provided in the Tick UTXO request
+3. AUTH\_ASSET\_ID \- the auth asset ID that the user provided in the voucher request  
+4. AUTH\_SCRIPT\_HASH \- the auth script hash that the user provided in the voucher request  
+5. AUTH\_PUBKEY \- the auth schnorr pubkey that the user provided in the voucher request
 
 ## 3.4. Spending paths
 
-The Tick asset contract has next spending paths:
+The voucher contract has the following spending paths:
 
 1. User spending via the Asset authorization method  
 2. User spending via the Script authorization method  
 3. User spending via the Signature authorization method  
 4. Network authorized spending
 
+The user spending paths burn the voucher into an OP\_RETURN tagged with the voucher's own input index: its first entry must be the pushed data *jet::current\_index()* as 4 big-endian bytes. Input indexes are unique, so two vouchers cannot be burned into the same output.
+
 ### 3.4.1. User spending via the Asset authorization method
 
-In this scenario, a user can spend a Tick UTXO if they include an input in the transaction that has the *AUTH\_ASSET\_ID* asset ID.
+In this scenario, a user can spend a voucher if they include an input in the transaction that has the *AUTH\_ASSET\_ID* asset ID.
 
 The following witness parameters are accepted for spending:
 
 1. *asset\_auth\_utxo\_input\_index* \- the input index of the Asset auth UTXO  
-2. *tick\_utxo\_output\_index* \- the output index of the Tick UTXO
+2. *voucher\_utxo\_output\_index* \- the output index of the burn output
 
 This spending path will include the following checks:
 
 1. assert(param::AUTH\_METHOD \== 0\)  
 2. assert(jet::input\_asset(*asset\_auth\_utxo\_input\_index*) \== param::AUTH\_ASSET\_ID)  
-3. assert(jet::output\_asset(*tick\_utxo\_output\_index*) \== jet::current\_asset())  
-4. assert(jet::output\_amount(*tick\_utxo\_output\_index*) \== jet::current\_amount())  
-5. assert(is\_op\_return(*tick\_utxo\_output\_index*))
+3. assert(jet::output\_asset(*voucher\_utxo\_output\_index*) \== jet::current\_asset())  
+4. assert(jet::output\_amount(*voucher\_utxo\_output\_index*) \== jet::current\_amount())  
+5. assert(jet::output\_null\_datum(*voucher\_utxo\_output\_index*, 0) \== Some(Some(Left((\_, sha256(u32\_be(jet::current\_index())))))))
 
 ### 3.4.2. User spending via the Script authorization method
 
-In this scenario, a user can spend a Tick UTXO if they include an input in the transaction that has the *AUTH\_SCRIPT\_HASH* script hash.
+In this scenario, a user can spend a voucher if they include an input in the transaction that has the *AUTH\_SCRIPT\_HASH* script hash.
 
 The following witness parameters are accepted for spending:
 
 1. *script\_auth\_utxo\_input\_index* \- the input index of the Script auth UTXO  
-2. *tick\_utxo\_output\_index* \- the output index of the Tick UTXO
+2. *voucher\_utxo\_output\_index* \- the output index of the burn output
 
 This spending path will include the following checks:
 
 1. assert(param::AUTH\_METHOD \== 1\)  
 2. assert(jet::input\_script\_hash(*script\_auth\_utxo\_input\_index*) \== param::AUTH\_SCRIPT\_HASH)  
-3. assert(jet::output\_asset(*tick\_utxo\_output\_index*) \== jet::current\_asset())  
-4. assert(jet::output\_amount(*tick\_utxo\_output\_index*) \== jet::current\_amount())  
-5. assert(is\_op\_return(*tick\_utxo\_output\_index*))
+3. assert(jet::output\_asset(*voucher\_utxo\_output\_index*) \== jet::current\_asset())  
+4. assert(jet::output\_amount(*voucher\_utxo\_output\_index*) \== jet::current\_amount())  
+5. assert(jet::output\_null\_datum(*voucher\_utxo\_output\_index*, 0) \== Some(Some(Left((\_, sha256(u32\_be(jet::current\_index())))))))
 
 ### 3.4.3. User spending via the Signature authorization method
 
-In this scenario, a user can spend a Tick UTXO if they provided the required signature in the transaction witness.
+In this scenario, a user can spend a voucher if they provide the required signature in the transaction witness.
 
 The following witness parameters are accepted for spending:
 
-1. *auth\_signature \-* the *jet::sig\_all\_hash* auth signature  
-2. *tick\_utxo\_output\_index* \- the output index of the Tick UTXO
+1. *auth\_signature* \- the *jet::sig\_all\_hash* auth signature  
+2. *voucher\_utxo\_output\_index* \- the output index of the burn output
 
 This spending path will include the following checks:
 
 1. assert(param::AUTH\_METHOD \== 2\)  
 2. jet::bip\_0340\_verify((param::AUTH\_PUBKEY, jet::sig\_all\_hash()), *auth\_signature*)  
-3. assert(jet::output\_asset(*tick\_utxo\_output\_index*) \== jet::current\_asset())  
-4. assert(jet::output\_amount(*tick\_utxo\_output\_index*) \== jet::current\_amount())  
-5. assert(is\_op\_return(*tick\_utxo\_output\_index*))
+3. assert(jet::output\_asset(*voucher\_utxo\_output\_index*) \== jet::current\_asset())  
+4. assert(jet::output\_amount(*voucher\_utxo\_output\_index*) \== jet::current\_amount())  
+5. assert(jet::output\_null\_datum(*voucher\_utxo\_output\_index*, 0) \== Some(Some(Left((\_, sha256(u32\_be(jet::current\_index())))))))
 
 ### 3.4.4. Network authorized spending
 
-In this scenario, the network can spend a Tick UTXO. To spend it, the network must include the Storm Eye UTXO in the transaction.
+In this scenario, the network can spend a voucher. To spend it, the network must include the Storm Eye UTXO in the transaction.
 
 The following witness parameter is accepted for spending:
 
@@ -311,9 +313,9 @@ This spending path includes only the following covenant check:
 
 1. assert(jet::input\_asset(*storm\_eye\_input\_index*) \== param::STORM\_EYE\_ASSET\_ID)  
 
-Before signing, every network node validates that all selected Tick amounts are summed exactly into one empty OP\_RETURN output with the Tick asset. This permits many Tick inputs to share one aggregate burn output without relying on an invalid per-input inequality.
+Before signing, every network node validates that all selected voucher amounts are summed exactly into one empty OP\_RETURN output with the voucher asset. This permits many voucher inputs to share one aggregate burn output without relying on an invalid per-input inequality.
 
-## 3.5. Contract creation transaction
+## 3.5. Tick creation transaction
 
 To create a Tick asset UTXO, the network must use a Tick asset inflation token. To do this, the network must include a Storm Eye transaction.
 
@@ -331,107 +333,7 @@ Outputs:
 4. Change from the input policy asset UTXOs  
 5. Transaction fee
 
-# 4\. Verifier asset contract
-
-## 4.1. Description
-
-This contract is designed for the Verifier asset UTXOs, which will be used to verify information about asset prices. These UTXOs will be issued to users and burned after being used by the user or by the network.
-
-## 4.2. Auth mechanisms
-
-This covenant will support three authorization options that the user can specify in the request to create a Verifier UTXO. The following authorization options are available:
-
-1. Asset auth \- this method allows you to spend a Verifier UTXO if an input with the desired Asset ID is added to the transaction.  
-2. Script auth \- this method allows you to spend a Verifier UTXO if an input with the desired script hash is added to the transaction.  
-3. Signature auth \- this method allows you to spend a Verifier UTXO if a valid signature for the *jet::sig\_all\_hash* message is provided in the transaction witness.
-
-Contract supports only one auth method at a time. The network must set the compilation parameters that do not apply to the user-selected auth method to their default values.
-
-## 4.3. Compilation parameters
-
-1. STORM\_EYE\_ASSET\_ID \- the Storm Eye asset ID that will be used for the network burning process.  
-2. AUTH\_METHOD \- the index of the auth method.  
-3. AUTH\_ASSET\_ID \- the auth asset ID that the user provided in the Verifier UTXO request  
-4. AUTH\_SCRIPT\_HASH \- the auth script hash that the user provided in the Verifier UTXO request  
-5. AUTH\_PUBKEY \- the auth schnorr pubkey that the user provided in the Verifier UTXO request
-
-## 4.4. Spending paths
-
-The Verifier asset contract has next spending paths:
-
-1. User spending via the Asset authorization method  
-2. User spending via the Script authorization method  
-3. User spending via the Signature authorization method  
-4. Network authorized spending
-
-### 4.4.1. User spending via the Asset authorization method
-
-In this scenario, a user can spend a Verifier UTXO if they include an input in the transaction that has the *AUTH\_ASSET\_ID* asset ID.
-
-The following witness parameters are accepted for spending:
-
-1. *asset\_auth\_utxo\_input\_index* \- the input index of the Asset auth UTXO  
-2. *verifier\_utxo\_output\_index* \- the output index of the Verifier UTXO
-
-This spending path will include the following checks:
-
-1. assert(param::AUTH\_METHOD \== 0\)  
-2. assert(jet::input\_asset(*asset\_auth\_utxo\_input\_index*) \== param::AUTH\_ASSET\_ID)  
-3. assert(jet::output\_asset(*verifier\_utxo\_output\_index*) \== jet::current\_asset())  
-4. assert(jet::output\_amount(*verifier\_utxo\_output\_index*) \== jet::current\_amount())  
-5. assert(is\_op\_return(*verifier\_utxo\_output\_index*))
-
-### 4.4.2. User spending via the Script authorization method
-
-In this scenario, a user can spend a Verifier UTXO if they include an input in the transaction that has the *AUTH\_SCRIPT\_HASH* script hash.
-
-The following witness parameters are accepted for spending:
-
-1. *script\_auth\_utxo\_input\_index* \- the input index of the Script auth UTXO  
-2. *verifier\_utxo\_output\_index* \- the output index of the Verifier UTXO
-
-This spending path will include the following checks:
-
-1. assert(param::AUTH\_METHOD \== 1\)  
-2. assert(jet::input\_script\_hash(*script\_auth\_utxo\_input\_index*) \== param::AUTH\_SCRIPT\_HASH)  
-3. assert(jet::output\_asset(*verifier\_utxo\_output\_index*) \== jet::current\_asset())  
-4. assert(jet::output\_amount(*verifier\_utxo\_output\_index*) \== jet::current\_amount())  
-5. assert(is\_op\_return(*verifier\_utxo\_output\_index*))
-
-### 4.4.3. User spending via the Signature authorization method
-
-In this scenario, a user can spend a Verifier UTXO if they provided the required signature in the transaction witness.
-
-The following witness parameters are accepted for spending:
-
-1. *auth\_signature \-* the *jet::sig\_all\_hash* auth signature  
-2. *verifier\_utxo\_output\_index* \- the output index of the Verifier UTXO
-
-This spending path will include the following checks:
-
-1. assert(param::AUTH\_METHOD \== 2\)  
-2. jet::bip\_0340\_verify((param::AUTH\_PUBKEY, jet::sig\_all\_hash()), *auth\_signature*)  
-3. assert(jet::output\_asset(*verifier\_utxo\_output\_index*) \== jet::current\_asset())  
-4. assert(jet::output\_amount(*verifier\_utxo\_output\_index*) \== jet::current\_amount())  
-5. assert(is\_op\_return(*verifier\_utxo\_output\_index*))
-
-### 4.4.4. Network authorized spending
-
-In this scenario, the network can spend a Verifier UTXO. To spend it, the network must include the Storm Eye UTXO in the transaction.
-
-The following witness parameters are accepted for spending:
-
-1. *storm\_eye\_input\_index* \- the Storm Eye UTXO input index  
-2. *verifier\_utxo\_output\_index* \- the output index of the Verifier UTXO
-
-This spending path will include the following checks:
-
-1. assert(jet::input\_asset(*storm\_eye\_input\_index*) \== param::STORM\_EYE\_ASSET\_ID)  
-2. assert(jet::output\_asset(*verifier\_utxo\_output\_index*) \== jet::current\_asset())  
-3. assert(jet::output\_amount(*verifier\_utxo\_output\_index*) \== jet::current\_amount())  
-4. assert(is\_op\_return(*verifier\_utxo\_output\_index*))
-
-## 4.5. Contract creation transaction
+## 3.6. Verifier creation transaction
 
 To create a Verifier asset UTXO, the network must use a Verifier asset inflation token. To do this, the network must include a Storm Eye transaction.
 
@@ -449,24 +351,24 @@ Outputs:
 4. Change from the input policy asset UTXOs  
 5. Transaction fee
 
-# 5\. Account contract
+# 4\. Account contract
 
-## 5.1. Description
+## 4.1. Description
 
 This contract is designed to store users' LBTC, which will be used by the network to issue and burn Tick and Verifier UTXOs.
 
-## 5.2. Compilation parameters
+## 4.2. Compilation parameters
 
 1. STORM\_EYE\_ASSET\_ID \- the Storm Eye asset ID that will be used for the network authorization.  
 2. ACCOUNT\_OWNER\_PUBKEY \- the account owner Schnorr pubkey
 
-## 5.3. Spending paths
+## 4.3. Spending paths
 
-The Verifier asset contract has next spending paths:
+The Account contract has the following spending paths:
 
 1. Network authorized spending
 
-### 5.3.1. Network authorized spending
+### 4.3.1. Network authorized spending
 
 In this scenario, the network can spend a user Account UTXO. To spend it, the network must include the Storm Eye UTXO in the transaction.
 
