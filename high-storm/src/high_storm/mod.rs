@@ -28,10 +28,11 @@ pub use droplets::DropletsError;
 pub(crate) use droplets::exchange_recipient_amount;
 pub use indexer::IndexerError;
 pub use message::{
-    ApproveVotingRequest, AttestPriceMsg, BurnExpiredUtxos, ExchangeRewards, ExecuteUserRequests,
-    ExecuteVotingRequest, ExpiredUtxosBurned, ExternalRequests, MergeStormEyes, NetworkAsset,
-    NetworkAssets, NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind,
-    PriceAttestation, RenewStormUtxos, SplitStormEye, StormEyeUtxo, UpdateNetworkMembers,
+    ApproveVotingRequest, AttestPriceMsg, BurnExpiredUtxos, ChainTip, ExchangeRewards,
+    ExecuteUserRequests, ExecuteVotingRequest, ExpiredUtxosBurned, ExternalRequests,
+    MergeStormEyes, NetworkAsset, NetworkAssets, NetworkVoteKind, NetworkVoteRequest, NodeMessage,
+    NodeMessageKind, PriceAttestation, RenewStormUtxos, SplitStormEye, StormEyeUtxo,
+    UpdateNetworkMembers,
 };
 pub use prices::{PollOutcome, PriceError};
 pub use renewal::RenewalError;
@@ -49,6 +50,7 @@ pub struct HighStorm {
 
 pub(crate) struct HighStormDependencies {
     network_store: crate::db::network::NetworkStore,
+    chain: crate::db::chain::ChainStore,
     voting_store: crate::db::voting::VotingStore,
     network_assets: crate::db::network_asset::NetworkAssetStore,
     monitored_utxos: crate::db::monitored_utxo::MonitoredUtxoStore,
@@ -72,8 +74,10 @@ impl HighStormDependencies {
         elements_rpc: crate::config::ElementsRpcConfig,
         protocol_config: crate::config::ProtocolConfig,
     ) -> Self {
+        let chain = network_store.chain();
         Self {
             network_store,
+            chain,
             voting_store,
             network_assets,
             monitored_utxos,
@@ -163,15 +167,34 @@ impl HighStorm {
             == leader::leader_for_height(&peers, self.state.block_height())
     }
 
+    pub fn is_recovering(&self) -> bool {
+        self.state.is_recovering()
+    }
+
+    fn is_transaction_production_blocked(&self) -> bool {
+        self.is_recovering() || self.state.is_spending_paused()
+    }
+
     pub async fn sign_execute_user_requests(
         &self,
         tx: Vec<u8>,
         signing_hash: [u8; 32],
         external_requests: Vec<ExternalRequests>,
     ) -> Result<SigningResult, SigningError> {
+        if self.is_transaction_production_blocked() {
+            return Err(SigningError::InvalidMessage(
+                "transaction production is paused for chain recovery or member migration".into(),
+            ));
+        }
+        let chain_tip = self
+            .state
+            .indexer()
+            .chain_tip()
+            .await
+            .map_err(|error| SigningError::InvalidMessage(error.to_string()))?;
         self.state
             .signing()
-            .sign_execute_user_requests(&self.storm, tx, signing_hash, external_requests)
+            .sign_execute_user_requests(&self.storm, tx, signing_hash, external_requests, chain_tip)
             .await
     }
 
@@ -181,6 +204,22 @@ impl HighStorm {
         signing_hash: [u8; 32],
         block_height: u64,
     ) -> Result<[u8; 32], DropletsError> {
+        if self.is_transaction_production_blocked() {
+            return Err(DropletsError::Invalid(
+                "transaction production is paused for chain recovery or member migration".into(),
+            ));
+        }
+        let chain_tip = self
+            .state
+            .indexer()
+            .chain_tip()
+            .await
+            .map_err(|error| DropletsError::Invalid(error.to_string()))?;
+        if chain_tip.height != block_height {
+            return Err(DropletsError::Invalid(
+                "Droplets exchange does not target the indexed chain tip".into(),
+            ));
+        }
         self.state.set_block_height(block_height);
         let peers = self.peers().await;
         let local = leader::local_public_key(&peers);
@@ -207,11 +246,12 @@ impl HighStorm {
             signing_hash,
             signing_storm_tree_branch: [0; 32],
             block_height,
+            chain_tip: Some(chain_tip),
         };
         match self
             .state
             .signing()
-            .sign_exchange_rewards(&self.storm, tx, signing_hash, block_height)
+            .sign_exchange_rewards(&self.storm, tx, signing_hash, block_height, chain_tip)
             .await
         {
             Ok(signing) => {
@@ -252,6 +292,9 @@ impl HighStorm {
     pub async fn process_droplet_exchange_request(
         &self,
     ) -> Result<Option<[u8; 32]>, DropletsError> {
+        if self.is_transaction_production_blocked() {
+            return Ok(None);
+        }
         let peers = self.peers().await;
         if !leader::is_local_leader(&peers, self.state.block_height()) {
             return Ok(None);
@@ -374,10 +417,12 @@ impl HighStorm {
         let indexed = self.state.indexer().sync().await?;
         if let Some(cursor) = self.state.indexer().cursor().await? {
             self.state.set_block_height(cursor.height);
-            self.state
-                .indexer()
-                .recover_droplet_exchanges(cursor.height, self.is_leader().await)
-                .await?;
+            if !self.state.is_spending_paused() {
+                self.state
+                    .indexer()
+                    .recover_droplet_exchanges(cursor.height, self.is_leader().await)
+                    .await?;
+            }
         }
         Ok(indexed)
     }
@@ -394,13 +439,30 @@ impl HighStorm {
     }
 
     pub async fn renew_storm_eye_timelock(&self) -> Result<Option<[u8; 32]>, RenewalError> {
+        if self.is_transaction_production_blocked() {
+            return Err(RenewalError::Invalid(
+                "transaction production is paused for chain recovery or member migration".into(),
+            ));
+        }
         if !self.is_coordinator().await {
             return Ok(None);
         }
         let block_height = self.state.block_height();
-        let Some(prepared) = self.state.renewal().prepare(block_height).await? else {
+        let Some(mut prepared) = self.state.renewal().prepare(block_height).await? else {
             return Ok(None);
         };
+        let chain_tip = self
+            .state
+            .indexer()
+            .chain_tip()
+            .await
+            .map_err(|error| RenewalError::Invalid(error.to_string()))?;
+        if chain_tip.height != block_height {
+            return Err(RenewalError::Invalid(
+                "renewal does not target the indexed chain tip".into(),
+            ));
+        }
+        prepared.request.chain_tip = Some(chain_tip);
         let request = prepared.request.clone();
         self.state.renewal().validate_request(&request).await?;
         let signing = self
@@ -501,11 +563,16 @@ impl HighStorm {
         storm_eye_lane: usize,
         max_transaction_weight: usize,
     ) -> Result<usize, user_requests::UserRequestError> {
+        if self.is_transaction_production_blocked() {
+            return Err(user_requests::UserRequestError::Invalid(
+                "transaction production is paused for chain recovery or member migration".into(),
+            ));
+        }
         if !self.is_coordinator().await {
             return Ok(0);
         }
 
-        let prepared = match self
+        let mut prepared = match self
             .state
             .user_requests()
             .prepare_round(storm_eye_lane, max_transaction_weight)
@@ -514,6 +581,13 @@ impl HighStorm {
             Some(prepared) => prepared,
             None => return Ok(0),
         };
+        let chain_tip = self
+            .state
+            .indexer()
+            .chain_tip()
+            .await
+            .map_err(|error| user_requests::UserRequestError::Invalid(error.to_string()))?;
+        prepared.request.chain_tip = Some(chain_tip);
         self.state
             .user_requests()
             .validate_execute(&prepared.request)
@@ -526,6 +600,7 @@ impl HighStorm {
                 prepared.request.tx.clone(),
                 prepared.request.signing_hash,
                 prepared.request.external_requests.clone(),
+                chain_tip,
             )
             .await
             .map_err(user_requests::UserRequestError::Signing)?;
@@ -547,6 +622,11 @@ impl HighStorm {
         storm_eye_lane: usize,
         max_transaction_weight: usize,
     ) -> Result<usize, BurningError> {
+        if self.is_transaction_production_blocked() {
+            return Err(BurningError::Invalid(
+                "transaction production is paused for chain recovery or member migration".into(),
+            ));
+        }
         let block_height = self.state.block_height();
         let reconciled = self.state.burning().reconcile_mempool(block_height).await?;
         if reconciled > 0 {
@@ -561,7 +641,7 @@ impl HighStorm {
             return Ok(0);
         }
 
-        let prepared = match self
+        let mut prepared = match self
             .state
             .burning()
             .prepare_round(block_height, storm_eye_lane, max_transaction_weight)
@@ -570,6 +650,18 @@ impl HighStorm {
             Some(prepared) => prepared,
             None => return Ok(0),
         };
+        let chain_tip = self
+            .state
+            .indexer()
+            .chain_tip()
+            .await
+            .map_err(|error| BurningError::Invalid(error.to_string()))?;
+        if chain_tip.height != block_height {
+            return Err(BurningError::Invalid(
+                "burn does not target the indexed chain tip".into(),
+            ));
+        }
+        prepared.request.chain_tip = Some(chain_tip);
         self.state
             .burning()
             .validate_request(&prepared.request)
@@ -582,6 +674,7 @@ impl HighStorm {
                 prepared.request.tx.clone(),
                 prepared.request.signing_hash,
                 block_height,
+                chain_tip,
             )
             .await?;
         let proof = self
@@ -646,6 +739,10 @@ impl HighStorm {
 }
 
 impl HighStormHandle {
+    fn is_transaction_production_blocked(&self) -> bool {
+        self.state.is_recovering() || self.state.is_spending_paused()
+    }
+
     /// Only a Direct feed has sources. Named with a Cross pair, this and the
     /// two below do nothing, since it is priced from the feeds it joins.
     pub async fn record_price_observation(
@@ -780,6 +877,11 @@ impl HighStormHandle {
         &self,
         request_hash: [u8; 32],
     ) -> Result<[u8; 32], VotingExecutionError> {
+        if self.is_transaction_production_blocked() {
+            return Err(VotingExecutionError::Invalid(
+                "transaction production is paused for chain recovery or member migration".into(),
+            ));
+        }
         self.spawn_voting_execution(request_hash)?
             .await
             .map_err(|error| {
@@ -829,11 +931,18 @@ impl HighStormHandle {
                 return Err(VotingExecutionError::MemberMigrationNotReady);
             }
         }
-        let request = self
+        let mut request = self
             .state
             .voting_execution()
             .prepare(request_hash, &current_members)
             .await?;
+        let chain_tip = self
+            .state
+            .indexer()
+            .chain_tip()
+            .await
+            .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
+        request.chain_tip = Some(chain_tip);
         let proposer = request.proposer_public_key;
         let local = leader::local_public_key(&self.peers().await).ok_or_else(|| {
             VotingExecutionError::Invalid("local network member is missing".into())
@@ -867,6 +976,7 @@ impl HighStormHandle {
                 request.tx.clone(),
                 request.signing_hashes.clone(),
                 proposer,
+                chain_tip,
             )
             .await
         {
@@ -882,7 +992,7 @@ impl HighStormHandle {
             Ok(proof) => proof,
             Err(error) => return Err(error.into()),
         };
-        let prepared = match self
+        let mut prepared = match self
             .state
             .voting_execution()
             .prepare_finalization(request_hash, &request, &current_members)
@@ -894,6 +1004,7 @@ impl HighStormHandle {
                 return Err(VotingExecutionError::Invalid(message));
             }
         };
+        prepared.request.chain_tip = Some(chain_tip);
         let (txid, notification) = match self
             .state
             .voting_execution()
@@ -926,6 +1037,8 @@ impl HighStormHandle {
         &self,
         request_hash: [u8; 32],
         txid: [u8; 32],
+        block_height: u64,
+        block_hash: [u8; 32],
         current_members: &BTreeSet<[u8; 32]>,
     ) -> Result<(), VotingExecutionError> {
         activate_member_migration_state(
@@ -933,6 +1046,8 @@ impl HighStormHandle {
             &self.storm,
             request_hash,
             txid,
+            block_height,
+            block_hash,
             current_members,
         )
         .await
@@ -955,14 +1070,6 @@ impl HighStormHandle {
         for (request_hash, txid, request) in
             self.state.voting_execution().pending_broadcasts().await?
         {
-            self.state.voting_execution().broadcast(txid, &request)?;
-            if let Err(error) = self.announce_voting_execution(request_hash, &request).await {
-                tracing::warn!(%error, "failed to reannounce voting execution");
-            }
-            if !self.state.voting_execution().is_confirmed(txid)? {
-                continue;
-            }
-
             let current_members = voting_member_keys(&self.peers().await)?;
             let vote = self
                 .state
@@ -971,9 +1078,63 @@ impl HighStormHandle {
                 .await
                 .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?
                 .ok_or_else(|| VotingExecutionError::UnknownRequest(hex::encode(request_hash)))?;
-            if member_migration_target(&vote.request, &current_members)?.is_some() {
-                self.activate_member_migration(request_hash, txid, &current_members)
+            let is_member_migration =
+                member_migration_target(&vote.request, &current_members)?.is_some();
+            let Some(inclusion) = self
+                .state
+                .voting_execution()
+                .transaction_confirmation(txid)?
+            else {
+                self.state
+                    .voting_execution()
+                    .mark_orphaned(request_hash, txid)
                     .await?;
+                self.state.voting_execution().broadcast(txid, &request)?;
+                if let Err(error) = self.announce_voting_execution(request_hash, &request).await {
+                    tracing::warn!(%error, "failed to reannounce voting execution");
+                }
+                continue;
+            };
+            if is_member_migration {
+                self.state
+                    .set_spending_paused(true)
+                    .await
+                    .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
+            }
+            let included_at = inclusion.block_height;
+            self.state
+                .voting_execution()
+                .mark_included(request_hash, txid, included_at, inclusion.block_hash)
+                .await?;
+            if !self
+                .state
+                .voting_execution()
+                .is_final(inclusion.confirmations)
+            {
+                continue;
+            }
+
+            if is_member_migration {
+                let canonical_hash = self
+                    .state
+                    .indexer()
+                    .hash_at(included_at)
+                    .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
+                if canonical_hash != inclusion.block_hash {
+                    self.state
+                        .voting_execution()
+                        .mark_orphaned(request_hash, txid)
+                        .await?;
+                    continue;
+                }
+                self.activate_member_migration(
+                    request_hash,
+                    txid,
+                    included_at,
+                    inclusion.block_hash,
+                    &current_members,
+                )
+                .await?;
             } else {
                 self.state
                     .voting_execution()
@@ -1086,6 +1247,8 @@ async fn activate_member_migration_state(
     storm: &StormHandle,
     request_hash: [u8; 32],
     txid: [u8; 32],
+    block_height: u64,
+    block_hash: [u8; 32],
     current_members: &BTreeSet<[u8; 32]>,
 ) -> Result<(), VotingExecutionError> {
     let _voting_guard = state.voting().lock_operations().await;
@@ -1111,7 +1274,12 @@ async fn activate_member_migration_state(
             &asset.kind,
             &asset.contract_script,
             contract_data,
-            crate::db::network::ConfirmedVotingExecution { request_hash, txid },
+            crate::db::network::ConfirmedVotingExecution {
+                request_hash,
+                txid,
+                block_height,
+                block_hash,
+            },
         )
         .await
         .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
@@ -1132,6 +1300,7 @@ async fn finish_member_migration_state(
         .await
         .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
     state.complete_member_migration().await;
+    state.migration_finalized();
 
     if let Err(error) = state.assets().announce_pending(storm).await {
         tracing::warn!(%error, "failed to announce migrated network assets");

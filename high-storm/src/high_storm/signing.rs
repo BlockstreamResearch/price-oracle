@@ -20,8 +20,9 @@ use tokio::{
 };
 
 use super::message::{
-    BurnExpiredUtxos, ExchangeRewards, ExecuteUserRequests, ExecuteVotingRequest, ExternalRequests,
-    NodeMessage, NodeMessageKind, PartialSignaturesMessage, RenewStormUtxos, SigningNoncesMessage,
+    BurnExpiredUtxos, ChainTip, ExchangeRewards, ExecuteUserRequests, ExecuteVotingRequest,
+    ExternalRequests, NodeMessage, NodeMessageKind, PartialSignaturesMessage, RenewStormUtxos,
+    SigningNoncesMessage,
 };
 
 const SIGNING_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -153,6 +154,7 @@ impl Signing {
         tx: Vec<u8>,
         signing_hash: [u8; 32],
         external_requests: Vec<ExternalRequests>,
+        chain_tip: ChainTip,
     ) -> Result<SigningResult, SigningError> {
         if tx.is_empty() {
             return Err(SigningError::InvalidMessage(
@@ -178,6 +180,7 @@ impl Signing {
                         signing_hash,
                         signing_storm_tree_branch: branch,
                         external_requests: external_requests.clone(),
+                        chain_tip: Some(chain_tip),
                     },
                 )
             },
@@ -191,6 +194,7 @@ impl Signing {
         tx: Vec<u8>,
         signing_hash: [u8; 32],
         block_height: u64,
+        chain_tip: ChainTip,
     ) -> Result<SigningResult, SigningError> {
         if tx.is_empty() {
             return Err(SigningError::InvalidMessage(
@@ -211,6 +215,7 @@ impl Signing {
                         signing_hash,
                         signing_storm_tree_branch: branch,
                         block_height,
+                        chain_tip: Some(chain_tip),
                     },
                 )
             },
@@ -224,6 +229,7 @@ impl Signing {
         tx: Vec<u8>,
         signing_hash: [u8; 32],
         block_height: u64,
+        chain_tip: ChainTip,
     ) -> Result<SigningResult, SigningError> {
         if tx.is_empty() {
             return Err(SigningError::InvalidMessage(
@@ -245,6 +251,7 @@ impl Signing {
                         signing_hash,
                         signing_storm_tree_branch: branch,
                         block_height,
+                        chain_tip: Some(chain_tip),
                     },
                 )
             },
@@ -259,6 +266,7 @@ impl Signing {
         tx: Vec<u8>,
         signing_hashes: Vec<[u8; 32]>,
         proposer_public_key: NodePublicKey,
+        chain_tip: ChainTip,
     ) -> Result<SigningResult, SigningError> {
         self.sign_with_message(
             storm,
@@ -274,6 +282,7 @@ impl Signing {
                         signing_hashes: signing_hashes.clone(),
                         signing_storm_tree_branch: branch,
                         proposer_public_key,
+                        chain_tip: Some(chain_tip),
                     },
                 )
             },

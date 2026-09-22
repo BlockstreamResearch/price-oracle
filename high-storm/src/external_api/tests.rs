@@ -568,6 +568,7 @@ async fn setup_with_database() -> (Router, PrivateKey, String, Database) {
                 burn_transaction_fee_sats: 500,
                 exchange_transaction_fee_sats: 500,
                 tick_lifetime_blocks: 60,
+                finality_confirmations: 2,
             },
         ),
     )

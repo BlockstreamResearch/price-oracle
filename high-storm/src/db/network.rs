@@ -8,8 +8,9 @@ use sqlx::{AnyPool, Row};
 use storm::{Peer, PeerStatus};
 
 use super::{
-    droplet::DropletStore, monitored_utxo::MonitoredUtxoStore, network_asset::NetworkAssetStore,
-    price_attestation::PriceAttestationStore, user_request::UserRequestStore, voting::VotingStore,
+    chain::ChainStore, droplet::DropletStore, monitored_utxo::MonitoredUtxoStore,
+    network_asset::NetworkAssetStore, price_attestation::PriceAttestationStore,
+    user_request::UserRequestStore, voting::VotingStore,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +41,8 @@ pub struct NetworkStore {
 pub(crate) struct ConfirmedVotingExecution {
     pub(crate) request_hash: [u8; 32],
     pub(crate) txid: [u8; 32],
+    pub(crate) block_height: u64,
+    pub(crate) block_hash: [u8; 32],
 }
 
 impl NetworkStore {
@@ -49,6 +52,10 @@ impl NetworkStore {
 
     pub(crate) fn voting(&self) -> VotingStore {
         VotingStore::new(self.pool.clone())
+    }
+
+    pub(crate) fn chain(&self) -> ChainStore {
+        ChainStore::new(self.pool.clone())
     }
 
     pub(crate) fn droplets(&self) -> DropletStore {
@@ -168,6 +175,48 @@ impl NetworkStore {
         validate_unique_member_identities(peers)?;
 
         let mut transaction = self.pool.begin().await?;
+        let previous_coordinator: String =
+            sqlx::query_scalar("SELECT coordinator_public_key FROM network_state WHERE id = 1")
+                .fetch_one(&mut *transaction)
+                .await?;
+        let previous_asset = sqlx::query(
+            "SELECT contract_script, contract_data FROM network_assets \
+             WHERE kind = $1 AND status = 'active'",
+        )
+        .bind(asset_kind)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(Error::MigrationAssetNotUpdated)?;
+        let previous_script: Vec<u8> = previous_asset.try_get("contract_script")?;
+        let previous_data: Option<Vec<u8>> = previous_asset.try_get("contract_data")?;
+        sqlx::query(
+            "INSERT INTO network_member_migrations (request_hash, execution_txid, block_height, \
+             block_hash, asset_kind, previous_script, previous_data, next_script, next_data, \
+             previous_coordinator_public_key, next_coordinator_public_key) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(execution.request_hash.to_vec())
+        .bind(execution.txid.to_vec())
+        .bind(i64::try_from(execution.block_height).map_err(|_| Error::TimestampOutOfRange)?)
+        .bind(execution.block_hash.to_vec())
+        .bind(asset_kind)
+        .bind(&previous_script)
+        .bind(&previous_data)
+        .bind(contract_script)
+        .bind(contract_data)
+        .bind(&previous_coordinator)
+        .bind(hex::encode(coordinator_public_key))
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO network_member_migration_peers \
+             (request_hash, snapshot_kind, peer_order, public_key, socket_address, last_seen, status, discovery) \
+             SELECT $1, 'previous', peer_order, public_key, socket_address, last_seen, status, discovery \
+             FROM network_peers",
+        )
+        .bind(execution.request_hash.to_vec())
+        .execute(&mut *transaction)
+        .await?;
         sqlx::query("DELETE FROM network_peers")
             .execute(&mut *transaction)
             .await?;
@@ -197,6 +246,20 @@ impl NetworkStore {
                     peer_order, public_key, socket_address, last_seen, status, discovery
                  ) VALUES ($1, $2, $3, $4, $5, $6)",
             )
+            .bind(i64::try_from(position).map_err(|_| Error::TimestampOutOfRange)?)
+            .bind(hex::encode(peer.compressed_public_key))
+            .bind(&peer.socket_address)
+            .bind(last_seen)
+            .bind(status_name(peer.status))
+            .bind(i64::from(peer.discovery))
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO network_member_migration_peers \
+                 (request_hash, snapshot_kind, peer_order, public_key, socket_address, last_seen, status, discovery) \
+                 VALUES ($1, 'next', $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(execution.request_hash.to_vec())
             .bind(i64::try_from(position).map_err(|_| Error::TimestampOutOfRange)?)
             .bind(hex::encode(peer.compressed_public_key))
             .bind(&peer.socket_address)
@@ -243,6 +306,9 @@ impl NetworkStore {
         .execute(&mut *transaction)
         .await?;
         sqlx::query("DELETE FROM voting_requests WHERE execution_confirmed = 0")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE chain_recovery_state SET migration_paused = 0 WHERE id = 1")
             .execute(&mut *transaction)
             .await?;
 
@@ -412,6 +478,8 @@ mod tests {
                     ConfirmedVotingExecution {
                         request_hash,
                         txid: execution_txid,
+                        block_height: 43,
+                        block_hash: [16; 32],
                     },
                 )
                 .await
@@ -429,6 +497,14 @@ mod tests {
         );
         assert!(votes.get(stale_request_hash).await.unwrap().is_some());
         assert_eq!(votes.approval_count(stale_request_hash).await.unwrap(), 1);
+        let migration_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM network_member_migrations WHERE request_hash = $1",
+        )
+        .bind(request_hash.to_vec())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(migration_count, 0);
 
         database
             .network_assets()
@@ -458,6 +534,8 @@ mod tests {
                     ConfirmedVotingExecution {
                         request_hash,
                         txid: [12; 32],
+                        block_height: 43,
+                        block_hash: [16; 32],
                     },
                 )
                 .await
@@ -475,7 +553,16 @@ mod tests {
         assert_eq!(unchanged_asset.contract_data, Some(vec![6; 32]));
         assert!(votes.get(stale_request_hash).await.unwrap().is_some());
         assert_eq!(votes.approval_count(stale_request_hash).await.unwrap(), 1);
+        let migration_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM network_member_migrations WHERE request_hash = $1",
+        )
+        .bind(request_hash.to_vec())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(migration_count, 0);
 
+        database.chain().set_migration_paused(true).await.unwrap();
         store
             .apply_member_migration(
                 std::slice::from_ref(&new_peer),
@@ -486,6 +573,8 @@ mod tests {
                 ConfirmedVotingExecution {
                     request_hash,
                     txid: execution_txid,
+                    block_height: 43,
+                    block_hash: [16; 32],
                 },
             )
             .await
@@ -509,6 +598,45 @@ mod tests {
             .unwrap();
         assert_eq!(asset.contract_script, vec![0x52]);
         assert_eq!(asset.contract_data, Some(vec![9; 32]));
+        let migrations = database
+            .chain()
+            .finalized_member_migrations()
+            .await
+            .unwrap();
+        assert_eq!(migrations.len(), 1);
+        assert_eq!(migrations[0].request_hash, request_hash);
+        assert_eq!(migrations[0].block_height, 43);
+        assert_eq!(migrations[0].block_hash, [16; 32]);
+        assert_eq!(migrations[0].previous_script, vec![0x51]);
+        assert_eq!(migrations[0].next_script, vec![0x52]);
+        assert_eq!(migrations[0].previous_members.len(), 1);
+        assert_eq!(migrations[0].next_members.len(), 1);
+        assert!(
+            !database
+                .chain()
+                .recovery_state()
+                .await
+                .unwrap()
+                .migration_paused
+        );
+
+        database.chain().reset_projections().await.unwrap();
+        let restored_asset = database
+            .network_assets()
+            .get(STORM_EYE_KIND)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored_asset.contract_script, vec![0x51]);
+        assert_eq!(
+            database
+                .chain()
+                .finalized_member_migrations()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -542,6 +670,8 @@ mod tests {
                 ConfirmedVotingExecution {
                     request_hash: [7; 32],
                     txid: [11; 32],
+                    block_height: 43,
+                    block_hash: [16; 32],
                 },
             )
             .await

@@ -378,6 +378,7 @@ impl Burning {
             signing_hash,
             signing_storm_tree_branch: signing_branch,
             block_height,
+            chain_tip: None,
         };
 
         Ok(Some(PreparedBurn {
@@ -659,6 +660,7 @@ impl Burning {
             ));
         }
 
+        let chain_tip = prepared.request.chain_tip;
         Ok(ExpiredUtxosBurned {
             txid: txid.to_byte_array(),
             utxos: prepared
@@ -667,6 +669,7 @@ impl Burning {
                 .map(|(txid, output_index)| StormEyeUtxo { txid, output_index })
                 .collect(),
             block_height,
+            chain_tip,
         })
     }
 

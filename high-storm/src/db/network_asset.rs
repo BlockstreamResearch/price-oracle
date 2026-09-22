@@ -1,4 +1,4 @@
-use sqlx::{AnyPool, Error, Row};
+use sqlx::{Any, AnyPool, Error, Row, Transaction};
 
 use crate::NetworkAsset;
 
@@ -149,7 +149,8 @@ impl NetworkAssetStore {
              FROM storm_eye_renewals AS renewal
              WHERE network_assets.kind = 'storm-eye'
                AND network_assets.status = 'active'
-               AND renewal.id = 1 AND renewal.txid = $1",
+               AND renewal.id = 1 AND renewal.txid = $1
+               AND renewal.included_block_hash IS NOT NULL",
         )
         .bind(txid.to_vec())
         .execute(&mut *transaction)
@@ -168,12 +169,56 @@ impl NetworkAssetStore {
         Ok(true)
     }
 
+    pub async fn mark_storm_eye_renewal_included(
+        &self,
+        txid: [u8; 32],
+        block_height: u64,
+        block_hash: [u8; 32],
+    ) -> Result<bool, Error> {
+        let updated = sqlx::query(
+            "UPDATE storm_eye_renewals SET included_at_block = $1, included_block_hash = $2 \
+             WHERE id = 1 AND txid = $3",
+        )
+        .bind(i64::try_from(block_height).map_err(|error| Error::Encode(Box::new(error)))?)
+        .bind(block_hash.to_vec())
+        .bind(txid.to_vec())
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    pub async fn mark_storm_eye_renewal_orphaned(&self, txid: [u8; 32]) -> Result<bool, Error> {
+        let updated = sqlx::query(
+            "UPDATE storm_eye_renewals SET included_at_block = NULL, included_block_hash = NULL \
+             WHERE id = 1 AND txid = $1",
+        )
+        .bind(txid.to_vec())
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     pub async fn index_storm_eye_renewal(
         &self,
         current: &NetworkAsset,
         renewed: &NetworkAsset,
     ) -> Result<bool, Error> {
         let mut transaction = self.pool.begin().await?;
+        let updated = Self::index_storm_eye_renewal_in(&mut transaction, current, renewed).await?;
+        if !updated {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        transaction.commit().await?;
+
+        Ok(true)
+    }
+
+    pub(crate) async fn index_storm_eye_renewal_in(
+        transaction: &mut Transaction<'_, Any>,
+        current: &NetworkAsset,
+        renewed: &NetworkAsset,
+    ) -> Result<bool, Error> {
         let updated = sqlx::query(
             "UPDATE network_assets
              SET contract_script = $1, contract_data = $2
@@ -186,18 +231,12 @@ impl NetworkAssetStore {
         .bind(&current.contract_script)
         .bind(&current.contract_data)
         .bind(&current.contract_data)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?
         .rows_affected();
         if updated != 1 {
-            transaction.rollback().await?;
             return Ok(false);
         }
-        sqlx::query("DELETE FROM storm_eye_renewals")
-            .execute(&mut *transaction)
-            .await?;
-        transaction.commit().await?;
-
         Ok(true)
     }
 
@@ -407,6 +446,12 @@ mod tests {
             Some(renewal)
         );
         assert!(!store.confirm_storm_eye_renewal([7; 32]).await.unwrap());
+        assert!(
+            store
+                .mark_storm_eye_renewal_included([4; 32], 43_201, [8; 32])
+                .await
+                .unwrap()
+        );
         assert!(store.confirm_storm_eye_renewal([4; 32]).await.unwrap());
         assert!(store.pending_storm_eye_renewal().await.unwrap().is_none());
 
@@ -441,7 +486,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn indexed_storm_eye_renewal_clears_pending_announcement() {
+    async fn indexed_storm_eye_renewal_keeps_pending_until_finality() {
         let database = Database::connect("sqlite::memory:", 1).await.unwrap();
         let store = database.network_assets();
         let current = pending_asset().asset;
@@ -466,7 +511,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(store.pending_storm_eye_renewal().await.unwrap().is_none());
+        assert!(store.pending_storm_eye_renewal().await.unwrap().is_some());
         assert_eq!(store.get(STORM_EYE_KIND).await.unwrap(), Some(renewed));
     }
 }

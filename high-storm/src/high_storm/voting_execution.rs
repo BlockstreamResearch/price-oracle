@@ -124,6 +124,14 @@ pub(crate) struct VotingExecution {
     assets: NetworkAssetStore,
     elements_rpc: ElementsRpcConfig,
     transaction_fee_sats: u64,
+    finality_confirmations: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TransactionConfirmation {
+    pub(crate) confirmations: u64,
+    pub(crate) block_height: u64,
+    pub(crate) block_hash: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +164,7 @@ impl VotingExecution {
         assets: NetworkAssetStore,
         elements_rpc: ElementsRpcConfig,
         transaction_fee_sats: u64,
+        finality_confirmations: u64,
     ) -> Self {
         Self {
             votes,
@@ -163,6 +172,7 @@ impl VotingExecution {
             assets,
             elements_rpc,
             transaction_fee_sats,
+            finality_confirmations: finality_confirmations.max(1),
         }
     }
 
@@ -581,12 +591,78 @@ impl VotingExecution {
             .collect()
     }
 
-    pub(crate) fn is_confirmed(&self, txid: [u8; 32]) -> Result<bool, VotingExecutionError> {
-        let transaction: RawTransactionInfo = self.client()?.call(
+    pub(crate) fn transaction_confirmation(
+        &self,
+        txid: [u8; 32],
+    ) -> Result<Option<TransactionConfirmation>, VotingExecutionError> {
+        let client = self.client()?;
+        let transaction = client.call::<RawTransactionInfo>(
             "getrawtransaction",
             &[Txid::from_byte_array(txid).to_string().into(), true.into()],
+        );
+        let Ok(transaction) = transaction else {
+            return Ok(None);
+        };
+        if transaction.confirmations == 0 {
+            return Ok(None);
+        }
+        let block_hash = transaction
+            .block_hash
+            .as_deref()
+            .ok_or_else(|| {
+                VotingExecutionError::Invalid(
+                    "confirmed voting transaction has no block hash".into(),
+                )
+            })?
+            .parse::<BlockHash>()
+            .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?
+            .to_byte_array();
+        let header: BlockHeaderInfo = client.call(
+            "getblockheader",
+            &[
+                BlockHash::from_byte_array(block_hash).to_string().into(),
+                true.into(),
+            ],
         )?;
-        Ok(transaction.confirmations > 0)
+        let canonical_hash: String = client.call("getblockhash", &[header.height.into()])?;
+        let canonical_hash = canonical_hash
+            .parse::<BlockHash>()
+            .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?
+            .to_byte_array();
+        Ok(canonical_confirmation(
+            transaction.confirmations,
+            header.height,
+            block_hash,
+            canonical_hash,
+        ))
+    }
+
+    pub(crate) fn is_final(&self, confirmations: u64) -> bool {
+        confirmations >= self.finality_confirmations
+    }
+
+    pub(crate) async fn mark_included(
+        &self,
+        request_hash: [u8; 32],
+        txid: [u8; 32],
+        block_height: u64,
+        block_hash: [u8; 32],
+    ) -> Result<(), VotingExecutionError> {
+        self.votes
+            .mark_execution_included(request_hash, txid, block_height, block_hash)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn mark_orphaned(
+        &self,
+        request_hash: [u8; 32],
+        txid: [u8; 32],
+    ) -> Result<(), VotingExecutionError> {
+        self.votes
+            .mark_execution_orphaned(request_hash, txid)
+            .await?;
+        Ok(())
     }
 
     pub(crate) async fn observe_broadcast(
@@ -843,6 +919,26 @@ struct ScannedUtxo {
 struct RawTransactionInfo {
     #[serde(default)]
     confirmations: u64,
+    #[serde(default, rename = "blockhash")]
+    block_hash: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BlockHeaderInfo {
+    height: u64,
+}
+
+fn canonical_confirmation(
+    confirmations: u64,
+    block_height: u64,
+    block_hash: [u8; 32],
+    canonical_hash: [u8; 32],
+) -> Option<TransactionConfirmation> {
+    (block_hash == canonical_hash).then_some(TransactionConfirmation {
+        confirmations,
+        block_height,
+        block_hash,
+    })
 }
 
 fn operation_utxos(
@@ -1097,6 +1193,7 @@ fn build_transaction(
         signing_hashes: signing_hashes(&pset, &storm_eye, &network, storm_eye_inputs)?,
         signing_storm_tree_branch: contract_data.storm_tree_root,
         proposer_public_key: proposer,
+        chain_tip: None,
     };
 
     Ok(PreparedVotingExecution {
@@ -1595,6 +1692,19 @@ mod inventory_tests {
     use simplex::simplicityhl::elements::{
         BlockHash, LockTime, OutPoint, Transaction, TxIn, confidential,
     };
+
+    #[test]
+    fn confirmation_uses_header_height_only_for_a_canonical_hash() {
+        assert_eq!(
+            canonical_confirmation(3, 42, [7; 32], [7; 32]),
+            Some(TransactionConfirmation {
+                confirmations: 3,
+                block_height: 42,
+                block_hash: [7; 32],
+            })
+        );
+        assert_eq!(canonical_confirmation(3, 42, [7; 32], [8; 32]), None);
+    }
 
     #[test]
     fn executing_votes_override_proposed_reservations() {

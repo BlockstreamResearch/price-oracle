@@ -263,7 +263,7 @@ impl VotingStore {
             "UPDATE voting_requests SET execution_started = 0, execution_confirmed = 1 \
              WHERE message_hash = $1 AND approved_at_block_height IS NOT NULL \
              AND execution_request IS NOT NULL AND execution_txid = $2 \
-             AND execution_confirmed = 0",
+             AND execution_included_block_hash IS NOT NULL AND execution_confirmed = 0",
         )
         .bind(message_hash.to_vec())
         .bind(txid.to_vec())
@@ -273,6 +273,48 @@ impl VotingStore {
         if updated != 1 {
             return Err(Error::ExecutionStateNotUpdated);
         }
+        Ok(())
+    }
+
+    pub async fn mark_execution_included(
+        &self,
+        message_hash: [u8; 32],
+        txid: [u8; 32],
+        block_height: u64,
+        block_hash: [u8; 32],
+    ) -> Result<(), Error> {
+        let updated = sqlx::query(
+            "UPDATE voting_requests SET execution_included_at_block = $1, \
+             execution_included_block_hash = $2 WHERE message_hash = $3 \
+             AND execution_txid = $4 AND execution_confirmed = 0",
+        )
+        .bind(height_to_i64(block_height)?)
+        .bind(block_hash.to_vec())
+        .bind(message_hash.to_vec())
+        .bind(txid.to_vec())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            return Err(Error::ExecutionStateNotUpdated);
+        }
+        Ok(())
+    }
+
+    pub async fn mark_execution_orphaned(
+        &self,
+        message_hash: [u8; 32],
+        txid: [u8; 32],
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "UPDATE voting_requests SET execution_included_at_block = NULL, \
+             execution_included_block_hash = NULL WHERE message_hash = $1 \
+             AND execution_txid = $2 AND execution_confirmed = 0",
+        )
+        .bind(message_hash.to_vec())
+        .bind(txid.to_vec())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -446,6 +488,10 @@ mod tests {
         assert_eq!(broadcast.execution_txid, Some(txid));
         assert!(!broadcast.execution_confirmed);
 
+        store
+            .mark_execution_included(request_hash, txid, 43, [8; 32])
+            .await
+            .unwrap();
         store.confirm_execution(request_hash, txid).await.unwrap();
         let executed = store.get(request_hash).await.unwrap().unwrap();
         assert!(!executed.execution_started);

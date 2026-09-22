@@ -112,6 +112,43 @@ fn burning_time_is_sixty_blocks_for_production_and_docker() {
 
 #[tokio::test]
 #[ignore = "requires the bundled three-node Docker Compose stack"]
+async fn rebuilds_all_chain_projections_after_a_block_reorganization() -> TestResult<()> {
+    let rpc = rpc_client(RPC_URL)?;
+    let wallet = rpc_client(WALLET_RPC_URL)?;
+    let databases = database_pools().await?;
+    let old_height: u64 = rpc.call("getblockcount", &[])?;
+    let old_tip: String = rpc.call("getblockhash", &[old_height.into()])?;
+    let mining_address = wallet
+        .call::<Vec<WalletUtxo>>("listunspent", &[1.into(), 9_999_999.into()])?
+        .into_iter()
+        .next()
+        .ok_or("funded wallet has no confirmed address for mining")?
+        .address;
+
+    wait_for_indexed_tip(&databases, old_height, &old_tip, Duration::from_secs(60)).await?;
+    let _: Value = rpc.call("invalidateblock", &[old_tip.clone().into()])?;
+    mine_blocks(&rpc, 2, &mining_address)?;
+
+    let new_height: u64 = rpc.call("getblockcount", &[])?;
+    let new_tip: String = rpc.call("getblockhash", &[new_height.into()])?;
+    assert_ne!(new_tip, old_tip);
+    wait_for_indexed_tip(&databases, new_height, &new_tip, Duration::from_secs(90)).await?;
+
+    for database in &databases {
+        let old_hash = BlockHash::from_str(&old_tip)?.to_byte_array().to_vec();
+        let old_block: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM canonical_blocks WHERE block_hash = $1")
+                .bind(old_hash)
+                .fetch_one(database)
+                .await?;
+        assert_eq!(old_block, 0, "disconnected block remained in the journal");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the bundled three-node Docker Compose stack"]
 async fn batches_two_users_and_burns_both_to_one_empty_op_return() -> TestResult<()> {
     let rpc = rpc_client(RPC_URL)?;
     let wallet = rpc_client(WALLET_RPC_URL)?;
@@ -509,6 +546,55 @@ fn mine_blocks(rpc: &Client, count: u64, address: &str) -> TestResult<()> {
         let _: Vec<String> = rpc.call("generatetoaddress", &[count.into(), address.into()])?;
     }
     Ok(())
+}
+
+async fn wait_for_indexed_tip(
+    databases: &[PgPool],
+    height: u64,
+    hash: &str,
+    timeout: Duration,
+) -> TestResult<()> {
+    let expected_hash = BlockHash::from_str(hash)?.to_byte_array().to_vec();
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut converged = true;
+        for database in databases {
+            let journal = sqlx::query(
+                "SELECT block_height, block_hash FROM canonical_blocks \
+                 ORDER BY block_height DESC LIMIT 1",
+            )
+            .fetch_optional(database)
+            .await?;
+            let recovery: i64 =
+                sqlx::query_scalar("SELECT recovering FROM chain_recovery_state WHERE id = 1")
+                    .fetch_one(database)
+                    .await?;
+            let cursors: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM indexer_cursors \
+                 WHERE block_height = $1 AND block_hash = $2",
+            )
+            .bind(i64::try_from(height)?)
+            .bind(expected_hash.clone())
+            .fetch_one(database)
+            .await?;
+            converged &= journal.is_some_and(|row| {
+                let indexed_height = row.try_get::<i64, _>("block_height").ok();
+                let indexed_hash = row.try_get::<Vec<u8>, _>("block_hash").ok();
+                indexed_height == Some(height as i64)
+                    && indexed_hash.as_deref() == Some(expected_hash.as_slice())
+            }) && recovery == 0
+                && cursors == 2;
+        }
+        if converged {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                format!("oracle databases did not converge at block {height} {hash}").into(),
+            );
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
 }
 
 async fn database_pools() -> TestResult<Vec<PgPool>> {

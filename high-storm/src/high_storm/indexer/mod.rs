@@ -1,9 +1,16 @@
-use std::{str::FromStr, sync::Arc};
+use std::{
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use contracts::artifacts::account::{AccountProgram, derived_account::AccountArguments};
 use contracts::artifacts::treasury::{TreasuryProgram, derived_treasury::TreasuryArguments};
 use secp256k1_zkp::Secp256k1;
+use serde::Deserialize;
 use simplex::{
     provider::SimplicityNetwork,
     simplicityhl::{
@@ -16,6 +23,7 @@ use tokio::sync::Mutex;
 use crate::{
     config::{ElementsRpcConfig, ProtocolConfig},
     db::{
+        chain::{CanonicalBlock, ChainStore},
         droplet::{DropletBalance, DropletError, DropletStore, TreasuryTransaction},
         monitored_utxo::{IndexedBlock, MonitoredUtxo, MonitoredUtxoStore},
         network_asset::{NetworkAssetStore, STORM_EYE_KIND, TICK_ASSET_KIND},
@@ -23,6 +31,7 @@ use crate::{
 };
 
 use super::{
+    ChainTip,
     assets::{
         initial_members_from_script, migrated_members_proposer_from_script, renewed_storm_eye,
         treasury_blinding_secret,
@@ -40,6 +49,13 @@ enum ExchangeRecovery {
     Keep,
     Unlock,
     Rebroadcast { transaction: Vec<u8>, txid: String },
+}
+
+#[derive(Deserialize)]
+struct MempoolAcceptance {
+    allowed: bool,
+    #[serde(rename = "reject-reason")]
+    reject_reason: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,21 +76,26 @@ pub enum IndexerError {
     Invalid(String),
     #[error("chain reorganization detected at block {height}")]
     Reorganization { height: u64 },
+    #[error("chain safety halt requires operator intervention: {0}")]
+    SafetyHalt(String),
 }
 
 #[derive(Clone)]
 pub(crate) struct Indexer {
+    chain: ChainStore,
     store: MonitoredUtxoStore,
     droplets: DropletStore,
     assets: NetworkAssetStore,
     elements_rpc: ElementsRpcConfig,
     tick_lifetime_blocks: u64,
     initial_members: Vec<[u8; 32]>,
+    recovering: Arc<AtomicBool>,
     sync_lock: Arc<Mutex<()>>,
 }
 
 impl Indexer {
     pub(crate) fn new(
+        chain: ChainStore,
         store: MonitoredUtxoStore,
         droplets: DropletStore,
         assets: NetworkAssetStore,
@@ -83,12 +104,14 @@ impl Indexer {
         initial_members: Vec<[u8; 32]>,
     ) -> Self {
         Self {
+            chain,
             store,
             droplets,
             assets,
             elements_rpc,
             tick_lifetime_blocks: protocol.tick_lifetime_blocks,
             initial_members,
+            recovering: Arc::new(AtomicBool::new(true)),
             sync_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -109,16 +132,74 @@ impl Indexer {
         let client = self.client()?;
         let network = network(&client)?;
         let tip: u64 = client.call("getblockcount", &[])?;
-        let issued_cursor = self.store.cursor(ISSUED_UTXO_RULE_SET).await?;
-        let droplets_cursor = self.droplets.cursor(DROPLETS_RULE_SET).await?;
-
-        for cursor in [&issued_cursor, &droplets_cursor].into_iter().flatten() {
-            let canonical = block_hash(&client, cursor.height)?;
-            if canonical != cursor.hash {
+        let target_tip_hash = block_hash(&client, tip)?;
+        let mut issued_cursor = self.store.cursor(ISSUED_UTXO_RULE_SET).await?;
+        let mut droplets_cursor = self.droplets.cursor(DROPLETS_RULE_SET).await?;
+        let persisted_recovery = self.chain.recovery_state().await?;
+        if persisted_recovery.safe_halted {
+            self.recovering.store(true, Ordering::Release);
+            return Err(IndexerError::SafetyHalt(
+                persisted_recovery
+                    .halt_reason
+                    .unwrap_or_else(|| "persisted chain safety halt".into()),
+            ));
+        }
+        let member_migrations = self.chain.finalized_member_migrations().await?;
+        for migration in &member_migrations {
+            if migration.block_height > tip {
+                self.recovering.store(true, Ordering::Release);
                 return Err(IndexerError::Reorganization {
-                    height: cursor.height,
+                    height: migration.block_height,
                 });
             }
+            if block_hash(&client, migration.block_height)? != migration.block_hash {
+                let reason = format!(
+                    "finalized member migration {} at block {} is no longer canonical",
+                    hex::encode(migration.request_hash),
+                    migration.block_height
+                );
+                self.chain.safe_halt(&reason).await?;
+                self.recovering.store(true, Ordering::Release);
+                return Err(IndexerError::SafetyHalt(reason));
+            }
+        }
+        let journal = self.chain.blocks_descending().await?;
+        let missing_journal =
+            journal.is_empty() && (issued_cursor.is_some() || droplets_cursor.is_some());
+        let journal_mismatch = if let Some(journal_tip) = journal.first() {
+            journal_tip.height > tip || block_hash(&client, journal_tip.height)? != journal_tip.hash
+        } else {
+            false
+        };
+        let mut cursor_mismatch = false;
+        for cursor in [&issued_cursor, &droplets_cursor].into_iter().flatten() {
+            if cursor.height > tip || block_hash(&client, cursor.height)? != cursor.hash {
+                cursor_mismatch = true;
+                break;
+            }
+        }
+
+        let mut recovered_locks = Vec::new();
+        let recovering =
+            persisted_recovery.recovering || missing_journal || journal_mismatch || cursor_mismatch;
+        if recovering {
+            self.recovering.store(true, Ordering::Release);
+            let ancestor = common_ancestor(&client, tip, &journal)?;
+            let fork_height = ancestor.map_or(0, |height| height.saturating_add(1));
+            self.chain.set_recovering(fork_height).await?;
+            recovered_locks = self.chain.reset_projections().await?;
+            storm_eye = self
+                .assets
+                .get(STORM_EYE_KIND)
+                .await?
+                .ok_or(IndexerError::MissingAsset(STORM_EYE_KIND))?;
+            issued_cursor = None;
+            droplets_cursor = None;
+            tracing::warn!(
+                fork_height,
+                common_ancestor = ancestor,
+                "rebuilding chain-derived state after a reorganization"
+            );
         }
 
         let issued_height = issued_cursor
@@ -128,72 +209,227 @@ impl Indexer {
             .as_ref()
             .map_or(storm_eye.created_at_block, |cursor| cursor.height + 1);
         let first_height = issued_height.min(droplets_height);
+        let mut active_members = member_migrations.first().map_or_else(
+            || self.initial_members.clone(),
+            |migration| migration.previous_members.clone(),
+        );
+        for migration in member_migrations
+            .iter()
+            .filter(|migration| migration.block_height < first_height)
+        {
+            active_members.clone_from(&migration.next_members);
+        }
         let treasury_script = TreasuryProgram::new(&TreasuryArguments {
             storm_eye_asset_id: storm_eye.asset_id,
         })
         .get_script_pubkey(&network);
         let mut indexed = 0;
+        let mut previous_hash = if recovering {
+            None
+        } else {
+            journal.first().map(|block| block.hash)
+        };
         for height in first_height..=tip {
             let hash = block_hash(&client, height)?;
             let block = get_block(&client, hash)?;
+            require_parent_hash(
+                previous_hash,
+                block.header.prev_blockhash.to_byte_array(),
+                height,
+            )?;
             let indexed_block = IndexedBlock { height, hash };
-            if let Some((txid, renewed)) =
-                indexed_storm_eye_renewal(&client, &block.txdata, &storm_eye, &network)?
-            {
-                if !self
-                    .assets
-                    .index_storm_eye_renewal(&storm_eye, &renewed)
-                    .await?
-                {
-                    return Err(IndexerError::Invalid(
-                        "indexed Storm Eye renewal does not match active state".into(),
-                    ));
-                }
-                tracing::info!(%txid, height, "indexed Storm Eye timelock renewal");
-                storm_eye = renewed;
+            let canonical_block = CanonicalBlock {
+                height,
+                hash,
+                parent_hash: block.header.prev_blockhash.to_byte_array(),
+            };
+            let renewal = indexed_storm_eye_renewal(&client, &block.txdata, &storm_eye, &network)?;
+            let member_migration = member_migrations
+                .iter()
+                .find(|migration| migration.block_height == height);
+            if renewal.is_some() && member_migration.is_some() {
+                return Err(IndexerError::Invalid(
+                    "Storm Eye renewal and member migration share one block".into(),
+                ));
             }
-            if height >= issued_height {
-                let issued = issued_tick_utxos(
+            let migrated_storm_eye = member_migration
+                .map(|migration| {
+                    if migration.asset_kind != storm_eye.kind
+                        || migration.previous_script != storm_eye.contract_script
+                        || migration.previous_data != storm_eye.contract_data
+                    {
+                        return Err(IndexerError::Invalid(
+                            "member migration does not match replayed Storm Eye state".into(),
+                        ));
+                    }
+                    let mut migrated = storm_eye.clone();
+                    migrated.contract_script.clone_from(&migration.next_script);
+                    migrated.contract_data.clone_from(&migration.next_data);
+                    Ok(migrated)
+                })
+                .transpose()?;
+            let block_storm_eye = renewal.as_ref().map_or(&storm_eye, |(_, renewed)| renewed);
+            let issued = if height >= issued_height {
+                Some(issued_tick_utxos(
                     &client,
                     &block.txdata,
                     height,
-                    &storm_eye,
+                    block_storm_eye,
                     &tick_asset,
                     tick_asset_id,
                     &network,
-                )?;
-                let spent = spent_monitored_outpoints(&block.txdata);
-                self.store
-                    .apply_block(
-                        ISSUED_UTXO_RULE_SET,
-                        &indexed_block,
-                        &issued,
-                        &spent,
-                        self.tick_lifetime_blocks,
-                    )
-                    .await?;
+                )?)
+            } else {
+                None
+            };
+            let spent = issued
+                .as_ref()
+                .map(|_| spent_monitored_outpoints(&block.txdata));
+            let treasury_transactions = if height >= droplets_height {
+                verify_initial_members(&block.txdata, block_storm_eye, &active_members)?;
+                Some(treasury_transactions(
+                    &block.txdata,
+                    &treasury_script,
+                    network.policy_asset(),
+                )?)
+            } else {
+                None
+            };
+
+            let mut transaction = self.chain.begin().await?;
+            if let Some((_, renewed)) = &renewal
+                && !NetworkAssetStore::index_storm_eye_renewal_in(
+                    &mut transaction,
+                    &storm_eye,
+                    renewed,
+                )
+                .await?
+            {
+                return Err(IndexerError::Invalid(
+                    "indexed Storm Eye renewal does not match active state".into(),
+                ));
             }
-            if height >= droplets_height {
-                verify_initial_members(&block.txdata, &storm_eye, &self.initial_members)?;
-                let treasury_transactions =
-                    treasury_transactions(&block.txdata, &treasury_script, network.policy_asset())?;
-                self.droplets
-                    .apply_block(
-                        DROPLETS_RULE_SET,
-                        &indexed_block,
-                        &treasury_transactions,
-                        &self.initial_members,
-                    )
-                    .await?;
+            if let Some((_, renewed)) = &renewal {
+                ChainStore::record_asset_transition(
+                    &mut transaction,
+                    &canonical_block,
+                    &storm_eye,
+                    renewed,
+                )
+                .await?;
             }
+            if let Some(migrated) = &migrated_storm_eye
+                && !NetworkAssetStore::index_storm_eye_renewal_in(
+                    &mut transaction,
+                    &storm_eye,
+                    migrated,
+                )
+                .await?
+            {
+                return Err(IndexerError::Invalid(
+                    "replayed member migration does not match active state".into(),
+                ));
+            }
+            if let (Some(issued), Some(spent)) = (&issued, &spent) {
+                MonitoredUtxoStore::apply_block_in(
+                    &mut transaction,
+                    &indexed_block,
+                    issued,
+                    spent,
+                    self.tick_lifetime_blocks,
+                )
+                .await?;
+                MonitoredUtxoStore::record_cursor(
+                    &mut transaction,
+                    ISSUED_UTXO_RULE_SET,
+                    &indexed_block,
+                )
+                .await?;
+            }
+            if let Some(treasury_transactions) = &treasury_transactions {
+                DropletStore::apply_block_in(
+                    &mut transaction,
+                    &indexed_block,
+                    treasury_transactions,
+                    &active_members,
+                )
+                .await?;
+                MonitoredUtxoStore::record_cursor(
+                    &mut transaction,
+                    DROPLETS_RULE_SET,
+                    &indexed_block,
+                )
+                .await?;
+            }
+            ChainStore::record_block(&mut transaction, &canonical_block).await?;
+            transaction.commit().await?;
+
+            if let Some((txid, renewed)) = renewal {
+                tracing::info!(%txid, height, "indexed Storm Eye timelock renewal");
+                storm_eye = renewed;
+            }
+            if let Some(migrated) = migrated_storm_eye {
+                storm_eye = migrated;
+            }
+            if let Some(migration) = member_migration {
+                active_members.clone_from(&migration.next_members);
+            }
+            previous_hash = Some(hash);
             indexed += 1;
         }
+
+        let current_tip: u64 = client.call("getblockcount", &[])?;
+        if !target_tip_is_canonical(current_tip, tip, block_hash(&client, tip)?, target_tip_hash) {
+            return Err(IndexerError::Reorganization { height: tip });
+        }
+
+        if recovering {
+            for lock in recovered_locks {
+                if !self
+                    .droplets
+                    .lock_exchange(
+                        lock.member,
+                        lock.amount,
+                        lock.block_height,
+                        &lock.transaction,
+                    )
+                    .await?
+                {
+                    tracing::warn!(
+                        member = %hex::encode(lock.member),
+                        "could not restore a pending Droplets lock after reorganization"
+                    );
+                }
+            }
+            self.chain.finish_recovery().await?;
+        }
+        self.recovering.store(false, Ordering::Release);
 
         Ok(indexed)
     }
 
+    pub(crate) fn is_recovering(&self) -> bool {
+        self.recovering.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn cursor(&self) -> Result<Option<IndexedBlock>, IndexerError> {
         Ok(self.store.cursor(ISSUED_UTXO_RULE_SET).await?)
+    }
+
+    pub(crate) async fn chain_tip(&self) -> Result<ChainTip, IndexerError> {
+        let block = self
+            .chain
+            .tip()
+            .await?
+            .ok_or_else(|| IndexerError::Invalid("canonical chain is not indexed".into()))?;
+        Ok(ChainTip {
+            height: block.height,
+            hash: block.hash,
+        })
+    }
+
+    pub(crate) fn hash_at(&self, height: u64) -> Result<[u8; 32], IndexerError> {
+        block_hash(&self.client()?, height)
     }
 
     pub(crate) fn tip(&self) -> Result<u64, IndexerError> {
@@ -216,12 +452,41 @@ impl Indexer {
                         .await?;
                 }
                 ExchangeRecovery::Rebroadcast { transaction, txid } => {
-                    let broadcast_txid: String =
-                        client.call("sendrawtransaction", &[hex::encode(transaction).into()])?;
-                    if broadcast_txid != txid {
-                        return Err(IndexerError::Invalid(
-                            "rebroadcast Droplets transaction id mismatch".into(),
-                        ));
+                    let encoded = hex::encode(&transaction);
+                    let acceptance = client.call::<Vec<MempoolAcceptance>>(
+                        "testmempoolaccept",
+                        &[serde_json::json!([encoded])],
+                    );
+                    let Ok(mut acceptance) = acceptance else {
+                        tracing::warn!(%txid, "could not preflight recovered Droplets transaction");
+                        continue;
+                    };
+                    let Some(acceptance) = acceptance.pop() else {
+                        tracing::warn!(%txid, "empty mempool preflight for recovered Droplets transaction");
+                        continue;
+                    };
+                    if !acceptance.allowed {
+                        let reason = acceptance.reject_reason.unwrap_or_default();
+                        if mempool_rejection_is_permanent(&reason) {
+                            self.droplets
+                                .unlock_exchange(balance.xonly_pubkey, block_height)
+                                .await?;
+                            tracing::warn!(%txid, %reason, "released invalid recovered Droplets transaction");
+                        }
+                        continue;
+                    }
+                    match client
+                        .call::<String>("sendrawtransaction", &[hex::encode(transaction).into()])
+                    {
+                        Ok(broadcast_txid) if broadcast_txid == txid => {}
+                        Ok(broadcast_txid) => {
+                            return Err(IndexerError::Invalid(format!(
+                                "rebroadcast Droplets transaction id mismatch: expected {txid}, got {broadcast_txid}"
+                            )));
+                        }
+                        Err(error) => {
+                            tracing::warn!(%txid, %error, "recovered Droplets rebroadcast failed");
+                        }
                     }
                 }
             }
@@ -239,6 +504,19 @@ impl Indexer {
             ),
         )?)
     }
+}
+
+fn common_ancestor(
+    client: &Client,
+    tip: u64,
+    journal: &[CanonicalBlock],
+) -> Result<Option<u64>, IndexerError> {
+    for block in journal {
+        if block.height <= tip && block_hash(client, block.height)? == block.hash {
+            return Ok(Some(block.height));
+        }
+    }
+    Ok(None)
 }
 
 fn indexed_storm_eye_renewal(
@@ -323,6 +601,19 @@ fn exchange_recovery(
             txid,
         }
     }
+}
+
+fn mempool_rejection_is_permanent(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    [
+        "missing inputs",
+        "missingorspent",
+        "mempool conflict",
+        "mempool-conflict",
+        "already spent",
+    ]
+    .iter()
+    .any(|marker| reason.contains(marker))
 }
 
 fn verify_initial_members(
@@ -735,6 +1026,26 @@ fn block_hash(client: &Client, height: u64) -> Result<[u8; 32], IndexerError> {
         .map_err(|_| IndexerError::Invalid("invalid block hash".into()))
 }
 
+fn require_parent_hash(
+    expected_parent: Option<[u8; 32]>,
+    actual_parent: [u8; 32],
+    height: u64,
+) -> Result<(), IndexerError> {
+    if expected_parent.is_some_and(|expected| expected != actual_parent) {
+        return Err(IndexerError::Reorganization { height });
+    }
+    Ok(())
+}
+
+fn target_tip_is_canonical(
+    current_tip: u64,
+    target_tip: u64,
+    current_target_hash: [u8; 32],
+    expected_target_hash: [u8; 32],
+) -> bool {
+    current_tip >= target_tip && current_target_hash == expected_target_hash
+}
+
 fn get_block(client: &Client, hash: [u8; 32]) -> Result<Block, IndexerError> {
     let hash = BlockHash::from_byte_array(hash).to_string();
     let encoded: String = client.call("getblock", &[hash.into(), 0.into()])?;
@@ -773,6 +1084,24 @@ mod tests {
             spent_monitored_outpoints(&[transaction]),
             vec![([1; 32], 7, spending_txid)]
         );
+    }
+
+    #[test]
+    fn rejects_a_block_that_does_not_extend_the_indexed_parent() {
+        require_parent_hash(Some([3; 32]), [3; 32], 42).unwrap();
+        require_parent_hash(None, [4; 32], 42).unwrap();
+
+        assert!(matches!(
+            require_parent_hash(Some([3; 32]), [4; 32], 42),
+            Err(IndexerError::Reorganization { height: 42 })
+        ));
+    }
+
+    #[test]
+    fn accepts_chain_growth_only_when_the_original_target_remains_canonical() {
+        assert!(target_tip_is_canonical(43, 42, [3; 32], [3; 32]));
+        assert!(!target_tip_is_canonical(41, 42, [3; 32], [3; 32]));
+        assert!(!target_tip_is_canonical(43, 42, [4; 32], [3; 32]));
     }
 
     #[test]
@@ -858,6 +1187,16 @@ mod tests {
                 txid,
             }
         );
+    }
+
+    #[test]
+    fn unlocks_only_permanently_conflicted_recovered_exchanges() {
+        assert!(mempool_rejection_is_permanent(
+            "bad-txns-inputs-missingorspent"
+        ));
+        assert!(mempool_rejection_is_permanent("txn-mempool-conflict"));
+        assert!(!mempool_rejection_is_permanent("min relay fee not met"));
+        assert!(!mempool_rejection_is_permanent("txn-already-in-mempool"));
     }
 
     #[test]

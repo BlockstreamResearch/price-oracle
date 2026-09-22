@@ -34,6 +34,8 @@ burn_transaction_fee_sats = 500
 exchange_transaction_fee_sats = 500
 # Tick lifetime measured in blocks. The default 60 blocks is one hour at the target interval.
 tick_lifetime_blocks = 60
+# Confirmations required before an included transaction becomes final. Defaults to 2.
+finality_confirmations = 2
 
 # Leave this section out to poll no price source; such a node attests no prices.
 [service.price_sources.coingecko]
