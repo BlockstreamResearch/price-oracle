@@ -162,6 +162,12 @@ pub struct StormEyeUtxo {
     pub output_index: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainTip {
+    pub height: u64,
+    pub hash: [u8; 32],
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenewStormUtxos {
     pub tx: Vec<u8>,
@@ -169,6 +175,8 @@ pub struct RenewStormUtxos {
     pub signing_hashes: Vec<[u8; 32]>,
     pub signing_storm_tree_branch: StormTreeBranch,
     pub block_height: u64,
+    #[serde(default)]
+    pub chain_tip: Option<ChainTip>,
     pub new_rescue_height: u32,
 }
 
@@ -205,6 +213,8 @@ pub struct ExecuteUserRequests {
     pub signing_hash: [u8; 32],
     pub signing_storm_tree_branch: StormTreeBranch,
     pub external_requests: Vec<ExternalRequests>,
+    #[serde(default)]
+    pub chain_tip: Option<ChainTip>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +224,8 @@ pub struct ExchangeRewards {
     pub signing_hash: [u8; 32],
     pub signing_storm_tree_branch: StormTreeBranch,
     pub block_height: u64,
+    #[serde(default)]
+    pub chain_tip: Option<ChainTip>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +234,8 @@ pub struct BurnExpiredUtxos {
     pub signing_hash: [u8; 32],
     pub signing_storm_tree_branch: StormTreeBranch,
     pub block_height: u64,
+    #[serde(default)]
+    pub chain_tip: Option<ChainTip>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +243,8 @@ pub struct ExpiredUtxosBurned {
     pub txid: [u8; 32],
     pub utxos: Vec<StormEyeUtxo>,
     pub block_height: u64,
+    #[serde(default)]
+    pub chain_tip: Option<ChainTip>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,6 +265,8 @@ pub struct ExecuteVotingRequest {
     pub signing_hashes: Vec<[u8; 32]>,
     pub signing_storm_tree_branch: StormTreeBranch,
     pub proposer_public_key: NodePublicKey,
+    #[serde(default)]
+    pub chain_tip: Option<ChainTip>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

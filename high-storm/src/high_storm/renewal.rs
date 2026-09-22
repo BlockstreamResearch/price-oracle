@@ -12,7 +12,7 @@ use simplex::{
     either::Either,
     provider::SimplicityNetwork,
     simplicityhl::{
-        elements::{Script, TxOut, Txid, encode, pset::PartiallySignedTransaction},
+        elements::{BlockHash, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction},
         simplicity::hashes::Hash,
     },
     transaction::{
@@ -106,6 +106,7 @@ pub(crate) struct Renewal {
     elements_rpc: ElementsRpcConfig,
     transaction_fee_sats: u64,
     coordinator_member: [u8; 32],
+    finality_confirmations: u64,
 }
 
 impl Renewal {
@@ -115,6 +116,7 @@ impl Renewal {
         elements_rpc: ElementsRpcConfig,
         transaction_fee_sats: u64,
         coordinator_member: [u8; 32],
+        finality_confirmations: u64,
     ) -> Self {
         Self {
             assets,
@@ -122,6 +124,7 @@ impl Renewal {
             elements_rpc,
             transaction_fee_sats,
             coordinator_member,
+            finality_confirmations: finality_confirmations.max(1),
         }
     }
 
@@ -351,7 +354,19 @@ impl Renewal {
                 "persisted renewal transaction id does not match its request".into(),
             ));
         }
-        if self.transaction_confirmed(txid)? {
+        let Some(confirmation) = self.transaction_confirmation(txid)? else {
+            self.assets.mark_storm_eye_renewal_orphaned(txid).await?;
+            self.broadcast(txid, &final_tx)?;
+            return Ok(false);
+        };
+        let tip = self.block_height()?;
+        let included_at = tip
+            .saturating_sub(confirmation.confirmations)
+            .saturating_add(1);
+        self.assets
+            .mark_storm_eye_renewal_included(txid, included_at, confirmation.block_hash)
+            .await?;
+        if confirmation.confirmations >= self.finality_confirmations {
             if !self.assets.confirm_storm_eye_renewal(txid).await? {
                 return Err(RenewalError::Invalid(
                     "pending renewal changed while confirming".into(),
@@ -359,8 +374,6 @@ impl Renewal {
             }
             return Ok(true);
         }
-        self.broadcast(txid, &final_tx)?;
-
         Ok(false)
     }
 
@@ -502,14 +515,38 @@ impl Renewal {
         ))
     }
 
-    fn transaction_confirmed(&self, txid: [u8; 32]) -> Result<bool, RenewalError> {
+    fn transaction_confirmation(
+        &self,
+        txid: [u8; 32],
+    ) -> Result<Option<RenewalConfirmation>, RenewalError> {
         let txid = Txid::from_byte_array(txid);
         let transaction = self.client()?.call::<RawTransactionInfo>(
             "getrawtransaction",
             &[txid.to_string().into(), true.into()],
         );
-        Ok(transaction.is_ok_and(|transaction| transaction.confirmations > 0))
+        let Ok(transaction) = transaction else {
+            return Ok(None);
+        };
+        if transaction.confirmations == 0 {
+            return Ok(None);
+        }
+        let block_hash = transaction
+            .block_hash
+            .as_deref()
+            .ok_or_else(|| RenewalError::Invalid("confirmed renewal has no block hash".into()))?
+            .parse::<BlockHash>()
+            .map_err(|error| RenewalError::Invalid(error.to_string()))?
+            .to_byte_array();
+        Ok(Some(RenewalConfirmation {
+            confirmations: transaction.confirmations,
+            block_hash,
+        }))
     }
+}
+
+struct RenewalConfirmation {
+    confirmations: u64,
+    block_hash: [u8; 32],
 }
 
 fn build_transaction(
@@ -613,6 +650,7 @@ fn build_transaction(
         signing_hashes: signing_hashes(&pset, &storm_eye, &network, storm_eye_inputs)?,
         signing_storm_tree_branch: data.storm_tree_root,
         block_height,
+        chain_tip: None,
         new_rescue_height,
     };
 
@@ -713,6 +751,8 @@ fn live_treasury_utxo(
 struct RawTransactionInfo {
     #[serde(default)]
     confirmations: u64,
+    #[serde(default, rename = "blockhash")]
+    block_hash: Option<String>,
 }
 
 pub(crate) async fn announce(

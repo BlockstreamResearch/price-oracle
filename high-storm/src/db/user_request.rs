@@ -13,6 +13,9 @@ pub struct StoredUserRequest {
     pub block_height: u64,
     pub status: String,
     pub payload: Option<Vec<u8>>,
+    pub execution_tx: Option<Vec<u8>>,
+    pub included_at_block: Option<u64>,
+    pub included_block_hash: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -87,7 +90,8 @@ impl UserRequestStore {
 
     pub async fn list_pending(&self, limit: u32) -> Result<Vec<StoredUserRequest>, Error> {
         sqlx::query(
-            "SELECT request_hash, request, block_height, status, payload \
+            "SELECT request_hash, request, block_height, status, payload, execution_tx, \
+                    included_at_block, included_block_hash \
              FROM network_user_requests WHERE status = 'pending' \
              ORDER BY block_height, request_hash LIMIT $1",
         )
@@ -101,8 +105,9 @@ impl UserRequestStore {
 
     pub async fn list_processing(&self) -> Result<Vec<StoredUserRequest>, Error> {
         sqlx::query(
-            "SELECT request_hash, request, block_height, status, payload \
-             FROM network_user_requests WHERE status = 'processing' \
+            "SELECT request_hash, request, block_height, status, payload, execution_tx, \
+                    included_at_block, included_block_hash \
+                 FROM network_user_requests WHERE status IN ('processing', 'included') \
              ORDER BY block_height, request_hash",
         )
         .fetch_all(&self.pool)
@@ -141,16 +146,51 @@ impl UserRequestStore {
         &self,
         request_hash: [u8; 32],
         payload: &[u8],
+        execution_tx: &[u8],
     ) -> Result<bool, Error> {
         let result = sqlx::query(
-            "UPDATE network_user_requests SET status = 'processing', payload = $2 \
+            "UPDATE network_user_requests SET status = 'processing', payload = $2, execution_tx = $3 \
              WHERE request_hash = $1 AND status = 'pending'",
         )
         .bind(request_hash.to_vec())
         .bind(payload)
+        .bind(execution_tx)
         .execute(&self.pool)
         .await?;
 
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn mark_included(
+        &self,
+        request_hash: [u8; 32],
+        block_height: u64,
+        block_hash: [u8; 32],
+    ) -> Result<bool, Error> {
+        let result = sqlx::query(
+            "UPDATE network_user_requests SET status = 'included', included_at_block = $2, \
+             included_block_hash = $3 WHERE request_hash = $1 \
+             AND status IN ('processing', 'included')",
+        )
+        .bind(request_hash.to_vec())
+        .bind(
+            i64::try_from(block_height)
+                .map_err(|error| Error::Sqlx(sqlx::Error::Encode(Box::new(error))))?,
+        )
+        .bind(block_hash.to_vec())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn mark_orphaned(&self, request_hash: [u8; 32]) -> Result<bool, Error> {
+        let result = sqlx::query(
+            "UPDATE network_user_requests SET status = 'processing', included_at_block = NULL, \
+             included_block_hash = NULL WHERE request_hash = $1 AND status = 'included'",
+        )
+        .bind(request_hash.to_vec())
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -158,7 +198,7 @@ impl UserRequestStore {
         let mut transaction = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE network_user_requests SET status = 'executed' \
-             WHERE request_hash = $1 AND status = 'processing'",
+             WHERE request_hash = $1 AND status = 'included'",
         )
         .bind(request_hash.to_vec())
         .execute(&mut *transaction)
@@ -203,7 +243,8 @@ impl UserRequestStore {
 
     pub async fn get(&self, request_hash: [u8; 32]) -> Result<Option<StoredUserRequest>, Error> {
         let Some(row) = sqlx::query(
-            "SELECT request_hash, request, block_height, status, payload \
+            "SELECT request_hash, request, block_height, status, payload, execution_tx, \
+                    included_at_block, included_block_hash \
              FROM network_user_requests WHERE request_hash = $1",
         )
         .bind(request_hash.to_vec())
@@ -228,6 +269,20 @@ fn decode_request(row: sqlx::any::AnyRow) -> Result<StoredUserRequest, Error> {
             .map_err(|error| Error::Sqlx(sqlx::Error::Decode(Box::new(error))))?,
         status: row.try_get("status")?,
         payload: row.try_get("payload")?,
+        execution_tx: row.try_get("execution_tx")?,
+        included_at_block: row
+            .try_get::<Option<i64>, _>("included_at_block")?
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|error| Error::Sqlx(sqlx::Error::Decode(Box::new(error))))?,
+        included_block_hash: row
+            .try_get::<Option<Vec<u8>>, _>("included_block_hash")?
+            .map(|value| {
+                value.try_into().map_err(|_| {
+                    Error::Sqlx(sqlx::Error::Decode("invalid block hash length".into()))
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -287,7 +342,12 @@ mod tests {
             InsertPendingResult::Inserted
         );
         assert_eq!(store.list_pending(10).await.unwrap().len(), 1);
-        assert!(store.mark_processing([1; 32], b"result").await.unwrap());
+        assert!(
+            store
+                .mark_processing([1; 32], b"result", b"transaction")
+                .await
+                .unwrap()
+        );
         assert!(store.list_pending(10).await.unwrap().is_empty());
         assert_eq!(
             store
@@ -297,6 +357,7 @@ mod tests {
             InsertPendingResult::FeeUtxoReserved(fee_utxo.clone())
         );
 
+        assert!(store.mark_included([1; 32], 44, [9; 32]).await.unwrap());
         assert!(store.mark_executed([1; 32]).await.unwrap());
         assert_eq!(
             store

@@ -1,4 +1,4 @@
-use sqlx::{AnyPool, Row};
+use sqlx::{Any, AnyPool, Row, Transaction};
 
 const BURNING_BLOCKS: u64 = 5;
 
@@ -62,6 +62,18 @@ impl MonitoredUtxoStore {
     ) -> Result<(), sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
 
+        Self::apply_block_in(&mut transaction, block, issued, spent, active_blocks).await?;
+        Self::record_cursor(&mut transaction, rule_set, block).await?;
+        transaction.commit().await
+    }
+
+    pub(crate) async fn apply_block_in(
+        transaction: &mut Transaction<'_, Any>,
+        block: &IndexedBlock,
+        issued: &[MonitoredUtxo],
+        spent: &[([u8; 32], u32, [u8; 32])],
+        active_blocks: u64,
+    ) -> Result<(), sqlx::Error> {
         for utxo in issued {
             sqlx::query(
                 "INSERT INTO monitored_utxos \
@@ -82,7 +94,7 @@ impl MonitoredUtxoStore {
             .bind(utxo.burning_fee_txid.to_vec())
             .bind(i64::from(utxo.burning_fee_output_index))
             .bind(encode_u64(utxo.block_height)?)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await?;
         }
 
@@ -90,7 +102,7 @@ impl MonitoredUtxoStore {
             sqlx::query("DELETE FROM monitored_utxos WHERE txid = $1 AND output_index = $2")
                 .bind(txid.to_vec())
                 .bind(i64::from(*output_index))
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await?;
         }
 
@@ -100,7 +112,7 @@ impl MonitoredUtxoStore {
         )
         .bind(encode_u64(block.height)?)
         .bind(encode_u64(active_blocks)?)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
         sqlx::query(
             "UPDATE monitored_utxos SET status = 'expired', status_block_height = $1, \
@@ -108,8 +120,16 @@ impl MonitoredUtxoStore {
         )
         .bind(encode_u64(block.height)?)
         .bind(encode_u64(BURNING_BLOCKS)?)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn record_cursor(
+        transaction: &mut Transaction<'_, Any>,
+        rule_set: &str,
+        block: &IndexedBlock,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO indexer_cursors (rule_set, block_height, block_hash) VALUES ($1, $2, $3) \
              ON CONFLICT (rule_set) DO UPDATE SET block_height = $2, block_hash = $3",
@@ -117,9 +137,9 @@ impl MonitoredUtxoStore {
         .bind(rule_set)
         .bind(encode_u64(block.height)?)
         .bind(block.hash.to_vec())
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
-        transaction.commit().await
+        Ok(())
     }
 
     pub async fn list_expired(&self, limit: u32) -> Result<Vec<MonitoredUtxo>, sqlx::Error> {

@@ -31,6 +31,7 @@ burn_transaction_fee_sats = 500
 exchange_transaction_fee_sats = 500
 # Tick lifetime in blocks; 60 blocks is one hour at the target interval.
 tick_lifetime_blocks = 60
+finality_confirmations = 2
 
 [service.price_sources.coingecko]
 # Optional CoinGecko Demo API key. All nodes share the host's address, so

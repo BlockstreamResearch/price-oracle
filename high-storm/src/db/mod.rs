@@ -1,3 +1,4 @@
+pub mod chain;
 pub mod droplet;
 pub mod monitored_utxo;
 pub mod network;
@@ -10,6 +11,7 @@ pub mod voting;
 use node_operator::NodeOperatorStore;
 use sqlx::{AnyPool, any::AnyPoolOptions};
 
+use chain::ChainStore;
 use droplet::DropletStore;
 use monitored_utxo::MonitoredUtxoStore;
 use network::NetworkStore;
@@ -48,6 +50,10 @@ impl Database {
 
     pub fn network(&self) -> NetworkStore {
         NetworkStore::new(self.pool.clone())
+    }
+
+    pub fn chain(&self) -> ChainStore {
+        ChainStore::new(self.pool.clone())
     }
 
     pub fn droplets(&self) -> DropletStore {

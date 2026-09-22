@@ -16,7 +16,7 @@ use storm::{Peer, Storm};
 use crate::config::Config;
 use crate::high_storm::HighStormDependencies;
 pub use high_storm::{
-    ApproveVotingRequest, AssetError, AttestPriceMsg, DropletsError, ExchangeRewards,
+    ApproveVotingRequest, AssetError, AttestPriceMsg, ChainTip, DropletsError, ExchangeRewards,
     ExecuteUserRequests, ExecuteVotingRequest, ExternalRequests, HighStorm, HighStormHandle,
     MergeStormEyes, NetworkAsset, NetworkAssets, NetworkVoteKind, NetworkVoteRequest, NodeMessage,
     NodeMessageKind, PriceAttestation, PriceError, SigningError, SigningResult, SplitStormEye,

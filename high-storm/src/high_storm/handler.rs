@@ -6,8 +6,8 @@ use super::{
     droplets::DropletsError,
     leader,
     message::{
-        BurnExpiredUtxos, ExecuteVotingRequest, ExpiredUtxosBurned, NodeMessage, NodeMessageKind,
-        RenewStormUtxos,
+        BurnExpiredUtxos, ChainTip, ExecuteVotingRequest, ExpiredUtxosBurned, NodeMessage,
+        NodeMessageKind, RenewStormUtxos,
     },
     signing::SigningError,
     state::NetworkState,
@@ -16,6 +16,10 @@ use super::{
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum HandlerError {
+    #[error("chain state is being rebuilt after a reorganization")]
+    Recovering,
+    #[error("transaction production is paused until member migration finality")]
+    MigrationFinalizing,
     #[error(transparent)]
     Signing(#[from] SigningError),
     #[error(transparent)]
@@ -55,6 +59,36 @@ pub(crate) async fn handle(
         ))
         .into());
     };
+    if state.is_recovering()
+        && matches!(
+            kind,
+            NodeMessageKind::ExecuteUserRequests
+                | NodeMessageKind::ExchangeRewards
+                | NodeMessageKind::SigningNonces
+                | NodeMessageKind::PartialSignatures
+                | NodeMessageKind::BurnExpiredUtxos
+                | NodeMessageKind::ExpiredUtxosBurned
+                | NodeMessageKind::ExecuteVotingRequest
+                | NodeMessageKind::RenewStormUtxos
+        )
+    {
+        return Err(HandlerError::Recovering);
+    }
+    if state.is_spending_paused()
+        && matches!(
+            kind,
+            NodeMessageKind::ExecuteUserRequests
+                | NodeMessageKind::ExchangeRewards
+                | NodeMessageKind::SigningNonces
+                | NodeMessageKind::PartialSignatures
+                | NodeMessageKind::BurnExpiredUtxos
+                | NodeMessageKind::ExpiredUtxosBurned
+                | NodeMessageKind::ExecuteVotingRequest
+                | NodeMessageKind::RenewStormUtxos
+        )
+    {
+        return Err(HandlerError::MigrationFinalizing);
+    }
     authorize_sender(
         kind,
         state.coordinator_public_key(),
@@ -64,6 +98,7 @@ pub(crate) async fn handle(
     match kind {
         NodeMessageKind::ExecuteUserRequests => {
             let request: crate::ExecuteUserRequests = message.decode_payload()?;
+            require_chain_tip(&state, required_chain_tip(request.chain_tip)?).await?;
             state.user_requests().validate_execute(&request).await?;
             state
                 .signing()
@@ -73,8 +108,13 @@ pub(crate) async fn handle(
         }
         NodeMessageKind::BurnExpiredUtxos => {
             let request: BurnExpiredUtxos = message.decode_payload()?;
-            let expected_leader =
-                require_current_leader(&state, &context, request.block_height).await?;
+            let expected_leader = require_current_leader(
+                &state,
+                &context,
+                request.block_height,
+                required_chain_tip(request.chain_tip)?,
+            )
+            .await?;
             state.burning().validate_request(&request).await?;
             state
                 .signing()
@@ -84,8 +124,13 @@ pub(crate) async fn handle(
         }
         NodeMessageKind::ExchangeRewards => {
             let request: crate::ExchangeRewards = message.decode_payload()?;
-            let expected_leader =
-                require_current_leader(&state, &context, request.block_height).await?;
+            let expected_leader = require_current_leader(
+                &state,
+                &context,
+                request.block_height,
+                required_chain_tip(request.chain_tip)?,
+            )
+            .await?;
             if request.final_tx.is_some() {
                 state
                     .droplets()
@@ -116,7 +161,13 @@ pub(crate) async fn handle(
         }
         NodeMessageKind::ExpiredUtxosBurned => {
             let notification: ExpiredUtxosBurned = message.decode_payload()?;
-            require_current_leader(&state, &context, notification.block_height).await?;
+            require_current_leader(
+                &state,
+                &context,
+                notification.block_height,
+                required_chain_tip(notification.chain_tip)?,
+            )
+            .await?;
             state.burning().observe_broadcast(&notification).await?;
             Ok(())
         }
@@ -159,6 +210,7 @@ pub(crate) async fn handle(
                 )
             })?;
             let request: ExecuteVotingRequest = message.decode_payload()?;
+            require_chain_tip(&state, required_chain_tip(request.chain_tip)?).await?;
             authorize_voting_proposer(
                 request.proposer_public_key,
                 context.message_context.peer_public_key,
@@ -215,6 +267,7 @@ pub(crate) async fn handle(
         }
         NodeMessageKind::RenewStormUtxos => {
             let request: RenewStormUtxos = message.decode_payload()?;
+            require_chain_tip(&state, required_chain_tip(request.chain_tip)?).await?;
             if request.final_tx.is_some() {
                 state.renewal().observe_broadcast(&request).await?;
                 return Ok(());
@@ -261,19 +314,38 @@ async fn require_current_leader(
     state: &NetworkState,
     context: &StormContext,
     block_height: u64,
+    chain_tip: ChainTip,
 ) -> Result<[u8; 33], HandlerError> {
+    if chain_tip.height != block_height {
+        return Err(SigningError::UnauthorizedMessage(
+            "leader message block height does not match its chain anchor".into(),
+        )
+        .into());
+    }
     let expected = leader::leader_for_height(&context.storm_handle.peers().await, block_height)
         .ok_or_else(|| SigningError::UnauthorizedMessage("network has no leader".into()))?;
     authorize_leader_sender(expected, context.message_context.peer_public_key)?;
-    require_current_tip(block_height, state.indexer().tip()?)?;
-
-    state.indexer().sync().await?;
-    if let Some(cursor) = state.indexer().cursor().await? {
-        state.set_block_height(cursor.height);
-    }
-    require_current_tip(block_height, state.block_height())?;
+    require_chain_tip(state, chain_tip).await?;
 
     Ok(expected)
+}
+
+fn required_chain_tip(chain_tip: Option<ChainTip>) -> Result<ChainTip, SigningError> {
+    chain_tip.ok_or_else(|| {
+        SigningError::UnauthorizedMessage("signing request has no canonical chain anchor".into())
+    })
+}
+
+async fn require_chain_tip(state: &NetworkState, chain_tip: ChainTip) -> Result<(), HandlerError> {
+    require_current_tip(chain_tip.height, state.indexer().tip()?)?;
+    require_current_hash(chain_tip.hash, state.indexer().hash_at(chain_tip.height)?)?;
+
+    state.indexer().sync().await?;
+    let indexed = state.indexer().chain_tip().await?;
+    state.set_block_height(indexed.height);
+    require_current_tip(chain_tip.height, indexed.height)?;
+    require_current_hash(chain_tip.hash, indexed.hash)?;
+    Ok(())
 }
 
 fn require_current_tip(block_height: u64, tip: u64) -> Result<(), SigningError> {
@@ -283,6 +355,15 @@ fn require_current_tip(block_height: u64, tip: u64) -> Result<(), SigningError> 
         ));
     }
 
+    Ok(())
+}
+
+fn require_current_hash(expected: [u8; 32], actual: [u8; 32]) -> Result<(), SigningError> {
+    if expected != actual {
+        return Err(SigningError::UnauthorizedMessage(
+            "signing request does not target the current block hash".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -381,6 +462,21 @@ mod tests {
         require_current_tip(42, 42).unwrap();
 
         let error = require_current_tip(43, 42).unwrap_err();
+        assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
+    }
+
+    #[test]
+    fn signing_messages_require_a_chain_anchor() {
+        let error = required_chain_tip(None).unwrap_err();
+
+        assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
+    }
+
+    #[test]
+    fn signing_messages_must_target_the_current_block_hash() {
+        require_current_hash([4; 32], [4; 32]).unwrap();
+
+        let error = require_current_hash([4; 32], [5; 32]).unwrap_err();
         assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
     }
 }

@@ -48,6 +48,8 @@ pub struct ProtocolConfig {
     pub exchange_transaction_fee_sats: u64,
     #[serde(default = "default_tick_lifetime_blocks")]
     pub tick_lifetime_blocks: u64,
+    #[serde(default = "default_finality_confirmations")]
+    pub finality_confirmations: u64,
 }
 
 fn default_burn_transaction_fee_sats() -> u64 {
@@ -60,6 +62,10 @@ fn default_exchange_transaction_fee_sats() -> u64 {
 
 fn default_tick_lifetime_blocks() -> u64 {
     60
+}
+
+fn default_finality_confirmations() -> u64 {
+    2
 }
 
 fn default_ipc_path() -> PathBuf {

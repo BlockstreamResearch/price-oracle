@@ -1,6 +1,6 @@
-use sqlx::{AnyPool, Row};
+use sqlx::{Any, AnyPool, Row, Transaction};
 
-use super::monitored_utxo::IndexedBlock;
+use super::monitored_utxo::{IndexedBlock, MonitoredUtxoStore};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreasuryTransaction {
@@ -240,9 +240,10 @@ impl DropletStore {
         transaction: &[u8],
     ) -> Result<bool, sqlx::Error> {
         let updated = sqlx::query(
-            "UPDATE droplets SET block_height = $1, exchange_locked = 1, last_tx = $2 \
+            "UPDATE droplets SET block_height = $1, exchange_locked = 1, last_tx = $2, \
+                    exchange_amount = $4 \
                WHERE xonly_pubkey = $3 AND amount >= $4 \
-               AND (exchange_locked = 0 OR last_tx = $2)",
+                    AND (exchange_locked = 0 OR (last_tx = $2 AND exchange_amount = $4))",
         )
         .bind(encode_u64(block_height)?)
         .bind(transaction)
@@ -278,13 +279,25 @@ impl DropletStore {
         treasury_transactions: &[TreasuryTransaction],
         members: &[[u8; 32]],
     ) -> Result<(), DropletError> {
+        let mut transaction = self.pool.begin().await?;
+        Self::apply_block_in(&mut transaction, block, treasury_transactions, members).await?;
+        MonitoredUtxoStore::record_cursor(&mut transaction, rule_set, block).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn apply_block_in(
+        transaction: &mut Transaction<'_, Any>,
+        block: &IndexedBlock,
+        treasury_transactions: &[TreasuryTransaction],
+        members: &[[u8; 32]],
+    ) -> Result<(), DropletError> {
         if members.is_empty() {
             return Err(DropletError::Invalid("network has no members".into()));
         }
         let mut members = members.to_vec();
         members.sort_unstable();
         members.dedup();
-        let mut transaction = self.pool.begin().await?;
 
         for treasury_transaction in treasury_transactions {
             let mut spent_amount = 0u64;
@@ -294,7 +307,7 @@ impl DropletStore {
                 )
                 .bind(txid.to_vec())
                 .bind(i64::from(*output_index))
-                .fetch_optional(&mut *transaction)
+                .fetch_optional(&mut **transaction)
                 .await?;
                 if let Some(row) = row {
                     spent_amount = spent_amount
@@ -303,7 +316,7 @@ impl DropletStore {
                     sqlx::query("DELETE FROM treasury_utxos WHERE txid = $1 AND output_index = $2")
                         .bind(txid.to_vec())
                         .bind(i64::from(*output_index))
-                        .execute(&mut *transaction)
+                        .execute(&mut **transaction)
                         .await?;
                 }
             }
@@ -322,13 +335,13 @@ impl DropletStore {
                 .bind(i64::from(*output_index))
                 .bind(encode_u64(*amount)?)
                 .bind(encode_u64(block.height)?)
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await?;
             }
 
             if spent_amount == 0 {
                 credit_deposit(
-                    &mut transaction,
+                    transaction,
                     &members,
                     treasury_transaction.deposit_member,
                     output_amount,
@@ -351,12 +364,13 @@ impl DropletStore {
             })?;
             let updated = sqlx::query(
                 "UPDATE droplets SET amount = amount - $1, block_height = $2, \
-                 exchange_locked = 0, last_tx = NULL WHERE xonly_pubkey = $3 AND amount >= $1",
+                 exchange_locked = 0, last_tx = NULL, exchange_amount = 0 \
+                 WHERE xonly_pubkey = $3 AND amount >= $1",
             )
             .bind(encode_u64(exchanged)?)
             .bind(encode_u64(block.height)?)
             .bind(member.to_vec())
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await?
             .rows_affected();
             if updated != 1 {
@@ -366,16 +380,6 @@ impl DropletStore {
             }
         }
 
-        sqlx::query(
-            "INSERT INTO indexer_cursors (rule_set, block_height, block_hash) VALUES ($1, $2, $3) \
-             ON CONFLICT (rule_set) DO UPDATE SET block_height = $2, block_hash = $3",
-        )
-        .bind(rule_set)
-        .bind(encode_u64(block.height)?)
-        .bind(block.hash.to_vec())
-        .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
         Ok(())
     }
 
@@ -385,7 +389,8 @@ impl DropletStore {
         block_height: u64,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE droplets SET block_height = $1, exchange_locked = 0, last_tx = NULL \
+            "UPDATE droplets SET block_height = $1, exchange_locked = 0, last_tx = NULL, \
+             exchange_amount = 0 \
              WHERE xonly_pubkey = $2",
         )
         .bind(encode_u64(block_height)?)
@@ -691,6 +696,139 @@ mod tests {
                 amount: 401,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn accounts_treasury_activity_to_members_active_in_each_epoch() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.droplets();
+        let removed = [1; 32];
+        let retained = [2; 32];
+        let added = [3; 32];
+        let previous_members = [removed, retained];
+        let next_members = [retained, added];
+
+        store
+            .apply_block(
+                "droplets-v1",
+                &IndexedBlock {
+                    height: 10,
+                    hash: [10; 32],
+                },
+                &[
+                    TreasuryTransaction {
+                        txid: [10; 32],
+                        inputs: vec![],
+                        outputs: vec![(0, 100)],
+                        deposit_member: Some(removed),
+                        exchange_member: None,
+                    },
+                    TreasuryTransaction {
+                        txid: [11; 32],
+                        inputs: vec![],
+                        outputs: vec![(0, 10)],
+                        deposit_member: None,
+                        exchange_member: None,
+                    },
+                ],
+                &previous_members,
+            )
+            .await
+            .unwrap();
+        store
+            .apply_block(
+                "droplets-v1",
+                &IndexedBlock {
+                    height: 11,
+                    hash: [11; 32],
+                },
+                &[TreasuryTransaction {
+                    txid: [12; 32],
+                    inputs: vec![([10; 32], 0)],
+                    outputs: vec![(0, 50)],
+                    deposit_member: None,
+                    exchange_member: Some(removed),
+                }],
+                &previous_members,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.balance(removed).await.unwrap().unwrap().amount, 55);
+        assert_eq!(store.balance(retained).await.unwrap().unwrap().amount, 5);
+
+        store
+            .apply_block(
+                "droplets-v1",
+                &IndexedBlock {
+                    height: 13,
+                    hash: [13; 32],
+                },
+                &[
+                    TreasuryTransaction {
+                        txid: [13; 32],
+                        inputs: vec![],
+                        outputs: vec![(0, 100)],
+                        deposit_member: Some(added),
+                        exchange_member: None,
+                    },
+                    TreasuryTransaction {
+                        txid: [14; 32],
+                        inputs: vec![],
+                        outputs: vec![(0, 10)],
+                        deposit_member: None,
+                        exchange_member: None,
+                    },
+                ],
+                &next_members,
+            )
+            .await
+            .unwrap();
+        store
+            .apply_block(
+                "droplets-v1",
+                &IndexedBlock {
+                    height: 14,
+                    hash: [14; 32],
+                },
+                &[TreasuryTransaction {
+                    txid: [15; 32],
+                    inputs: vec![([13; 32], 0)],
+                    outputs: vec![(0, 60)],
+                    deposit_member: None,
+                    exchange_member: Some(added),
+                }],
+                &next_members,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.balance(removed).await.unwrap().unwrap().amount, 55);
+        assert_eq!(store.balance(retained).await.unwrap().unwrap().amount, 10);
+        assert_eq!(store.balance(added).await.unwrap().unwrap().amount, 65);
+
+        let removed_member_exchange = TreasuryTransaction {
+            txid: [16; 32],
+            inputs: vec![([12; 32], 0)],
+            outputs: vec![(0, 25)],
+            deposit_member: None,
+            exchange_member: Some(removed),
+        };
+        assert!(matches!(
+            store
+                .apply_block(
+                    "droplets-v1",
+                    &IndexedBlock {
+                        height: 15,
+                        hash: [15; 32],
+                    },
+                    &[removed_member_exchange],
+                    &next_members,
+                )
+                .await,
+            Err(DropletError::Invalid(_))
+        ));
+        assert_eq!(store.balance(removed).await.unwrap().unwrap().amount, 55);
     }
 
     #[tokio::test]

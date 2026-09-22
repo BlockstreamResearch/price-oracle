@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -32,6 +32,7 @@ pub(crate) struct NetworkState {
     indexer: Indexer,
     user_requests: UserRequestProcessor,
     block_height: Arc<AtomicU64>,
+    migration_paused: Arc<AtomicBool>,
     member_migration: Arc<Mutex<Option<MemberMigrationAttempt>>>,
     voting_execution_attempts: VotingExecutionAttempts,
 }
@@ -87,6 +88,7 @@ impl NetworkState {
     ) -> Self {
         let HighStormDependencies {
             network_store,
+            chain,
             voting_store,
             network_assets,
             monitored_utxos,
@@ -109,6 +111,10 @@ impl NetworkState {
                     .serialize()
             })
             .collect();
+        let migration_paused = chain
+            .recovery_state()
+            .await
+            .map_or(true, |state| state.migration_paused);
 
         Self {
             network_store,
@@ -121,6 +127,7 @@ impl NetworkState {
                 network_assets.clone(),
                 elements_rpc.clone(),
                 protocol_config.exchange_transaction_fee_sats,
+                protocol_config.finality_confirmations,
             ),
             prices: Prices::new(secret_key, price_attestations, price_feed::Clock::System),
             assets: Assets::new(network_assets.clone()),
@@ -134,6 +141,7 @@ impl NetworkState {
                     .x_only_public_key()
                     .0
                     .serialize(),
+                protocol_config.finality_confirmations,
             ),
             burning: Burning::new(
                 monitored_utxos.clone(),
@@ -148,6 +156,7 @@ impl NetworkState {
                 protocol_config.exchange_transaction_fee_sats,
             ),
             indexer: Indexer::new(
+                chain,
                 monitored_utxos.clone(),
                 droplets,
                 network_assets.clone(),
@@ -163,6 +172,7 @@ impl NetworkState {
                 protocol_config,
             ),
             block_height: Arc::new(AtomicU64::new(0)),
+            migration_paused: Arc::new(AtomicBool::new(migration_paused)),
             member_migration: Arc::new(Mutex::new(None)),
             voting_execution_attempts: VotingExecutionAttempts::default(),
         }
@@ -217,6 +227,32 @@ impl NetworkState {
 
     pub(crate) fn indexer(&self) -> &Indexer {
         &self.indexer
+    }
+
+    pub(crate) fn is_recovering(&self) -> bool {
+        self.indexer.is_recovering()
+    }
+
+    pub(crate) fn is_spending_paused(&self) -> bool {
+        self.migration_paused.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn set_spending_paused(&self, paused: bool) -> Result<(), sqlx::Error> {
+        if paused {
+            self.migration_paused.store(true, Ordering::Release);
+        }
+        self.network_store
+            .chain()
+            .set_migration_paused(paused)
+            .await?;
+        if !paused {
+            self.migration_paused.store(false, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn migration_finalized(&self) {
+        self.migration_paused.store(false, Ordering::Release);
     }
 
     pub(crate) fn user_requests(&self) -> &UserRequestProcessor {
@@ -348,6 +384,7 @@ mod tests {
                     burn_transaction_fee_sats: 500,
                     exchange_transaction_fee_sats: 500,
                     tick_lifetime_blocks: 60,
+                    finality_confirmations: 2,
                 },
             ),
         )

@@ -85,7 +85,7 @@ async fn rejects_malformed_execute_user_requests_transaction() {
     .await;
 
     assert!(
-        result.is_err(),
+        !matches!(result, Ok(Ok(_))),
         "peers signed a malformed issuance transaction"
     );
     network.shutdown().await;

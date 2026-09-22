@@ -584,6 +584,7 @@ impl UserRequestProcessor {
             signing_hash,
             signing_storm_tree_branch: signing_branch,
             external_requests,
+            chain_tip: None,
         };
 
         Ok(Some(PreparedRound {
@@ -716,7 +717,8 @@ impl UserRequestProcessor {
             ))
         })?;
         let txid = final_tx.txid().to_string();
-        let transaction_hex = hex::encode(encode::serialize(&final_tx));
+        let final_bytes = encode::serialize(&final_tx);
+        let transaction_hex = hex::encode(&final_bytes);
         tracing::debug!(%txid, "prepared Tick issuance transaction");
         let client = self.client()?;
         let broadcast_txid: String =
@@ -748,7 +750,7 @@ impl UserRequestProcessor {
             })?;
             updated += usize::from(
                 self.requests
-                    .mark_processing(result.request_hash, &payload)
+                    .mark_processing(result.request_hash, &payload, &final_bytes)
                     .await?,
             );
         }
@@ -762,17 +764,47 @@ impl UserRequestProcessor {
             return Ok(0);
         }
         let client = self.client()?;
+        let tip: u64 = client.call("getblockcount", &[])?;
         let mut updated = 0;
         for request in processing {
             let Some(payload) = request.payload else {
                 continue;
             };
             let result: NetworkRequestsResult = serde_json::from_slice(&payload)?;
-            let confirmation: RawTransactionInfo = client.call(
+            let confirmation = client.call::<RawTransactionInfo>(
                 "getrawtransaction",
                 &[result.txid.clone().into(), true.into()],
-            )?;
-            if confirmation.confirmations > 0 {
+            );
+            let Ok(confirmation) = confirmation else {
+                self.requests.mark_orphaned(request.request_hash).await?;
+                if let Some(transaction) = request.execution_tx {
+                    let _: String =
+                        client.call("sendrawtransaction", &[hex::encode(transaction).into()])?;
+                }
+                continue;
+            };
+            if confirmation.confirmations == 0 {
+                self.requests.mark_orphaned(request.request_hash).await?;
+                continue;
+            }
+            let block_hash = confirmation
+                .block_hash
+                .as_deref()
+                .ok_or_else(|| {
+                    UserRequestError::Invalid(
+                        "confirmed issuance transaction has no block hash".into(),
+                    )
+                })?
+                .parse::<BlockHash>()
+                .map_err(|error| UserRequestError::Invalid(error.to_string()))?
+                .to_byte_array();
+            let included_at = tip
+                .saturating_sub(confirmation.confirmations)
+                .saturating_add(1);
+            self.requests
+                .mark_included(request.request_hash, included_at, block_hash)
+                .await?;
+            if confirmation.confirmations >= self.config.finality_confirmations.max(1) {
                 updated += usize::from(self.requests.mark_executed(request.request_hash).await?);
             }
         }
@@ -1829,6 +1861,8 @@ struct SpendingPrevout {
 struct RawTransactionInfo {
     #[serde(default)]
     confirmations: u64,
+    #[serde(default, rename = "blockhash")]
+    block_hash: Option<String>,
 }
 
 #[cfg(test)]
@@ -1898,6 +1932,7 @@ mod tests {
             burn_transaction_fee_sats: 50,
             exchange_transaction_fee_sats: 50,
             tick_lifetime_blocks: 60,
+            finality_confirmations: 2,
         }
     }
 

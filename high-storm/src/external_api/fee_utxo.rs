@@ -378,6 +378,7 @@ mod tests {
             burn_transaction_fee_sats: 500,
             exchange_transaction_fee_sats: 500,
             tick_lifetime_blocks: 60,
+            finality_confirmations: 2,
         };
 
         assert_eq!(minimum_fee_value(3, &config).unwrap(), 9_500);

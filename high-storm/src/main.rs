@@ -241,6 +241,9 @@ async fn run_until_shutdown(
                         tracing::info!(block_count, "indexed confirmed blocks");
                     }
                     Err(error) => {
+                        round_schedule = None;
+                        issuance_round.as_mut().reset(idle_round_deadline());
+                        burning_round.as_mut().reset(idle_round_deadline());
                         tracing::warn!(%error, "failed to index confirmed blocks");
                     }
                 }
