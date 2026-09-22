@@ -82,7 +82,7 @@ This spending path will include the following checks:
 
 ### 1.4.2. Authorized inclusion in a transaction with an update to the Storm Tree root using the network signature
 
-In this scenario, the Storm Eye UTXO must be spent in its entirety, changing the `script_pubkey` to migrate to the new Storm Tree root. The network authorization (1.4.0) is checked against the **current** root.
+In this scenario, the Storm Eye UTXO must be spent in its entirety, changing the `script_pubkey` to migrate to the new Storm Tree root.
 
 The following witness parameters are accepted for spending:
 
