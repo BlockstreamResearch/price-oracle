@@ -1,5 +1,6 @@
 pub(crate) mod fee_utxo;
 mod operators;
+mod prices;
 #[cfg(test)]
 mod tests;
 pub(crate) mod users;
@@ -88,6 +89,7 @@ pub(crate) fn router(
     Router::new()
         .nest("/users", users::router())
         .nest("/operators", operators::router())
+        .nest("/price-feeds", prices::router())
         .with_state(state)
         .layer(
             CorsLayer::new()
@@ -129,6 +131,15 @@ async fn detect_auth_network(
             .ok_or_else(|| ExternalApiError::UnsupportedChain(chain.chain))
     })
     .await?
+}
+
+/// Only the coordinator serves the user API; the other members answer nothing.
+async fn require_coordinator(state: &ExternalApiState) -> Result<(), ApiError> {
+    if state.node.is_coordinator().await {
+        Ok(())
+    } else {
+        Err(ApiError::unavailable("this node is not the coordinator"))
+    }
 }
 
 #[derive(Serialize)]

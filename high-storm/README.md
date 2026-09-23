@@ -165,6 +165,8 @@ key's mainnet P2WPKH address and verifies BIP322-simple signatures against it.
 | `POST` | `/operators/voting/{hash}/approve` | Signed request envelope |
 | `POST` | `/users/requests` | User Schnorr signature in JSON |
 | `GET` | `/users/requests/{request_hash}` | None; coordinator node only |
+| `GET` | `/price-feeds` | None; coordinator node only |
+| `GET` | `/price-feeds/{id}` | None; coordinator node only |
 
 Challenge and token requests use these shapes:
 
@@ -247,6 +249,43 @@ covenant transaction. The status becomes `processing` after broadcast and
 `executed` after confirmation. A node that is not the current coordinator returns
 `503` for both user routes. `signed-price-data` returns `422` until price request
 processing is implemented.
+
+`GET /price-feeds` lists the registry every node shares: each feed with its id
+and symbols, in id order. `GET /price-feeds/{id}` returns the current rate for
+one feed, in the same shape for a Direct feed and a Cross pair:
+
+```json
+{"main":{"feed":{"feed_id":0,"price":9876543210,"decimals":8,"received_at":1700000000,"valid_until":1700000300},"signature":"<128 hex characters>","public_key":"<64 hex characters>"},"auxiliary":[]}
+```
+
+`main` is the coordinator's own attestation; `auxiliary` holds the attestations
+of the same feed from the other current members, so what a removed member last
+attested is not served on. A read answers from what the node holds, so it needs
+no coordination round and stays available while issuance is stopped. No price is
+served past its `valid_until`: an expired attestation is left out of `auxiliary`
+entirely. A feed id that is not a number returns `400`, an unregistered one
+`404`, and a feed the coordinator holds no valid price of its own for returns
+`503`, saying whether that feed has expired or was never attested. A rate
+response is `no-store`, so no cache between the node and a client may serve a
+price the node itself would no longer serve.
+
+Each `signature` is a BIP-340 signature by `public_key` over
+`SHA256(SHA256(tag) || SHA256(tag) || feed)`, where `tag` is the ASCII string
+`OracleNetworkV1/Price` and `feed` is its 32 canonical bytes: `feed_id` and
+`decimals` as 4-byte big-endian integers, `price`, `received_at`, and
+`valid_until` as 8-byte big-endian integers, laid out in the order `feed_id`,
+`decimals`, `price`, `received_at`, `valid_until`. A client can therefore check
+that the coordinator did not alter what a member signed.
+
+It cannot check what the coordinator left out or added: this API exposes no
+member list, so the keys in `auxiliary` are only as trustworthy as the
+coordinator serving them. Obtain the member keys out of band — an operator can
+read them from `GET /operators/state/peers` — and treat `auxiliary` as
+unverified until you do.
+
+An attestation says that the member saw that price, not that the price is
+right. A feed with no source of its own never becomes available and answers
+`503` permanently, and so does a Cross pair whose legs have none.
 
 Each node indexes confirmed Tick outputs and their dedicated Account burn
 reserves. A Tick expires after 60 blocks, or one hour at the target one-minute

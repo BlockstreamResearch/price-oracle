@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use ::secp256k1::{Keypair as SchnorrKeypair, SecretKey as SchnorrSecretKey, schnorr};
 use axum::{
     Router,
@@ -7,6 +9,7 @@ use axum::{
 };
 use bitcoin::{Address, Network, PrivateKey, secp256k1};
 use http_body_util::BodyExt;
+use price_feed::{FeedId, SourceObservation};
 use secp256k1_zkp::{Secp256k1, SecretKey};
 use simplex::simplicityhl::elements::AssetId;
 use storm::{Peer, Storm};
@@ -481,6 +484,130 @@ async fn rejects_unsupported_or_invalid_user_requests() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn lists_every_price_feed_with_its_symbols() {
+    let (app, _node, ..) = node_setup().await;
+
+    let response = app.oneshot(get_request("/price-feeds")).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let feeds = response_json(response).await;
+    assert_eq!(feeds.as_array().unwrap().len(), 8);
+    assert_eq!(
+        feeds[0],
+        serde_json::json!({
+            "id": 0, "symbol": "LBTC/USD", "base": "LBTC", "quote": "USD",
+            "decimals": 8, "kind": "direct",
+        })
+    );
+    // A Cross pair is listed like any other feed.
+    assert_eq!(
+        feeds[4],
+        serde_json::json!({
+            "id": 4, "symbol": "LBTC/USDT", "base": "LBTC", "quote": "USDT",
+            "decimals": 8, "kind": "cross",
+        })
+    );
+}
+
+#[tokio::test]
+async fn serves_the_rate_it_attested_for_a_feed() {
+    let (app, node, ..) = node_setup().await;
+
+    let unknown = app
+        .clone()
+        .oneshot(get_request("/price-feeds/99"))
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    // An id that is not a number is answered in this API's error shape.
+    let malformed = app
+        .clone()
+        .oneshot(get_request("/price-feeds/abc"))
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(malformed).await["error"],
+        "invalid price feed id 'abc'"
+    );
+
+    // A feed the node has not attested yet has no rate to read.
+    let unattested = app
+        .clone()
+        .oneshot(get_request("/price-feeds/0"))
+        .await
+        .unwrap();
+    assert_eq!(unattested.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let at = now();
+    node.handle()
+        .record_price_observation(
+            LBTC_USD,
+            0,
+            SourceObservation::new(9_876_543_210, 8, at, at),
+        )
+        .await;
+    assert_eq!(node.attest_prices().await.unwrap(), 1);
+
+    let response = app.oneshot(get_request("/price-feeds/0")).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // A cache must not answer with a price the node would no longer serve.
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let rate = response_json(response).await;
+    assert_eq!(rate["main"]["feed"]["feed_id"], 0);
+    assert_eq!(rate["main"]["feed"]["price"], 9_876_543_210u64);
+    assert_eq!(rate["main"]["feed"]["decimals"], 8);
+    assert_eq!(rate["main"]["feed"]["received_at"], at);
+    assert!(rate["main"]["feed"]["valid_until"].as_u64().unwrap() > at);
+    assert_eq!(rate["main"]["public_key"], hex::encode(attester_key()));
+    assert_eq!(rate["main"]["signature"].as_str().unwrap().len(), 128);
+    // The only member is the coordinator itself, so nothing stands beside it.
+    assert_eq!(rate["auxiliary"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn serves_no_price_from_a_node_that_is_not_the_coordinator() {
+    let elsewhere = SecretKey::from_slice(&[22; 32])
+        .unwrap()
+        .public_key(&Secp256k1::new())
+        .serialize();
+    let (app, _node, ..) = node_setup_with_coordinator(elsewhere).await;
+
+    for path in ["/price-feeds", "/price-feeds/0"] {
+        let response = app.clone().oneshot(get_request(path)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+const NODE_KEY: [u8; 32] = [21; 32];
+const LBTC_USD: FeedId = 0;
+
+fn node_public_key() -> [u8; 33] {
+    SecretKey::from_slice(&NODE_KEY)
+        .unwrap()
+        .public_key(&Secp256k1::new())
+        .serialize()
+}
+
+/// The same key, which the node signs its attestations with.
+fn attester_key() -> [u8; 32] {
+    SchnorrKeypair::from_secret_key(&SchnorrSecretKey::from_secret_bytes(NODE_KEY).unwrap())
+        .x_only_public_key()
+        .0
+        .serialize()
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 async fn setup() -> (Router, PrivateKey, String) {
     let (app, private_key, public_key, _) = setup_with_database().await;
 
@@ -488,6 +615,20 @@ async fn setup() -> (Router, PrivateKey, String) {
 }
 
 async fn setup_with_database() -> (Router, PrivateKey, String, Database) {
+    let (app, _, private_key, public_key, database) = node_setup().await;
+
+    (app, private_key, public_key, database)
+}
+
+/// Keeps the node, for the tests that drive it before they read it.
+async fn node_setup() -> (Router, HighStorm, PrivateKey, String, Database) {
+    node_setup_with_coordinator(node_public_key()).await
+}
+
+/// Naming another node as the coordinator leaves this one serving nothing.
+async fn node_setup_with_coordinator(
+    coordinator_public_key: [u8; 33],
+) -> (Router, HighStorm, PrivateKey, String, Database) {
     let database = Database::connect("sqlite::memory:", 1).await.unwrap();
     let operators = database.node_operators();
     let mut storm_eye_asset_id = [1; 32];
@@ -540,13 +681,12 @@ async fn setup_with_database() -> (Router, PrivateKey, String, Database) {
         .serialize();
     operators.add(compressed_operator_public_key).await.unwrap();
 
-    let node_secret = SecretKey::from_slice(&[21; 32]).unwrap();
-    let node_public_key = node_secret.public_key(&Secp256k1::new()).serialize();
-    let storm = Storm::from_peers(node_secret, vec![Peer::new(node_public_key)]);
+    let node_secret = SecretKey::from_slice(&NODE_KEY).unwrap();
+    let storm = Storm::from_peers(node_secret, vec![Peer::new(node_public_key())]);
     let node = HighStorm::new(
         storm,
         node_secret.secret_bytes(),
-        node_public_key,
+        coordinator_public_key,
         crate::high_storm::HighStormDependencies::new(
             database.network(),
             database.voting(),
@@ -584,10 +724,15 @@ async fn setup_with_database() -> (Router, PrivateKey, String, Database) {
 
     (
         app,
+        node,
         operator_private_key,
         hex::encode(operator_public_key),
         database,
     )
+}
+
+fn get_request(uri: &str) -> Request<Body> {
+    Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
 fn json_request(uri: &str, body: serde_json::Value) -> Request<Body> {
