@@ -63,6 +63,10 @@ use super::{
 };
 
 const MAX_TICK_TIME_SKEW_SECS: u64 = 120;
+/// Ten blocks, about ten minutes at the target interval: long enough to ride
+/// out a restart or a slow poll, short enough not to strand a user's fees on a
+/// feed this node never prices.
+const MAX_UNPRICED_REQUEST_BLOCKS: u64 = 10;
 const MAX_MEMPOOL_TOKEN_CHAIN_LENGTH: usize = 100;
 pub(crate) const STORM_EYE_TAG: &str = "OracleNetworkV1/StormEye";
 const MAX_REQUESTS_PER_ROUND: u32 = 100;
@@ -203,6 +207,7 @@ impl UserRequestProcessor {
 
     pub(crate) async fn prepare_round(
         &self,
+        block_height: u64,
         storm_eye_lane: usize,
         max_transaction_weight: usize,
     ) -> Result<Option<PreparedRound>, UserRequestError> {
@@ -213,7 +218,12 @@ impl UserRequestProcessor {
 
         while lower_limit <= upper_limit {
             let Some(candidate) = self
-                .prepare_round_candidate(storm_eye_lane, request_limit, max_transaction_weight)
+                .prepare_round_candidate(
+                    block_height,
+                    storm_eye_lane,
+                    request_limit,
+                    max_transaction_weight,
+                )
                 .await?
             else {
                 return Ok(best);
@@ -248,6 +258,7 @@ impl UserRequestProcessor {
 
     async fn prepare_round_candidate(
         &self,
+        block_height: u64,
         storm_eye_lane: usize,
         request_limit: u32,
         max_transaction_weight: usize,
@@ -296,11 +307,30 @@ impl UserRequestProcessor {
             };
             match round_rate(instructed, named_feed, own) {
                 RoundRate::Carries(rate) => instructed = rate,
-                RoundRate::Defer => {
-                    tracing::debug!(
+                RoundRate::AnotherFeed => continue,
+                RoundRate::NoLocalPrice => {
+                    let waited = block_height.saturating_sub(stored.block_height);
+                    if !waited_too_long(block_height, stored.block_height) {
+                        tracing::debug!(
+                            request_hash = %hex::encode(stored.request_hash),
+                            feed = named_feed,
+                            "deferred a user request to a round that can price it"
+                        );
+                        continue;
+                    }
+                    // Its fee UTXOs are reserved while it waits, so a feed this
+                    // node never prices releases them rather than holding them.
+                    let reason = format!(
+                        "no price for feed {} in {waited} blocks",
+                        named_feed.unwrap_or_default()
+                    );
+                    self.requests
+                        .mark_failed(stored.request_hash, reason.as_bytes())
+                        .await?;
+                    tracing::warn!(
                         request_hash = %hex::encode(stored.request_hash),
-                        feed = named_feed,
-                        "deferred a user request to a round that can price it"
+                        %reason,
+                        "rejected pending user request before issuance"
                     );
                     continue;
                 }
@@ -1627,10 +1657,12 @@ fn validate_execute_request(
 enum RoundRate {
     /// It joins the round, which goes on carrying this rate.
     Carries(Option<PriceFeedData>),
-    /// It waits for a round issued at its feed, which this node can price. A
-    /// feed is unavailable after a restart and between polls, and failing the
-    /// request there would lose the fee UTXOs it reserved.
-    Defer,
+    /// It waits for a round issued at the feed it names.
+    AnotherFeed,
+    /// This node cannot price the feed it names. A feed is unavailable after a
+    /// restart and between polls, so the batch waits rather than failing and
+    /// losing the fee UTXOs it reserved — but only for so long.
+    NoLocalPrice,
 }
 
 /// `own` is this node's value for the feed the batch names, read only when the
@@ -1644,13 +1676,19 @@ fn round_rate(
         return RoundRate::Carries(instructed);
     };
     match instructed {
-        Some(held) if held.feed_id != feed => RoundRate::Defer,
+        Some(held) if held.feed_id != feed => RoundRate::AnotherFeed,
         Some(held) => RoundRate::Carries(Some(held)),
         None => match own {
             Some(own) => RoundRate::Carries(Some(own)),
-            None => RoundRate::Defer,
+            None => RoundRate::NoLocalPrice,
         },
     }
+}
+
+/// Its fee UTXOs stay reserved while it waits, so it does not wait forever. A
+/// height that rewound in a reorg never ages a request early.
+fn waited_too_long(block_height: u64, since: u64) -> bool {
+    block_height.saturating_sub(since) > MAX_UNPRICED_REQUEST_BLOCKS
 }
 
 /// Only a batch issued at the round's feed carries its rate.
@@ -2020,12 +2058,23 @@ mod tests {
             round_rate(Some(own), Some(LBTC_USDT), None),
             RoundRate::Carries(Some(own))
         );
-        // Another feed, or one this node cannot price, waits.
+        // A batch of another feed waits for a round of its own, while one this
+        // node cannot price waits only until it has waited too long.
         assert_eq!(
             round_rate(Some(other), Some(LBTC_USDT), None),
-            RoundRate::Defer
+            RoundRate::AnotherFeed
         );
-        assert_eq!(round_rate(None, Some(LBTC_USDT), None), RoundRate::Defer);
+        assert_eq!(
+            round_rate(None, Some(LBTC_USDT), None),
+            RoundRate::NoLocalPrice
+        );
+    }
+
+    #[test]
+    fn fails_an_unpriced_request_only_once_it_has_waited_its_blocks() {
+        assert!(!waited_too_long(MAX_UNPRICED_REQUEST_BLOCKS, 0));
+        assert!(waited_too_long(MAX_UNPRICED_REQUEST_BLOCKS + 1, 0));
+        assert!(!waited_too_long(5, 9));
     }
 
     #[test]
