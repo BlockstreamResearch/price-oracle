@@ -153,6 +153,7 @@ impl Signing {
         storm: &Storm,
         tx: Vec<u8>,
         signing_hash: [u8; 32],
+        price_hash: Option<[u8; 32]>,
         external_requests: Vec<ExternalRequests>,
         chain_tip: ChainTip,
     ) -> Result<SigningResult, SigningError> {
@@ -169,7 +170,7 @@ impl Signing {
 
         self.sign_with_message(
             &storm.handle(),
-            vec![signing_hash],
+            execute_message_hashes(signing_hash, price_hash),
             SIGNING_SESSION_TIMEOUT,
             move |branch| {
                 NodeMessage::new(
@@ -411,10 +412,13 @@ impl Signing {
         recipient_transport_keys(&state, signers, requestor)
     }
 
+    /// `price_hash` is derived from the rate this node validated, never taken
+    /// from the message: a signer signs the price it accepted or no price.
     pub(crate) async fn handle_execute_user_requests(
         &self,
         message: NodeMessage,
         context: &StormContext,
+        price_hash: Option<[u8; 32]>,
     ) -> Result<(), SigningError> {
         require_coordinator(
             self.coordinator_public_key,
@@ -438,7 +442,7 @@ impl Signing {
                 sender,
                 SigningRequest {
                     signing_storm_tree_branch: request.signing_storm_tree_branch,
-                    message_hashes: vec![request.signing_hash],
+                    message_hashes: execute_message_hashes(request.signing_hash, price_hash),
                 },
                 None,
             )?
@@ -1004,6 +1008,15 @@ impl SigningState {
     }
 }
 
+/// A round issued at a rate signs it after the transaction, so both sides build
+/// the same list and a signer that holds no rate signs only the transaction.
+fn execute_message_hashes(signing_hash: [u8; 32], price_hash: Option<[u8; 32]>) -> Vec<[u8; 32]> {
+    let mut hashes = vec![signing_hash];
+    hashes.extend(price_hash);
+
+    hashes
+}
+
 fn musig_session(
     session: &SigningSession,
     cache: &KeyAggCache,
@@ -1150,5 +1163,14 @@ mod tests {
         let error = require_coordinator(COORDINATOR, MEMBER).unwrap_err();
 
         assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
+    }
+
+    #[test]
+    fn a_round_signs_its_rate_after_its_transaction() {
+        assert_eq!(execute_message_hashes([7; 32], None), vec![[7; 32]]);
+        assert_eq!(
+            execute_message_hashes([7; 32], Some([8; 32])),
+            vec![[7; 32], [8; 32]]
+        );
     }
 }

@@ -2,6 +2,7 @@ import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils";
 const REQUEST_TAG = "OracleNetworkV1/NetworkUserRequests";
+const PRICE_TAG = "OracleNetworkV1/Price";
 const HEX_32 = /^[0-9a-f]{64}$/i;
 const OUTPOINT = /^[0-9a-f]{64}:[0-9]+$/i;
 export class ElementsRpcClient {
@@ -143,9 +144,40 @@ export function tickRequestSigningHash(request) {
     const tagHash = sha256(utf8ToBytes(REQUEST_TAG));
     return sha256(new Uint8Array([...tagHash, ...tagHash, ...utf8ToBytes(message)]));
 }
+/** The 32 canonical bytes the network signs, as the numbers they encode. */
+export function decodePriceData(priceData) {
+    if (!HEX_32.test(priceData)) {
+        throw new Error("price data must be 32-byte hex");
+    }
+    const bytes = hexToBytes(priceData);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    return {
+        feedId: view.getUint32(0),
+        decimals: view.getUint32(4),
+        price: view.getBigUint64(8),
+        receivedAt: view.getBigUint64(16),
+        validUntil: view.getBigUint64(24),
+    };
+}
+/**
+ * Whether the network signed this rate, under the Storm Tree branch the bloom
+ * names. The caller still has to check that branch against the Storm Eye root
+ * the chain holds, which this cannot see.
+ */
+export function verifySignedPriceData(details) {
+    const { signature, branch } = details.storm_tree_bloom;
+    if (!HEX_32.test(branch) || !/^[0-9a-f]{128}$/i.test(signature)) {
+        throw new Error("bloom must carry a 32-byte branch and 64-byte signature");
+    }
+    const tagHash = sha256(utf8ToBytes(PRICE_TAG));
+    const message = sha256(new Uint8Array([...tagHash, ...tagHash, ...hexToBytes(details.price_data)]));
+    return schnorr.verify(hexToBytes(signature), message, hexToBytes(branch));
+}
 export function parseExecutedTick(status) {
     if (status.payload === null ||
-        (status.status !== "processing" && status.status !== "executed")) {
+        (status.status !== "processing" &&
+            status.status !== "included" &&
+            status.status !== "executed")) {
         return null;
     }
     return JSON.parse(status.payload);

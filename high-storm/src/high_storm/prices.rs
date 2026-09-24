@@ -417,7 +417,9 @@ fn verify(attestation: &PriceAttestation) -> Result<(), PriceError> {
     .map_err(|_| PriceError::InvalidSignature(attestation.feed.feed_id))
 }
 
-fn price_hash(feed: &PriceFeedData) -> [u8; 32] {
+/// The message an attestation signs, and the one a round signs beside its
+/// issuance transaction so a user can verify the rate it was issued at.
+pub(crate) fn price_hash(feed: &PriceFeedData) -> [u8; 32] {
     tagged_hash(PRICE_TAG, &feed.to_bytes())
 }
 
@@ -433,6 +435,28 @@ mod tests {
 
     fn keypair(byte: u8) -> Keypair {
         Keypair::from_secret_key(&SecretKey::from_secret_bytes([byte; 32]).unwrap())
+    }
+
+    /// The same vector the SDK checks itself against, so the two
+    /// implementations of the message cannot drift apart unnoticed.
+    #[test]
+    fn signs_a_price_under_the_message_a_client_recomputes() {
+        let price = PriceFeedData {
+            feed_id: 4,
+            decimals: 8,
+            price: 10_000_000_000,
+            received_at: 1_700_000_000,
+            valid_until: 1_700_000_300,
+        };
+
+        assert_eq!(
+            hex::encode(price.to_bytes()),
+            "000000040000000800000002540be400000000006553f100000000006553f22c"
+        );
+        assert_eq!(
+            hex::encode(price_hash(&price)),
+            "dd5c6a22d1a989ec39cfcd82b64d8e1f43bcca770dc3d2949022a9808b3d6340"
+        );
     }
 
     fn feed() -> PriceFeedData {

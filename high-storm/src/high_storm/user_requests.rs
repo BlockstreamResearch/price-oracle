@@ -46,7 +46,9 @@ use crate::{
     },
     external_api::{
         fee_utxo::{MIN_FEE_UTXO_CONFIRMATIONS, parse_coin_value},
-        users::{TickUtxoRequestDetails, UtxoAuthMethod, validate_encoded_request},
+        users::{
+            PRICE_REQUEST_KIND, TickUtxoRequestDetails, UtxoAuthMethod, validate_encoded_request,
+        },
     },
 };
 use price_feed::{FeedId, PriceFeedData};
@@ -58,7 +60,7 @@ use super::{
     },
     issuance::{IssuedTickDescriptor, MAX_ISSUED_TICK_DESCRIPTORS},
     message::{ExecuteUserRequests, ExternalRequests},
-    prices::Prices,
+    prices::{Prices, price_hash},
     signing::SigningError,
 };
 
@@ -89,6 +91,8 @@ pub(crate) struct PreparedRound {
     network: SimplicityNetwork,
     storm_eye: NetworkAsset,
     max_transaction_weight: usize,
+    instructed: Option<PriceFeedData>,
+    timestamp: u64,
 }
 
 struct PreparedRequestResult {
@@ -113,6 +117,32 @@ struct RequestResult {
 #[derive(Serialize)]
 struct TickUtxoDetails {
     timestamp: u64,
+}
+
+/// What a `signed-price-data` request receives: the Tick UTXO a `tick-utxo`
+/// request would have produced, and the rate the round was issued at with the
+/// network signature over it.
+#[derive(Serialize)]
+struct SignedPriceDataDetails {
+    timestamp: u64,
+    price_data: String,
+    storm_tree_bloom: StormTreeBloom,
+}
+
+/// Everything needed to check the network signature over `price_data`. The
+/// root it proves against is the Storm Eye's on-chain one, so a reader takes
+/// that from the chain rather than from here.
+#[derive(Clone, Serialize)]
+struct StormTreeBloom {
+    signature: String,
+    branch: String,
+    proof: Vec<BloomStep>,
+}
+
+#[derive(Clone, Serialize)]
+struct BloomStep {
+    right: bool,
+    hash: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -180,11 +210,12 @@ impl UserRequestProcessor {
         }
     }
 
-    /// A rate this node refuses rejects the whole message.
+    /// A rate this node refuses rejects the whole message. Returns the rate the
+    /// round is issued at, which is the only one this node will sign beside it.
     pub(crate) async fn validate_execute(
         &self,
         request: &ExecuteUserRequests,
-    ) -> Result<(), UserRequestError> {
+    ) -> Result<Option<PriceFeedData>, UserRequestError> {
         let storm_eye = self
             .assets
             .get(STORM_EYE_KIND)
@@ -202,7 +233,7 @@ impl UserRequestProcessor {
         if let Some(instructed) = instructed {
             self.prices.validate_instruction(&instructed).await?;
         }
-        Ok(())
+        Ok(instructed)
     }
 
     pub(crate) async fn prepare_round(
@@ -630,9 +661,9 @@ impl UserRequestProcessor {
         ));
         let env = auth_program.as_ref().get_env(&pset, 0, &network)?;
         let sighash = env.c_tx_env().sighash_all().to_byte_array();
-        // The hash covers the transaction, not the rate beside it. Commit to
-        // the rate here once a covenant field records it on-chain, or the
-        // signature says nothing about the price every member validated.
+        // This hash covers the transaction; the rate is the round's second
+        // signed message. Fold it in here once a covenant field records it
+        // on-chain, so the issuance itself commits to the price.
         let signing_hash = SigMessage::Tagged(STORM_EYE_TAG.to_string()).digest(sighash);
         let external_requests = decoded
             .iter()
@@ -659,6 +690,8 @@ impl UserRequestProcessor {
             network,
             storm_eye,
             max_transaction_weight,
+            instructed,
+            timestamp,
         }))
     }
 
@@ -704,6 +737,10 @@ impl UserRequestProcessor {
                     "Storm Eye signature failed independent BIP340 verification".into(),
                 )
             })?;
+        let signed_price = prepared
+            .instructed
+            .map(|price| signed_price_bloom(&price, &signing, &proof))
+            .transpose()?;
         let signature = *signature.as_ref();
         let mut transaction = prepared.final_transaction;
         let contract_data: StormEyeContractData =
@@ -807,9 +844,22 @@ impl UserRequestProcessor {
         }
         let mut updated = 0;
         for result in prepared.request_results {
+            let mut results = result.results;
+            if let Some((price_data, bloom)) = &signed_price {
+                for issued in results
+                    .iter_mut()
+                    .filter(|issued| issued.kind == PRICE_REQUEST_KIND)
+                {
+                    issued.payload = serde_json::to_string(&SignedPriceDataDetails {
+                        timestamp: prepared.timestamp,
+                        price_data: price_data.clone(),
+                        storm_tree_bloom: bloom.clone(),
+                    })?;
+                }
+            }
             let payload = serde_json::to_vec(&NetworkRequestsResult {
                 txid: txid.clone(),
-                results: result.results,
+                results,
             })?;
             updated += usize::from(
                 self.requests
@@ -1691,6 +1741,49 @@ fn waited_too_long(block_height: u64, since: u64) -> bool {
     block_height.saturating_sub(since) > MAX_UNPRICED_REQUEST_BLOCKS
 }
 
+/// The round's second signature, checked here for the same reason the Storm Eye
+/// one is: nothing else verifies it before a user is handed it.
+fn signed_price_bloom(
+    price: &PriceFeedData,
+    signing: &SigningResult,
+    proof: &storm_tree::StormTreeProof,
+) -> Result<(String, StormTreeBloom), UserRequestError> {
+    let signature = *signing
+        .signatures
+        .get(1)
+        .ok_or_else(|| UserRequestError::Invalid("missing price signature".into()))?;
+    let branch_key = XOnlyPublicKey::from_slice(&signing.signing_storm_tree_branch)
+        .map_err(|_| UserRequestError::Invalid("invalid Storm Eye signing branch".into()))?;
+    Secp256k1::verification_only()
+        .verify_schnorr(
+            &Signature::from_slice(&signature)
+                .map_err(|_| UserRequestError::Invalid("invalid price signature".into()))?,
+            &Message::from_digest_slice(&price_hash(price)).expect("the price hash has 32 bytes"),
+            &branch_key,
+        )
+        .map_err(|_| {
+            UserRequestError::Invalid(
+                "price signature failed independent BIP340 verification".into(),
+            )
+        })?;
+
+    Ok((
+        hex::encode(price.to_bytes()),
+        StormTreeBloom {
+            signature: hex::encode(signature),
+            branch: hex::encode(signing.signing_storm_tree_branch),
+            proof: proof
+                .siblings
+                .iter()
+                .map(|(right, hash)| BloomStep {
+                    right: *right,
+                    hash: hex::encode(hash),
+                })
+                .collect(),
+        },
+    ))
+}
+
 /// Only a batch issued at the round's feed carries its rate.
 fn batch_payload(
     named_feed: Option<FeedId>,
@@ -2024,9 +2117,33 @@ struct RawTransactionInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secp256k1::{Keypair, SecretKey, schnorr};
 
     const NOW: u64 = 1_700_000_000;
     const LBTC_USDT: FeedId = 4;
+    const SIBLING: [u8; 32] = [3; 32];
+
+    /// A round whose second signature covers `price`, as the signers produce it.
+    fn round_signed_over(price: &PriceFeedData) -> SigningResult {
+        let keypair = Keypair::from_secret_key(&SecretKey::from_secret_bytes([9; 32]).unwrap());
+
+        SigningResult {
+            request_hash: [0; 32],
+            signing_storm_tree_branch: keypair.x_only_public_key().0.serialize(),
+            signatures: vec![
+                [0; 64],
+                schnorr::sign(&price_hash(price), &keypair).to_byte_array(),
+            ],
+        }
+    }
+
+    fn proof() -> storm_tree::StormTreeProof {
+        storm_tree::StormTreeProof {
+            leaf: [1; 32],
+            root: [2; 32],
+            siblings: vec![(true, SIBLING)],
+        }
+    }
 
     fn rate(feed: FeedId, price: u64) -> PriceFeedData {
         PriceFeedData {
@@ -2219,5 +2336,38 @@ mod tests {
 
         assert_eq!(network.genesis_block_hash().to_string(), genesis_hash);
         assert_eq!(network.policy_asset().to_string(), policy_asset);
+    }
+
+    #[test]
+    fn hands_a_user_the_signature_over_the_rate_it_was_issued_at() {
+        let price = rate(LBTC_USDT, 10_000_000_000);
+        let signing = round_signed_over(&price);
+
+        let (price_data, bloom) = signed_price_bloom(&price, &signing, &proof()).unwrap();
+
+        assert_eq!(price_data, hex::encode(price.to_bytes()));
+        assert_eq!(bloom.branch, hex::encode(signing.signing_storm_tree_branch));
+        assert_eq!(bloom.signature, hex::encode(signing.signatures[1]));
+        assert_eq!(bloom.proof.len(), 1);
+        assert!(bloom.proof[0].right);
+        assert_eq!(bloom.proof[0].hash, hex::encode(SIBLING));
+    }
+
+    #[test]
+    fn refuses_a_signature_taken_over_another_rate() {
+        let signing = round_signed_over(&rate(LBTC_USDT, 10_000_000_001));
+
+        let error = signed_price_bloom(&rate(LBTC_USDT, 10_000_000_000), &signing, &proof());
+
+        assert!(error.is_err());
+    }
+
+    #[test]
+    fn refuses_a_round_that_signed_only_its_transaction() {
+        let price = rate(LBTC_USDT, 10_000_000_000);
+        let mut signing = round_signed_over(&price);
+        signing.signatures.truncate(1);
+
+        assert!(signed_price_bloom(&price, &signing, &proof()).is_err());
     }
 }
