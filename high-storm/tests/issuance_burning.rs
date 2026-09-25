@@ -7,7 +7,7 @@ use high_storm::{
     config::Config,
     db::{Database, network_asset::STORM_EYE_KIND},
 };
-use secp256k1::{Keypair, SecretKey, schnorr};
+use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, schnorr};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
@@ -26,6 +26,9 @@ use tokio::{
 };
 
 const USER_REQUEST_TAG: &str = "OracleNetworkV1/NetworkUserRequests";
+const PRICE_TAG: &str = "OracleNetworkV1/Price";
+/// LBTC/USD, the Direct feed the bundled CoinGecko source prices.
+const PRICE_FEED_ID: u32 = 0;
 const TICK_LIFETIME_BLOCKS: u64 = 60;
 const RPC_URL: &str = "http://127.0.0.1:18884";
 const WALLET_RPC_URL: &str = "http://127.0.0.1:18884/wallet/funded-key";
@@ -65,6 +68,37 @@ struct CreatedRequest {
 #[derive(Deserialize)]
 struct RequestStatus {
     status: String,
+}
+
+#[derive(Deserialize)]
+struct ExecutedRequest {
+    results: Vec<IssuedResult>,
+}
+
+#[derive(Deserialize)]
+struct IssuedResult {
+    kind: String,
+    payload: String,
+}
+
+#[derive(Deserialize)]
+struct SignedPriceDataDetails {
+    timestamp: u64,
+    price_data: String,
+    storm_tree_bloom: StormTreeBloom,
+}
+
+#[derive(Deserialize)]
+struct StormTreeBloom {
+    signature: String,
+    branch: String,
+    proof: Vec<BloomStep>,
+}
+
+#[derive(Deserialize)]
+struct BloomStep {
+    right: bool,
+    hash: String,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +142,121 @@ fn burning_time_is_sixty_blocks_for_production_and_docker() {
             "{node} must expire Ticks after 60 blocks"
         );
     }
+}
+
+/// The whole signed-price path against a running network: the round collects a
+/// second signature over the rate, and only the request that asked for one
+/// receives it.
+#[tokio::test]
+#[ignore = "requires the bundled three-node Docker Compose stack"]
+async fn issues_a_price_request_at_a_rate_the_network_signed() -> TestResult<()> {
+    let rpc = rpc_client(RPC_URL)?;
+    let wallet = rpc_client(WALLET_RPC_URL)?;
+    let asset_database = Database::connect(
+        "postgres://high-storm:high-storm@127.0.0.1:5432/high-storm-node-1",
+        1,
+    )
+    .await?;
+    let storm_eye = asset_database
+        .network_assets()
+        .get(STORM_EYE_KIND)
+        .await?
+        .expect("Storm Eye must be initialized");
+    let network = elements_network(&rpc)?;
+    let policy_asset = network.policy_asset();
+    wait_for_priced_feed(PRICE_FEED_ID, Duration::from_secs(180)).await?;
+
+    let users = [
+        user(41, storm_eye.asset_id, &network)?,
+        user(42, storm_eye.asset_id, &network)?,
+    ];
+    let (funding_txid, mining_address) = fund_accounts(
+        &rpc,
+        &wallet,
+        policy_asset,
+        [&users[0].address, &users[1].address],
+    )
+    .await?;
+    mine_blocks(&rpc, 1, &mining_address)?;
+
+    let priced = signed_price_request(
+        &users[0].keypair,
+        users[0].owner,
+        &format!("{funding_txid}:0"),
+        PRICE_FEED_ID,
+    );
+    let plain = signed_tick_request(
+        &users[1].keypair,
+        users[1].owner,
+        &format!("{funding_txid}:1"),
+    );
+    let mut request_hashes = Vec::new();
+    for request in [&priced, &plain] {
+        let (status, body) = http_json("POST", "/users/requests", Some(request)).await?;
+        assert_eq!(status, 201, "request submission failed: {body}");
+        request_hashes.push(serde_json::from_value::<CreatedRequest>(body)?.request_hash);
+    }
+
+    let issuance_txid = wait_for_spender(&rpc, &funding_txid, 0, Duration::from_secs(60)).await?;
+    if transaction_height(&rpc, &issuance_txid)?.is_none() {
+        mine_blocks(&rpc, 1, &mining_address)?;
+    }
+    wait_for_confirmation(&rpc, &issuance_txid).await?;
+
+    let results = wait_for_results(&request_hashes[0], Duration::from_secs(60)).await?;
+    let issued = results.first().ok_or("the priced request issued nothing")?;
+    assert_eq!(issued.kind, "signed-price-data");
+    let details: SignedPriceDataDetails = serde_json::from_str(&issued.payload)?;
+
+    let price_data = hex::decode(&details.price_data)?;
+    assert_eq!(price_data.len(), 32, "price data is the canonical 32 bytes");
+    assert_eq!(
+        u32::from_be_bytes(price_data[0..4].try_into()?),
+        PRICE_FEED_ID,
+        "the rate is the feed the request named"
+    );
+    assert!(details.timestamp > 0, "the issued Tick keeps its timestamp");
+
+    // The point of the whole feature: the aggregate signature the round
+    // collected verifies over the rate, under the branch that signed it.
+    let branch: [u8; 32] = hex::decode(&details.storm_tree_bloom.branch)?
+        .as_slice()
+        .try_into()?;
+    let branch = XOnlyPublicKey::from_byte_array(branch)?;
+    let signature: [u8; 64] = hex::decode(&details.storm_tree_bloom.signature)?
+        .as_slice()
+        .try_into()?;
+    schnorr::verify(
+        &schnorr::Signature::from_byte_array(signature),
+        &price_message(&price_data),
+        &branch,
+    )?;
+
+    assert!(
+        !details.storm_tree_bloom.proof.is_empty(),
+        "the branch carries an inclusion path"
+    );
+    for step in &details.storm_tree_bloom.proof {
+        assert_eq!(
+            hex::decode(&step.hash)?.len(),
+            32,
+            "the sibling at right={} is a 32-byte hash",
+            step.right
+        );
+    }
+
+    let plain_results = wait_for_results(&request_hashes[1], Duration::from_secs(60)).await?;
+    let plain_issued = plain_results
+        .first()
+        .ok_or("the plain request issued nothing")?;
+    assert_eq!(plain_issued.kind, "tick-utxo");
+    assert!(
+        !plain_issued.payload.contains("price_data"),
+        "a plain Tick request receives no rate: {}",
+        plain_issued.payload
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -391,6 +540,44 @@ fn signed_tick_request(keypair: &Keypair, owner: [u8; 32], fee_utxo: &str) -> Ne
     request
 }
 
+fn signed_price_request(
+    keypair: &Keypair,
+    owner: [u8; 32],
+    fee_utxo: &str,
+    feed_id: u32,
+) -> NetworkUserRequests {
+    let mut request = NetworkUserRequests {
+        header: UserRequestHeader {
+            signature: String::new(),
+            public_key: hex::encode(owner),
+            fee_utxos: vec![fee_utxo.to_string()],
+        },
+        requests: vec![UserRequest {
+            kind: "signed-price-data".to_string(),
+            payload: json!({
+                "utxo_auth_method": {
+                    "kind": "signature-auth",
+                    "auth_data": hex::encode(owner),
+                },
+                "feed_id": feed_id,
+            })
+            .to_string(),
+        }],
+    };
+    request.header.signature =
+        hex::encode(schnorr::sign(&request_signing_hash(&request), keypair).to_byte_array());
+    request
+}
+
+fn price_message(price_data: &[u8]) -> [u8; 32] {
+    let tag_hash = Sha256::digest(PRICE_TAG.as_bytes());
+    let mut hash = Sha256::new();
+    hash.update(tag_hash);
+    hash.update(tag_hash);
+    hash.update(price_data);
+    hash.finalize().into()
+}
+
 fn request_signing_hash(request: &NetworkUserRequests) -> [u8; 32] {
     let mut message = Vec::new();
     for request in &request.requests {
@@ -449,6 +636,40 @@ async fn wait_for_request_status(request_hash: &str, expected: &str) -> TestResu
         }
         if Instant::now() >= deadline {
             return Err(format!("request did not reach {expected}").into());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// A node prices a feed only once its source has been polled, so a request
+/// submitted before that would wait for a round that can price it.
+async fn wait_for_priced_feed(feed_id: u32, timeout: Duration) -> TestResult<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (status, _) =
+            http_json::<Value>("GET", &format!("/price-feeds/{feed_id}"), None).await?;
+        if status == 200 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("the coordinator never priced feed {feed_id}").into());
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// The issued results a request carries once the coordinator has broadcast it.
+async fn wait_for_results(request_hash: &str, timeout: Duration) -> TestResult<Vec<IssuedResult>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (status, body) =
+            http_json::<Value>("GET", &format!("/users/requests/{request_hash}"), None).await?;
+        assert_eq!(status, 200);
+        if let Some(payload) = body.get("payload").and_then(Value::as_str) {
+            return Ok(serde_json::from_str::<ExecutedRequest>(payload)?.results);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("request {request_hash} never carried a result: {body}").into());
         }
         sleep(Duration::from_millis(250)).await;
     }
