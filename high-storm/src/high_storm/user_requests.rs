@@ -46,9 +46,12 @@ use crate::{
     },
     external_api::{
         fee_utxo::{MIN_FEE_UTXO_CONFIRMATIONS, parse_coin_value},
-        users::{TickUtxoRequestDetails, UtxoAuthMethod, validate_encoded_request},
+        users::{
+            PRICE_REQUEST_KIND, TickUtxoRequestDetails, UtxoAuthMethod, validate_encoded_request,
+        },
     },
 };
+use price_feed::{FeedId, PriceFeedData};
 
 use super::{
     SigningResult,
@@ -57,10 +60,15 @@ use super::{
     },
     issuance::{IssuedTickDescriptor, MAX_ISSUED_TICK_DESCRIPTORS},
     message::{ExecuteUserRequests, ExternalRequests},
+    prices::{Prices, price_hash},
     signing::SigningError,
 };
 
 const MAX_TICK_TIME_SKEW_SECS: u64 = 120;
+/// Ten blocks, about ten minutes at the target interval: long enough to ride
+/// out a restart or a slow poll, short enough not to strand a user's fees on a
+/// feed this node never prices.
+const MAX_UNPRICED_REQUEST_BLOCKS: u64 = 10;
 const MAX_MEMPOOL_TOKEN_CHAIN_LENGTH: usize = 100;
 pub(crate) const STORM_EYE_TAG: &str = "OracleNetworkV1/StormEye";
 const MAX_REQUESTS_PER_ROUND: u32 = 100;
@@ -83,6 +91,8 @@ pub(crate) struct PreparedRound {
     network: SimplicityNetwork,
     storm_eye: NetworkAsset,
     max_transaction_weight: usize,
+    instructed: Option<PriceFeedData>,
+    timestamp: u64,
 }
 
 struct PreparedRequestResult {
@@ -107,6 +117,32 @@ struct RequestResult {
 #[derive(Serialize)]
 struct TickUtxoDetails {
     timestamp: u64,
+}
+
+/// What a `signed-price-data` request receives: the Tick UTXO a `tick-utxo`
+/// request would have produced, and the rate the round was issued at with the
+/// network signature over it.
+#[derive(Serialize)]
+struct SignedPriceDataDetails {
+    timestamp: u64,
+    price_data: String,
+    storm_tree_bloom: StormTreeBloom,
+}
+
+/// Everything needed to check the network signature over `price_data`. The
+/// root it proves against is the Storm Eye's on-chain one, so a reader takes
+/// that from the chain rather than from here.
+#[derive(Clone, Serialize)]
+struct StormTreeBloom {
+    signature: String,
+    branch: String,
+    proof: Vec<BloomStep>,
+}
+
+#[derive(Clone, Serialize)]
+struct BloomStep {
+    right: bool,
+    hash: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -141,6 +177,8 @@ pub enum UserRequestError {
     Encoding(#[from] postcard::Error),
     #[error("failed to extract final transaction: {0}")]
     Pset(String),
+    #[error("the instructed price was refused: {0}")]
+    InstructedPrice(#[from] price_feed::ValidationError),
 }
 
 #[derive(Clone)]
@@ -150,6 +188,7 @@ pub(crate) struct UserRequestProcessor {
     assets: NetworkAssetStore,
     elements_rpc: ElementsRpcConfig,
     config: ProtocolConfig,
+    prices: Prices,
 }
 
 impl UserRequestProcessor {
@@ -159,6 +198,7 @@ impl UserRequestProcessor {
         assets: NetworkAssetStore,
         elements_rpc: ElementsRpcConfig,
         config: ProtocolConfig,
+        prices: Prices,
     ) -> Self {
         Self {
             requests,
@@ -166,13 +206,16 @@ impl UserRequestProcessor {
             assets,
             elements_rpc,
             config,
+            prices,
         }
     }
 
+    /// A rate this node refuses rejects the whole message. Returns the rate the
+    /// round is issued at, which is the only one this node will sign beside it.
     pub(crate) async fn validate_execute(
         &self,
         request: &ExecuteUserRequests,
-    ) -> Result<(), UserRequestError> {
+    ) -> Result<Option<PriceFeedData>, UserRequestError> {
         let storm_eye = self
             .assets
             .get(STORM_EYE_KIND)
@@ -185,11 +228,17 @@ impl UserRequestProcessor {
             .ok_or(UserRequestError::MissingAsset(TICK_ASSET_KIND))?;
         let network = self.network()?;
 
-        validate_execute_request(request, &storm_eye, &tick_asset, &self.config, &network)
+        let instructed =
+            validate_execute_request(request, &storm_eye, &tick_asset, &self.config, &network)?;
+        if let Some(instructed) = instructed {
+            self.prices.validate_instruction(&instructed).await?;
+        }
+        Ok(instructed)
     }
 
     pub(crate) async fn prepare_round(
         &self,
+        block_height: u64,
         storm_eye_lane: usize,
         max_transaction_weight: usize,
     ) -> Result<Option<PreparedRound>, UserRequestError> {
@@ -200,7 +249,12 @@ impl UserRequestProcessor {
 
         while lower_limit <= upper_limit {
             let Some(candidate) = self
-                .prepare_round_candidate(storm_eye_lane, request_limit, max_transaction_weight)
+                .prepare_round_candidate(
+                    block_height,
+                    storm_eye_lane,
+                    request_limit,
+                    max_transaction_weight,
+                )
                 .await?
             else {
                 return Ok(best);
@@ -235,6 +289,7 @@ impl UserRequestProcessor {
 
     async fn prepare_round_candidate(
         &self,
+        block_height: u64,
         storm_eye_lane: usize,
         request_limit: u32,
         max_transaction_weight: usize,
@@ -272,9 +327,52 @@ impl UserRequestProcessor {
             .as_secs();
         let mut decoded = Vec::with_capacity(pending.len());
         let mut tick_count = 0usize;
+        // One round is issued at one feed; batches naming another wait.
+        let mut instructed: Option<PriceFeedData> = None;
         for stored in pending {
-            let (request, fee_utxos) =
+            let (request, fee_utxos, named_feed) =
                 validate_encoded_request(&stored.request).map_err(UserRequestError::Invalid)?;
+            // A priced request is held up by more than a missing local price: a
+            // signer that refuses the rate fails the whole round, and the same
+            // batch returns every block. Age it out whatever held it up, so its
+            // fees come back and the requests queued behind it can issue.
+            if let Some(feed) = named_feed
+                && waited_too_long(block_height, stored.block_height)
+            {
+                let waited = block_height.saturating_sub(stored.block_height);
+                let reason = format!("feed {feed} was not issued in {waited} blocks");
+                self.requests
+                    .mark_failed(stored.request_hash, reason.as_bytes())
+                    .await?;
+                tracing::warn!(
+                    request_hash = %hex::encode(stored.request_hash),
+                    %reason,
+                    "failed a user request no round could issue"
+                );
+                continue;
+            }
+            // A rate the issued Tick outlives cannot be spent beside it, so the
+            // round waits for a fresher one rather than minting the pair.
+            let own = match named_feed {
+                Some(feed) if instructed.is_none() => self
+                    .prices
+                    .value(feed)
+                    .await
+                    .filter(|rate| outlives_tick(rate, timestamp)),
+                _ => None,
+            };
+            match round_rate(instructed, named_feed, own) {
+                RoundRate::Carries(rate) => instructed = rate,
+                RoundRate::AnotherFeed => continue,
+                RoundRate::NoLocalPrice => {
+                    tracing::debug!(
+                        request_hash = %hex::encode(stored.request_hash),
+                        feed = named_feed,
+                        "deferred a user request to a round that can price it"
+                    );
+                    continue;
+                }
+            }
             let account = AccountProgram::new(&AccountArguments {
                 storm_eye_asset_id: storm_eye.asset_id,
                 account_owner_pubkey: decode_array(&request.header.public_key)?,
@@ -327,7 +425,7 @@ impl UserRequestProcessor {
                 break;
             }
             tick_count += request.requests.len();
-            decoded.push((stored, request, resolved_fee_utxos));
+            decoded.push((stored, request, resolved_fee_utxos, named_feed));
         }
         if decoded.is_empty() {
             return Ok(None);
@@ -395,7 +493,7 @@ impl UserRequestProcessor {
         ];
         let mut spent_utxos = vec![storm_eye_utxo.txout.clone(), token_utxo.txout.clone()];
         let mut account_balances = Vec::with_capacity(decoded.len());
-        for (_, request, fee_utxos) in &decoded {
+        for (_, request, fee_utxos, _) in &decoded {
             let owner = decode_array(&request.header.public_key)?;
             let account = AccountProgram::new(&AccountArguments {
                 storm_eye_asset_id: storm_eye.asset_id,
@@ -428,7 +526,7 @@ impl UserRequestProcessor {
         final_transaction.add_output(output_from_utxo(&token_utxo));
         let mut request_results = Vec::with_capacity(decoded.len());
         let mut descriptor_data = Vec::with_capacity(tick_count);
-        for (request_index, (stored, request, _)) in decoded.iter().enumerate() {
+        for (request_index, (stored, request, _, _)) in decoded.iter().enumerate() {
             let mut results = Vec::with_capacity(request.requests.len());
             let owner = decode_array(&request.header.public_key)?;
             for user_request in &request.requests {
@@ -462,10 +560,10 @@ impl UserRequestProcessor {
         let account_requirements = decoded
             .iter()
             .zip(&account_balances)
-            .map(|((_, request, _), input_total)| (request.requests.len(), *input_total))
+            .map(|((_, request, _, _), input_total)| (request.requests.len(), *input_total))
             .collect::<Vec<_>>();
         let account_reserves = allocate_account_reserves(&account_requirements, &self.config)?;
-        for ((_, request, _), reserve) in decoded.iter().zip(account_reserves) {
+        for ((_, request, _, _), reserve) in decoded.iter().zip(account_reserves) {
             let account = AccountProgram::new(&AccountArguments {
                 storm_eye_asset_id: storm_eye.asset_id,
                 account_owner_pubkey: decode_array(&request.header.public_key)?,
@@ -570,13 +668,16 @@ impl UserRequestProcessor {
         ));
         let env = auth_program.as_ref().get_env(&pset, 0, &network)?;
         let sighash = env.c_tx_env().sighash_all().to_byte_array();
+        // This hash covers the transaction; the rate is the round's second
+        // signed message. Fold it in here once a covenant field records it
+        // on-chain, so the issuance itself commits to the price.
         let signing_hash = SigMessage::Tagged(STORM_EYE_TAG.to_string()).digest(sighash);
         let external_requests = decoded
             .iter()
-            .map(|(stored, _, _)| ExternalRequests {
+            .map(|(stored, _, _, named_feed)| ExternalRequests {
                 request_hash: stored.request_hash,
                 network_user_requests: stored.request.clone(),
-                additional_payload: None,
+                additional_payload: batch_payload(*named_feed, instructed.as_ref()),
             })
             .collect();
         let request = ExecuteUserRequests {
@@ -596,6 +697,8 @@ impl UserRequestProcessor {
             network,
             storm_eye,
             max_transaction_weight,
+            instructed,
+            timestamp,
         }))
     }
 
@@ -641,6 +744,10 @@ impl UserRequestProcessor {
                     "Storm Eye signature failed independent BIP340 verification".into(),
                 )
             })?;
+        let signed_price = prepared
+            .instructed
+            .map(|price| signed_price_bloom(&price, &signing, &proof))
+            .transpose()?;
         let signature = *signature.as_ref();
         let mut transaction = prepared.final_transaction;
         let contract_data: StormEyeContractData =
@@ -744,9 +851,22 @@ impl UserRequestProcessor {
         }
         let mut updated = 0;
         for result in prepared.request_results {
+            let mut results = result.results;
+            if let Some((price_data, bloom)) = &signed_price {
+                for issued in results
+                    .iter_mut()
+                    .filter(|issued| issued.kind == PRICE_REQUEST_KIND)
+                {
+                    issued.payload = serde_json::to_string(&SignedPriceDataDetails {
+                        timestamp: prepared.timestamp,
+                        price_data: price_data.clone(),
+                        storm_tree_bloom: bloom.clone(),
+                    })?;
+                }
+            }
             let payload = serde_json::to_vec(&NetworkRequestsResult {
                 txid: txid.clone(),
-                results: result.results,
+                results,
             })?;
             updated += usize::from(
                 self.requests
@@ -1318,13 +1438,14 @@ pub(crate) fn pack_proof(
     }))
 }
 
+/// The rate the message is issued at, `None` for plain Tick requests.
 fn validate_execute_request(
     request: &ExecuteUserRequests,
     storm_eye: &NetworkAsset,
     tick_asset: &NetworkAsset,
     config: &ProtocolConfig,
     network: &SimplicityNetwork,
-) -> Result<(), UserRequestError> {
+) -> Result<Option<PriceFeedData>, UserRequestError> {
     if request.external_requests.is_empty() {
         return Err(UserRequestError::Invalid("no external requests".into()));
     }
@@ -1411,6 +1532,7 @@ fn validate_execute_request(
     let mut expected_ticks = Vec::new();
     let mut expected_descriptor_data = Vec::new();
     let mut expected_account_scripts = Vec::new();
+    let mut instructed = None;
     for external in &request.external_requests {
         let request_hash: [u8; 32] = sha2::Sha256::digest(&external.network_user_requests).into();
         if request_hash != external.request_hash {
@@ -1418,13 +1540,14 @@ fn validate_execute_request(
                 "external request hash mismatch".into(),
             ));
         }
-        if external.additional_payload.is_some() {
-            return Err(UserRequestError::Invalid(
-                "additional payload is unsupported for Tick requests".into(),
-            ));
-        }
-        let (user_request, fee_utxos) = validate_encoded_request(&external.network_user_requests)
-            .map_err(UserRequestError::Invalid)?;
+        let (user_request, fee_utxos, named_feed) =
+            validate_encoded_request(&external.network_user_requests)
+                .map_err(UserRequestError::Invalid)?;
+        instructed = instructed_price(
+            named_feed,
+            external.additional_payload.as_deref(),
+            instructed,
+        )?;
         let owner = secp256k1_zkp::XOnlyPublicKey::from_slice(
             &hex::decode(&user_request.header.public_key)
                 .map_err(|_| UserRequestError::Invalid("invalid requester public key".into()))?,
@@ -1576,12 +1699,152 @@ fn validate_execute_request(
             UserRequestError::Invalid(format!("cannot derive Storm Eye sighash: {error}"))
         })?;
     let sighash = env.c_tx_env().sighash_all().to_byte_array();
+    // The other half of the note at the coordinator's `signing_hash`: the rate
+    // validated above is not in what this re-derives, so it is not signed for.
     let signing_hash = SigMessage::Tagged(STORM_EYE_TAG.to_string()).digest(sighash);
     if signing_hash != request.signing_hash {
         return Err(UserRequestError::Invalid("signing hash mismatch".into()));
     }
 
-    Ok(())
+    Ok(instructed)
+}
+
+/// What a round does with the batch it is looking at.
+#[derive(Debug, PartialEq, Eq)]
+enum RoundRate {
+    /// It joins the round, which goes on carrying this rate.
+    Carries(Option<PriceFeedData>),
+    /// It waits for a round issued at the feed it names.
+    AnotherFeed,
+    /// This node cannot price the feed it names. A feed is unavailable after a
+    /// restart and between polls, so the batch waits rather than failing and
+    /// losing the fee UTXOs it reserved — but only for so long.
+    NoLocalPrice,
+}
+
+/// `own` is this node's value for the feed the batch names, read only when the
+/// round has no rate yet.
+fn round_rate(
+    instructed: Option<PriceFeedData>,
+    named_feed: Option<FeedId>,
+    own: Option<PriceFeedData>,
+) -> RoundRate {
+    let Some(feed) = named_feed else {
+        return RoundRate::Carries(instructed);
+    };
+    match instructed {
+        Some(held) if held.feed_id != feed => RoundRate::AnotherFeed,
+        Some(held) => RoundRate::Carries(Some(held)),
+        None => match own {
+            Some(own) => RoundRate::Carries(Some(own)),
+            None => RoundRate::NoLocalPrice,
+        },
+    }
+}
+
+/// The covenant spends a Tick beside a rate only while the Tick's timestamp is
+/// strictly before `valid_until`, so a round issued at the second a rate
+/// expires in mints a pair that cannot be spent together.
+fn outlives_tick(rate: &PriceFeedData, timestamp: u64) -> bool {
+    rate.valid_until > timestamp
+}
+
+/// Its fee UTXOs stay reserved while it waits, so it does not wait forever. A
+/// height that rewound in a reorg never ages a request early.
+fn waited_too_long(block_height: u64, since: u64) -> bool {
+    block_height.saturating_sub(since) > MAX_UNPRICED_REQUEST_BLOCKS
+}
+
+/// The round's second signature, checked here for the same reason the Storm Eye
+/// one is: nothing else verifies it before a user is handed it.
+fn signed_price_bloom(
+    price: &PriceFeedData,
+    signing: &SigningResult,
+    proof: &storm_tree::StormTreeProof,
+) -> Result<(String, StormTreeBloom), UserRequestError> {
+    let signature = *signing
+        .signatures
+        .get(1)
+        .ok_or_else(|| UserRequestError::Invalid("missing price signature".into()))?;
+    let branch_key = XOnlyPublicKey::from_slice(&signing.signing_storm_tree_branch)
+        .map_err(|_| UserRequestError::Invalid("invalid Storm Eye signing branch".into()))?;
+    Secp256k1::verification_only()
+        .verify_schnorr(
+            &Signature::from_slice(&signature)
+                .map_err(|_| UserRequestError::Invalid("invalid price signature".into()))?,
+            &Message::from_digest_slice(&price_hash(price)).expect("the price hash has 32 bytes"),
+            &branch_key,
+        )
+        .map_err(|_| {
+            UserRequestError::Invalid(
+                "price signature failed independent BIP340 verification".into(),
+            )
+        })?;
+
+    Ok((
+        hex::encode(price.to_bytes()),
+        StormTreeBloom {
+            signature: hex::encode(signature),
+            branch: hex::encode(signing.signing_storm_tree_branch),
+            proof: proof
+                .siblings
+                .iter()
+                .map(|(right, hash)| BloomStep {
+                    right: *right,
+                    hash: hex::encode(hash),
+                })
+                .collect(),
+        },
+    ))
+}
+
+/// Only a batch issued at the round's feed carries its rate.
+fn batch_payload(
+    named_feed: Option<FeedId>,
+    instructed: Option<&PriceFeedData>,
+) -> Option<Vec<u8>> {
+    named_feed
+        .and(instructed)
+        .map(|price| price.to_bytes().to_vec())
+}
+
+/// A batch carries a rate exactly when it names a feed, and one message
+/// carries one rate, so `carried` is what the batches before it named.
+fn instructed_price(
+    named_feed: Option<FeedId>,
+    payload: Option<&[u8]>,
+    carried: Option<PriceFeedData>,
+) -> Result<Option<PriceFeedData>, UserRequestError> {
+    let instructed = match (named_feed, payload) {
+        (None, None) => return Ok(carried),
+        (None, Some(_)) => {
+            return Err(UserRequestError::Invalid(
+                "a batch that names no price feed carries no instructed price".into(),
+            ));
+        }
+        (Some(_), None) => {
+            return Err(UserRequestError::Invalid(
+                "a batch issued at a price feed carries no instructed price".into(),
+            ));
+        }
+        (Some(feed), Some(payload)) => {
+            let instructed = PriceFeedData::from_bytes(payload)
+                .map_err(|error| UserRequestError::Invalid(error.to_string()))?;
+            if instructed.feed_id != feed {
+                return Err(UserRequestError::Invalid(
+                    "the instructed price is for another feed than the batch".into(),
+                ));
+            }
+            instructed
+        }
+    };
+    if carried.is_some_and(|carried| carried != instructed) {
+        return Err(UserRequestError::Invalid(
+            "one execute-user-requests carries one rate for one feed".into(),
+        ));
+    }
+
+    Ok(Some(instructed))
 }
 
 fn tick_program(
@@ -1868,6 +2131,140 @@ struct RawTransactionInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secp256k1::{Keypair, SecretKey, schnorr};
+
+    const NOW: u64 = 1_700_000_000;
+    const LBTC_USDT: FeedId = 4;
+    const SIBLING: [u8; 32] = [3; 32];
+
+    /// A round whose second signature covers `price`, as the signers produce it.
+    fn round_signed_over(price: &PriceFeedData) -> SigningResult {
+        let keypair = Keypair::from_secret_key(&SecretKey::from_secret_bytes([9; 32]).unwrap());
+
+        SigningResult {
+            request_hash: [0; 32],
+            signing_storm_tree_branch: keypair.x_only_public_key().0.serialize(),
+            signatures: vec![
+                [0; 64],
+                schnorr::sign(&price_hash(price), &keypair).to_byte_array(),
+            ],
+        }
+    }
+
+    fn proof() -> storm_tree::StormTreeProof {
+        storm_tree::StormTreeProof {
+            leaf: [1; 32],
+            root: [2; 32],
+            siblings: vec![(true, SIBLING)],
+        }
+    }
+
+    fn rate(feed: FeedId, price: u64) -> PriceFeedData {
+        PriceFeedData {
+            feed_id: feed,
+            price,
+            decimals: 8,
+            received_at: NOW,
+            valid_until: NOW + 300,
+        }
+    }
+
+    #[test]
+    fn issues_a_round_at_the_feed_its_first_priced_batch_names() {
+        let own = rate(LBTC_USDT, 10_000_000_000);
+        let other = rate(0, 500_000_000);
+
+        // A plain Tick batch rides along with any round.
+        assert_eq!(round_rate(None, None, None), RoundRate::Carries(None));
+        assert_eq!(
+            round_rate(Some(own), None, None),
+            RoundRate::Carries(Some(own))
+        );
+        // The first batch naming a feed sets the rate from this node's value.
+        assert_eq!(
+            round_rate(None, Some(LBTC_USDT), Some(own)),
+            RoundRate::Carries(Some(own))
+        );
+        assert_eq!(
+            round_rate(Some(own), Some(LBTC_USDT), None),
+            RoundRate::Carries(Some(own))
+        );
+        // A batch of another feed waits for a round of its own, while one this
+        // node cannot price waits only until it has waited too long.
+        assert_eq!(
+            round_rate(Some(other), Some(LBTC_USDT), None),
+            RoundRate::AnotherFeed
+        );
+        assert_eq!(
+            round_rate(None, Some(LBTC_USDT), None),
+            RoundRate::NoLocalPrice
+        );
+    }
+
+    #[test]
+    fn fails_an_unpriced_request_only_once_it_has_waited_its_blocks() {
+        assert!(!waited_too_long(MAX_UNPRICED_REQUEST_BLOCKS, 0));
+        assert!(waited_too_long(MAX_UNPRICED_REQUEST_BLOCKS + 1, 0));
+        assert!(!waited_too_long(5, 9));
+    }
+
+    #[test]
+    fn issues_only_at_a_rate_the_tick_it_mints_does_not_outlive() {
+        let expiring = rate(LBTC_USDT, 10_000_000_000);
+        let timestamp = expiring.valid_until;
+
+        assert!(!outlives_tick(&expiring, timestamp));
+        assert!(outlives_tick(&expiring, timestamp - 1));
+    }
+
+    #[test]
+    fn carries_the_rate_only_beside_the_batches_issued_at_it() {
+        let instructed = rate(LBTC_USDT, 10_000_000_000);
+
+        assert_eq!(
+            batch_payload(Some(LBTC_USDT), Some(&instructed)),
+            Some(instructed.to_bytes().to_vec())
+        );
+        assert_eq!(batch_payload(None, Some(&instructed)), None);
+        assert_eq!(batch_payload(Some(LBTC_USDT), None), None);
+    }
+
+    #[test]
+    fn reads_the_rate_a_batch_is_issued_at() {
+        let instructed = rate(LBTC_USDT, 10_000_000_000);
+        let payload = instructed.to_bytes();
+
+        assert_eq!(
+            instructed_price(Some(LBTC_USDT), Some(&payload), None).unwrap(),
+            Some(instructed)
+        );
+        assert_eq!(instructed_price(None, None, None).unwrap(), None);
+        // A later batch of the same round repeats the rate.
+        assert_eq!(
+            instructed_price(None, None, Some(instructed)).unwrap(),
+            Some(instructed)
+        );
+    }
+
+    #[test]
+    fn rejects_a_batch_whose_instructed_rate_does_not_match_it() {
+        let instructed = rate(LBTC_USDT, 10_000_000_000);
+        let payload = instructed.to_bytes();
+        let other_feed = rate(0, 10_000_000_000).to_bytes();
+
+        assert!(instructed_price(Some(LBTC_USDT), None, None).is_err());
+        assert!(instructed_price(None, Some(&payload), None).is_err());
+        assert!(instructed_price(Some(LBTC_USDT), Some(&other_feed), None).is_err());
+        assert!(
+            instructed_price(
+                Some(LBTC_USDT),
+                Some(&payload),
+                Some(rate(LBTC_USDT, 10_000_000_001))
+            )
+            .is_err()
+        );
+        assert!(instructed_price(Some(LBTC_USDT), Some(&[7; 8]), None).is_err());
+    }
 
     #[test]
     fn excludes_foreign_assets_from_contract_lanes() {
@@ -1962,5 +2359,38 @@ mod tests {
 
         assert_eq!(network.genesis_block_hash().to_string(), genesis_hash);
         assert_eq!(network.policy_asset().to_string(), policy_asset);
+    }
+
+    #[test]
+    fn hands_a_user_the_signature_over_the_rate_it_was_issued_at() {
+        let price = rate(LBTC_USDT, 10_000_000_000);
+        let signing = round_signed_over(&price);
+
+        let (price_data, bloom) = signed_price_bloom(&price, &signing, &proof()).unwrap();
+
+        assert_eq!(price_data, hex::encode(price.to_bytes()));
+        assert_eq!(bloom.branch, hex::encode(signing.signing_storm_tree_branch));
+        assert_eq!(bloom.signature, hex::encode(signing.signatures[1]));
+        assert_eq!(bloom.proof.len(), 1);
+        assert!(bloom.proof[0].right);
+        assert_eq!(bloom.proof[0].hash, hex::encode(SIBLING));
+    }
+
+    #[test]
+    fn refuses_a_signature_taken_over_another_rate() {
+        let signing = round_signed_over(&rate(LBTC_USDT, 10_000_000_001));
+
+        let error = signed_price_bloom(&rate(LBTC_USDT, 10_000_000_000), &signing, &proof());
+
+        assert!(error.is_err());
+    }
+
+    #[test]
+    fn refuses_a_round_that_signed_only_its_transaction() {
+        let price = rate(LBTC_USDT, 10_000_000_000);
+        let mut signing = round_signed_over(&price);
+        signing.signatures.truncate(1);
+
+        assert!(signed_price_bloom(&price, &signing, &proof()).is_err());
     }
 }

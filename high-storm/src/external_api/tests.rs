@@ -451,9 +451,10 @@ async fn derives_oracle_account_from_the_active_storm_eye() {
 async fn rejects_unsupported_or_invalid_user_requests() {
     let (app, _, _) = setup().await;
 
+    // A request issued at a price has to name the feed.
     let price = signed_user_request("signed-price-data", "signature-auth");
     let response = app.clone().oneshot(user_request(&price)).await.unwrap();
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let invalid_auth = signed_user_request("tick-utxo", "unknown-auth");
     let response = app
@@ -569,6 +570,36 @@ async fn serves_the_rate_it_attested_for_a_feed() {
 }
 
 #[tokio::test]
+async fn registers_a_request_issued_at_a_feed_it_prices() {
+    let (app, _, _) = setup().await;
+
+    let response = app
+        .clone()
+        .oneshot(user_request(&signed_price_request(LBTC_USDT)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let unknown = app
+        .clone()
+        .oneshot(user_request(&signed_price_request(99)))
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+
+    let named = signed_batch(&[("tick-utxo", "signature-auth", Some(LBTC_USDT))]);
+    let response = app.clone().oneshot(user_request(&named)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let two_feeds = signed_batch(&[
+        ("signed-price-data", "signature-auth", Some(LBTC_USDT)),
+        ("signed-price-data", "signature-auth", Some(LBTC_USD)),
+    ]);
+    let response = app.oneshot(user_request(&two_feeds)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn serves_no_price_from_a_node_that_is_not_the_coordinator() {
     let elsewhere = SecretKey::from_slice(&[22; 32])
         .unwrap()
@@ -585,6 +616,7 @@ async fn serves_no_price_from_a_node_that_is_not_the_coordinator() {
 
 const NODE_KEY: [u8; 32] = [21; 32];
 const LBTC_USD: FeedId = 0;
+const LBTC_USDT: FeedId = 4;
 
 fn node_public_key() -> [u8; 33] {
     SecretKey::from_slice(&NODE_KEY)
@@ -766,26 +798,43 @@ fn signed_request(
 }
 
 fn signed_user_request(kind: &str, auth_kind: &str) -> NetworkUserRequests {
+    signed_batch(&[(kind, auth_kind, None)])
+}
+
+fn signed_price_request(feed: FeedId) -> NetworkUserRequests {
+    signed_batch(&[("signed-price-data", "signature-auth", Some(feed))])
+}
+
+/// A batch of `(kind, authentication method, feed it is issued at)`.
+fn signed_batch(requests: &[(&str, &str, Option<FeedId>)]) -> NetworkUserRequests {
     let secret_key = SchnorrSecretKey::from_secret_bytes([31; 32]).unwrap();
     let keypair = SchnorrKeypair::from_secret_key(&secret_key);
     let public_key = keypair.x_only_public_key().0.serialize();
-    let payload = serde_json::json!({
-        "utxo_auth_method": {
-            "kind": auth_kind,
-            "auth_data": hex::encode(public_key),
-        }
-    })
-    .to_string();
+    let requests = requests
+        .iter()
+        .map(|(kind, auth_kind, feed)| {
+            let mut payload = serde_json::json!({
+                "utxo_auth_method": {
+                    "kind": auth_kind,
+                    "auth_data": hex::encode(public_key),
+                }
+            });
+            if let Some(feed) = feed {
+                payload["feed_id"] = serde_json::json!(feed);
+            }
+            UserRequest {
+                kind: kind.to_string(),
+                payload: payload.to_string(),
+            }
+        })
+        .collect();
     let mut request = NetworkUserRequests {
         header: UserRequestHeader {
             signature: String::new(),
             public_key: hex::encode(public_key),
             fee_utxos: vec![format!("{}:3", hex::encode([8; 32]))],
         },
-        requests: vec![UserRequest {
-            kind: kind.to_string(),
-            payload,
-        }],
+        requests,
     };
     request.header.signature =
         hex::encode(schnorr::sign(&signing_hash(&request), &keypair).to_byte_array());

@@ -9,6 +9,7 @@ use super::{
         BurnExpiredUtxos, ChainTip, ExecuteVotingRequest, ExpiredUtxosBurned, NodeMessage,
         NodeMessageKind, RenewStormUtxos,
     },
+    prices::price_hash,
     signing::SigningError,
     state::NetworkState,
     voting::VotingError,
@@ -99,10 +100,14 @@ pub(crate) async fn handle(
         NodeMessageKind::ExecuteUserRequests => {
             let request: crate::ExecuteUserRequests = message.decode_payload()?;
             require_chain_tip(&state, required_chain_tip(request.chain_tip)?).await?;
-            state.user_requests().validate_execute(&request).await?;
+            let instructed = state.user_requests().validate_execute(&request).await?;
             state
                 .signing()
-                .handle_execute_user_requests(message, &context)
+                .handle_execute_user_requests(
+                    message,
+                    &context,
+                    instructed.as_ref().map(price_hash),
+                )
                 .await?;
             Ok(())
         }

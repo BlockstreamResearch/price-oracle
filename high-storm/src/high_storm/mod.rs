@@ -179,6 +179,7 @@ impl HighStorm {
         &self,
         tx: Vec<u8>,
         signing_hash: [u8; 32],
+        price_hash: Option<[u8; 32]>,
         external_requests: Vec<ExternalRequests>,
     ) -> Result<SigningResult, SigningError> {
         if self.is_transaction_production_blocked() {
@@ -194,7 +195,14 @@ impl HighStorm {
             .map_err(|error| SigningError::InvalidMessage(error.to_string()))?;
         self.state
             .signing()
-            .sign_execute_user_requests(&self.storm, tx, signing_hash, external_requests, chain_tip)
+            .sign_execute_user_requests(
+                &self.storm,
+                tx,
+                signing_hash,
+                price_hash,
+                external_requests,
+                chain_tip,
+            )
             .await
     }
 
@@ -575,7 +583,11 @@ impl HighStorm {
         let mut prepared = match self
             .state
             .user_requests()
-            .prepare_round(storm_eye_lane, max_transaction_weight)
+            .prepare_round(
+                self.state.block_height(),
+                storm_eye_lane,
+                max_transaction_weight,
+            )
             .await?
         {
             Some(prepared) => prepared,
@@ -588,7 +600,8 @@ impl HighStorm {
             .await
             .map_err(|error| user_requests::UserRequestError::Invalid(error.to_string()))?;
         prepared.request.chain_tip = Some(chain_tip);
-        self.state
+        let instructed = self
+            .state
             .user_requests()
             .validate_execute(&prepared.request)
             .await?;
@@ -599,6 +612,7 @@ impl HighStorm {
                 &self.storm,
                 prepared.request.tx.clone(),
                 prepared.request.signing_hash,
+                instructed.as_ref().map(prices::price_hash),
                 prepared.request.external_requests.clone(),
                 chain_tip,
             )
