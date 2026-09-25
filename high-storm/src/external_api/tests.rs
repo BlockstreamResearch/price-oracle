@@ -7,7 +7,12 @@ use axum::{
     http::{Request, StatusCode, header},
     response::Response,
 };
-use bitcoin::{Address, Network, PrivateKey, secp256k1};
+use bitcoin::{
+    Address, Network, PrivateKey,
+    hashes::Hash,
+    secp256k1::{self, Message},
+    sign_message::signed_msg_hash,
+};
 use http_body_util::BodyExt;
 use price_feed::{FeedId, SourceObservation};
 use secp256k1_zkp::{Secp256k1, SecretKey};
@@ -186,6 +191,84 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
         .await
         .unwrap();
     assert_eq!(users.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn authenticates_operator_reads_with_a_humid_signature() {
+    let (app, private_key, _) = setup().await;
+    let public_key = hex::encode(
+        private_key
+            .public_key(&secp256k1::Secp256k1::new())
+            .inner
+            .serialize(),
+    );
+    let scheme = "bitcoin-signed-message-ecdsa-v1";
+
+    let config = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/operators/auth/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(config.status(), StatusCode::OK);
+    let config = response_json(config).await;
+    assert_eq!(config["network"], "elementsregtest");
+    assert_eq!(config["caip2_chain_id"], serde_json::Value::Null);
+    assert_eq!(config["signature_scheme"], scheme);
+    assert_eq!(config["identity_derivation"]["branch"], 0);
+    assert_eq!(config["identity_derivation"]["index"], 0);
+
+    let challenge = app
+        .clone()
+        .oneshot(json_request(
+            "/operators/auth/challenge",
+            serde_json::json!({
+                "public_key": public_key,
+                "signature_scheme": scheme,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(challenge.status(), StatusCode::OK);
+    let challenge = response_json(challenge).await;
+    assert_eq!(challenge["signature_scheme"], scheme);
+    let message = challenge["message"].as_str().unwrap();
+    let signature = sign_humid(&private_key, message);
+
+    let token = app
+        .clone()
+        .oneshot(json_request(
+            "/operators/auth/token",
+            serde_json::json!({
+                "public_key": public_key,
+                "signature_scheme": scheme,
+                "message": message,
+                "signature": signature,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(token.status(), StatusCode::OK);
+    let token = response_json(token).await;
+
+    let voting = app
+        .oneshot(
+            Request::builder()
+                .uri("/operators/voting")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token["token"].as_str().unwrap()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(voting.status(), StatusCode::OK);
 }
 
 fn assert_xonly_public_key(value: &serde_json::Value) {
@@ -820,4 +903,14 @@ fn sign(private_key: &PrivateKey, message: &str) -> String {
         None,
     )
     .unwrap()
+}
+
+fn sign_humid(private_key: &PrivateKey, message: &str) -> String {
+    let message = Message::from_digest(signed_msg_hash(message).to_byte_array());
+    let signature =
+        secp256k1::Secp256k1::signing_only().sign_ecdsa_recoverable(&message, &private_key.inner);
+    let (recovery_id, compact) = signature.serialize_compact();
+    let mut encoded = Vec::from(compact);
+    encoded.push(recovery_id.to_i32() as u8);
+    hex::encode(encoded)
 }

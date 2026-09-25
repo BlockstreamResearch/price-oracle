@@ -208,6 +208,7 @@ impl From<AuthError> for ApiError {
     fn from(error: AuthError) -> Self {
         let status = match error {
             AuthError::InvalidPublicKey
+            | AuthError::InvalidSignatureScheme
             | AuthError::InvalidChallenge
             | AuthError::InvalidTimestamp
             | AuthError::InvalidNonce => StatusCode::BAD_REQUEST,

@@ -3,7 +3,7 @@ import type { OperatorSession } from "./types";
 
 export type AuthContextValue = {
   session: OperatorSession | null;
-  login: (secretKey: string) => Promise<void>;
+  login: () => Promise<void>;
   logout: () => void;
 };
 

@@ -228,10 +228,6 @@ tbody tr:hover td { background: #f6f5f0; }
 .login-copy h1 { max-width: 430px; font-size: 3.5rem; line-height: .98; }
 .login-copy p { max-width: 390px; color: var(--muted); font-size: .82rem; line-height: 1.6; }
 .login-form { width: min(470px, 100%); margin-bottom: auto; }
-.login-form > label { display: block; margin-bottom: 8px; font-size: .69rem; font-weight: 650; }
-.secret-field { display: flex; align-items: center; gap: 10px; height: 48px; padding: 0 13px; background: white; border: 1px solid #bfc0ba; border-radius: 3px; }
-.secret-field:focus-within { border-color: var(--ink); box-shadow: 0 0 0 2px rgba(18,21,21,.08); }
-.secret-field input { width: 100%; min-width: 0; border: 0; outline: 0; background: transparent; font-family: var(--mono); font-size: .73rem; }
 .form-footnote { display: flex; align-items: center; gap: 6px; margin-top: 9px; color: var(--muted); font-size: .61rem; }
 .login-form .form-error { margin-top: 15px; }.login-button { width: 100%; min-height: 45px; justify-content: space-between; margin-top: 22px; }
 .login-meta { display: flex; justify-content: space-between; margin-top: 40px; color: #8b8e88; font-family: var(--mono); font-size: .55rem; }

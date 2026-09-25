@@ -1,5 +1,12 @@
 import { createWriteMessage } from "./crypto";
-import type { AuthNetwork, OperatorIdentity, OperatorSession } from "./types";
+import type {
+  AuthConfig,
+  AuthNetwork,
+  OperatorIdentity,
+  OperatorSession,
+} from "./types";
+
+export const HUMID_SIGNATURE_SCHEME = "bitcoin-signed-message-ecdsa-v1";
 
 type ApiErrorBody = { error?: string };
 
@@ -12,18 +19,49 @@ export class ApiError extends Error {
   }
 }
 
+export class OperatorNotAuthorizedError extends ApiError {
+  readonly operatorIdentifier: string;
+
+  constructor(operatorIdentifier: string) {
+    super(
+      `Operator is not authorized. Register this operator identifier in HighStorm: ${operatorIdentifier}`,
+      403,
+    );
+    this.operatorIdentifier = operatorIdentifier;
+  }
+}
+
 export async function authenticateOperator(
   identity: OperatorIdentity,
 ): Promise<OperatorSession> {
-  const challenge = await requestJson<{
+  let challenge: {
     message: string;
     expires_at: number;
     network: AuthNetwork;
-  }>("/operators/auth/challenge", {
-    method: "POST",
-    body: JSON.stringify({ public_key: identity.publicKey }),
-  });
-  identity.configureNetwork(challenge.network);
+    signature_scheme: string;
+  };
+  try {
+    challenge = await requestJson("/operators/auth/challenge", {
+      method: "POST",
+      body: JSON.stringify({
+        public_key: identity.publicKey,
+        signature_scheme: HUMID_SIGNATURE_SCHEME,
+      }),
+    });
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 403) {
+      throw new OperatorNotAuthorizedError(identity.publicKey);
+    }
+    throw error;
+  }
+  if (
+    challenge.network !== identity.network ||
+    challenge.signature_scheme !== HUMID_SIGNATURE_SCHEME
+  ) {
+    throw new Error(
+      "HighStorm returned a mismatched authentication challenge.",
+    );
+  }
   const signature = await identity.sign(challenge.message);
   const access = await requestJson<{ token: string; expires_at: number }>(
     "/operators/auth/token",
@@ -31,6 +69,7 @@ export async function authenticateOperator(
       method: "POST",
       body: JSON.stringify({
         public_key: identity.publicKey,
+        signature_scheme: HUMID_SIGNATURE_SCHEME,
         message: challenge.message,
         signature,
       }),
@@ -41,6 +80,25 @@ export async function authenticateOperator(
     expiresAt: access.expires_at,
     identity,
   };
+}
+
+export async function getAuthConfig(): Promise<AuthConfig> {
+  const config = await requestJson<AuthConfig>("/operators/auth/config");
+  if (
+    !["liquidv1", "liquidtestnet", "elementsregtest"].includes(
+      config.network,
+    ) ||
+    (config.caip2_chain_id !== null &&
+      typeof config.caip2_chain_id !== "string") ||
+    config.signature_scheme !== HUMID_SIGNATURE_SCHEME ||
+    config.descriptor_type !== "publicWalletDescriptor" ||
+    config.descriptor_format !== "bip380-split-branches" ||
+    config.identity_derivation?.branch !== 0 ||
+    config.identity_derivation?.index !== 0
+  ) {
+    throw new Error("HighStorm returned an unsupported Humid configuration.");
+  }
+  return config;
 }
 
 export async function authenticatedGet<T>(
@@ -72,6 +130,7 @@ export async function signedPost<T>(
     method: "POST",
     body: JSON.stringify({
       public_key: session.identity.publicKey,
+      signature_scheme: HUMID_SIGNATURE_SCHEME,
       timestamp,
       nonce,
       signature: await session.identity.sign(message),
