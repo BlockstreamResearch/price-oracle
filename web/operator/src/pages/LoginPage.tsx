@@ -1,27 +1,23 @@
-import { useRef, useState, type FormEvent } from 'react'
-import { ArrowRight, KeyRound, ShieldCheck } from 'lucide-react'
+import { useState, type FormEvent } from 'react'
+import { ArrowRight, ShieldCheck, WalletCards } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth-context'
 
 export function LoginPage() {
   const { login } = useAuth()
   const navigate = useNavigate()
-  const secretInput = useRef<HTMLInputElement>(null)
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
   async function submit(event: FormEvent) {
     event.preventDefault()
-    const secret = secretInput.current?.value ?? ''
-    if (secretInput.current) secretInput.current.value = ''
     setError('')
     setSubmitting(true)
     try {
-      await login(secret)
+      await login()
       navigate('/', { replace: true })
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Authentication failed.')
-      secretInput.current?.focus()
     } finally {
       setSubmitting(false)
     }
@@ -37,25 +33,19 @@ export function LoginPage() {
         <div className="login-copy">
           <span className="eyebrow">Restricted network access</span>
           <h1>Enter the operator workspace.</h1>
-          <p>Authenticate against this node with your registered operator key.</p>
+          <p>Connect Humid and approve a signature with your registered operator account.</p>
         </div>
         <form className="login-form" onSubmit={submit}>
-          <label htmlFor="secret-key">Operator secret key</label>
-          <div className="secret-field">
-            <KeyRound size={19} aria-hidden="true" />
-            <input ref={secretInput} id="secret-key" type="text" autoComplete="off"
-              autoCapitalize="none" spellCheck={false} placeholder="64-character hex key"
-              aria-describedby="secret-note" required />
-          </div>
           <div className="form-footnote" id="secret-note">
-            <ShieldCheck size={15} /><span>Stored in this tab until logout.</span>
+            <ShieldCheck size={15} /><span>Your private key stays inside Humid.</span>
           </div>
           {error && <div className="form-error" role="alert">{error}</div>}
           <button className="primary-button login-button" disabled={submitting}>
-            <span>{submitting ? 'Signing challenge…' : 'Authenticate'}</span><ArrowRight size={18} />
+            <WalletCards size={18} />
+            <span>{submitting ? 'Waiting for Humid…' : 'Connect Humid'}</span><ArrowRight size={18} />
           </button>
         </form>
-        <div className="login-meta"><span>HIGH-STORM</span><span>BIP322 / ELEMENTS</span></div>
+        <div className="login-meta"><span>HIGH-STORM</span><span>HUMID / ELEMENTS</span></div>
       </section>
 
       <section className="login-visual" aria-label="Storm network status graphic">

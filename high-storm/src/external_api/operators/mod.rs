@@ -14,6 +14,7 @@ pub(super) use auth::{AuthError, AuthService};
 
 pub(super) fn router() -> Router<ExternalApiState> {
     Router::new()
+        .route("/auth/config", get(auth::get_config))
         .route("/auth/challenge", post(auth::issue_challenge))
         .route("/auth/token", post(auth::exchange_token))
         .route("/state", get(state::get_network_state))

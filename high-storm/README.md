@@ -148,13 +148,20 @@ client with `--socket <path>`.
 
 ## External API
 
-Operator identities are compressed secp256k1 public keys. High-storm derives each
-key's mainnet P2WPKH address and verifies BIP322-simple signatures against it.
+Operator identities are compressed secp256k1 public keys. The operator dashboard
+derives its fixed `/0/0` identity from Humid's approved public descriptor and asks
+Humid to create recoverable Bitcoin signed-message ECDSA proofs. High-storm
+recovers the full compressed key and requires an exact registered-key match.
+
+Legacy requests without a `signature_scheme` continue to use BIP322 during the
+migration period. New clients send
+`signature_scheme: "bitcoin-signed-message-ecdsa-v1"`.
 
 | Method | Path | Authentication |
 | --- | --- | --- |
+| `GET` | `/operators/auth/config` | None |
 | `POST` | `/operators/auth/challenge` | Operator public key in JSON |
-| `POST` | `/operators/auth/token` | BIP322 signature of the returned challenge |
+| `POST` | `/operators/auth/token` | Signature of the returned challenge |
 | `GET` | `/operators/state` | `Authorization: Bearer <token>` |
 | `GET` | `/operators/state/peers` | `Authorization: Bearer <token>` |
 | `GET` | `/operators/droplets` | `Authorization: Bearer <token>` |
