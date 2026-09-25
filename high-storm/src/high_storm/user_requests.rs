@@ -332,36 +332,43 @@ impl UserRequestProcessor {
         for stored in pending {
             let (request, fee_utxos, named_feed) =
                 validate_encoded_request(&stored.request).map_err(UserRequestError::Invalid)?;
+            // A priced request is held up by more than a missing local price: a
+            // signer that refuses the rate fails the whole round, and the same
+            // batch returns every block. Age it out whatever held it up, so its
+            // fees come back and the requests queued behind it can issue.
+            if let Some(feed) = named_feed
+                && waited_too_long(block_height, stored.block_height)
+            {
+                let waited = block_height.saturating_sub(stored.block_height);
+                let reason = format!("feed {feed} was not issued in {waited} blocks");
+                self.requests
+                    .mark_failed(stored.request_hash, reason.as_bytes())
+                    .await?;
+                tracing::warn!(
+                    request_hash = %hex::encode(stored.request_hash),
+                    %reason,
+                    "failed a user request no round could issue"
+                );
+                continue;
+            }
+            // A rate the issued Tick outlives cannot be spent beside it, so the
+            // round waits for a fresher one rather than minting the pair.
             let own = match named_feed {
-                Some(feed) if instructed.is_none() => self.prices.value(feed).await,
+                Some(feed) if instructed.is_none() => self
+                    .prices
+                    .value(feed)
+                    .await
+                    .filter(|rate| outlives_tick(rate, timestamp)),
                 _ => None,
             };
             match round_rate(instructed, named_feed, own) {
                 RoundRate::Carries(rate) => instructed = rate,
                 RoundRate::AnotherFeed => continue,
                 RoundRate::NoLocalPrice => {
-                    let waited = block_height.saturating_sub(stored.block_height);
-                    if !waited_too_long(block_height, stored.block_height) {
-                        tracing::debug!(
-                            request_hash = %hex::encode(stored.request_hash),
-                            feed = named_feed,
-                            "deferred a user request to a round that can price it"
-                        );
-                        continue;
-                    }
-                    // Its fee UTXOs are reserved while it waits, so a feed this
-                    // node never prices releases them rather than holding them.
-                    let reason = format!(
-                        "no price for feed {} in {waited} blocks",
-                        named_feed.unwrap_or_default()
-                    );
-                    self.requests
-                        .mark_failed(stored.request_hash, reason.as_bytes())
-                        .await?;
-                    tracing::warn!(
+                    tracing::debug!(
                         request_hash = %hex::encode(stored.request_hash),
-                        %reason,
-                        "rejected pending user request before issuance"
+                        feed = named_feed,
+                        "deferred a user request to a round that can price it"
                     );
                     continue;
                 }
@@ -1735,6 +1742,13 @@ fn round_rate(
     }
 }
 
+/// The covenant spends a Tick beside a rate only while the Tick's timestamp is
+/// strictly before `valid_until`, so a round issued at the second a rate
+/// expires in mints a pair that cannot be spent together.
+fn outlives_tick(rate: &PriceFeedData, timestamp: u64) -> bool {
+    rate.valid_until > timestamp
+}
+
 /// Its fee UTXOs stay reserved while it waits, so it does not wait forever. A
 /// height that rewound in a reorg never ages a request early.
 fn waited_too_long(block_height: u64, since: u64) -> bool {
@@ -2192,6 +2206,15 @@ mod tests {
         assert!(!waited_too_long(MAX_UNPRICED_REQUEST_BLOCKS, 0));
         assert!(waited_too_long(MAX_UNPRICED_REQUEST_BLOCKS + 1, 0));
         assert!(!waited_too_long(5, 9));
+    }
+
+    #[test]
+    fn issues_only_at_a_rate_the_tick_it_mints_does_not_outlive() {
+        let expiring = rate(LBTC_USDT, 10_000_000_000);
+        let timestamp = expiring.valid_until;
+
+        assert!(!outlives_tick(&expiring, timestamp));
+        assert!(outlives_tick(&expiring, timestamp - 1));
     }
 
     #[test]

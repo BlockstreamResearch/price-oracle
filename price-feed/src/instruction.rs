@@ -36,7 +36,9 @@ pub fn validate(
         return Err(ValidationError::UnknownFeed);
     };
     let own = own.ok_or(ValidationError::NoLocalPrice)?;
-    if now > instructed.valid_until {
+    // The covenant spends a price only while `now` is strictly before
+    // `valid_until`, so a rate accepted here at that second signs unusably.
+    if now >= instructed.valid_until {
         return Err(ValidationError::Stale);
     }
     // The coordinator's clock may run ahead of this one by the skew.
@@ -124,9 +126,14 @@ mod tests {
             valid_until: NOW - 1,
             ..own
         };
-        // The second it expires in is still its own.
+        // The covenant reads the second it expires in as expired, so this side
+        // does too, and the last second it signs for is the one before.
         let expiring = PriceFeedData {
             valid_until: NOW,
+            ..own
+        };
+        let last = PriceFeedData {
+            valid_until: NOW + 1,
             ..own
         };
 
@@ -134,7 +141,11 @@ mod tests {
             validate_against(expired, Some(own)),
             Err(ValidationError::Stale)
         );
-        assert_eq!(validate_against(expiring, Some(own)), Ok(()));
+        assert_eq!(
+            validate_against(expiring, Some(own)),
+            Err(ValidationError::Stale)
+        );
+        assert_eq!(validate_against(last, Some(own)), Ok(()));
     }
 
     #[test]
