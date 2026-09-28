@@ -25,7 +25,7 @@ use super::message::{
     SigningNoncesMessage,
 };
 
-const SIGNING_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const SIGNING_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 type OutboundNodeMessage = (NodeMessage, Vec<[u8; 33]>);
 
 /// A completed signing request.

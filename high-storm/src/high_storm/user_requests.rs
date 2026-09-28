@@ -61,7 +61,7 @@ use super::{
     issuance::{IssuedTickDescriptor, MAX_ISSUED_TICK_DESCRIPTORS},
     message::{ExecuteUserRequests, ExternalRequests},
     prices::{Prices, price_hash},
-    signing::SigningError,
+    signing::{SIGNING_SESSION_TIMEOUT, SigningError},
 };
 
 const MAX_TICK_TIME_SKEW_SECS: u64 = 120;
@@ -69,6 +69,13 @@ const MAX_TICK_TIME_SKEW_SECS: u64 = 120;
 /// out a restart or a slow poll, short enough not to strand a user's fees on a
 /// feed this node never prices.
 const MAX_UNPRICED_REQUEST_BLOCKS: u64 = 10;
+/// How many pending requests a round reads at a time while looking for ones it
+/// can issue.
+const PENDING_SCAN_PAGE: u32 = 100;
+/// The most pending requests one round reads. Every row costs a signature
+/// check, so the scan stays bounded even when the queue ahead of it is all
+/// requests this round cannot issue.
+const MAX_PENDING_SCAN: usize = 1_000;
 const MAX_MEMPOOL_TOKEN_CHAIN_LENGTH: usize = 100;
 pub(crate) const STORM_EYE_TAG: &str = "OracleNetworkV1/StormEye";
 const MAX_REQUESTS_PER_ROUND: u32 = 100;
@@ -294,7 +301,11 @@ impl UserRequestProcessor {
         request_limit: u32,
         max_transaction_weight: usize,
     ) -> Result<Option<PreparedRound>, UserRequestError> {
-        let pending = self.requests.list_pending(request_limit).await?;
+        let mut cursor = None;
+        let mut pending = self
+            .requests
+            .list_pending_after(PENDING_SCAN_PAGE, cursor)
+            .await?;
         if pending.is_empty() {
             return Ok(None);
         }
@@ -329,19 +340,56 @@ impl UserRequestProcessor {
         let mut tick_count = 0usize;
         // One round is issued at one feed; batches naming another wait.
         let mut instructed: Option<PriceFeedData> = None;
-        for stored in pending {
-            let (request, fee_utxos, named_feed) =
-                validate_encoded_request(&stored.request).map_err(UserRequestError::Invalid)?;
-            let own = match named_feed {
-                Some(feed) if instructed.is_none() => self.prices.value(feed).await,
-                _ => None,
-            };
-            match round_rate(instructed, named_feed, own) {
-                RoundRate::Carries(rate) => instructed = rate,
-                RoundRate::AnotherFeed => continue,
-                RoundRate::NoLocalPrice => {
+        // The queue is walked in pages, not taken as one window, so a run of
+        // requests this round cannot issue delays only those requests. Taking a
+        // window would let a page of them empty the round and stop issuance for
+        // everyone behind them. The scan is still bounded, since every row read
+        // costs a signature check.
+        let mut scanned = 0usize;
+        'fill: loop {
+            for stored in pending {
+                cursor = Some((stored.block_height, stored.request_hash));
+                scanned += 1;
+                let (request, fee_utxos, named_feed) =
+                    validate_encoded_request(&stored.request).map_err(UserRequestError::Invalid)?;
+                // A priced request is held up by more than a missing local price: a
+                // signer that refuses the rate fails the whole round, and the same
+                // batch returns every block. Age it out whatever held it up, so its
+                // fees come back and the requests queued behind it can issue.
+                if let Some(feed) = named_feed
+                    && waited_too_long(block_height, stored.block_height)
+                {
                     let waited = block_height.saturating_sub(stored.block_height);
-                    if !waited_too_long(block_height, stored.block_height) {
+                    let reason = format!("feed {feed} was not issued in {waited} blocks");
+                    self.requests
+                        .mark_failed(stored.request_hash, reason.as_bytes())
+                        .await?;
+                    tracing::warn!(
+                        request_hash = %hex::encode(stored.request_hash),
+                        %reason,
+                        "failed a user request no round could issue"
+                    );
+                    continue;
+                }
+                // A rate the issued Tick outlives cannot be spent beside it, so the
+                // round waits for a fresher one rather than minting the pair.
+                let own = match named_feed {
+                    Some(feed) if instructed.is_none() => self
+                        .prices
+                        .value(feed)
+                        .await
+                        .filter(|rate| usable_for_round(rate, timestamp)),
+                    _ => None,
+                };
+                // The rate this batch would have the round carry. It is committed
+                // below, once the batch itself is in: a batch dropped after this
+                // point must not leave the round issued at a feed that no included
+                // batch names, which carries the rate beside none of them and
+                // leaves the round signing a price its own message does not hold.
+                let carried = match round_rate(instructed, named_feed, own) {
+                    RoundRate::Carries(rate) => rate,
+                    RoundRate::AnotherFeed => continue,
+                    RoundRate::NoLocalPrice => {
                         tracing::debug!(
                             request_hash = %hex::encode(stored.request_hash),
                             feed = named_feed,
@@ -349,12 +397,45 @@ impl UserRequestProcessor {
                         );
                         continue;
                     }
-                    // Its fee UTXOs are reserved while it waits, so a feed this
-                    // node never prices releases them rather than holding them.
-                    let reason = format!(
-                        "no price for feed {} in {waited} blocks",
-                        named_feed.unwrap_or_default()
-                    );
+                };
+                let account = AccountProgram::new(&AccountArguments {
+                    storm_eye_asset_id: storm_eye.asset_id,
+                    account_owner_pubkey: decode_array(&request.header.public_key)?,
+                });
+                let account_script = account.get_script_pubkey(&network);
+                let mut resolved_fee_utxos = Vec::with_capacity(fee_utxos.len());
+                let mut unavailable = None;
+                for fee_utxo in fee_utxos {
+                    let outpoint =
+                        format!("{}:{}", hex::encode(fee_utxo.txid), fee_utxo.output_index);
+                    if self
+                        .monitored_utxos
+                        .is_reserved_for_burning(fee_utxo.txid, fee_utxo.output_index)
+                        .await?
+                    {
+                        unavailable = Some(format!(
+                            "fee UTXO '{outpoint}' is reserved for burning issued Ticks"
+                        ));
+                        break;
+                    }
+                    let Some(utxo) = get_confirmed_fee_outpoint(&rpc, &fee_utxo)? else {
+                        unavailable = Some(format!(
+                            "fee UTXO '{outpoint}' is unavailable or has fewer than \
+                         {MIN_FEE_UTXO_CONFIRMATIONS} confirmations"
+                        ));
+                        break;
+                    };
+                    if utxo.asset() != network.policy_asset()
+                        || utxo.txout.script_pubkey != account_script
+                    {
+                        unavailable = Some(format!(
+                            "fee UTXO '{outpoint}' no longer satisfies the request fee policy"
+                        ));
+                        break;
+                    }
+                    resolved_fee_utxos.push(utxo);
+                }
+                if let Some(reason) = unavailable {
                     self.requests
                         .mark_failed(stored.request_hash, reason.as_bytes())
                         .await?;
@@ -365,60 +446,32 @@ impl UserRequestProcessor {
                     );
                     continue;
                 }
-            }
-            let account = AccountProgram::new(&AccountArguments {
-                storm_eye_asset_id: storm_eye.asset_id,
-                account_owner_pubkey: decode_array(&request.header.public_key)?,
-            });
-            let account_script = account.get_script_pubkey(&network);
-            let mut resolved_fee_utxos = Vec::with_capacity(fee_utxos.len());
-            let mut unavailable = None;
-            for fee_utxo in fee_utxos {
-                let outpoint = format!("{}:{}", hex::encode(fee_utxo.txid), fee_utxo.output_index);
-                if self
-                    .monitored_utxos
-                    .is_reserved_for_burning(fee_utxo.txid, fee_utxo.output_index)
-                    .await?
-                {
-                    unavailable = Some(format!(
-                        "fee UTXO '{outpoint}' is reserved for burning issued Ticks"
-                    ));
-                    break;
-                }
-                let Some(utxo) = get_confirmed_fee_outpoint(&rpc, &fee_utxo)? else {
-                    unavailable = Some(format!(
-                        "fee UTXO '{outpoint}' is unavailable or has fewer than \
-                         {MIN_FEE_UTXO_CONFIRMATIONS} confirmations"
-                    ));
-                    break;
-                };
-                if utxo.asset() != network.policy_asset()
-                    || utxo.txout.script_pubkey != account_script
-                {
-                    unavailable = Some(format!(
-                        "fee UTXO '{outpoint}' no longer satisfies the request fee policy"
-                    ));
-                    break;
-                }
-                resolved_fee_utxos.push(utxo);
-            }
-            if let Some(reason) = unavailable {
-                self.requests
-                    .mark_failed(stored.request_hash, reason.as_bytes())
-                    .await?;
-                tracing::warn!(
-                    request_hash = %hex::encode(stored.request_hash),
-                    %reason,
-                    "rejected pending user request before issuance"
-                );
-                continue;
-            }
 
-            if tick_count + request.requests.len() > MAX_ISSUED_TICK_DESCRIPTORS {
+                if tick_count + request.requests.len() > MAX_ISSUED_TICK_DESCRIPTORS {
+                    break 'fill;
+                }
+                tick_count += request.requests.len();
+                instructed = carried;
+                decoded.push((stored, request, resolved_fee_utxos, named_feed));
+                if decoded.len() >= request_limit as usize {
+                    break 'fill;
+                }
+            }
+            if scanned >= MAX_PENDING_SCAN {
+                tracing::debug!(
+                    scanned,
+                    accepted = decoded.len(),
+                    "stopped scanning pending user requests at the round's bound"
+                );
                 break;
             }
-            tick_count += request.requests.len();
-            decoded.push((stored, request, resolved_fee_utxos, named_feed));
+            pending = self
+                .requests
+                .list_pending_after(PENDING_SCAN_PAGE, cursor)
+                .await?;
+            if pending.is_empty() {
+                break;
+            }
         }
         if decoded.is_empty() {
             return Ok(None);
@@ -1735,6 +1788,16 @@ fn round_rate(
     }
 }
 
+/// A rate the round can still both sign and mint against. The covenant spends a
+/// Tick beside a rate only while the Tick's timestamp is strictly before
+/// `valid_until`, and every signer re-checks the rate against its own clock when
+/// the message reaches it, so the rate has to outlast the signing session it is
+/// chosen for. One that expires mid-session fails the round for every member
+/// instead, and the round is rebuilt on the same rate until the feed polls again.
+fn usable_for_round(rate: &PriceFeedData, timestamp: u64) -> bool {
+    rate.valid_until > timestamp.saturating_add(SIGNING_SESSION_TIMEOUT.as_secs())
+}
+
 /// Its fee UTXOs stay reserved while it waits, so it does not wait forever. A
 /// height that rewound in a reorg never ages a request early.
 fn waited_too_long(block_height: u64, since: u64) -> bool {
@@ -2192,6 +2255,22 @@ mod tests {
         assert!(!waited_too_long(MAX_UNPRICED_REQUEST_BLOCKS, 0));
         assert!(waited_too_long(MAX_UNPRICED_REQUEST_BLOCKS + 1, 0));
         assert!(!waited_too_long(5, 9));
+    }
+
+    #[test]
+    fn issues_only_at_a_rate_that_outlasts_the_session_signing_it() {
+        let expiring = rate(LBTC_USDT, 10_000_000_000);
+        let margin = SIGNING_SESSION_TIMEOUT.as_secs();
+
+        // The second it expires in is too late, and so is the whole session
+        // before it: a signer reaching the message at the end of one would
+        // read the rate as stale and fail the round for everyone in it.
+        assert!(!usable_for_round(&expiring, expiring.valid_until));
+        assert!(!usable_for_round(&expiring, expiring.valid_until - margin));
+        assert!(usable_for_round(
+            &expiring,
+            expiring.valid_until - margin - 1
+        ));
     }
 
     #[test]

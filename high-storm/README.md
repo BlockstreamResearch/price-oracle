@@ -267,12 +267,16 @@ another wait for a round of their own, and plain `tick-utxo` requests ride along
 with either. The coordinator takes its own current value for that feed, encodes
 it as the 32-byte `PriceFeedData`, and carries it beside every batch issued at
 it; a request whose feed the coordinator cannot price yet waits for a later
-round, since a feed is unavailable after a restart and between polls, and fails
-once it has waited ten blocks, so a feed this node never prices does not hold
-its fee UTXOs reserved forever. Before signing, each member checks the
-instructed rate against the value it holds itself and rejects the whole message
-on the first failure: an unregistered feed, no valid local price, a rate the
-node clock has passed, one stamped ahead of its clock or valid for longer than
+round, since a feed is unavailable after a restart and between polls, and the
+round is issued only at a rate the Tick it mints does not outlive. A priced
+request fails once it has waited ten blocks, whatever held it up: a feed this
+node never prices, or signers that keep refusing the rate and fail the round
+with it. Its fee UTXOs are released rather than reserved forever, and the
+requests queued behind it stop waiting on it. Before signing, each member
+checks the instructed rate against the value it holds itself and rejects the
+whole message on the first failure: an unregistered feed, no valid local price,
+a rate its clock has reached `valid_until` on, one stamped ahead of its clock
+or valid for longer than
 `VALIDITY_WINDOW` from when it was received, one quoted at other decimals than
 its feed, or one that differs from its own by `MAX_ACCEPT_DEVIATION_FEED` (one
 percent) or more. A round issued at a rate signs that rate as a second message,
