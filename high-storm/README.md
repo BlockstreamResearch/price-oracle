@@ -275,10 +275,25 @@ on the first failure: an unregistered feed, no valid local price, a rate the
 node clock has passed, one stamped ahead of its clock or valid for longer than
 `VALIDITY_WINDOW` from when it was received, one quoted at other decimals than
 its feed, or one that differs from its own by `MAX_ACCEPT_DEVIATION_FEED` (one
-percent) or more. An issued batch therefore carries a rate two thirds of the
-members accepted, but no signature covers the rate itself: the issued Tick UTXO
-is the same one a `tick-utxo` request produces, and recording the rate on-chain
-needs a covenant field that does not exist yet.
+percent) or more. A round issued at a rate signs that rate as a second message,
+the `OracleNetworkV1/Price` tagged hash over the 32-byte `PriceFeedData`, with
+the same two-thirds Storm Tree branch that signs the transaction. Every signer
+derives that message from the rate it validated itself, so the signature is one
+no coordinator can obtain for a price the network did not accept. A
+`signed-price-data` request receives it as its result `payload`:
+
+```json
+{"timestamp":1700000000,"price_data":"<64 hex characters>","storm_tree_bloom":{"signature":"<128 hex characters>","branch":"<64 hex characters>","proof":[{"right":true,"hash":"<64 hex characters>"}]}}
+```
+
+`price_data` is the canonical `PriceFeedData` the signature covers, and `branch`
+is the x-only key it verifies under. `proof` carries that branch's inclusion
+path, leaf to root; the root it proves against is the Storm Eye's on-chain one,
+so a reader takes that from the chain rather than from this payload.
+`timestamp` is the issued Tick's, since the Tick UTXO is still the one a
+`tick-utxo` request produces: the transaction commits to the batch, not to the
+price, and recording the rate on-chain needs a covenant field that does not
+exist yet.
 
 `GET /price-feeds` lists the registry every node shares: each feed with its id
 and symbols, in id order. `GET /price-feeds/{id}` returns the current rate for

@@ -79,6 +79,7 @@ async fn rejects_malformed_execute_user_requests_transaction() {
         network.nodes[0].sign_execute_user_requests(
             b"unsigned issuance transaction".to_vec(),
             signing_hash,
+            None,
             external_requests,
         ),
     )

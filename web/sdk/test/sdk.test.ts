@@ -5,12 +5,20 @@ import {
   PriceOracleClient,
   createTickRequest,
   createTickSpendPlan,
+  decodePriceData,
   publicKeyFromPrivateKey,
   signSchnorrDigest,
   tickRequestSigningHash,
+  verifySignedPriceData,
 } from "../src";
 
 const PRIVATE_KEY = "1f".repeat(32);
+/** Feed 4 at 100.00000000, as the coordinator encodes and signs it. */
+const PRICE_DATA =
+  "000000040000000800000002540be400000000006553f100000000006553f22c";
+/** The `OracleNetworkV1/Price` message over PRICE_DATA, pinned in Rust too. */
+const PRICE_MESSAGE =
+  "dd5c6a22d1a989ec39cfcd82b64d8e1f43bcca770dc3d2949022a9808b3d6340";
 
 describe("Price Oracle SDK", () => {
   test("derives an x-only key and signs coordinator Tick requests", () => {
@@ -120,5 +128,36 @@ describe("Price Oracle SDK", () => {
     });
 
     expect(await rpc.getTransactionConfirmations("ab".repeat(32))).toBe(2);
+  });
+
+  test("reads the canonical price bytes the network signs", () => {
+    expect(decodePriceData(PRICE_DATA)).toEqual({
+      feedId: 4,
+      decimals: 8,
+      price: 10_000_000_000n,
+      receivedAt: 1_700_000_000n,
+      validUntil: 1_700_000_300n,
+    });
+  });
+
+  test("accepts a network signature over the rate and rejects another rate", () => {
+    const branch = publicKeyFromPrivateKey(PRIVATE_KEY);
+    const details = {
+      timestamp: 1_700_000_000,
+      price_data: PRICE_DATA,
+      storm_tree_bloom: {
+        signature: signSchnorrDigest(PRIVATE_KEY, PRICE_MESSAGE),
+        branch,
+        proof: [{ right: true, hash: "03".repeat(32) }],
+      },
+    };
+
+    expect(verifySignedPriceData(details)).toBe(true);
+    expect(
+      verifySignedPriceData({
+        ...details,
+        price_data: PRICE_DATA.replace(/.$/, "d"),
+      }),
+    ).toBe(false);
   });
 });

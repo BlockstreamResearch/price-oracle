@@ -43,8 +43,28 @@ export type TickRequestResult = {
     payload: string;
 };
 export type TickRequestStatus = {
-    status: "pending" | "processing" | "executed" | "failed";
+    status: "pending" | "processing" | "included" | "executed" | "failed";
     payload: string | null;
+};
+export type StormTreeBloom = {
+    signature: string;
+    branch: string;
+    proof: Array<{
+        right: boolean;
+        hash: string;
+    }>;
+};
+export type SignedPriceData = {
+    timestamp: number;
+    price_data: string;
+    storm_tree_bloom: StormTreeBloom;
+};
+export type PriceFeedData = {
+    feedId: number;
+    decimals: number;
+    price: bigint;
+    receivedAt: bigint;
+    validUntil: bigint;
 };
 export type IssuedTick = {
     txid: string;
@@ -112,6 +132,14 @@ export declare function publicKeyFromPrivateKey(privateKey: string): string;
 export declare function signSchnorrDigest(privateKey: string, digest: string): string;
 export declare function createTickRequest(privateKey: string, feeUtxos: string[], authMethod?: TickAuthMethod): TickRequest;
 export declare function tickRequestSigningHash(request: TickRequest): Uint8Array;
+/** The 32 canonical bytes the network signs, as the numbers they encode. */
+export declare function decodePriceData(priceData: string): PriceFeedData;
+/**
+ * Whether the network signed this rate, under the Storm Tree branch the bloom
+ * names. The caller still has to check that branch against the Storm Eye root
+ * the chain holds, which this cannot see.
+ */
+export declare function verifySignedPriceData(details: SignedPriceData): boolean;
 export declare function parseExecutedTick(status: TickRequestStatus): {
     txid: string;
     results: TickRequestResult[];
