@@ -2,8 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use price_feed::{
     Clock, FeedAvailability, FeedId, FeedRegistry, FeedStates, PriceFeedData, PriceSource,
-    RejectionReason, SourceObservation,
-    constants::{MAX_CLOCK_SKEW, VALIDITY_WINDOW},
+    RejectionReason, SourceObservation, ValidationError, instruction,
 };
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, schnorr};
 use secp256k1_zkp::PublicKey as TransportPublicKey;
@@ -264,6 +263,22 @@ impl Prices {
         &self.registry
     }
 
+    /// The value it would attest next, `None` while the feed is unavailable.
+    pub(crate) async fn value(&self, feed: FeedId) -> Option<PriceFeedData> {
+        self.feeds.lock().await.value(feed)
+    }
+
+    /// An instructed rate is judged by what its sources say now, not by what
+    /// it last attested.
+    pub(crate) async fn validate_instruction(
+        &self,
+        instructed: &PriceFeedData,
+    ) -> Result<(), ValidationError> {
+        let own = self.value(instructed.feed_id).await;
+
+        instruction::validate(instructed, &self.registry, own, self.clock.now())
+    }
+
     /// Only a current member's attestation is read, this node's own included,
     /// and none of them past its `valid_until`. A feed reads as `Current` only
     /// while the node holds a price of its own for it, since that is the one
@@ -282,8 +297,8 @@ impl Prices {
             let own = attestation.public_key == attester;
             // Its own attestations never pass through `check`.
             if now > attestation.feed.valid_until
-                || stamped_ahead(&attestation.feed, now)
-                || validity_stretched(&attestation.feed)
+                || attestation.feed.stamped_ahead(now)
+                || attestation.feed.validity_stretched()
             {
                 attested_before |= own;
                 continue;
@@ -353,10 +368,10 @@ fn check(
         let Some(definition) = registry.get(attestation.feed.feed_id) else {
             return Err(PriceError::UnregisteredFeed(attestation.feed.feed_id));
         };
-        if stamped_ahead(&attestation.feed, now) {
+        if attestation.feed.stamped_ahead(now) {
             return Err(PriceError::ImplausibleTimestamp(attestation.feed.feed_id));
         }
-        if validity_stretched(&attestation.feed) {
+        if attestation.feed.validity_stretched() {
             return Err(PriceError::StretchedValidity(attestation.feed.feed_id));
         }
         // Other decimals put a client reading the price off by that power.
@@ -370,17 +385,6 @@ fn check(
         verify(attestation)?;
     }
     Ok(())
-}
-
-/// No member's clock runs more than `MAX_CLOCK_SKEW` ahead of this one.
-fn stamped_ahead(feed: &PriceFeedData, now: u64) -> bool {
-    feed.received_at > now.saturating_add(MAX_CLOCK_SKEW)
-}
-
-/// A price is valid for `VALIDITY_WINDOW` from when it was received, or an old
-/// one beside a fresh `valid_until` reads as current.
-fn validity_stretched(feed: &PriceFeedData) -> bool {
-    feed.valid_until > feed.received_at.saturating_add(VALIDITY_WINDOW)
 }
 
 fn verify(attestation: &PriceAttestation) -> Result<(), PriceError> {
@@ -409,7 +413,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use price_feed::{ConnectionError, SourceState, constants::MAX_POLLING_ERROR_NUM};
+    use price_feed::{
+        ConnectionError, SourceState,
+        constants::{MAX_CLOCK_SKEW, MAX_POLLING_ERROR_NUM, VALIDITY_WINDOW},
+    };
     use sha2::{Digest, Sha256};
 
     const NOW: u64 = 1_700_000_000;

@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::registry::FeedId;
+use crate::{
+    constants::{MAX_CLOCK_SKEW, VALIDITY_WINDOW},
+    registry::FeedId,
+};
 
 pub const PRICE_FEED_DATA_LEN: usize = 32;
 
@@ -45,6 +48,20 @@ impl PriceFeedData {
             received_at: u64::from_be_bytes(bytes[16..24].try_into().expect("8 bytes")),
             valid_until: u64::from_be_bytes(bytes[24..32].try_into().expect("8 bytes")),
         })
+    }
+
+    /// No clock runs more than `MAX_CLOCK_SKEW` ahead of `now`, so a stamp
+    /// further ahead than that is not something clock drift explains. Read by
+    /// both the node checking a peer's attestation and the signer checking an
+    /// instructed rate, so the two cannot answer it differently.
+    pub fn stamped_ahead(&self, now: u64) -> bool {
+        self.received_at > now.saturating_add(MAX_CLOCK_SKEW)
+    }
+
+    /// A price is valid for `VALIDITY_WINDOW` from when it was received, or an
+    /// old one beside a fresh `valid_until` reads as a current rate.
+    pub fn validity_stretched(&self) -> bool {
+        self.valid_until > self.received_at.saturating_add(VALIDITY_WINDOW)
     }
 }
 

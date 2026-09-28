@@ -116,6 +116,9 @@ impl NetworkState {
             .await
             .map_or(true, |state| state.migration_paused);
 
+        // An issuance round instructs a rate from these, and checks one.
+        let prices = Prices::new(secret_key, price_attestations, price_feed::Clock::System);
+
         Self {
             network_store,
             coordinator_public_key,
@@ -129,7 +132,7 @@ impl NetworkState {
                 protocol_config.exchange_transaction_fee_sats,
                 protocol_config.finality_confirmations,
             ),
-            prices: Prices::new(secret_key, price_attestations, price_feed::Clock::System),
+            prices: prices.clone(),
             assets: Assets::new(network_assets.clone()),
             renewal: super::renewal::Renewal::new(
                 network_assets.clone(),
@@ -170,6 +173,7 @@ impl NetworkState {
                 network_assets,
                 elements_rpc,
                 protocol_config,
+                prices,
             ),
             block_height: Arc::new(AtomicU64::new(0)),
             migration_paused: Arc::new(AtomicBool::new(migration_paused)),

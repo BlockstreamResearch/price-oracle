@@ -575,7 +575,11 @@ impl HighStorm {
         let mut prepared = match self
             .state
             .user_requests()
-            .prepare_round(storm_eye_lane, max_transaction_weight)
+            .prepare_round(
+                self.state.block_height(),
+                storm_eye_lane,
+                max_transaction_weight,
+            )
             .await?
         {
             Some(prepared) => prepared,
