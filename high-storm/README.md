@@ -20,6 +20,16 @@ high-storm/devenv.sh connections 1 # List node 1's active connections.
 high-storm/devenv.sh elements 1 getblockchaininfo # Call node 1's Elements RPC.
 ```
 
+To give every development node a CoinGecko Demo API key, create the ignored
+`high-storm/.env` file before starting the deployment:
+
+```dotenv
+COINGECKO_API_KEY=your-rotated-demo-key
+```
+
+The environment value overrides `service.price_sources.coingecko.api_key` and
+also enables the CoinGecko source for extra nodes deployed with `deploy-node`.
+
 `deploy-node NODE` accepts node numbers from 4 through 99. It creates a persistent
 development signer configuration and PostgreSQL database, then starts the node on
 host ports `8999 + NODE` and `9099 + NODE`. The node waits to be admitted by an
