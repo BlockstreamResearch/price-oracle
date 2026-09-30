@@ -25,6 +25,8 @@ export type TickAuthMethod = {
     kind: "scriptPubKey-auth";
     auth_data: string;
 };
+/** A plain Tick UTXO, or one issued at a price feed the network signs for. */
+export type TickRequestKind = "tick-utxo" | "signed-price-data";
 export type TickRequest = {
     header: {
         signature: string;
@@ -32,7 +34,7 @@ export type TickRequest = {
         fee_utxos: string[];
     };
     requests: Array<{
-        kind: "tick-utxo";
+        kind: TickRequestKind;
         payload: string;
     }>;
 };
@@ -131,6 +133,12 @@ export declare class PriceOracleClient {
 export declare function publicKeyFromPrivateKey(privateKey: string): string;
 export declare function signSchnorrDigest(privateKey: string, digest: string): string;
 export declare function createTickRequest(privateKey: string, feeUtxos: string[], authMethod?: TickAuthMethod): TickRequest;
+/**
+ * A request issued at a price feed. The network answers it with the rate the
+ * round was issued at and its signature over that rate, which
+ * {@link verifySignedPriceData} checks.
+ */
+export declare function createSignedPriceRequest(privateKey: string, feeUtxos: string[], priceFeedId: number, authMethod?: TickAuthMethod): TickRequest;
 export declare function tickRequestSigningHash(request: TickRequest): Uint8Array;
 /** The 32 canonical bytes the network signs, as the numbers they encode. */
 export declare function decodePriceData(priceData: string): PriceFeedData;

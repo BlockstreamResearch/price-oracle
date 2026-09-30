@@ -3,6 +3,7 @@ import { schnorr } from "@noble/curves/secp256k1";
 
 import {
   PriceOracleClient,
+  createSignedPriceRequest,
   createTickRequest,
   createTickSpendPlan,
   decodePriceData,
@@ -34,6 +35,60 @@ describe("Price Oracle SDK", () => {
         request.header.public_key,
       ),
     ).toBe(true);
+  });
+
+  test("builds a request issued at a price feed that the network accepts", () => {
+    const request = createSignedPriceRequest(
+      PRIVATE_KEY,
+      [`${"ab".repeat(32)}:1`],
+      4,
+    );
+
+    expect(request.requests.map(({ kind }) => kind)).toEqual([
+      "signed-price-data",
+    ]);
+    // The field is spelled as the specification spells it, and nothing else
+    // rides along: the network rejects an unknown field outright, so either
+    // mistake is a 400 rather than a default.
+    expect(request.requests.map(({ payload }) => JSON.parse(payload))).toEqual([
+      {
+        utxo_auth_method: {
+          kind: "signature-auth",
+          auth_data: publicKeyFromPrivateKey(PRIVATE_KEY),
+        },
+        price_feed_id: 4,
+      },
+    ]);
+    // The signing hash covers the payloads, so it covers the feed it names.
+    expect(
+      schnorr.verify(
+        request.header.signature,
+        tickRequestSigningHash(request),
+        request.header.public_key,
+      ),
+    ).toBe(true);
+  });
+
+  test("keeps a plain Tick request free of any price feed", () => {
+    const payloads = createTickRequest(PRIVATE_KEY, [
+      `${"ab".repeat(32)}:1`,
+    ]).requests.map(({ payload }) => JSON.parse(payload) as object);
+
+    // A Tick naming a feed is rejected, so the key is absent entirely rather
+    // than present and empty.
+    expect(payloads.map((payload) => "price_feed_id" in payload)).toEqual([
+      false,
+    ]);
+  });
+
+  test("refuses a feed id the network cannot encode", () => {
+    const feeUtxos = [`${"ab".repeat(32)}:1`];
+
+    expect(() => createSignedPriceRequest(PRIVATE_KEY, feeUtxos, -1)).toThrow();
+    expect(() => createSignedPriceRequest(PRIVATE_KEY, feeUtxos, 1.5)).toThrow();
+    expect(() =>
+      createSignedPriceRequest(PRIVATE_KEY, feeUtxos, 0x1_0000_0000),
+    ).toThrow();
   });
 
   test("signs a covenant digest with the owner key", () => {

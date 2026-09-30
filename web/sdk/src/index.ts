@@ -32,13 +32,16 @@ export type TickAuthMethod =
   | { kind: "asset-id-auth"; auth_data: string }
   | { kind: "scriptPubKey-auth"; auth_data: string };
 
+/** A plain Tick UTXO, or one issued at a price feed the network signs for. */
+export type TickRequestKind = "tick-utxo" | "signed-price-data";
+
 export type TickRequest = {
   header: {
     signature: string;
     public_key: string;
     fee_utxos: string[];
   };
-  requests: Array<{ kind: "tick-utxo"; payload: string }>;
+  requests: Array<{ kind: TickRequestKind; payload: string }>;
 };
 
 export type TickRequestResult = {
@@ -274,6 +277,43 @@ export function createTickRequest(
   feeUtxos: string[],
   authMethod?: TickAuthMethod,
 ): TickRequest {
+  return buildRequest(privateKey, feeUtxos, "tick-utxo", authMethod);
+}
+
+/**
+ * A request issued at a price feed. The network answers it with the rate the
+ * round was issued at and its signature over that rate, which
+ * {@link verifySignedPriceData} checks.
+ */
+export function createSignedPriceRequest(
+  privateKey: string,
+  feeUtxos: string[],
+  priceFeedId: number,
+  authMethod?: TickAuthMethod,
+): TickRequest {
+  if (
+    !Number.isInteger(priceFeedId) ||
+    priceFeedId < 0 ||
+    priceFeedId > 0xffffffff
+  ) {
+    throw new Error("price feed id must be an unsigned 32-bit integer");
+  }
+  return buildRequest(
+    privateKey,
+    feeUtxos,
+    "signed-price-data",
+    authMethod,
+    priceFeedId,
+  );
+}
+
+function buildRequest(
+  privateKey: string,
+  feeUtxos: string[],
+  kind: TickRequestKind,
+  authMethod: TickAuthMethod | undefined,
+  priceFeedId?: number,
+): TickRequest {
   assertPrivateKey(privateKey);
   if (
     feeUtxos.length === 0 ||
@@ -287,14 +327,21 @@ export function createTickRequest(
     auth_data: publicKey,
   };
   validateAuthMethod(selectedAuth);
-  const payload = JSON.stringify({ utxo_auth_method: selectedAuth });
+  // The network rejects a payload carrying any field it does not know, and a
+  // plain Tick must name no feed at all, so the key is present only for a
+  // priced request and spelled as the specification spells it.
+  const payload = JSON.stringify(
+    priceFeedId === undefined
+      ? { utxo_auth_method: selectedAuth }
+      : { utxo_auth_method: selectedAuth, price_feed_id: priceFeedId },
+  );
   const request: TickRequest = {
     header: {
       signature: "",
       public_key: publicKey,
       fee_utxos: [...feeUtxos],
     },
-    requests: [{ kind: "tick-utxo", payload }],
+    requests: [{ kind, payload }],
   };
   request.header.signature = bytesToHex(
     schnorr.sign(tickRequestSigningHash(request), privateKey),

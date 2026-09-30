@@ -115,6 +115,22 @@ export function signSchnorrDigest(privateKey, digest) {
     return bytesToHex(schnorr.sign(hexToBytes(digest), privateKey));
 }
 export function createTickRequest(privateKey, feeUtxos, authMethod) {
+    return buildRequest(privateKey, feeUtxos, "tick-utxo", authMethod);
+}
+/**
+ * A request issued at a price feed. The network answers it with the rate the
+ * round was issued at and its signature over that rate, which
+ * {@link verifySignedPriceData} checks.
+ */
+export function createSignedPriceRequest(privateKey, feeUtxos, priceFeedId, authMethod) {
+    if (!Number.isInteger(priceFeedId) ||
+        priceFeedId < 0 ||
+        priceFeedId > 0xffffffff) {
+        throw new Error("price feed id must be an unsigned 32-bit integer");
+    }
+    return buildRequest(privateKey, feeUtxos, "signed-price-data", authMethod, priceFeedId);
+}
+function buildRequest(privateKey, feeUtxos, kind, authMethod, priceFeedId) {
     assertPrivateKey(privateKey);
     if (feeUtxos.length === 0 ||
         feeUtxos.some((outpoint) => !OUTPOINT.test(outpoint))) {
@@ -126,14 +142,19 @@ export function createTickRequest(privateKey, feeUtxos, authMethod) {
         auth_data: publicKey,
     };
     validateAuthMethod(selectedAuth);
-    const payload = JSON.stringify({ utxo_auth_method: selectedAuth });
+    // The network rejects a payload carrying any field it does not know, and a
+    // plain Tick must name no feed at all, so the key is present only for a
+    // priced request and spelled as the specification spells it.
+    const payload = JSON.stringify(priceFeedId === undefined
+        ? { utxo_auth_method: selectedAuth }
+        : { utxo_auth_method: selectedAuth, price_feed_id: priceFeedId });
     const request = {
         header: {
             signature: "",
             public_key: publicKey,
             fee_utxos: [...feeUtxos],
         },
-        requests: [{ kind: "tick-utxo", payload }],
+        requests: [{ kind, payload }],
     };
     request.header.signature = bytesToHex(schnorr.sign(tickRequestSigningHash(request), privateKey));
     return request;
