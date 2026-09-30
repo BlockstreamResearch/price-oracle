@@ -404,6 +404,7 @@ mod tests {
                     auth_method: "signature-auth".into(),
                     auth_data: vec![4; 32],
                     account_owner_pubkey: [5; 32],
+                    internal_key: None,
                     burning_fee_txid: [6; 32],
                     burning_fee_output_index: 7,
                     block_height: 1,

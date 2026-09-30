@@ -11,10 +11,10 @@ use contracts::artifacts::{
         TreasuryProgram,
         derived_treasury::{TreasuryArguments, TreasuryWitness},
     },
-    voucher::{VoucherProgram, derived_voucher::VoucherArguments},
 };
 use secp256k1_zkp::{
-    Message, PublicKey, RangeProof, Secp256k1, SurjectionProof, XOnlyPublicKey, schnorr::Signature,
+    Message, PublicKey, RangeProof, Secp256k1, SecretKey, SurjectionProof, XOnlyPublicKey,
+    schnorr::Signature,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Number;
@@ -32,7 +32,6 @@ use simplex::{
         FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
         partial_input::IssuanceInput, utxo::UTXO,
     },
-    utils::hash_script,
 };
 use url::Url;
 
@@ -41,7 +40,7 @@ use crate::{
     config::{ElementsRpcConfig, ProtocolConfig},
     db::{
         monitored_utxo::MonitoredUtxoStore,
-        network_asset::{NetworkAssetStore, STORM_EYE_KIND, TICK_ASSET_KIND},
+        network_asset::{NetworkAssetStore, ORACLE_VERIFIER_KIND, STORM_EYE_KIND, TICK_ASSET_KIND},
         user_request::{FeeUtxo, UserRequestStore},
     },
     external_api::{
@@ -52,13 +51,14 @@ use crate::{
     },
 };
 use price_feed::{FeedId, PriceFeedData};
+use storm_tree::StormTreeBranch;
 
 use super::{
     SigningResult,
     assets::{
         StormEyeContractData, TickAssetContractData, storm_eye_program, treasury_blinding_secret,
     },
-    issuance::{IssuedTickDescriptor, MAX_ISSUED_TICK_DESCRIPTORS},
+    issuance::{IssuedUtxoDescriptor, MAX_ISSUED_DESCRIPTORS},
     message::{ExecuteUserRequests, ExternalRequests},
     prices::{Prices, price_hash},
     signing::{SIGNING_SESSION_TIMEOUT, SigningError},
@@ -80,6 +80,11 @@ const MAX_MEMPOOL_TOKEN_CHAIN_LENGTH: usize = 100;
 pub(crate) const STORM_EYE_TAG: &str = "OracleNetworkV1/StormEye";
 const MAX_REQUESTS_PER_ROUND: u32 = 100;
 const STORM_EYE_AUTH_WITNESS_TEMPLATE: [usize; 4] = [512, 2_048, 32, 129];
+/// Verifier key until an attempt sets the branch (secp256k1 generator).
+const PLACEHOLDER_SIGNER: StormTreeBranch = [
+    0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b, 0x07,
+    0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+];
 pub(crate) type PackedStormTreeProof =
     [Either<(), (bool, [u8; 32])>; storm_tree::TREE_DEPTH as usize];
 
@@ -91,15 +96,30 @@ pub(crate) enum StormEyePool {
 
 pub(crate) struct PreparedRound {
     pub(crate) request: ExecuteUserRequests,
+    pub(crate) transaction: RoundTransaction,
     final_transaction: FinalTransaction,
-    pset: PartiallySignedTransaction,
     spent_utxos: Vec<TxOut>,
     request_results: Vec<PreparedRequestResult>,
-    network: SimplicityNetwork,
-    storm_eye: NetworkAsset,
     max_transaction_weight: usize,
     instructed: Option<PriceFeedData>,
-    timestamp: u64,
+}
+
+/// Issuance tx before its signing branch is known.
+#[derive(Clone)]
+pub(crate) struct RoundTransaction {
+    pset: PartiallySignedTransaction,
+    descriptors: Vec<IssuedUtxoDescriptor>,
+    descriptor_output: usize,
+    storm_eye: NetworkAsset,
+    network: SimplicityNetwork,
+}
+
+/// A token a round spends and the amount it reissues.
+struct RoundToken {
+    asset: NetworkAsset,
+    utxo: UTXO,
+    secrets: TxOutSecrets,
+    issuance_amount: u64,
 }
 
 struct PreparedRequestResult {
@@ -126,12 +146,9 @@ struct TickUtxoDetails {
     timestamp: u64,
 }
 
-/// What a `signed-price-data` request receives: the Tick UTXO a `tick-utxo`
-/// request would have produced, and the rate the round was issued at with the
-/// network signature over it.
+/// Payload of a `signed-price-data` result.
 #[derive(Serialize)]
 struct SignedPriceDataDetails {
-    timestamp: u64,
     price_data: String,
     storm_tree_bloom: StormTreeBloom,
 }
@@ -228,15 +245,18 @@ impl UserRequestProcessor {
             .get(STORM_EYE_KIND)
             .await?
             .ok_or(UserRequestError::MissingAsset(STORM_EYE_KIND))?;
-        let tick_asset = self
-            .assets
-            .get(TICK_ASSET_KIND)
-            .await?
-            .ok_or(UserRequestError::MissingAsset(TICK_ASSET_KIND))?;
+        let tick_asset = self.assets.get(TICK_ASSET_KIND).await?;
+        let verifier_asset = self.assets.get(ORACLE_VERIFIER_KIND).await?;
         let network = self.network()?;
 
-        let instructed =
-            validate_execute_request(request, &storm_eye, &tick_asset, &self.config, &network)?;
+        let instructed = validate_execute_request(
+            request,
+            &storm_eye,
+            tick_asset.as_ref(),
+            verifier_asset.as_ref(),
+            &self.config,
+            &network,
+        )?;
         if let Some(instructed) = instructed {
             self.prices.validate_instruction(&instructed).await?;
         }
@@ -314,11 +334,6 @@ impl UserRequestProcessor {
             .get(STORM_EYE_KIND)
             .await?
             .ok_or(UserRequestError::MissingAsset(STORM_EYE_KIND))?;
-        let tick_asset = self
-            .assets
-            .get(TICK_ASSET_KIND)
-            .await?
-            .ok_or(UserRequestError::MissingAsset(TICK_ASSET_KIND))?;
         let network = self.network()?;
         let rpc = self.client()?;
         let storm_eye_utxo = find_contract_utxo(
@@ -327,17 +342,13 @@ impl UserRequestProcessor {
             Some(storm_eye.asset_id),
             StormEyePool::UserRequests(storm_eye_lane),
         )?;
-        let token_utxo = find_token_utxo(&rpc, &tick_asset)?;
-        let token_secrets = token_utxo
-            .secrets
-            .ok_or_else(|| UserRequestError::Invalid("Tick token secrets are missing".into()))?;
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| UserRequestError::Clock)?
             .as_secs();
         let mut decoded = Vec::with_capacity(pending.len());
-        let mut tick_count = 0usize;
+        let mut issued_count = 0usize;
         // One round is issued at one feed; batches naming another wait.
         let mut instructed: Option<PriceFeedData> = None;
         // The queue is walked in pages, not taken as one window, so a run of
@@ -414,7 +425,7 @@ impl UserRequestProcessor {
                         .await?
                     {
                         unavailable = Some(format!(
-                            "fee UTXO '{outpoint}' is reserved for burning issued Ticks"
+                            "fee UTXO '{outpoint}' is reserved for burning issued UTXOs"
                         ));
                         break;
                     }
@@ -447,10 +458,10 @@ impl UserRequestProcessor {
                     continue;
                 }
 
-                if tick_count + request.requests.len() > MAX_ISSUED_TICK_DESCRIPTORS {
+                if issued_count + request.requests.len() > MAX_ISSUED_DESCRIPTORS {
                     break 'fill;
                 }
-                tick_count += request.requests.len();
+                issued_count += request.requests.len();
                 instructed = carried;
                 decoded.push((stored, request, resolved_fee_utxos, named_feed));
                 if decoded.len() >= request_limit as usize {
@@ -476,9 +487,29 @@ impl UserRequestProcessor {
         if decoded.is_empty() {
             return Ok(None);
         }
-        let issuance_amount = timestamp
-            .checked_mul(tick_count as u64)
-            .ok_or_else(|| UserRequestError::Invalid("Tick issuance amount overflow".into()))?;
+        let verifier_count = decoded
+            .iter()
+            .flat_map(|(_, request, _, _)| &request.requests)
+            .filter(|user_request| issues_verifier(&user_request.kind))
+            .count();
+        let tick_count = issued_count - verifier_count;
+        // Each token reissues the sum of its asset's outputs.
+        let mut tokens = Vec::with_capacity(2);
+        let mut tick_asset_id = None;
+        let mut verifier_asset_id = None;
+        if tick_count > 0 {
+            let asset = self.asset(TICK_ASSET_KIND).await?;
+            tick_asset_id = Some(asset_id(asset.asset_id)?);
+            let amount = timestamp
+                .checked_mul(tick_count as u64)
+                .ok_or_else(|| UserRequestError::Invalid("Tick issuance amount overflow".into()))?;
+            tokens.push(RoundToken::find(&rpc, asset, amount)?);
+        }
+        if verifier_count > 0 {
+            let asset = self.asset(ORACLE_VERIFIER_KIND).await?;
+            verifier_asset_id = Some(asset_id(asset.asset_id)?);
+            tokens.push(RoundToken::find(&rpc, asset, verifier_count as u64)?);
+        }
 
         let mut final_transaction = FinalTransaction::new();
         let auth_program = storm_eye_program(&storm_eye)?;
@@ -508,36 +539,33 @@ impl UserRequestProcessor {
         let treasury = TreasuryProgram::new(&TreasuryArguments {
             storm_eye_asset_id: storm_eye.asset_id,
         });
-        final_transaction.add_program_issuance_input(
-            PartialInput::new(token_utxo.clone()),
-            ProgramInput::new(
-                Box::new(treasury.as_ref().clone()),
-                Box::new(TreasuryWitness {
-                    storm_eye_input_index: 0,
-                }),
-            ),
-            IssuanceInput::new_reissuance(
-                issuance_amount,
-                tick_asset
-                    .entropy
-                    .ok_or_else(|| UserRequestError::Invalid("Tick entropy is missing".into()))?,
-            ),
-            RequiredSignature::None,
-        );
+        for token in &tokens {
+            final_transaction.add_program_issuance_input(
+                PartialInput::new(token.utxo.clone()),
+                ProgramInput::new(
+                    Box::new(treasury.as_ref().clone()),
+                    Box::new(TreasuryWitness {
+                        storm_eye_input_index: 0,
+                    }),
+                ),
+                IssuanceInput::new_reissuance(
+                    token.issuance_amount,
+                    token.asset.entropy.ok_or_else(|| {
+                        UserRequestError::Invalid(format!(
+                            "{} entropy is missing",
+                            token.asset.name
+                        ))
+                    })?,
+                ),
+                RequiredSignature::None,
+            );
+        }
 
         let policy_asset = network.policy_asset();
-        let tick_asset_id = asset_id(tick_asset.asset_id)?;
-        let mut spent_utxo_secrets = vec![
-            explicit_txout_secrets(&storm_eye_utxo.txout)?,
-            token_secrets,
-            TxOutSecrets::new(
-                tick_asset_id,
-                confidential::AssetBlindingFactor::zero(),
-                issuance_amount,
-                confidential::ValueBlindingFactor::zero(),
-            ),
-        ];
-        let mut spent_utxos = vec![storm_eye_utxo.txout.clone(), token_utxo.txout.clone()];
+        let mut spent_utxo_secrets = vec![explicit_txout_secrets(&storm_eye_utxo.txout)?];
+        spent_utxo_secrets.extend(token_input_secrets(&tokens)?);
+        let mut spent_utxos = vec![storm_eye_utxo.txout.clone()];
+        spent_utxos.extend(tokens.iter().map(|token| token.utxo.txout.clone()));
         let mut account_balances = Vec::with_capacity(decoded.len());
         for (_, request, fee_utxos, _) in &decoded {
             let owner = decode_array(&request.header.public_key)?;
@@ -569,34 +597,60 @@ impl UserRequestProcessor {
         }
 
         final_transaction.add_output(output_from_utxo(&storm_eye_utxo));
-        final_transaction.add_output(output_from_utxo(&token_utxo));
+        for token in &tokens {
+            final_transaction.add_output(output_from_utxo(&token.utxo));
+        }
+        let first_reserve_output = 1 + tokens.len() + issued_count;
         let mut request_results = Vec::with_capacity(decoded.len());
-        let mut descriptor_data = Vec::with_capacity(tick_count);
+        let mut descriptors = Vec::with_capacity(issued_count);
         for (request_index, (stored, request, _, _)) in decoded.iter().enumerate() {
             let mut results = Vec::with_capacity(request.requests.len());
             let owner = decode_array(&request.header.public_key)?;
+            let reserve_output_index = u32::try_from(first_reserve_output + request_index)
+                .map_err(|_| UserRequestError::Invalid("reserve output index overflow".into()))?;
             for user_request in &request.requests {
                 let details: TickUtxoRequestDetails = serde_json::from_str(&user_request.payload)?;
                 let vout = final_transaction.n_outputs();
+                let verifier = issues_verifier(&user_request.kind);
+                let descriptor = IssuedUtxoDescriptor::from_request(
+                    u32::try_from(vout).map_err(|_| {
+                        UserRequestError::Invalid("issued output index overflow".into())
+                    })?,
+                    reserve_output_index,
+                    owner,
+                    &details.utxo_auth_method,
+                    verifier.then_some(PLACEHOLDER_SIGNER),
+                )
+                .map_err(UserRequestError::Invalid)?;
+                // Filled in once the rate is signed.
+                let (amount, asset, payload) = if verifier {
+                    (
+                        1,
+                        verifier_asset_id.expect("a round with Verifiers reissues them"),
+                        String::new(),
+                    )
+                } else {
+                    (
+                        timestamp,
+                        tick_asset_id.expect("a round with Ticks reissues them"),
+                        serde_json::to_string(&TickUtxoDetails { timestamp })?,
+                    )
+                };
                 final_transaction.add_output(PartialOutput::new(
-                    tick_program(storm_eye.asset_id, &details)?.get_script_pubkey(&network),
-                    timestamp,
-                    tick_asset_id,
+                    descriptor
+                        .voucher_program(storm_eye.asset_id)
+                        .map_err(UserRequestError::Invalid)?
+                        .get_script_pubkey(&network),
+                    amount,
+                    asset,
                 ));
                 results.push(RequestResult {
                     kind: user_request.kind.clone(),
                     vout: vout as u64,
-                    auth_method: details.utxo_auth_method.clone(),
-                    payload: serde_json::to_string(&TickUtxoDetails { timestamp })?,
+                    auth_method: details.utxo_auth_method,
+                    payload,
                 });
-                descriptor_data.push((
-                    u32::try_from(vout).map_err(|_| {
-                        UserRequestError::Invalid("Tick output index overflow".into())
-                    })?,
-                    request_index,
-                    owner,
-                    details.utxo_auth_method,
-                ));
+                descriptors.push(descriptor);
             }
             request_results.push(PreparedRequestResult {
                 request_hash: stored.request_hash,
@@ -620,27 +674,13 @@ impl UserRequestProcessor {
                 policy_asset,
             ));
         }
-        let first_reserve_output = 2 + tick_count;
-        let mut descriptors = Vec::with_capacity(descriptor_data.len());
-        for (tick_output_index, request_index, owner, auth_method) in descriptor_data {
-            let reserve_output_index = u32::try_from(first_reserve_output + request_index)
-                .map_err(|_| UserRequestError::Invalid("reserve output index overflow".into()))?;
-            descriptors.push(
-                IssuedTickDescriptor::from_request(
-                    tick_output_index,
-                    reserve_output_index,
-                    owner,
-                    &auth_method,
-                )
-                .map_err(UserRequestError::Invalid)?,
-            );
-        }
+        let descriptor_output = final_transaction.n_outputs();
         let descriptor_script =
-            IssuedTickDescriptor::script_pubkey(&descriptors).map_err(UserRequestError::Invalid)?;
+            IssuedUtxoDescriptor::script_pubkey(&descriptors).map_err(UserRequestError::Invalid)?;
         final_transaction.add_output(PartialOutput::new(descriptor_script, 0, policy_asset));
         final_transaction.add_output(PartialOutput::new(
             treasury.get_script_pubkey(&network),
-            self.config.operational_fee_sats * tick_count as u64,
+            self.config.operational_fee_sats * issued_count as u64,
             policy_asset,
         ));
         final_transaction.add_output(PartialOutput::new(
@@ -650,74 +690,18 @@ impl UserRequestProcessor {
         ));
 
         let (mut pset, _) = final_transaction.extract_pst();
-        let output_secrets = pset
-            .outputs()
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != 1)
-            .map(|(_, output)| explicit_txout_secrets(&output.to_txout()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_secret_refs = output_secrets.iter().collect::<Vec<_>>();
-        let secp = Secp256k1::new();
-        let treasury_blinding_public_key =
-            PublicKey::from_secret_key(&secp, &treasury_blinding_secret());
-        let (token_output, _, _, _) = TxOut::new_last_confidential(
-            &mut secp256k1_zkp::rand::thread_rng(),
-            &secp,
-            token_secrets.value,
-            token_secrets.asset,
-            token_utxo.txout.script_pubkey.clone(),
-            treasury_blinding_public_key,
-            &spent_utxo_secrets,
-            &output_secret_refs,
-        )
-        .map_err(|_| UserRequestError::Invalid("failed to reblind Tick token".into()))?;
-        let mut token_pset_output =
-            simplex::simplicityhl::elements::pset::Output::from_txout(token_output);
-        token_pset_output.blinding_key = Some(
-            simplex::simplicityhl::elements::bitcoin::PublicKey::new(treasury_blinding_public_key),
-        );
-        token_pset_output.blinder_index = Some(1);
-        pset.outputs_mut()[1] = token_pset_output;
-        let token_input = &mut pset.inputs_mut()[1];
-        let token_asset_commitment = token_utxo
-            .txout
-            .asset
-            .commitment()
-            .ok_or_else(|| UserRequestError::Invalid("Tick token asset is explicit".into()))?;
-        let token_value_commitment = token_utxo
-            .txout
-            .value
-            .commitment()
-            .ok_or_else(|| UserRequestError::Invalid("Tick token value is explicit".into()))?;
-        token_input.asset = Some(token_secrets.asset);
-        token_input.amount = Some(token_secrets.value);
-        token_input.blind_asset_proof = Some(Box::new(
-            SurjectionProof::blind_asset_proof(
-                &mut secp256k1_zkp::rand::thread_rng(),
-                &secp,
-                token_secrets.asset,
-                token_secrets.asset_bf,
-            )
-            .map_err(|_| UserRequestError::Invalid("failed to prove Tick token asset".into()))?,
-        ));
-        token_input.blind_value_proof = Some(Box::new(
-            RangeProof::blind_value_proof(
-                &mut secp256k1_zkp::rand::thread_rng(),
-                &secp,
-                token_secrets.value,
-                token_value_commitment,
-                token_asset_commitment,
-                token_secrets.value_bf,
-            )
-            .map_err(|_| UserRequestError::Invalid("failed to prove Tick token value".into()))?,
-        ));
-        let env = auth_program.as_ref().get_env(&pset, 0, &network)?;
-        let sighash = env.c_tx_env().sighash_all().to_byte_array();
+        reblind_tokens(&mut pset, &tokens, &spent_utxo_secrets)?;
+        let transaction = RoundTransaction {
+            pset,
+            descriptors,
+            descriptor_output,
+            storm_eye,
+            network,
+        };
         // This hash covers the transaction; the rate is the round's second
         // signed message. Fold it in here once a covenant field records it
         // on-chain, so the issuance itself commits to the price.
-        let signing_hash = SigMessage::Tagged(STORM_EYE_TAG.to_string()).digest(sighash);
+        let (pset, signing_hash) = transaction.for_branch(PLACEHOLDER_SIGNER)?;
         let external_requests = decoded
             .iter()
             .map(|(stored, _, _, named_feed)| ExternalRequests {
@@ -726,26 +710,31 @@ impl UserRequestProcessor {
                 additional_payload: batch_payload(*named_feed, instructed.as_ref()),
             })
             .collect();
+        // Placeholder branch; each attempt names its real one.
         let request = ExecuteUserRequests {
             tx: encode::serialize(&pset),
             signing_hash,
-            signing_storm_tree_branch: signing_branch,
+            signing_storm_tree_branch: PLACEHOLDER_SIGNER,
             external_requests,
             chain_tip: None,
         };
 
         Ok(Some(PreparedRound {
             request,
+            transaction,
             final_transaction,
-            pset,
             spent_utxos,
             request_results,
-            network,
-            storm_eye,
             max_transaction_weight,
             instructed,
-            timestamp,
         }))
+    }
+
+    async fn asset(&self, kind: &'static str) -> Result<NetworkAsset, UserRequestError> {
+        self.assets
+            .get(kind)
+            .await?
+            .ok_or(UserRequestError::MissingAsset(kind))
     }
 
     pub(crate) async fn storm_eye_utxo_count(&self) -> Result<usize, UserRequestError> {
@@ -778,11 +767,14 @@ impl UserRequestProcessor {
             .map_err(|_| UserRequestError::Invalid("invalid Storm Eye signing branch".into()))?;
         let signature = Signature::from_slice(&signature)
             .map_err(|_| UserRequestError::Invalid("invalid Storm Eye signature".into()))?;
+        // The tx for the branch that signed.
+        let (mut pset, signing_hash) = prepared
+            .transaction
+            .for_branch(signing.signing_storm_tree_branch)?;
         Secp256k1::verification_only()
             .verify_schnorr(
                 &signature,
-                &Message::from_digest_slice(&prepared.request.signing_hash)
-                    .expect("the signing hash has 32 bytes"),
+                &Message::from_digest_slice(&signing_hash).expect("the signing hash has 32 bytes"),
                 &branch_key,
             )
             .map_err(|_| {
@@ -796,10 +788,12 @@ impl UserRequestProcessor {
             .transpose()?;
         let signature = *signature.as_ref();
         let mut transaction = prepared.final_transaction;
+        let storm_eye = &prepared.transaction.storm_eye;
+        let network = &prepared.transaction.network;
         let contract_data: StormEyeContractData =
-            postcard::from_bytes(prepared.storm_eye.contract_data.as_deref().ok_or_else(
-                || UserRequestError::Invalid("Storm Eye contract data is missing".into()),
-            )?)?;
+            postcard::from_bytes(storm_eye.contract_data.as_deref().ok_or_else(|| {
+                UserRequestError::Invalid("Storm Eye contract data is missing".into())
+            })?)?;
         if !storm_tree::StormTree::verify_branch(
             &contract_data.storm_tree_root,
             &signing.signing_storm_tree_branch,
@@ -822,7 +816,6 @@ impl UserRequestProcessor {
             )),
         });
 
-        let mut pset = prepared.pset;
         for (index, input) in transaction.inputs().iter().enumerate() {
             let Some(program_input) = &input.program_input else {
                 continue;
@@ -833,7 +826,7 @@ impl UserRequestProcessor {
                     &pset,
                     &program_input.witness.build_witness(),
                     index,
-                    &prepared.network,
+                    network,
                 )
                 .map_err(|error| {
                     UserRequestError::Invalid(format!(
@@ -842,16 +835,9 @@ impl UserRequestProcessor {
                 })?;
             pset.inputs_mut()[index].final_script_witness = Some(final_witness);
         }
-        let storm_eye_program = storm_eye_program(&prepared.storm_eye)?;
-        let final_env = storm_eye_program
-            .as_ref()
-            .get_env(&pset, 0, &prepared.network)?;
-        let final_sighash = final_env.c_tx_env().sighash_all().to_byte_array();
-        let final_signing_hash =
-            SigMessage::Tagged(STORM_EYE_TAG.to_string()).digest(final_sighash);
-        if final_signing_hash != prepared.request.signing_hash {
+        if issuance_signing_hash(&pset, storm_eye, network)? != signing_hash {
             return Err(UserRequestError::Invalid(
-                "final Tick issuance signing hash changed".into(),
+                "final issuance signing hash changed".into(),
             ));
         }
         let final_tx = pset
@@ -866,13 +852,13 @@ impl UserRequestProcessor {
         }
         verify_tx_amt_proofs(&final_tx, &prepared.spent_utxos).map_err(|error| {
             UserRequestError::Invalid(format!(
-                "failed to verify Tick issuance amounts and proofs: {error}"
+                "failed to verify issuance amounts and proofs: {error}"
             ))
         })?;
         let txid = final_tx.txid().to_string();
         let final_bytes = encode::serialize(&final_tx);
         let transaction_hex = hex::encode(&final_bytes);
-        tracing::debug!(%txid, "prepared Tick issuance transaction");
+        tracing::debug!(%txid, "prepared issuance transaction");
         let client = self.client()?;
         let broadcast_txid: String =
             client.call("sendrawtransaction", &[transaction_hex.into()])?;
@@ -898,17 +884,18 @@ impl UserRequestProcessor {
         let mut updated = 0;
         for result in prepared.request_results {
             let mut results = result.results;
-            if let Some((price_data, bloom)) = &signed_price {
-                for issued in results
-                    .iter_mut()
-                    .filter(|issued| issued.kind == PRICE_REQUEST_KIND)
-                {
-                    issued.payload = serde_json::to_string(&SignedPriceDataDetails {
-                        timestamp: prepared.timestamp,
-                        price_data: price_data.clone(),
-                        storm_tree_bloom: bloom.clone(),
-                    })?;
-                }
+            for issued in results
+                .iter_mut()
+                .filter(|issued| issues_verifier(&issued.kind))
+            {
+                // A priced batch always sets the rate.
+                let (price_data, bloom) = signed_price
+                    .as_ref()
+                    .expect("a round issuing Verifiers carries a signed rate");
+                issued.payload = serde_json::to_string(&SignedPriceDataDetails {
+                    price_data: price_data.clone(),
+                    storm_tree_bloom: bloom.clone(),
+                })?;
             }
             let payload = serde_json::to_vec(&NetworkRequestsResult {
                 txid: txid.clone(),
@@ -1013,8 +1000,224 @@ impl UserRequestProcessor {
 
 impl PreparedRound {
     fn estimated_weight(&self) -> Result<usize, UserRequestError> {
-        finalized_dummy_weight(&self.final_transaction, &self.pset, &self.network)
+        finalized_dummy_weight(
+            &self.final_transaction,
+            &self.transaction.pset,
+            &self.transaction.network,
+        )
     }
+}
+
+impl RoundTransaction {
+    /// The tx with Verifiers committed to `branch`, and its signing hash.
+    pub(crate) fn for_branch(
+        &self,
+        branch: StormTreeBranch,
+    ) -> Result<(PartiallySignedTransaction, [u8; 32]), UserRequestError> {
+        let mut pset = self.pset.clone();
+        if self
+            .descriptors
+            .iter()
+            .any(IssuedUtxoDescriptor::is_verifier)
+        {
+            let descriptors = committed_to(&self.descriptors, branch);
+            for descriptor in descriptors
+                .iter()
+                .filter(|descriptor| descriptor.is_verifier())
+            {
+                pset.outputs_mut()[descriptor.output_index as usize].script_pubkey = descriptor
+                    .voucher_program(self.storm_eye.asset_id)
+                    .map_err(UserRequestError::Invalid)?
+                    .get_script_pubkey(&self.network);
+            }
+            pset.outputs_mut()[self.descriptor_output].script_pubkey =
+                IssuedUtxoDescriptor::script_pubkey(&descriptors)
+                    .map_err(UserRequestError::Invalid)?;
+        }
+        let signing_hash = issuance_signing_hash(&pset, &self.storm_eye, &self.network)?;
+
+        Ok((pset, signing_hash))
+    }
+}
+
+impl RoundToken {
+    fn find(
+        client: &Client,
+        asset: NetworkAsset,
+        issuance_amount: u64,
+    ) -> Result<Self, UserRequestError> {
+        let utxo = find_token_utxo(client, &asset)?;
+        let secrets = utxo.secrets.ok_or_else(|| {
+            UserRequestError::Invalid(format!("{} token secrets are missing", asset.name))
+        })?;
+
+        Ok(Self {
+            asset,
+            utxo,
+            secrets,
+            issuance_amount,
+        })
+    }
+}
+
+/// Sets `branch` as every Verifier's signer.
+fn committed_to(
+    descriptors: &[IssuedUtxoDescriptor],
+    branch: StormTreeBranch,
+) -> Vec<IssuedUtxoDescriptor> {
+    descriptors
+        .iter()
+        .cloned()
+        .map(|mut descriptor| {
+            if descriptor.is_verifier() {
+                descriptor.signer = Some(branch);
+            }
+            descriptor
+        })
+        .collect()
+}
+
+fn issuance_signing_hash(
+    pset: &PartiallySignedTransaction,
+    storm_eye: &NetworkAsset,
+    network: &SimplicityNetwork,
+) -> Result<[u8; 32], UserRequestError> {
+    let env = storm_eye_program(storm_eye)?
+        .as_ref()
+        .get_env(pset, 0, network)
+        .map_err(|error| {
+            UserRequestError::Invalid(format!("cannot derive Storm Eye sighash: {error}"))
+        })?;
+
+    Ok(SigMessage::Tagged(STORM_EYE_TAG.to_string())
+        .digest(env.c_tx_env().sighash_all().to_byte_array()))
+}
+
+/// `signed-price-data` issues a Verifier, anything else a Tick.
+fn issues_verifier(request_kind: &str) -> bool {
+    request_kind == PRICE_REQUEST_KIND
+}
+
+/// Surjection inputs of the token inputs: each token, then what it reissues,
+/// in the order consensus builds the domain.
+fn token_input_secrets(tokens: &[RoundToken]) -> Result<Vec<TxOutSecrets>, UserRequestError> {
+    let mut secrets = Vec::with_capacity(tokens.len() * 2);
+    for token in tokens {
+        secrets.push(token.secrets);
+        secrets.push(TxOutSecrets::new(
+            asset_id(token.asset.asset_id)?,
+            confidential::AssetBlindingFactor::zero(),
+            token.issuance_amount,
+            confidential::ValueBlindingFactor::zero(),
+        ));
+    }
+    Ok(secrets)
+}
+
+/// Reblinds token outputs to the Treasury; the last balances them.
+fn reblind_tokens(
+    pset: &mut PartiallySignedTransaction,
+    tokens: &[RoundToken],
+    spent_utxo_secrets: &[TxOutSecrets],
+) -> Result<(), UserRequestError> {
+    let token_indexes = 1..=tokens.len();
+    let mut output_secrets = pset
+        .outputs()
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !token_indexes.contains(index))
+        .map(|(_, output)| explicit_txout_secrets(&output.to_txout()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let secp = Secp256k1::new();
+    let treasury_blinding_public_key =
+        PublicKey::from_secret_key(&secp, &treasury_blinding_secret());
+    for (offset, token) in tokens.iter().enumerate() {
+        let index = 1 + offset;
+        let name = &token.asset.name;
+        let mut rng = secp256k1_zkp::rand::thread_rng();
+        let script = token.utxo.txout.script_pubkey.clone();
+        let token_output = if index == tokens.len() {
+            let output_secret_refs = output_secrets.iter().collect::<Vec<_>>();
+            TxOut::new_last_confidential(
+                &mut rng,
+                &secp,
+                token.secrets.value,
+                token.secrets.asset,
+                script,
+                treasury_blinding_public_key,
+                spent_utxo_secrets,
+                &output_secret_refs,
+            )
+            .map(|(output, _, _, _)| output)
+        } else {
+            let secrets = TxOutSecrets::new(
+                token.secrets.asset,
+                confidential::AssetBlindingFactor::new(&mut rng),
+                token.secrets.value,
+                confidential::ValueBlindingFactor::new(&mut rng),
+            );
+            output_secrets.push(secrets);
+            let ephemeral_key = SecretKey::new(&mut rng);
+            TxOut::with_txout_secrets(
+                &mut rng,
+                &secp,
+                script,
+                treasury_blinding_public_key,
+                ephemeral_key,
+                secrets,
+                spent_utxo_secrets,
+            )
+        }
+        .map_err(|_| UserRequestError::Invalid(format!("failed to reblind {name} token")))?;
+        let mut token_pset_output =
+            simplex::simplicityhl::elements::pset::Output::from_txout(token_output);
+        token_pset_output.blinding_key = Some(
+            simplex::simplicityhl::elements::bitcoin::PublicKey::new(treasury_blinding_public_key),
+        );
+        token_pset_output.blinder_index = Some(
+            u32::try_from(index)
+                .map_err(|_| UserRequestError::Invalid("token input index overflow".into()))?,
+        );
+        pset.outputs_mut()[index] = token_pset_output;
+
+        let token_input = &mut pset.inputs_mut()[index];
+        let token_asset_commitment =
+            token.utxo.txout.asset.commitment().ok_or_else(|| {
+                UserRequestError::Invalid(format!("{name} token asset is explicit"))
+            })?;
+        let token_value_commitment =
+            token.utxo.txout.value.commitment().ok_or_else(|| {
+                UserRequestError::Invalid(format!("{name} token value is explicit"))
+            })?;
+        token_input.asset = Some(token.secrets.asset);
+        token_input.amount = Some(token.secrets.value);
+        token_input.blind_asset_proof = Some(Box::new(
+            SurjectionProof::blind_asset_proof(
+                &mut rng,
+                &secp,
+                token.secrets.asset,
+                token.secrets.asset_bf,
+            )
+            .map_err(|_| {
+                UserRequestError::Invalid(format!("failed to prove {name} token asset"))
+            })?,
+        ));
+        token_input.blind_value_proof = Some(Box::new(
+            RangeProof::blind_value_proof(
+                &mut rng,
+                &secp,
+                token.secrets.value,
+                token_value_commitment,
+                token_asset_commitment,
+                token.secrets.value_bf,
+            )
+            .map_err(|_| {
+                UserRequestError::Invalid(format!("failed to prove {name} token value"))
+            })?,
+        ));
+    }
+
+    Ok(())
 }
 
 pub(crate) fn finalized_dummy_weight(
@@ -1142,34 +1345,35 @@ fn storm_eye_pool_index(candidate_count: usize, pool: StormEyePool) -> Option<us
     Some(index)
 }
 
-fn find_token_utxo(client: &Client, tick_asset: &NetworkAsset) -> Result<UTXO, UserRequestError> {
+fn find_token_utxo(client: &Client, asset: &NetworkAsset) -> Result<UTXO, UserRequestError> {
+    let name = &asset.name;
     let token_id = asset_id(
-        tick_asset
+        asset
             .reissuance_token_id
-            .ok_or_else(|| UserRequestError::Invalid("Tick token id is missing".into()))?,
+            .ok_or_else(|| UserRequestError::Invalid(format!("{name} token id is missing")))?,
     )?;
-    let token_txout = tick_token_txout(tick_asset)?;
+    let token_txout = token_txout(asset)?;
     let secrets = token_txout
         .unblind(&Secp256k1::new(), treasury_blinding_secret())
-        .map_err(|_| UserRequestError::Invalid("failed to unblind Tick token".into()))?;
+        .map_err(|_| UserRequestError::Invalid(format!("failed to unblind {name} token")))?;
     if secrets.asset != token_id
-        || token_txout.script_pubkey.as_bytes() != tick_asset.contract_script
+        || token_txout.script_pubkey.as_bytes() != asset.contract_script
         || !token_txout.asset.is_confidential()
         || !token_txout.value.is_confidential()
     {
-        return Err(UserRequestError::Invalid(
-            "invalid confidential Tick token template".into(),
-        ));
+        return Err(UserRequestError::Invalid(format!(
+            "invalid confidential {name} token template"
+        )));
     }
 
-    let descriptor = format!("raw({})", hex::encode(&tick_asset.contract_script));
+    let descriptor = format!("raw({})", hex::encode(&asset.contract_script));
     let scan: ScanResult = client.call(
         "scantxoutset",
         &["start".into(), serde_json::json!([descriptor])],
     )?;
     for unspent in scan.unspents {
         let txid = Txid::from_str(&unspent.txid)
-            .map_err(|_| UserRequestError::Invalid("invalid Tick token txid".into()))?;
+            .map_err(|_| UserRequestError::Invalid(format!("invalid {name} token txid")))?;
         let transaction = get_raw_transaction(client, txid, unspent.height)?;
         let Some(candidate) = transaction.output.get(unspent.vout as usize).cloned() else {
             continue;
@@ -1178,20 +1382,15 @@ fn find_token_utxo(client: &Client, tick_asset: &NetworkAsset) -> Result<UTXO, U
             OutPoint::new(txid, unspent.vout),
             candidate,
             &secrets,
-            &tick_asset.contract_script,
+            &asset.contract_script,
         ) {
-            return follow_mempool_token_chain(
-                client,
-                token,
-                &secrets,
-                &tick_asset.contract_script,
-            );
+            return follow_mempool_token_chain(client, token, &secrets, &asset.contract_script);
         }
     }
 
-    Err(UserRequestError::Invalid(
-        "confidential Tick token UTXO is unavailable".into(),
-    ))
+    Err(UserRequestError::Invalid(format!(
+        "confidential {name} token UTXO is unavailable"
+    )))
 }
 
 fn follow_mempool_token_chain(
@@ -1277,22 +1476,23 @@ fn token_candidate(
     })
 }
 
-fn tick_token_txout(tick_asset: &NetworkAsset) -> Result<TxOut, UserRequestError> {
-    let contract_data: TickAssetContractData = postcard::from_bytes(
-        tick_asset
-            .contract_data
-            .as_deref()
-            .ok_or_else(|| UserRequestError::Invalid("Tick contract data is missing".into()))?,
-    )?;
+/// The asset's original token output.
+fn token_txout(asset: &NetworkAsset) -> Result<TxOut, UserRequestError> {
+    let name = &asset.name;
+    let contract_data: TickAssetContractData =
+        postcard::from_bytes(asset.contract_data.as_deref().ok_or_else(|| {
+            UserRequestError::Invalid(format!("{name} contract data is missing"))
+        })?)?;
 
     let transaction: simplex::simplicityhl::elements::Transaction =
-        encode::deserialize(&contract_data.issuance_tx)
-            .map_err(|_| UserRequestError::Invalid("invalid Tick issuance transaction".into()))?;
+        encode::deserialize(&contract_data.issuance_tx).map_err(|_| {
+            UserRequestError::Invalid(format!("invalid {name} issuance transaction"))
+        })?;
     transaction
         .output
         .get(contract_data.token_output_index as usize)
         .cloned()
-        .ok_or_else(|| UserRequestError::Invalid("invalid Tick token output index".into()))
+        .ok_or_else(|| UserRequestError::Invalid(format!("invalid {name} token output index")))
 }
 
 #[derive(Deserialize)]
@@ -1437,7 +1637,7 @@ fn get_raw_transaction(
     };
     encode::deserialize(
         &hex::decode(raw)
-            .map_err(|_| UserRequestError::Invalid("invalid Tick token transaction".into()))?,
+            .map_err(|_| UserRequestError::Invalid("invalid token transaction".into()))?,
     )
     .map_err(UserRequestError::Transaction)
 }
@@ -1488,7 +1688,8 @@ pub(crate) fn pack_proof(
 fn validate_execute_request(
     request: &ExecuteUserRequests,
     storm_eye: &NetworkAsset,
-    tick_asset: &NetworkAsset,
+    tick_asset: Option<&NetworkAsset>,
+    verifier_asset: Option<&NetworkAsset>,
     config: &ProtocolConfig,
     network: &SimplicityNetwork,
 ) -> Result<Option<PriceFeedData>, UserRequestError> {
@@ -1502,7 +1703,6 @@ fn validate_execute_request(
         ));
     }
 
-    let storm_eye_program = storm_eye_program(storm_eye)?;
     let storm_eye_input = witness_utxo(&pset, 0)?;
     let storm_eye_asset_id = asset_id(storm_eye.asset_id)?;
     require_explicit_utxo(
@@ -1513,20 +1713,242 @@ fn validate_execute_request(
     )?;
     require_preserved_output(&pset, 0, storm_eye_input, "Storm Eye")?;
 
-    let token_input = witness_utxo(&pset, 1)?;
-    let expected_token = tick_token_txout(tick_asset)?;
+    let mut batches = Vec::with_capacity(request.external_requests.len());
+    let mut instructed = None;
+    for external in &request.external_requests {
+        let request_hash: [u8; 32] = sha2::Sha256::digest(&external.network_user_requests).into();
+        if request_hash != external.request_hash {
+            return Err(UserRequestError::Invalid(
+                "external request hash mismatch".into(),
+            ));
+        }
+        let (user_request, fee_utxos, named_feed) =
+            validate_encoded_request(&external.network_user_requests)
+                .map_err(UserRequestError::Invalid)?;
+        instructed = instructed_price(
+            named_feed,
+            external.additional_payload.as_deref(),
+            instructed,
+        )?;
+        let owner = secp256k1_zkp::XOnlyPublicKey::from_slice(
+            &hex::decode(&user_request.header.public_key)
+                .map_err(|_| UserRequestError::Invalid("invalid requester public key".into()))?,
+        )
+        .map_err(|_| UserRequestError::Invalid("invalid requester public key".into()))?;
+        batches.push((user_request, fee_utxos, owner.serialize()));
+    }
+
+    // Token inputs follow the Storm Eye, Tick first.
+    let issued_count = batches
+        .iter()
+        .map(|(user_request, _, _)| user_request.requests.len())
+        .sum::<usize>();
+    let verifier_count = batches
+        .iter()
+        .flat_map(|(user_request, _, _)| &user_request.requests)
+        .filter(|user_request| issues_verifier(&user_request.kind))
+        .count();
+    let mut tokens = Vec::with_capacity(2);
+    if issued_count > verifier_count {
+        tokens.push(tick_asset.ok_or(UserRequestError::MissingAsset(TICK_ASSET_KIND))?);
+    }
+    if verifier_count > 0 {
+        tokens.push(verifier_asset.ok_or(UserRequestError::MissingAsset(ORACLE_VERIFIER_KIND))?);
+    }
+    for (offset, asset) in tokens.iter().enumerate() {
+        validate_token(&pset, 1 + offset, asset)?;
+    }
+    let first_fee_input = 1 + tokens.len();
+    let first_issued_output = 1 + tokens.len();
+
+    let mut expected_fee_inputs = 0usize;
+    let mut expected_account_scripts = Vec::with_capacity(batches.len());
+    for (user_request, fee_utxos, owner) in &batches {
+        let account_script = AccountProgram::new(&AccountArguments {
+            storm_eye_asset_id: storm_eye.asset_id,
+            account_owner_pubkey: *owner,
+        })
+        .get_script_pubkey(network);
+
+        let mut input_total = 0u64;
+        for fee_utxo in fee_utxos {
+            let input_index = first_fee_input + expected_fee_inputs;
+            let input = pset.inputs().get(input_index).ok_or_else(|| {
+                UserRequestError::Invalid("a submitted fee UTXO is missing".into())
+            })?;
+            let expected_txid =
+                simplex::simplicityhl::elements::Txid::from_str(&hex::encode(fee_utxo.txid))
+                    .map_err(|_| UserRequestError::Invalid("invalid fee UTXO txid".into()))?;
+            if input.previous_txid != expected_txid
+                || input.previous_output_index != fee_utxo.output_index
+                || input
+                    .witness_utxo
+                    .as_ref()
+                    .is_none_or(|utxo| utxo.script_pubkey != account_script)
+            {
+                return Err(UserRequestError::Invalid(
+                    "fee UTXO input does not match the signed user request".into(),
+                ));
+            }
+            let amount = input
+                .witness_utxo
+                .as_ref()
+                .and_then(|utxo| utxo.value.explicit())
+                .ok_or_else(|| UserRequestError::Invalid("fee UTXO must be explicit".into()))?;
+            input_total = input_total
+                .checked_add(amount)
+                .ok_or_else(|| UserRequestError::Invalid("fee input overflow".into()))?;
+            expected_fee_inputs += 1;
+        }
+        expected_account_scripts.push((account_script, user_request.requests.len(), input_total));
+    }
+    if pset.inputs().len() != first_fee_input + expected_fee_inputs {
+        return Err(UserRequestError::Invalid(
+            "issuance transaction has unrequested inputs".into(),
+        ));
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| UserRequestError::Clock)?
+        .as_secs();
+    let first_reserve_output = first_issued_output + issued_count;
+    let first_descriptor_output = first_reserve_output + expected_account_scripts.len();
+    // Verifiers commit to this message's branch.
+    let signer = request.signing_storm_tree_branch;
+    let mut issued_amounts = vec![0u64; tokens.len()];
+    let mut descriptors = Vec::with_capacity(issued_count);
+    for (request_index, (user_request, _, owner)) in batches.iter().enumerate() {
+        let reserve_output_index = u32::try_from(first_reserve_output + request_index)
+            .map_err(|_| UserRequestError::Invalid("reserve output index overflow".into()))?;
+        for issued in &user_request.requests {
+            let details: TickUtxoRequestDetails = serde_json::from_str(&issued.payload)
+                .map_err(|error| UserRequestError::Invalid(error.to_string()))?;
+            let output_index = first_issued_output + descriptors.len();
+            let verifier = issues_verifier(&issued.kind);
+            let descriptor = IssuedUtxoDescriptor::from_request(
+                u32::try_from(output_index).map_err(|_| {
+                    UserRequestError::Invalid("issued output index overflow".into())
+                })?,
+                reserve_output_index,
+                *owner,
+                &details.utxo_auth_method,
+                verifier.then_some(signer),
+            )
+            .map_err(UserRequestError::Invalid)?;
+            let output = pset.outputs().get(output_index).ok_or_else(|| {
+                UserRequestError::Invalid("a requested issued output is missing".into())
+            })?;
+            let amount = output.amount.ok_or_else(|| {
+                UserRequestError::Invalid("issued output amount is confidential".into())
+            })?;
+            let (token, asset) = if verifier {
+                if amount != 1 {
+                    return Err(UserRequestError::Invalid(
+                        "an Oracle Verifier is issued with an amount of one".into(),
+                    ));
+                }
+                (tokens.len() - 1, verifier_asset)
+            } else {
+                if amount.abs_diff(now) > MAX_TICK_TIME_SKEW_SECS {
+                    return Err(UserRequestError::Invalid(
+                        "Tick timestamp is outside the accepted window".into(),
+                    ));
+                }
+                (0, tick_asset)
+            };
+            let asset = asset.expect("the round reissues every asset it issues");
+            let expected_script = descriptor
+                .voucher_program(storm_eye.asset_id)
+                .map_err(UserRequestError::Invalid)?
+                .get_script_pubkey(network);
+            if output.asset != Some(asset_id(asset.asset_id)?)
+                || output.script_pubkey != expected_script
+            {
+                return Err(UserRequestError::Invalid(format!(
+                    "{} output does not match the request",
+                    asset.name
+                )));
+            }
+            issued_amounts[token] = issued_amounts[token].checked_add(amount).ok_or_else(|| {
+                UserRequestError::Invalid(format!("{} issuance amount overflow", asset.name))
+            })?;
+            descriptors.push(descriptor);
+        }
+    }
+    for (offset, (asset, issued_amount)) in tokens.iter().zip(issued_amounts).enumerate() {
+        let issuance_input = &pset.inputs()[1 + offset];
+        if issuance_input.issuance_value_amount != Some(issued_amount)
+            || issuance_input.issuance_asset_entropy != asset.entropy
+            || issuance_input.issuance_value_comm.is_some()
+            || issuance_input.issuance_value_rangeproof.is_some()
+            || issuance_input.in_issuance_blind_value_proof.is_some()
+        {
+            return Err(UserRequestError::Invalid(format!(
+                "{} reissuance metadata does not match the requested outputs",
+                asset.name
+            )));
+        }
+    }
+
+    let policy_asset = network.policy_asset();
+    let expected_descriptor_script =
+        IssuedUtxoDescriptor::script_pubkey(&descriptors).map_err(UserRequestError::Invalid)?;
+    let output = pset
+        .outputs()
+        .get(first_descriptor_output)
+        .ok_or_else(|| UserRequestError::Invalid("issued UTXO descriptor is missing".into()))?;
+    if output.asset != Some(policy_asset)
+        || output.amount != Some(0)
+        || output.script_pubkey != expected_descriptor_script
+    {
+        return Err(UserRequestError::Invalid(
+            "invalid issued UTXO descriptor".into(),
+        ));
+    }
+    validate_accounting_outputs(
+        &pset,
+        &expected_account_scripts,
+        tokens.len(),
+        issued_count,
+        storm_eye.asset_id,
+        policy_asset,
+        config,
+        network,
+    )?;
+
+    // The other half of the note at the coordinator's `signing_hash`: the rate
+    // validated above is not in what this re-derives, so it is not signed for.
+    if issuance_signing_hash(&pset, storm_eye, network)? != request.signing_hash {
+        return Err(UserRequestError::Invalid("signing hash mismatch".into()));
+    }
+
+    Ok(instructed)
+}
+
+/// The token at `index` is returned unchanged.
+fn validate_token(
+    pset: &PartiallySignedTransaction,
+    index: usize,
+    asset: &NetworkAsset,
+) -> Result<(), UserRequestError> {
+    let name = &asset.name;
+    let token_input = witness_utxo(pset, index)?;
+    let expected_token = token_txout(asset)?;
     let expected_token_secrets = expected_token
         .unblind(&Secp256k1::new(), treasury_blinding_secret())
-        .map_err(|_| UserRequestError::Invalid("failed to unblind Tick token template".into()))?;
-    let token_input_map = &pset.inputs()[1];
+        .map_err(|_| {
+            UserRequestError::Invalid(format!("failed to unblind {name} token template"))
+        })?;
+    let token_input_map = &pset.inputs()[index];
     let token_asset_commitment = token_input
         .asset
         .commitment()
-        .ok_or_else(|| UserRequestError::Invalid("Tick token asset is explicit".into()))?;
+        .ok_or_else(|| UserRequestError::Invalid(format!("{name} token asset is explicit")))?;
     let token_value_commitment = token_input
         .value
         .commitment()
-        .ok_or_else(|| UserRequestError::Invalid("Tick token value is explicit".into()))?;
+        .ok_or_else(|| UserRequestError::Invalid(format!("{name} token value is explicit")))?;
     let secp = Secp256k1::new();
     if token_input_map.asset != Some(expected_token_secrets.asset)
         || token_input_map.amount != Some(expected_token_secrets.value)
@@ -1555,204 +1977,30 @@ fn validate_execute_request(
                 )
             })
     {
-        return Err(UserRequestError::Invalid(
-            "invalid Tick reissuance token input".into(),
-        ));
+        return Err(UserRequestError::Invalid(format!(
+            "invalid {name} reissuance token input"
+        )));
     }
-    let token_output = pset.outputs()[1].to_txout();
+    let token_output = pset
+        .outputs()
+        .get(index)
+        .ok_or_else(|| UserRequestError::Invalid(format!("missing {name} token output")))?
+        .to_txout();
     let token_output_secrets = token_output
         .unblind(&Secp256k1::new(), treasury_blinding_secret())
-        .map_err(|_| UserRequestError::Invalid("failed to unblind Tick token output".into()))?;
+        .map_err(|_| UserRequestError::Invalid(format!("failed to unblind {name} token output")))?;
     if token_output_secrets.asset != expected_token_secrets.asset
         || token_output_secrets.value != expected_token_secrets.value
         || token_output.script_pubkey != token_input.script_pubkey
         || !token_output.asset.is_confidential()
         || !token_output.value.is_confidential()
     {
-        return Err(UserRequestError::Invalid(
-            "Tick reissuance token is not preserved".into(),
-        ));
+        return Err(UserRequestError::Invalid(format!(
+            "{name} reissuance token is not preserved"
+        )));
     }
 
-    let mut expected_fee_inputs = 0usize;
-    let mut expected_ticks = Vec::new();
-    let mut expected_descriptor_data = Vec::new();
-    let mut expected_account_scripts = Vec::new();
-    let mut instructed = None;
-    for external in &request.external_requests {
-        let request_hash: [u8; 32] = sha2::Sha256::digest(&external.network_user_requests).into();
-        if request_hash != external.request_hash {
-            return Err(UserRequestError::Invalid(
-                "external request hash mismatch".into(),
-            ));
-        }
-        let (user_request, fee_utxos, named_feed) =
-            validate_encoded_request(&external.network_user_requests)
-                .map_err(UserRequestError::Invalid)?;
-        instructed = instructed_price(
-            named_feed,
-            external.additional_payload.as_deref(),
-            instructed,
-        )?;
-        let owner = secp256k1_zkp::XOnlyPublicKey::from_slice(
-            &hex::decode(&user_request.header.public_key)
-                .map_err(|_| UserRequestError::Invalid("invalid requester public key".into()))?,
-        )
-        .map_err(|_| UserRequestError::Invalid("invalid requester public key".into()))?;
-        let account_script = AccountProgram::new(&AccountArguments {
-            storm_eye_asset_id: storm_eye.asset_id,
-            account_owner_pubkey: owner.serialize(),
-        })
-        .get_script_pubkey(network);
-
-        let mut input_total = 0u64;
-        for fee_utxo in &fee_utxos {
-            let input_index = 2 + expected_fee_inputs;
-            let input = pset.inputs().get(input_index).ok_or_else(|| {
-                UserRequestError::Invalid("a submitted fee UTXO is missing".into())
-            })?;
-            let expected_txid =
-                simplex::simplicityhl::elements::Txid::from_str(&hex::encode(fee_utxo.txid))
-                    .map_err(|_| UserRequestError::Invalid("invalid fee UTXO txid".into()))?;
-            if input.previous_txid != expected_txid
-                || input.previous_output_index != fee_utxo.output_index
-                || input
-                    .witness_utxo
-                    .as_ref()
-                    .is_none_or(|utxo| utxo.script_pubkey != account_script)
-            {
-                return Err(UserRequestError::Invalid(
-                    "fee UTXO input does not match the signed user request".into(),
-                ));
-            }
-            let amount = input
-                .witness_utxo
-                .as_ref()
-                .and_then(|utxo| utxo.value.explicit())
-                .ok_or_else(|| UserRequestError::Invalid("fee UTXO must be explicit".into()))?;
-            input_total = input_total
-                .checked_add(amount)
-                .ok_or_else(|| UserRequestError::Invalid("fee input overflow".into()))?;
-            expected_fee_inputs += 1;
-        }
-
-        for user_request in &user_request.requests {
-            let details: TickUtxoRequestDetails = serde_json::from_str(&user_request.payload)
-                .map_err(|error| UserRequestError::Invalid(error.to_string()))?;
-            expected_descriptor_data.push((owner.serialize(), details.utxo_auth_method.clone()));
-            expected_ticks.push(details);
-        }
-        expected_account_scripts.push((account_script, user_request.requests.len(), input_total));
-    }
-    if pset.inputs().len() != 2 + expected_fee_inputs {
-        return Err(UserRequestError::Invalid(
-            "issuance transaction has unrequested inputs".into(),
-        ));
-    }
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| UserRequestError::Clock)?
-        .as_secs();
-    let tick_asset_id = asset_id(tick_asset.asset_id)?;
-    let mut issued_amount = 0u64;
-    for (offset, details) in expected_ticks.iter().enumerate() {
-        let output = pset.outputs().get(2 + offset).ok_or_else(|| {
-            UserRequestError::Invalid("a requested Tick output is missing".into())
-        })?;
-        let timestamp = output
-            .amount
-            .ok_or_else(|| UserRequestError::Invalid("Tick amount is confidential".into()))?;
-        if timestamp.abs_diff(now) > MAX_TICK_TIME_SKEW_SECS {
-            return Err(UserRequestError::Invalid(
-                "Tick timestamp is outside the accepted window".into(),
-            ));
-        }
-        let expected_script = tick_program(storm_eye.asset_id, details)?.get_script_pubkey(network);
-        if output.asset != Some(tick_asset_id) || output.script_pubkey != expected_script {
-            return Err(UserRequestError::Invalid(
-                "Tick output does not match the requested authentication method".into(),
-            ));
-        }
-        issued_amount = issued_amount
-            .checked_add(timestamp)
-            .ok_or_else(|| UserRequestError::Invalid("Tick issuance amount overflow".into()))?;
-    }
-    let issuance_input = &pset.inputs()[1];
-    if issuance_input.issuance_value_amount != Some(issued_amount)
-        || issuance_input.issuance_asset_entropy != tick_asset.entropy
-        || issuance_input.issuance_value_comm.is_some()
-        || issuance_input.issuance_value_rangeproof.is_some()
-        || issuance_input.in_issuance_blind_value_proof.is_some()
-    {
-        return Err(UserRequestError::Invalid(
-            "Tick reissuance metadata does not match the requested outputs".into(),
-        ));
-    }
-
-    let policy_asset = network.policy_asset();
-    let first_reserve_output = 2 + expected_ticks.len();
-    let first_descriptor_output = first_reserve_output + expected_account_scripts.len();
-    let mut descriptors = Vec::with_capacity(expected_descriptor_data.len());
-    let mut tick_offset = 0usize;
-    for (request_index, (_, request_count, _)) in expected_account_scripts.iter().enumerate() {
-        for _ in 0..*request_count {
-            let (owner, auth_method) = &expected_descriptor_data[tick_offset];
-            descriptors.push(
-                IssuedTickDescriptor::from_request(
-                    u32::try_from(2 + tick_offset).map_err(|_| {
-                        UserRequestError::Invalid("Tick output index overflow".into())
-                    })?,
-                    u32::try_from(first_reserve_output + request_index).map_err(|_| {
-                        UserRequestError::Invalid("reserve output index overflow".into())
-                    })?,
-                    *owner,
-                    auth_method,
-                )
-                .map_err(UserRequestError::Invalid)?,
-            );
-            tick_offset += 1;
-        }
-    }
-    let expected_descriptor_script =
-        IssuedTickDescriptor::script_pubkey(&descriptors).map_err(UserRequestError::Invalid)?;
-    let output = pset
-        .outputs()
-        .get(first_descriptor_output)
-        .ok_or_else(|| UserRequestError::Invalid("issued Tick descriptor is missing".into()))?;
-    if output.asset != Some(policy_asset)
-        || output.amount != Some(0)
-        || output.script_pubkey != expected_descriptor_script
-    {
-        return Err(UserRequestError::Invalid(
-            "invalid issued Tick descriptor".into(),
-        ));
-    }
-    validate_accounting_outputs(
-        &pset,
-        &expected_account_scripts,
-        expected_ticks.len(),
-        storm_eye.asset_id,
-        policy_asset,
-        config,
-        network,
-    )?;
-
-    let env = storm_eye_program
-        .as_ref()
-        .get_env(&pset, 0, network)
-        .map_err(|error| {
-            UserRequestError::Invalid(format!("cannot derive Storm Eye sighash: {error}"))
-        })?;
-    let sighash = env.c_tx_env().sighash_all().to_byte_array();
-    // The other half of the note at the coordinator's `signing_hash`: the rate
-    // validated above is not in what this re-derives, so it is not signed for.
-    let signing_hash = SigMessage::Tagged(STORM_EYE_TAG.to_string()).digest(sighash);
-    if signing_hash != request.signing_hash {
-        return Err(UserRequestError::Invalid("signing hash mismatch".into()));
-    }
-
-    Ok(instructed)
+    Ok(())
 }
 
 /// What a round does with the batch it is looking at.
@@ -1896,60 +2144,26 @@ fn instructed_price(
     Ok(Some(instructed))
 }
 
-fn tick_program(
-    storm_eye_asset_id: [u8; 32],
-    details: &TickUtxoRequestDetails,
-) -> Result<VoucherProgram, UserRequestError> {
-    let mut arguments = VoucherArguments {
-        storm_eye_asset_id,
-        auth_method: 0,
-        auth_asset_id: [0; 32],
-        auth_script_hash: [0; 32],
-        auth_pubkey: [0; 32],
-    };
-    match details.utxo_auth_method.kind.as_str() {
-        "asset-id-auth" => {
-            arguments.auth_asset_id = decode_array(&details.utxo_auth_method.auth_data)?;
-        }
-        "scriptPubKey-auth" => {
-            arguments.auth_method = 1;
-            let script = Script::from(
-                hex::decode(&details.utxo_auth_method.auth_data)
-                    .map_err(|_| UserRequestError::Invalid("invalid auth script".into()))?,
-            );
-            arguments.auth_script_hash = hash_script(&script);
-        }
-        "signature-auth" => {
-            arguments.auth_method = 2;
-            arguments.auth_pubkey = decode_array(&details.utxo_auth_method.auth_data)?;
-        }
-        _ => {
-            return Err(UserRequestError::Invalid(
-                "unsupported Tick auth method".into(),
-            ));
-        }
-    }
-
-    Ok(VoucherProgram::new(&arguments))
-}
-
+#[allow(clippy::too_many_arguments)]
 fn validate_accounting_outputs(
     pset: &PartiallySignedTransaction,
     accounts: &[(Script, usize, u64)],
-    tick_count: usize,
+    token_count: usize,
+    issued_count: usize,
     storm_eye_asset_id: [u8; 32],
     policy_asset: AssetId,
     config: &ProtocolConfig,
     network: &SimplicityNetwork,
 ) -> Result<(), UserRequestError> {
-    let expected_output_count = 2 + tick_count + accounts.len() + 1 + 2;
+    let expected_output_count = 1 + token_count + issued_count + accounts.len() + 1 + 2;
     if pset.outputs().len() != expected_output_count {
         return Err(UserRequestError::Invalid(
             "issuance transaction has unexpected outputs".into(),
         ));
     }
+    let token_outputs = 1..=token_count;
     for (index, output) in pset.outputs().iter().enumerate() {
-        if index != 1 && !is_fully_explicit_output(output) {
+        if !token_outputs.contains(&index) && !is_fully_explicit_output(output) {
             return Err(UserRequestError::Invalid(format!(
                 "issuance output {index} must be explicit"
             )));
@@ -1960,7 +2174,7 @@ fn validate_accounting_outputs(
         TreasuryProgram::new(&TreasuryArguments { storm_eye_asset_id }).get_script_pubkey(network);
     let expected_operational = config
         .operational_fee_sats
-        .checked_mul(tick_count as u64)
+        .checked_mul(issued_count as u64)
         .ok_or_else(|| UserRequestError::Invalid("operational fee overflow".into()))?;
     let treasury_ok = pset.outputs().iter().any(|output| {
         output.script_pubkey == treasury_script
@@ -1980,9 +2194,12 @@ fn validate_accounting_outputs(
     for (index, ((script, _, _), expected_reserve)) in
         accounts.iter().zip(account_reserves).enumerate()
     {
-        let output = pset.outputs().get(2 + tick_count + index).ok_or_else(|| {
-            UserRequestError::Invalid("user burn-fee reserve output is missing".into())
-        })?;
+        let output = pset
+            .outputs()
+            .get(1 + token_count + issued_count + index)
+            .ok_or_else(|| {
+                UserRequestError::Invalid("user burn-fee reserve output is missing".into())
+            })?;
         if output.script_pubkey != *script
             || output.asset != Some(policy_asset)
             || output.amount != Some(expected_reserve)
@@ -2001,22 +2218,23 @@ fn validate_accounting_outputs(
             "miner fee output is missing".into(),
         ));
     }
-    let input_total = pset.inputs()[2..].iter().try_fold(0u64, |total, input| {
-        let utxo = input
-            .witness_utxo
-            .as_ref()
-            .ok_or_else(|| UserRequestError::Invalid("fee UTXO is missing".into()))?;
-        if utxo.asset.explicit() != Some(policy_asset) {
-            return Err(UserRequestError::Invalid("fee UTXO asset mismatch".into()));
-        }
-        total
-            .checked_add(
-                utxo.value
-                    .explicit()
-                    .ok_or_else(|| UserRequestError::Invalid("fee UTXO must be explicit".into()))?,
-            )
-            .ok_or_else(|| UserRequestError::Invalid("fee input overflow".into()))
-    })?;
+    let input_total =
+        pset.inputs()[1 + token_count..]
+            .iter()
+            .try_fold(0u64, |total, input| {
+                let utxo = input
+                    .witness_utxo
+                    .as_ref()
+                    .ok_or_else(|| UserRequestError::Invalid("fee UTXO is missing".into()))?;
+                if utxo.asset.explicit() != Some(policy_asset) {
+                    return Err(UserRequestError::Invalid("fee UTXO asset mismatch".into()));
+                }
+                total
+                    .checked_add(utxo.value.explicit().ok_or_else(|| {
+                        UserRequestError::Invalid("fee UTXO must be explicit".into())
+                    })?)
+                    .ok_or_else(|| UserRequestError::Invalid("fee input overflow".into()))
+            })?;
     let output_total = pset.outputs().iter().try_fold(0u64, |total, output| {
         if output.asset != Some(policy_asset) {
             return Ok(total);
@@ -2448,5 +2666,304 @@ mod tests {
         signing.signatures.truncate(1);
 
         assert!(signed_price_bloom(&price, &signing, &proof()).is_err());
+    }
+
+    use simplex::simplicityhl::elements::{
+        AssetIssuance, LockTime, Transaction, TxIn, hashes::sha256::Midstate,
+    };
+
+    fn network() -> SimplicityNetwork {
+        SimplicityNetwork::ElementsCustom {
+            policy_asset: AssetId::from_byte_array([8; 32]),
+            genesis_hash: BlockHash::from_byte_array([6; 32]),
+        }
+    }
+
+    fn explicit(asset: AssetId, value: u64, script: Script) -> TxOut {
+        TxOut {
+            asset: confidential::Asset::Explicit(asset),
+            value: confidential::Value::Explicit(value),
+            nonce: confidential::Nonce::Null,
+            script_pubkey: script,
+            witness: Default::default(),
+        }
+    }
+
+    fn input(vout: u32) -> TxIn {
+        TxIn {
+            previous_output: OutPoint::new(Txid::from_byte_array([10; 32]), vout),
+            ..Default::default()
+        }
+    }
+
+    fn storm_eye() -> NetworkAsset {
+        let mut storm_eye = NetworkAsset {
+            kind: STORM_EYE_KIND.into(),
+            name: "Storm Eye".into(),
+            asset_id: [7; 32],
+            reissuance_token_id: None,
+            entropy: None,
+            issuance_txid: [2; 32],
+            contract_script: vec![],
+            contract_data: Some(
+                postcard::to_stdvec(&StormEyeContractData {
+                    storm_tree_root: [3; 32],
+                    rescue_height: 100,
+                    rescue_output_script_hash: [4; 32],
+                })
+                .unwrap(),
+            ),
+            supply: 10_000,
+            created_at_block: 1,
+        };
+        storm_eye.contract_script = storm_eye_program(&storm_eye)
+            .unwrap()
+            .get_script_pubkey(&network())
+            .into_bytes();
+        storm_eye
+    }
+
+    fn signature_auth() -> UtxoAuthMethod {
+        UtxoAuthMethod {
+            kind: "signature-auth".into(),
+            auth_data: hex::encode([5; 32]),
+        }
+    }
+
+    /// A Verifier at output 1 and a Tick at output 2, before any branch signs.
+    fn round_transaction() -> RoundTransaction {
+        let network = network();
+        let storm_eye = storm_eye();
+        let descriptors = vec![
+            IssuedUtxoDescriptor::from_request(
+                1,
+                4,
+                [4; 32],
+                &signature_auth(),
+                Some(PLACEHOLDER_SIGNER),
+            )
+            .unwrap(),
+            IssuedUtxoDescriptor::from_request(2, 4, [4; 32], &signature_auth(), None).unwrap(),
+        ];
+        let script = |descriptor: &IssuedUtxoDescriptor| {
+            descriptor
+                .voucher_program(storm_eye.asset_id)
+                .unwrap()
+                .get_script_pubkey(&network)
+        };
+        let storm_eye_utxo = explicit(
+            AssetId::from_byte_array(storm_eye.asset_id),
+            1,
+            Script::from(storm_eye.contract_script.clone()),
+        );
+        let transaction = Transaction {
+            version: 2,
+            lock_time: LockTime::ZERO,
+            input: vec![input(0)],
+            output: vec![
+                storm_eye_utxo.clone(),
+                explicit(
+                    AssetId::from_byte_array([12; 32]),
+                    1,
+                    script(&descriptors[0]),
+                ),
+                explicit(
+                    AssetId::from_byte_array([13; 32]),
+                    NOW,
+                    script(&descriptors[1]),
+                ),
+                explicit(
+                    network.policy_asset(),
+                    0,
+                    IssuedUtxoDescriptor::script_pubkey(&descriptors).unwrap(),
+                ),
+            ],
+        };
+        let mut pset = PartiallySignedTransaction::from_tx(transaction);
+        pset.inputs_mut()[0].witness_utxo = Some(storm_eye_utxo);
+
+        RoundTransaction {
+            pset,
+            descriptors,
+            descriptor_output: 3,
+            storm_eye,
+            network,
+        }
+    }
+
+    #[test]
+    fn commits_every_verifier_to_the_branch_an_attempt_signs_under() {
+        let round = round_transaction();
+        let branch = Keypair::from_secret_key(&SecretKey::from_secret_bytes([9; 32]).unwrap())
+            .x_only_public_key()
+            .0
+            .serialize();
+
+        let (pset, signing_hash) = round.for_branch(branch).unwrap();
+
+        let committed = committed_to(&round.descriptors, branch);
+        assert_eq!(committed[0].signer, Some(branch));
+        assert_eq!(
+            pset.outputs()[1].script_pubkey,
+            committed[0]
+                .voucher_program(round.storm_eye.asset_id)
+                .unwrap()
+                .get_script_pubkey(&round.network)
+        );
+        // The Tick keeps its script, and the descriptor names the new signer.
+        assert_eq!(
+            pset.outputs()[2].script_pubkey,
+            round.pset.outputs()[2].script_pubkey
+        );
+        assert_eq!(
+            IssuedUtxoDescriptor::from_script(&pset.outputs()[3].script_pubkey).unwrap(),
+            Some(committed)
+        );
+        // Another branch is another transaction, so another signing hash.
+        let (_, placeholder_hash) = round.for_branch(PLACEHOLDER_SIGNER).unwrap();
+        assert_ne!(signing_hash, placeholder_hash);
+        assert_eq!(round.for_branch(branch).unwrap().1, signing_hash);
+    }
+
+    #[test]
+    fn signs_a_round_without_verifiers_the_same_under_every_branch() {
+        let mut round = round_transaction();
+        round.descriptors.remove(0);
+        let branch = Keypair::from_secret_key(&SecretKey::from_secret_bytes([9; 32]).unwrap())
+            .x_only_public_key()
+            .0
+            .serialize();
+
+        assert_eq!(
+            round.for_branch(branch).unwrap().1,
+            round.for_branch(PLACEHOLDER_SIGNER).unwrap().1
+        );
+    }
+
+    /// A reissuance token blinded to the Treasury, as a round finds it.
+    fn round_token(entropy: [u8; 32], vout: u32, issuance_amount: u64) -> RoundToken {
+        let secp = Secp256k1::new();
+        let midstate = Midstate::from_byte_array(entropy);
+        let token_id = AssetId::reissuance_token_from_entropy(midstate, false);
+        let script = Script::from(vec![0x51]);
+        let (txout, _, _, _) = TxOut::new_last_confidential(
+            &mut secp256k1_zkp::rand::thread_rng(),
+            &secp,
+            1,
+            token_id,
+            script,
+            PublicKey::from_secret_key(&secp, &treasury_blinding_secret()),
+            &[explicit_txout_secrets(&explicit(token_id, 1, Script::new())).unwrap()],
+            &[],
+        )
+        .unwrap();
+        let secrets = txout.unblind(&secp, treasury_blinding_secret()).unwrap();
+
+        RoundToken {
+            asset: NetworkAsset {
+                kind: "token".into(),
+                name: "token".into(),
+                asset_id: AssetId::from_entropy(midstate).into_inner().to_byte_array(),
+                reissuance_token_id: Some(token_id.into_inner().to_byte_array()),
+                entropy: Some(entropy),
+                issuance_txid: [2; 32],
+                contract_script: vec![0x51],
+                contract_data: None,
+                supply: 0,
+                created_at_block: 1,
+            },
+            utxo: UTXO {
+                outpoint: OutPoint::new(Txid::from_byte_array([10; 32]), vout),
+                txout,
+                secrets: Some(secrets),
+            },
+            secrets,
+            issuance_amount,
+        }
+    }
+
+    /// Reissues a Tick and a Verifier with `secrets` as the surjection inputs.
+    fn reissue_both(
+        spent_secrets: impl Fn(&[RoundToken], TxOutSecrets) -> Vec<TxOutSecrets>,
+    ) -> Result<(), String> {
+        let policy_asset = network().policy_asset();
+        let tokens = [round_token([21; 32], 1, NOW), round_token([22; 32], 2, 1)];
+        let fee_input = explicit(policy_asset, 10_000, Script::from(vec![0x52]));
+        let mut transaction = Transaction {
+            version: 2,
+            lock_time: LockTime::ZERO,
+            input: vec![input(0), input(1), input(2)],
+            output: vec![explicit(policy_asset, 9_000, Script::from(vec![0x52]))],
+        };
+        for (offset, token) in tokens.iter().enumerate() {
+            transaction.input[1 + offset].asset_issuance = AssetIssuance {
+                asset_blinding_nonce: token.secrets.asset_bf.into_inner(),
+                asset_entropy: token.asset.entropy.unwrap(),
+                amount: confidential::Value::Explicit(token.issuance_amount),
+                inflation_keys: confidential::Value::Null,
+            };
+            transaction.output.push(token.utxo.txout.clone());
+        }
+        for token in &tokens {
+            transaction.output.push(explicit(
+                AssetId::from_byte_array(token.asset.asset_id),
+                token.issuance_amount,
+                Script::from(vec![0x53]),
+            ));
+        }
+        transaction
+            .output
+            .push(explicit(policy_asset, 1_000, Script::new()));
+        let mut pset = PartiallySignedTransaction::from_tx(transaction);
+        pset.inputs_mut()[0].witness_utxo = Some(fee_input.clone());
+        for (offset, token) in tokens.iter().enumerate() {
+            pset.inputs_mut()[1 + offset].witness_utxo = Some(token.utxo.txout.clone());
+        }
+
+        let fee_secrets = explicit_txout_secrets(&fee_input).unwrap();
+        reblind_tokens(&mut pset, &tokens, &spent_secrets(&tokens, fee_secrets))
+            .map_err(|error| error.to_string())?;
+        let transaction = pset.extract_tx().map_err(|error| error.to_string())?;
+        for (offset, token) in tokens.iter().enumerate() {
+            let returned = transaction.output[1 + offset]
+                .unblind(&Secp256k1::new(), treasury_blinding_secret())
+                .map_err(|error| error.to_string())?;
+            assert_eq!((returned.asset, returned.value), (token.secrets.asset, 1));
+        }
+        transaction
+            .verify_tx_amt_proofs(
+                &Secp256k1::new(),
+                &[
+                    fee_input,
+                    tokens[0].utxo.txout.clone(),
+                    tokens[1].utxo.txout.clone(),
+                ],
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn reblinds_both_tokens_of_a_round_into_a_balanced_transaction() {
+        reissue_both(|tokens, fee| {
+            let mut secrets = vec![fee];
+            secrets.extend(token_input_secrets(tokens).unwrap());
+            secrets
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn surjects_over_each_token_beside_what_it_reissues() {
+        // Both tokens first, then both reissued assets: not the domain order
+        // consensus checks the token surjection proofs against.
+        let grouped = reissue_both(|tokens, fee| {
+            let interleaved = token_input_secrets(tokens).unwrap();
+            let mut secrets = vec![fee];
+            secrets.extend(interleaved.iter().step_by(2));
+            secrets.extend(interleaved.iter().skip(1).step_by(2));
+            secrets
+        });
+
+        assert!(grouped.is_err());
     }
 }

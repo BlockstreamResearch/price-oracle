@@ -109,6 +109,7 @@ describe("Price Oracle SDK", () => {
           storm_eye_asset_id: "01".repeat(32),
           tick_asset_id: "02".repeat(32),
           tick_script_pubkey: "5120" + "03".repeat(32),
+          oracle_verifier_asset_id: "04".repeat(32),
           network: "elementsregtest",
         });
       },
@@ -198,7 +199,6 @@ describe("Price Oracle SDK", () => {
   test("accepts a network signature over the rate and rejects another rate", () => {
     const branch = publicKeyFromPrivateKey(PRIVATE_KEY);
     const details = {
-      timestamp: 1_700_000_000,
       price_data: PRICE_DATA,
       storm_tree_bloom: {
         signature: signSchnorrDigest(PRIVATE_KEY, PRICE_MESSAGE),

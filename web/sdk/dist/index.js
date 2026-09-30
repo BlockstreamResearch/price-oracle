@@ -118,9 +118,8 @@ export function createTickRequest(privateKey, feeUtxos, authMethod) {
     return buildRequest(privateKey, feeUtxos, "tick-utxo", authMethod);
 }
 /**
- * A request issued at a price feed. The network answers it with the rate the
- * round was issued at and its signature over that rate, which
- * {@link verifySignedPriceData} checks.
+ * A priced request: issues an Oracle Verifier and returns the signed rate,
+ * checked by {@link verifySignedPriceData}.
  */
 export function createSignedPriceRequest(privateKey, feeUtxos, priceFeedId, authMethod) {
     if (!Number.isInteger(priceFeedId) ||

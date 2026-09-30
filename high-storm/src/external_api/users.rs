@@ -16,7 +16,7 @@ use simplex::simplicityhl::elements::AssetId;
 use super::{ApiError, ExternalApiState, require_coordinator};
 use crate::crypto::tagged_hash;
 use crate::db::{
-    network_asset::{STORM_EYE_KIND, TICK_ASSET_KIND},
+    network_asset::{ORACLE_VERIFIER_KIND, STORM_EYE_KIND, TICK_ASSET_KIND},
     user_request::{FeeUtxo, InsertPendingResult},
 };
 
@@ -45,6 +45,8 @@ struct OracleAccount {
     storm_eye_asset_id: String,
     tick_asset_id: String,
     tick_script_pubkey: String,
+    /// The asset a `signed-price-data` request is issued in.
+    oracle_verifier_asset_id: String,
     network: super::operators::auth::AuthNetwork,
 }
 
@@ -73,6 +75,12 @@ async fn get_account(
         .await
         .map_err(ApiError::unavailable)?
         .ok_or_else(|| ApiError::unavailable("Tick asset is not active"))?;
+    let oracle_verifier = state
+        .node
+        .network_asset(ORACLE_VERIFIER_KIND)
+        .await
+        .map_err(ApiError::unavailable)?
+        .ok_or_else(|| ApiError::unavailable("Oracle Verifier asset is not active"))?;
     let voucher = Voucher::new(VoucherParameters {
         storm_eye_asset_id: AssetId::from_byte_array(storm_eye.asset_id),
         auth_method: VoucherAuthMethod::Signature {
@@ -90,6 +98,7 @@ async fn get_account(
         storm_eye_asset_id: AssetId::from_byte_array(storm_eye.asset_id).to_string(),
         tick_asset_id: AssetId::from_byte_array(tick.asset_id).to_string(),
         tick_script_pubkey: hex::encode(voucher.get_script_pubkey().into_bytes()),
+        oracle_verifier_asset_id: AssetId::from_byte_array(oracle_verifier.asset_id).to_string(),
         network,
     }))
 }

@@ -229,8 +229,9 @@ Their combined value must cover the configured operational fee and Tick burn
 reserve for every requested output, plus one issuance transaction fee. Accepted
 fee UTXOs are reserved atomically, cannot be reused by another request, and remain
 reserved until the issuance transaction confirms. The accepted request kinds are
-`tick-utxo` and `signed-price-data`. Each `payload` is a JSON-encoded string
-with this shape:
+`tick-utxo`, issued a Tick whose amount is its timestamp, and
+`signed-price-data`, issued an Oracle Verifier of amount 1. Each `payload` is a
+JSON-encoded string with this shape:
 
 ```json
 {"utxo_auth_method":{"kind":"signature-auth","auth_data":"<64-character x-only public key>"}}
@@ -261,7 +262,9 @@ schedule is recalculated whenever the confirmed Storm Eye count changes. Each
 issuance round takes the oldest pending requests and packs the largest FIFO prefix
 whose conservative weight estimate does not exceed `400000 / storm_eye_count`.
 The exact finalized weight is checked again after signing and before broadcast.
-Consecutive issuance rounds chain through the Tick reissuance token in the mempool.
+Consecutive issuance rounds chain through the reissuance tokens in the mempool: a
+round spends the Tick token when it issues Ticks and the Oracle Verifier token
+when it issues Verifiers, in that order right after the Storm Eye.
 The coordinator collects a two-thirds Storm Tree signature and broadcasts the
 covenant transaction. The status becomes `processing` after broadcast,
 `included` once the issuance transaction is in a block, and `executed` once that
@@ -297,17 +300,23 @@ no coordinator can obtain for a price the network did not accept. A
 `signed-price-data` request receives it as its result `payload`:
 
 ```json
-{"timestamp":1700000000,"price_data":"<64 hex characters>","storm_tree_bloom":{"signature":"<128 hex characters>","branch":"<64 hex characters>","proof":[{"right":true,"hash":"<64 hex characters>"}]}}
+{"price_data":"<64 hex characters>","storm_tree_bloom":{"signature":"<128 hex characters>","branch":"<64 hex characters>","proof":[{"right":true,"hash":"<64 hex characters>"}]}}
 ```
 
 `price_data` is the canonical `PriceFeedData` the signature covers, and `branch`
 is the x-only key it verifies under. `proof` carries that branch's inclusion
 path, leaf to root; the root it proves against is the Storm Eye's on-chain one,
 so a reader takes that from the chain rather than from this payload.
-`timestamp` is the issued Tick's, since the Tick UTXO is still the one a
-`tick-utxo` request produces: the transaction commits to the batch, not to the
-price, and recording the rate on-chain needs a covenant field that does not
-exist yet.
+
+The Oracle Verifier at the result's `vout` is locked by the same Voucher
+covenant as a Tick, under the requested authentication method, but its Taproot
+internal key is `branch`: a contract checks the signed price against the key it
+rebuilds the Verifier's script from, and takes the time to hold it against from
+a Tick spent beside it. Since that key is known only once a branch signs, the
+coordinator rebuilds the transaction for every branch it falls back to, and
+each member checks the Verifiers against the branch the message it signs
+names. Verifiers expire and are burned with Ticks: a burn aggregates each
+asset into an empty `OP_RETURN` of its own.
 
 `GET /price-feeds` lists the registry every node shares: each feed with its id
 and symbols, in id order. `GET /price-feeds/{id}` returns the current rate for

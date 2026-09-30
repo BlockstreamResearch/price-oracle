@@ -197,8 +197,7 @@ impl HighStorm {
             .signing()
             .sign_execute_user_requests(
                 &self.storm,
-                tx,
-                signing_hash,
+                move |_| Ok((tx.clone(), signing_hash)),
                 price_hash,
                 external_requests,
                 chain_tip,
@@ -562,6 +561,29 @@ impl HighStorm {
             .map(Some)
     }
 
+    /// The asset a `signed-price-data` request is issued in. Issued beside the
+    /// Tick, since a priced round mints one of these instead of a Tick.
+    pub async fn initialize_oracle_verifier_asset(
+        &self,
+        config: &crate::config::ElementsRpcConfig,
+    ) -> Result<Option<NetworkAsset>, AssetError> {
+        if !self.is_coordinator().await {
+            return Ok(None);
+        }
+
+        let storm_eye = self
+            .state
+            .assets()
+            .storm_eye()
+            .await?
+            .ok_or_else(|| AssetError::Conflict("Storm Eye is not initialized".to_string()))?;
+        self.state
+            .assets()
+            .initialize_oracle_verifier_asset(&self.storm.handle(), config, storm_eye.asset_id)
+            .await
+            .map(Some)
+    }
+
     pub async fn network_asset(&self, kind: &str) -> Result<Option<NetworkAsset>, AssetError> {
         self.state.assets().get(kind).await
     }
@@ -605,13 +627,23 @@ impl HighStorm {
             .user_requests()
             .validate_execute(&prepared.request)
             .await?;
+        let round = prepared.transaction.clone();
         let signing = self
             .state
             .signing()
             .sign_execute_user_requests(
                 &self.storm,
-                prepared.request.tx.clone(),
-                prepared.request.signing_hash,
+                move |branch| {
+                    round
+                        .for_branch(branch)
+                        .map(|(pset, signing_hash)| {
+                            (
+                                simplex::simplicityhl::elements::encode::serialize(&pset),
+                                signing_hash,
+                            )
+                        })
+                        .map_err(|error| SigningError::InvalidMessage(error.to_string()))
+                },
                 instructed.as_ref().map(prices::price_hash),
                 prepared.request.external_requests.clone(),
                 chain_tip,

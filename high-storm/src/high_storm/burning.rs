@@ -8,10 +8,7 @@ use bitcoincore_rpc::{Auth, Client, RpcApi};
 use contracts::artifacts::{
     account::{AccountProgram, derived_account::AccountArguments},
     auth::derived_auth::AuthWitness,
-    voucher::{
-        VoucherProgram,
-        derived_voucher::{VoucherArguments, VoucherWitness},
-    },
+    voucher::{VoucherProgram, derived_voucher::VoucherWitness},
 };
 use secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
 use serde::Deserialize;
@@ -37,13 +34,14 @@ use crate::{
     config::{ElementsRpcConfig, ProtocolConfig},
     db::{
         monitored_utxo::{MonitoredUtxo, MonitoredUtxoStore},
-        network_asset::{NetworkAssetStore, STORM_EYE_KIND, TICK_ASSET_KIND},
+        network_asset::{NetworkAssetStore, ORACLE_VERIFIER_KIND, STORM_EYE_KIND, TICK_ASSET_KIND},
     },
 };
 
 use super::{
     SigningResult,
     assets::{StormEyeContractData, storm_eye_program},
+    issuance::voucher_program,
     message::{BurnExpiredUtxos, ExpiredUtxosBurned, StormEyeUtxo},
     signing::SigningError,
     user_requests::{
@@ -102,6 +100,12 @@ pub(crate) struct Burning {
     assets: NetworkAssetStore,
     elements_rpc: ElementsRpcConfig,
     config: ProtocolConfig,
+}
+
+/// Asset ids a burn can spend.
+struct BurnAssets {
+    tick: Option<AssetId>,
+    verifier: Option<AssetId>,
 }
 
 #[derive(Debug)]
@@ -189,11 +193,7 @@ impl Burning {
             .get(STORM_EYE_KIND)
             .await?
             .ok_or(BurningError::MissingAsset(STORM_EYE_KIND))?;
-        let tick_asset = self
-            .assets
-            .get(TICK_ASSET_KIND)
-            .await?
-            .ok_or(BurningError::MissingAsset(TICK_ASSET_KIND))?;
+        let burn_assets = self.burn_assets().await?;
         let network = self.network()?;
         let client = self.client()?;
         let policy_asset = network.policy_asset();
@@ -287,10 +287,8 @@ impl Burning {
             RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
         );
 
-        let tick_asset_id = asset_id(tick_asset.asset_id)?;
         let mut spent_utxos = vec![storm_eye_utxo.txout.clone()];
         let mut selected = Vec::new();
-        let mut burn_amount = 0u64;
         for (group, _, _) in &burnable_groups {
             for tick in &group.ticks {
                 let tick_utxo = get_explicit_outpoint(
@@ -298,13 +296,13 @@ impl Burning {
                     Txid::from_byte_array(tick.txid),
                     tick.output_index,
                 )?;
-                if tick_utxo.asset() != tick_asset_id
+                if tick_utxo.asset() != burn_assets.of(tick)?
                     || tick_utxo.amount() != tick.amount
                     || tick_utxo.txout.script_pubkey.as_bytes() != tick.script_pubkey
                 {
-                    return Err(BurningError::Invalid("indexed Tick UTXO changed".into()));
+                    return Err(BurningError::Invalid("indexed issued UTXO changed".into()));
                 }
-                let program = tick_program(storm_eye.asset_id, tick)?;
+                let program = issued_program(storm_eye.asset_id, tick)?;
                 final_transaction.add_program_input(
                     PartialInput::new(tick_utxo.clone()),
                     ProgramInput::new(
@@ -317,11 +315,14 @@ impl Burning {
                 );
                 spent_utxos.push(tick_utxo.txout);
                 selected.push((tick.txid, tick.output_index));
-                burn_amount = burn_amount
-                    .checked_add(tick.amount)
-                    .ok_or_else(|| BurningError::Invalid("burn amount overflow".into()))?;
             }
         }
+        let burns = burn_outputs(
+            burnable_groups
+                .iter()
+                .flat_map(|(group, _, _)| &group.ticks),
+            &burn_assets,
+        )?;
 
         let policy_asset = network.policy_asset();
         for (_, reserve, account) in &burnable_groups {
@@ -341,11 +342,13 @@ impl Burning {
         }
 
         final_transaction.add_output(output_from_utxo(&storm_eye_utxo));
-        final_transaction.add_output(PartialOutput::new(
-            Script::new_op_return(&[]),
-            burn_amount,
-            tick_asset_id,
-        ));
+        for (asset, amount) in burns {
+            final_transaction.add_output(PartialOutput::new(
+                Script::new_op_return(&[]),
+                amount,
+                asset,
+            ));
+        }
         for (index, (_, reserve, account)) in burnable_groups.iter().enumerate() {
             let fee_share = fee_share(
                 self.config.burn_transaction_fee_sats,
@@ -403,11 +406,7 @@ impl Burning {
             .get(STORM_EYE_KIND)
             .await?
             .ok_or(BurningError::MissingAsset(STORM_EYE_KIND))?;
-        let tick_asset = self
-            .assets
-            .get(TICK_ASSET_KIND)
-            .await?
-            .ok_or(BurningError::MissingAsset(TICK_ASSET_KIND))?;
+        let burn_assets = self.burn_assets().await?;
         let expired = self.store.list_expired(u32::MAX).await?;
         let pset: PartiallySignedTransaction = encode::deserialize(&request.tx)?;
         let client = self.client()?;
@@ -425,10 +424,26 @@ impl Burning {
             request,
             &expired,
             &storm_eye,
-            &tick_asset,
+            &burn_assets,
             &self.network()?,
             self.config.burn_transaction_fee_sats,
         )
+    }
+
+    /// Either asset may not be issued yet.
+    async fn burn_assets(&self) -> Result<BurnAssets, BurningError> {
+        Ok(BurnAssets {
+            tick: self
+                .assets
+                .get(TICK_ASSET_KIND)
+                .await?
+                .map(|asset| AssetId::from_byte_array(asset.asset_id)),
+            verifier: self
+                .assets
+                .get(ORACLE_VERIFIER_KIND)
+                .await?
+                .map(|asset| AssetId::from_byte_array(asset.asset_id)),
+        })
     }
 
     pub(crate) async fn observe_broadcast(
@@ -790,34 +805,68 @@ fn select_groups(
     Ok(selected)
 }
 
-fn tick_program(
+impl BurnAssets {
+    fn of(&self, utxo: &MonitoredUtxo) -> Result<AssetId, BurningError> {
+        let asset = match utxo.asset_kind.as_str() {
+            TICK_ASSET_KIND => self.tick,
+            ORACLE_VERIFIER_KIND => self.verifier,
+            _ => None,
+        };
+        asset.ok_or_else(|| {
+            BurningError::Invalid(format!(
+                "cannot burn an issued UTXO of kind '{}'",
+                utxo.asset_kind
+            ))
+        })
+    }
+}
+
+/// One empty OP_RETURN per asset, Ticks first.
+fn burn_outputs<'a>(
+    utxos: impl IntoIterator<Item = &'a MonitoredUtxo>,
+    assets: &BurnAssets,
+) -> Result<Vec<(AssetId, u64)>, BurningError> {
+    let mut burns = BTreeMap::<bool, (AssetId, u64)>::new();
+    for utxo in utxos {
+        let asset = assets.of(utxo)?;
+        let (_, amount) = burns
+            .entry(utxo.asset_kind == ORACLE_VERIFIER_KIND)
+            .or_insert((asset, 0));
+        *amount = amount
+            .checked_add(utxo.amount)
+            .ok_or_else(|| BurningError::Invalid("burn amount overflow".into()))?;
+    }
+    Ok(burns.into_values().collect())
+}
+
+/// Covenant of an issued UTXO, with a Verifier's internal key.
+fn issued_program(
     storm_eye_asset_id: [u8; 32],
-    tick: &MonitoredUtxo,
+    utxo: &MonitoredUtxo,
 ) -> Result<VoucherProgram, BurningError> {
-    let mut arguments = VoucherArguments {
-        storm_eye_asset_id,
-        auth_method: 0,
-        auth_asset_id: [0; 32],
-        auth_script_hash: [0; 32],
-        auth_pubkey: [0; 32],
-    };
-    match tick.auth_method.as_str() {
-        "asset-id-auth" => arguments.auth_asset_id = decode_32(&tick.auth_data)?,
-        "scriptPubKey-auth" => {
-            arguments.auth_method = 1;
-            arguments.auth_script_hash = decode_32(&tick.auth_data)?;
-        }
-        "signature-auth" => {
-            arguments.auth_method = 2;
-            arguments.auth_pubkey = decode_32(&tick.auth_data)?;
-        }
+    let auth_kind = match utxo.auth_method.as_str() {
+        "asset-id-auth" => 0,
+        "scriptPubKey-auth" => 1,
+        "signature-auth" => 2,
         _ => {
             return Err(BurningError::Invalid(
-                "unsupported Tick authentication method".into(),
+                "unsupported issued UTXO authentication method".into(),
             ));
         }
-    }
-    Ok(VoucherProgram::new(&arguments))
+    };
+    let signer = match utxo.asset_kind.as_str() {
+        ORACLE_VERIFIER_KIND => Some(utxo.internal_key.ok_or_else(|| {
+            BurningError::Invalid("indexed Oracle Verifier has no internal key".into())
+        })?),
+        _ => None,
+    };
+    voucher_program(
+        storm_eye_asset_id,
+        auth_kind,
+        decode_32(&utxo.auth_data)?,
+        signer,
+    )
+    .map_err(BurningError::Invalid)
 }
 
 fn fee_share(total: u64, groups: usize, index: usize) -> Result<u64, BurningError> {
@@ -849,7 +898,7 @@ fn validate_layout(
     request: &BurnExpiredUtxos,
     expired: &[MonitoredUtxo],
     storm_eye: &NetworkAsset,
-    tick_asset: &NetworkAsset,
+    burn_assets: &BurnAssets,
     network: &SimplicityNetwork,
     fee: u64,
 ) -> Result<(), BurningError> {
@@ -889,42 +938,45 @@ fn validate_layout(
         ));
     }
 
-    let tick_asset_id = asset_id(tick_asset.asset_id)?;
-    let mut expected_burn_amount = 0u64;
     for (offset, tick) in ticks.iter().enumerate() {
         let index = 1 + offset;
         let input = witness_utxo(pset, index)?;
-        require_explicit_utxo(input, tick_asset_id, &tick.script_pubkey, "Tick")?;
+        require_explicit_utxo(
+            input,
+            burn_assets.of(tick)?,
+            &tick.script_pubkey,
+            "issued UTXO",
+        )?;
         if input.value.explicit() != Some(tick.amount)
-            || tick_program(storm_eye.asset_id, tick)?.get_script_pubkey(network)
+            || issued_program(storm_eye.asset_id, tick)?.get_script_pubkey(network)
                 != input.script_pubkey
         {
             return Err(BurningError::Invalid(
-                "Tick input does not match indexed state".into(),
+                "issued UTXO input does not match indexed state".into(),
             ));
         }
-        expected_burn_amount = expected_burn_amount
-            .checked_add(tick.amount)
-            .ok_or_else(|| BurningError::Invalid("burn amount overflow".into()))?;
     }
 
-    let burn_output = pset
-        .outputs()
-        .get(1)
-        .ok_or_else(|| BurningError::Invalid("Tick burn output is missing".into()))?;
-    if burn_output.asset != Some(tick_asset_id)
-        || burn_output.amount != Some(expected_burn_amount)
-        || burn_output.script_pubkey != Script::new_op_return(&[])
-    {
-        return Err(BurningError::Invalid(
-            "Ticks are not aggregated into one empty OP_RETURN".into(),
-        ));
+    let burns = burn_outputs(&ticks, burn_assets)?;
+    for (offset, (asset, amount)) in burns.iter().enumerate() {
+        let burn_output = pset
+            .outputs()
+            .get(1 + offset)
+            .ok_or_else(|| BurningError::Invalid("burn output is missing".into()))?;
+        if burn_output.asset != Some(*asset)
+            || burn_output.amount != Some(*amount)
+            || burn_output.script_pubkey != Script::new_op_return(&[])
+        {
+            return Err(BurningError::Invalid(
+                "issued UTXOs are not aggregated into one empty OP_RETURN per asset".into(),
+            ));
+        }
     }
 
     let groups = select_groups(ticks, MAX_TICKS_PER_BURN)?;
     if pset.inputs().len()
         != 1 + groups.iter().map(|group| group.ticks.len()).sum::<usize>() + groups.len()
-        || pset.outputs().len() != 3 + groups.len()
+        || pset.outputs().len() != 2 + burns.len() + groups.len()
     {
         return Err(BurningError::Invalid(
             "burn transaction has unexpected inputs or outputs".into(),
@@ -932,7 +984,7 @@ fn validate_layout(
     }
 
     let first_reserve_input = 1 + groups.iter().map(|group| group.ticks.len()).sum::<usize>();
-    let first_reserve_output = 2;
+    let first_reserve_output = 1 + burns.len();
     let policy_asset = network.policy_asset();
     for (offset, group) in groups.iter().enumerate() {
         let input_map = &pset.inputs()[first_reserve_input + offset];
@@ -1010,7 +1062,23 @@ struct SidechainInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{external_api::users::UtxoAuthMethod, high_storm::issuance::IssuedTickDescriptor};
+    use crate::{external_api::users::UtxoAuthMethod, high_storm::issuance::IssuedUtxoDescriptor};
+
+    /// x of the secp256k1 generator, a valid signing branch.
+    const SIGNER: [u8; 32] = [
+        0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b,
+        0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8,
+        0x17, 0x98,
+    ];
+
+    fn verifier(txid: u8, output_index: u32, reserve: u8, owner: u8) -> MonitoredUtxo {
+        MonitoredUtxo {
+            asset_kind: ORACLE_VERIFIER_KIND.into(),
+            amount: 1,
+            internal_key: Some(SIGNER),
+            ..tick(txid, output_index, reserve, owner)
+        }
+    }
 
     fn tick(txid: u8, output_index: u32, reserve: u8, owner: u8) -> MonitoredUtxo {
         MonitoredUtxo {
@@ -1022,6 +1090,7 @@ mod tests {
             auth_method: "signature-auth".into(),
             auth_data: vec![2; 32],
             account_owner_pubkey: [owner; 32],
+            internal_key: None,
             burning_fee_txid: [reserve; 32],
             burning_fee_output_index: 7,
             block_height: 1,
@@ -1098,26 +1167,80 @@ mod tests {
         };
 
         for (kind, auth_data) in authentication {
-            let descriptor = IssuedTickDescriptor::from_request(
-                2,
-                3,
-                [4; 32],
-                &UtxoAuthMethod {
-                    kind: kind.into(),
-                    auth_data,
-                },
-            )
-            .unwrap();
-            let mut monitored = tick(1, 2, 3, 4);
-            monitored.auth_method = descriptor.auth_method_name().into();
-            monitored.auth_data = descriptor.auth_data.to_vec();
+            for signer in [None, Some(SIGNER)] {
+                let descriptor = IssuedUtxoDescriptor::from_request(
+                    2,
+                    3,
+                    [4; 32],
+                    &UtxoAuthMethod {
+                        kind: kind.into(),
+                        auth_data: auth_data.clone(),
+                    },
+                    signer,
+                )
+                .unwrap();
+                let mut monitored = if signer.is_some() {
+                    verifier(1, 2, 3, 4)
+                } else {
+                    tick(1, 2, 3, 4)
+                };
+                monitored.auth_method = descriptor.auth_method_name().into();
+                monitored.auth_data = descriptor.auth_data.to_vec();
 
-            assert_eq!(
-                tick_program([7; 32], &monitored)
-                    .unwrap()
-                    .get_script_pubkey(&network),
-                descriptor.tick_program([7; 32]).get_script_pubkey(&network)
-            );
+                assert_eq!(
+                    issued_program([7; 32], &monitored)
+                        .unwrap()
+                        .get_script_pubkey(&network),
+                    descriptor
+                        .voucher_program([7; 32])
+                        .unwrap()
+                        .get_script_pubkey(&network)
+                );
+            }
         }
+    }
+
+    #[test]
+    fn refuses_to_burn_a_verifier_without_its_internal_key() {
+        let mut monitored = verifier(1, 2, 3, 4);
+        monitored.internal_key = None;
+
+        assert!(issued_program([7; 32], &monitored).is_err());
+    }
+
+    #[test]
+    fn burns_each_asset_into_an_op_return_of_its_own() {
+        let assets = BurnAssets {
+            tick: Some(AssetId::from_byte_array([1; 32])),
+            verifier: Some(AssetId::from_byte_array([2; 32])),
+        };
+        let utxos = [
+            verifier(1, 1, 1, 1),
+            tick(2, 1, 1, 1),
+            verifier(3, 1, 1, 1),
+            tick(4, 1, 1, 1),
+        ];
+
+        assert_eq!(
+            burn_outputs(&utxos, &assets).unwrap(),
+            vec![
+                (AssetId::from_byte_array([1; 32]), 3_400_000_000),
+                (AssetId::from_byte_array([2; 32]), 2),
+            ]
+        );
+        assert_eq!(
+            burn_outputs(&utxos[..1], &assets).unwrap(),
+            vec![(AssetId::from_byte_array([2; 32]), 1)]
+        );
+        assert!(
+            burn_outputs(
+                &utxos,
+                &BurnAssets {
+                    verifier: None,
+                    ..assets
+                }
+            )
+            .is_err()
+        );
     }
 }

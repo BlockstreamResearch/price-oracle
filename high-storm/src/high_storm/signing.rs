@@ -148,44 +148,44 @@ impl Signing {
             .map_err(SigningError::StormTree)
     }
 
-    pub(crate) async fn sign_execute_user_requests(
+    /// `round` builds the tx and signing hash per branch: Verifiers commit to it.
+    pub(crate) async fn sign_execute_user_requests<R>(
         &self,
         storm: &Storm,
-        tx: Vec<u8>,
-        signing_hash: [u8; 32],
+        round: R,
         price_hash: Option<[u8; 32]>,
         external_requests: Vec<ExternalRequests>,
         chain_tip: ChainTip,
-    ) -> Result<SigningResult, SigningError> {
-        if tx.is_empty() {
-            return Err(SigningError::InvalidMessage(
-                "issuance transaction cannot be empty".into(),
-            ));
-        }
+    ) -> Result<SigningResult, SigningError>
+    where
+        R: Fn(StormTreeBranch) -> Result<(Vec<u8>, [u8; 32]), SigningError>,
+    {
         if external_requests.is_empty() {
             return Err(SigningError::InvalidMessage(
                 "issuance transaction has no external requests".into(),
             ));
         }
 
-        self.sign_with_message(
-            &storm.handle(),
-            execute_message_hashes(signing_hash, price_hash),
-            SIGNING_SESSION_TIMEOUT,
-            move |branch| {
-                NodeMessage::new(
-                    NodeMessageKind::ExecuteUserRequests,
-                    None,
-                    &ExecuteUserRequests {
-                        tx: tx.clone(),
-                        signing_hash,
-                        signing_storm_tree_branch: branch,
-                        external_requests: external_requests.clone(),
-                        chain_tip: Some(chain_tip),
-                    },
-                )
-            },
-        )
+        self.sign_per_branch(&storm.handle(), SIGNING_SESSION_TIMEOUT, move |branch| {
+            let (tx, signing_hash) = round(branch)?;
+            if tx.is_empty() {
+                return Err(SigningError::InvalidMessage(
+                    "issuance transaction cannot be empty".into(),
+                ));
+            }
+            let message = NodeMessage::new(
+                NodeMessageKind::ExecuteUserRequests,
+                None,
+                &ExecuteUserRequests {
+                    tx,
+                    signing_hash,
+                    signing_storm_tree_branch: branch,
+                    external_requests: external_requests.clone(),
+                    chain_tip: Some(chain_tip),
+                },
+            )?;
+            Ok((message, execute_message_hashes(signing_hash, price_hash)))
+        })
         .await
     }
 
@@ -320,11 +320,27 @@ impl Signing {
     where
         F: Fn(StormTreeBranch) -> Result<NodeMessage, postcard::Error>,
     {
+        self.sign_per_branch(storm, attempt_timeout, move |branch| {
+            Ok((make_message(branch)?, message_hashes.clone()))
+        })
+        .await
+    }
+
+    /// Tries branches in turn; each attempt builds its own message and hashes.
+    async fn sign_per_branch<F>(
+        &self,
+        storm: &StormHandle,
+        attempt_timeout: Duration,
+        make_attempt: F,
+    ) -> Result<SigningResult, SigningError>
+    where
+        F: Fn(StormTreeBranch) -> Result<(NodeMessage, Vec<[u8; 32]>), SigningError>,
+    {
         let mut attempted = BTreeSet::new();
 
         loop {
             let peers = storm.peers().await;
-            let (request_hash, signers, requestor, initial, nonce_message, receiver) = {
+            let branch = {
                 let mut state = self.state.lock().await;
                 state.refresh_members(&peers)?;
                 state.remove_expired_sessions();
@@ -335,18 +351,37 @@ impl Signing {
                         SigningError::SigningFailed
                     });
                 };
-                attempted.insert(branch);
-                let signers = state
+                branch
+            };
+            attempted.insert(branch);
+            // Built outside the lock: an attempt can take a while, and the lock
+            // also serves every other session's nonces and signatures.
+            let (initial, message_hashes) = match make_attempt(branch) {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    tracing::warn!(
+                        branch = %hex::encode(branch),
+                        %error,
+                        "skipped a Storm Tree branch the attempt could not be built for"
+                    );
+                    continue;
+                }
+            };
+            let (request_hash, signers, requestor, initial, nonce_message, receiver) = {
+                let mut state = self.state.lock().await;
+                // The tree may have changed while the lock was released.
+                let Ok(signers) = state
                     .tree
                     .as_ref()
-                    .expect("tree exists when a branch was selected")
-                    .nodes_for_branch(&branch)?
-                    .to_vec();
+                    .ok_or(SigningError::TooFewMembers)
+                    .and_then(|tree| Ok(tree.nodes_for_branch(&branch)?.to_vec()))
+                else {
+                    continue;
+                };
                 let request = SigningRequest {
                     signing_storm_tree_branch: branch,
-                    message_hashes: message_hashes.clone(),
+                    message_hashes,
                 };
-                let initial = make_message(branch)?;
                 let request_hash = initial.hash()?;
                 let (sender, receiver) = oneshot::channel();
                 let requestor = state.local_node;

@@ -15,6 +15,8 @@ export type OracleAccount = {
   storm_eye_asset_id: string;
   tick_asset_id: string;
   tick_script_pubkey: string;
+  /** The asset a `signed-price-data` request is issued in. */
+  oracle_verifier_asset_id: string;
   network: OracleNetwork;
 };
 
@@ -32,7 +34,7 @@ export type TickAuthMethod =
   | { kind: "asset-id-auth"; auth_data: string }
   | { kind: "scriptPubKey-auth"; auth_data: string };
 
-/** A plain Tick UTXO, or one issued at a price feed the network signs for. */
+/** `tick-utxo` issues a Tick; `signed-price-data` an Oracle Verifier. */
 export type TickRequestKind = "tick-utxo" | "signed-price-data";
 
 export type TickRequest = {
@@ -62,8 +64,8 @@ export type StormTreeBloom = {
   proof: Array<{ right: boolean; hash: string }>;
 };
 
+/** The payload of an executed `signed-price-data` request. */
 export type SignedPriceData = {
-  timestamp: number;
   price_data: string;
   storm_tree_bloom: StormTreeBloom;
 };
@@ -281,9 +283,8 @@ export function createTickRequest(
 }
 
 /**
- * A request issued at a price feed. The network answers it with the rate the
- * round was issued at and its signature over that rate, which
- * {@link verifySignedPriceData} checks.
+ * A priced request: issues an Oracle Verifier and returns the signed rate,
+ * checked by {@link verifySignedPriceData}.
  */
 export function createSignedPriceRequest(
   privateKey: string,

@@ -20,7 +20,7 @@ use crate::{
     db::{
         Database,
         monitored_utxo::{IndexedBlock, MonitoredUtxo},
-        network_asset::{STORM_EYE_KIND, TICK_ASSET_KIND},
+        network_asset::{ORACLE_VERIFIER_KIND, STORM_EYE_KIND, TICK_ASSET_KIND},
     },
 };
 
@@ -367,6 +367,7 @@ async fn classifies_fee_utxos_reserved_for_burning() {
                 auth_method: "signature-auth".to_string(),
                 auth_data: vec![2; 32],
                 account_owner_pubkey: [3; 32],
+                internal_key: None,
                 burning_fee_txid: [4; 32],
                 burning_fee_output_index: 5,
                 block_height: 10,
@@ -431,6 +432,10 @@ async fn derives_oracle_account_from_the_active_storm_eye() {
     assert_eq!(
         account["tick_asset_id"],
         AssetId::from_byte_array(tick_asset_id).to_string()
+    );
+    assert_eq!(
+        account["oracle_verifier_asset_id"],
+        AssetId::from_byte_array(ORACLE_VERIFIER_ASSET_ID).to_string()
     );
     assert!(
         account["tick_script_pubkey"]
@@ -652,6 +657,8 @@ async fn setup_with_database() -> (Router, PrivateKey, String, Database) {
     (app, private_key, public_key, database)
 }
 
+const ORACLE_VERIFIER_ASSET_ID: [u8; 32] = [11; 32];
+
 /// Keeps the node, for the tests that drive it before they read it.
 async fn node_setup() -> (Router, HighStorm, PrivateKey, String, Database) {
     node_setup_with_coordinator(node_public_key()).await
@@ -695,6 +702,22 @@ async fn node_setup_with_coordinator(
             contract_script: vec![0x51],
             contract_data: None,
             supply: 1,
+            created_at_block: 1,
+        })
+        .await
+        .unwrap();
+    database
+        .network_assets()
+        .insert_active(&NetworkAsset {
+            kind: ORACLE_VERIFIER_KIND.to_string(),
+            name: "Oracle Verifier".to_string(),
+            asset_id: ORACLE_VERIFIER_ASSET_ID,
+            reissuance_token_id: Some([7; 32]),
+            entropy: Some([8; 32]),
+            issuance_txid: [9; 32],
+            contract_script: vec![0x51],
+            contract_data: None,
+            supply: 0,
             created_at_block: 1,
         })
         .await
