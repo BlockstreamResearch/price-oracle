@@ -1,4 +1,4 @@
-import { Clock3, KeyRound, LogOut, Network, Radio, ShieldCheck } from 'lucide-react'
+import { Clock3, KeyRound, Link2, LogOut, Network, Radio, ShieldCheck, WalletCards } from 'lucide-react'
 import { useAuth } from '../auth-context'
 import { CopyableHex } from '../components/CopyableHex'
 
@@ -16,12 +16,14 @@ export function SettingsPage() {
           <div><dt><KeyRound size={16} /> Public key</dt><dd><CopyableHex value={session.identity.publicKey} visible={13} label="operator public key" /></dd></div>
           <div><dt><Radio size={16} /> Authentication address</dt><dd><code>{session.identity.address}</code></dd></div>
           <div><dt><Network size={16} /> Elements network</dt><dd><code>{session.identity.network}</code></dd></div>
+          <div><dt><Link2 size={16} /> Humid chain</dt><dd><code>{session.identity.chainId}</code></dd></div>
+          <div><dt><WalletCards size={16} /> Humid account</dt><dd><code>{session.identity.accountIdentifier}</code></dd></div>
           <div><dt><Clock3 size={16} /> Session expires</dt><dd>{new Date(session.expiresAt * 1000).toLocaleString()}</dd></div>
         </dl>
       </section>
       <section className="settings-section danger-section">
         <div><span className="eyebrow">Session control</span><h2>End operator session</h2>
-          <p>Clears the operator key and bearer session stored in this tab.</p></div>
+          <p>Revokes the Humid connection and clears the bearer session stored in this tab.</p></div>
         <button className="danger-button" type="button" onClick={logout}><LogOut size={17} /> Log out</button>
       </section>
     </div>

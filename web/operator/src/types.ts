@@ -73,13 +73,22 @@ export type Voting = {
 
 export type AuthNetwork = "liquidv1" | "liquidtestnet" | "elementsregtest";
 
+export type AuthConfig = {
+  network: AuthNetwork;
+  caip2_chain_id: string | null;
+  signature_scheme: "bitcoin-signed-message-ecdsa-v1";
+  descriptor_type: "publicWalletDescriptor";
+  descriptor_format: "bip380-split-branches";
+  identity_derivation: { branch: 0; index: 0 };
+};
+
 export type OperatorIdentity = {
   publicKey: string;
-  address: string | null;
-  network: AuthNetwork | null;
-  configureNetwork: (network: AuthNetwork) => void;
+  address: string;
+  network: AuthNetwork;
+  chainId: string;
+  accountIdentifier: string;
   sign: (message: string) => Promise<string>;
-  destroy: () => void;
 };
 
 export type OperatorSession = {

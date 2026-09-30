@@ -24,6 +24,14 @@ bun run lint
 bun run build
 ```
 
-## Key handling
+## Humid authentication
 
-The login form accepts a 32-byte secp256k1 secret key as hexadecimal text. The browser derives the compressed public key and signs BIP322 messages locally. The bearer token, expiry, identity, and secret key are stored in tab-scoped session storage so authenticated reads and signed actions survive a page refresh. Logout, tab closure, or token expiry clears the session. The secret key is never sent to HighStorm, but scripts running in the same browser origin can access it while the tab session exists.
+Install and unlock Humid before connecting. The dashboard requests access to `getWalletDescriptor` and `signMessage`, derives the fixed external `/0/0` operator identity from the approved public descriptor, and asks Humid to approve every login and write signature. Private key material never enters the dashboard.
+
+The bearer token, expiry, compressed public key, signing address, account identifier, and chain ID are stored in tab-scoped session storage so authenticated reads survive a refresh. Logout revokes the Humid session and clears that public metadata.
+
+Liquid mainnet and testnet use Humid's built-in chains. Elements regtest uses the custom chain remembered in local storage. The default Esplora backend is `http://127.0.0.1:3001`, matching the local Compose stack; override it for another backend:
+
+```sh
+VITE_HUMID_REGTEST_BACKEND_URL=http://127.0.0.1:3001 bun run dev
+```

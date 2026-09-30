@@ -5,7 +5,15 @@ use std::{
 };
 
 use axum::{Json, extract::State, http::HeaderMap};
-use bitcoin::{Address, Network, secp256k1::XOnlyPublicKey};
+use bitcoin::{
+    Address, Network,
+    hashes::Hash,
+    secp256k1::{
+        Message, PublicKey, Secp256k1, XOnlyPublicKey,
+        ecdsa::{RecoverableSignature, RecoveryId},
+    },
+    sign_message::signed_msg_hash,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use simplex::provider::SimplicityNetwork;
@@ -19,6 +27,32 @@ use crate::{
 const CHALLENGE_TTL: Duration = Duration::from_secs(5 * 60);
 const TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
 const WRITE_WINDOW: Duration = Duration::from_secs(5 * 60);
+const HUMID_ECDSA_SCHEME: &str = "bitcoin-signed-message-ecdsa-v1";
+const LIQUID_MAINNET_CHAIN_ID: &str = "bip122:1466275836220db2944ca059a3a10ef6";
+const LIQUID_TESTNET_CHAIN_ID: &str = "bip122:a771da8e52ee6ad581ed1e9a99825e5b";
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum SignatureScheme {
+    Bip322V1,
+    HumidEcdsaV1,
+}
+
+impl SignatureScheme {
+    fn from_request(value: Option<&str>) -> Result<Self, AuthError> {
+        match value {
+            None => Ok(Self::Bip322V1),
+            Some(HUMID_ECDSA_SCHEME) => Ok(Self::HumidEcdsaV1),
+            Some(_) => Err(AuthError::InvalidSignatureScheme),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bip322V1 => "bip322-v1",
+            Self::HumidEcdsaV1 => HUMID_ECDSA_SCHEME,
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -30,8 +64,10 @@ pub enum AuthError {
     InvalidChallenge,
     #[error("authentication token is invalid or expired")]
     InvalidToken,
-    #[error("BIP322 signature is invalid")]
+    #[error("operator signature is invalid")]
     InvalidSignature,
+    #[error("signature scheme is invalid or unsupported")]
+    InvalidSignatureScheme,
     #[error("signed request timestamp is outside the accepted window")]
     InvalidTimestamp,
     #[error("signed request nonce is invalid")]
@@ -51,6 +87,7 @@ pub struct Challenge {
     pub message: String,
     pub expires_at: u64,
     pub network: AuthNetwork,
+    pub signature_scheme: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -59,9 +96,26 @@ pub struct AccessToken {
     pub expires_at: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct AuthConfig {
+    pub network: AuthNetwork,
+    pub caip2_chain_id: Option<&'static str>,
+    pub signature_scheme: &'static str,
+    pub descriptor_type: &'static str,
+    pub descriptor_format: &'static str,
+    pub identity_derivation: IdentityDerivation,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct IdentityDerivation {
+    pub branch: u32,
+    pub index: u32,
+}
+
 #[derive(Deserialize)]
 pub(super) struct ChallengeRequest {
     public_key: String,
+    signature_scheme: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -69,11 +123,13 @@ pub(super) struct TokenRequest {
     public_key: String,
     message: String,
     signature: String,
+    signature_scheme: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub(super) struct SignedRequest<T> {
     pub(super) public_key: String,
+    pub(super) signature_scheme: Option<String>,
     pub(super) timestamp: u64,
     pub(super) nonce: String,
     pub(super) signature: String,
@@ -106,6 +162,14 @@ impl AuthNetwork {
         }
     }
 
+    fn caip2_chain_id(self) -> Option<&'static str> {
+        match self {
+            Self::LiquidV1 => Some(LIQUID_MAINNET_CHAIN_ID),
+            Self::LiquidTestnet => Some(LIQUID_TESTNET_CHAIN_ID),
+            Self::ElementsRegtest => None,
+        }
+    }
+
     pub(crate) fn simplicity_network(self) -> SimplicityNetwork {
         match self {
             Self::LiquidV1 => SimplicityNetwork::Liquid,
@@ -126,11 +190,12 @@ pub struct AuthService {
 struct AuthState {
     challenges: HashMap<String, ExpiringOperator>,
     tokens: HashMap<String, ExpiringOperator>,
-    nonces: HashMap<(String, String), u64>,
+    nonces: HashMap<(String, SignatureScheme, String), u64>,
 }
 
 struct ExpiringOperator {
     public_key: String,
+    signature_scheme: SignatureScheme,
     expires_at: u64,
 }
 
@@ -147,20 +212,6 @@ impl AuthService {
         self.network
     }
 
-    pub async fn issue_challenge(&self, public_key: &str) -> Result<Challenge, AuthError> {
-        self.issue_challenge_at(public_key, unix_time()?).await
-    }
-
-    pub async fn exchange_token(
-        &self,
-        public_key: &str,
-        message: &str,
-        signature: &str,
-    ) -> Result<AccessToken, AuthError> {
-        self.exchange_token_at(public_key, message, signature, unix_time()?)
-            .await
-    }
-
     pub async fn authenticate_token(&self, token: &str) -> Result<String, AuthError> {
         self.authenticate_token_at(token, unix_time()?).await
     }
@@ -173,11 +224,14 @@ impl AuthService {
     ) -> Result<String, AuthError> {
         let payload = canonical_json(&request.payload).map_err(|_| AuthError::InvalidSignature)?;
 
-        self.verify_write_at(
+        let signature_scheme = SignatureScheme::from_request(request.signature_scheme.as_deref())?;
+
+        self.verify_write_for_scheme_at(
             &request.public_key,
             request.timestamp,
             &request.nonce,
             &request.signature,
+            signature_scheme,
             method,
             path,
             &payload,
@@ -195,36 +249,51 @@ impl AuthService {
         payload: &T,
     ) -> Result<String, serde_json::Error> {
         let payload = canonical_json(payload)?;
-        Ok(write_message(method, path, timestamp, nonce, &payload))
+        Ok(write_message(
+            SignatureScheme::Bip322V1,
+            method,
+            path,
+            timestamp,
+            nonce,
+            &payload,
+        ))
     }
 
+    #[cfg(test)]
     async fn issue_challenge_at(&self, public_key: &str, now: u64) -> Result<Challenge, AuthError> {
-        let (public_key, bytes) = parse_public_key(public_key)?;
-        self.require_operator(bytes).await?;
+        self.issue_challenge_for_scheme_at(public_key, SignatureScheme::Bip322V1, now)
+            .await
+    }
 
-        let message = format!(
-            "high-storm:operator-auth:v1\n{public_key}\n{}",
-            random_hex()?
-        );
+    async fn issue_challenge_for_scheme_at(
+        &self,
+        public_key: &str,
+        signature_scheme: SignatureScheme,
+        now: u64,
+    ) -> Result<Challenge, AuthError> {
+        let (public_key, parsed_key) = parse_public_key(public_key, signature_scheme)?;
+        self.require_operator(parsed_key).await?;
+
+        let message = challenge_message(signature_scheme, &public_key, &random_hex()?);
         let expires_at = now + CHALLENGE_TTL.as_secs();
 
         let mut state = self.state.lock().await;
         state.cleanup(now);
-        if let Some((message, challenge)) = state
-            .challenges
-            .iter()
-            .find(|(_, challenge)| challenge.public_key == public_key)
-        {
+        if let Some((message, challenge)) = state.challenges.iter().find(|(_, challenge)| {
+            challenge.public_key == public_key && challenge.signature_scheme == signature_scheme
+        }) {
             return Ok(Challenge {
                 message: message.clone(),
                 expires_at: challenge.expires_at,
                 network: self.network,
+                signature_scheme: signature_scheme.as_str().to_string(),
             });
         }
         state.challenges.insert(
             message.clone(),
             ExpiringOperator {
                 public_key,
+                signature_scheme,
                 expires_at,
             },
         );
@@ -233,9 +302,11 @@ impl AuthService {
             message,
             expires_at,
             network: self.network,
+            signature_scheme: signature_scheme.as_str().to_string(),
         })
     }
 
+    #[cfg(test)]
     async fn exchange_token_at(
         &self,
         public_key: &str,
@@ -243,8 +314,26 @@ impl AuthService {
         signature: &str,
         now: u64,
     ) -> Result<AccessToken, AuthError> {
-        let (public_key, bytes) = parse_public_key(public_key)?;
-        self.require_operator(bytes).await?;
+        self.exchange_token_for_scheme_at(
+            public_key,
+            message,
+            signature,
+            SignatureScheme::Bip322V1,
+            now,
+        )
+        .await
+    }
+
+    async fn exchange_token_for_scheme_at(
+        &self,
+        public_key: &str,
+        message: &str,
+        signature: &str,
+        signature_scheme: SignatureScheme,
+        now: u64,
+    ) -> Result<AccessToken, AuthError> {
+        let (public_key, parsed_key) = parse_public_key(public_key, signature_scheme)?;
+        self.require_operator(parsed_key).await?;
 
         {
             let mut state = self.state.lock().await;
@@ -253,19 +342,23 @@ impl AuthService {
                 .challenges
                 .get(message)
                 .ok_or(AuthError::InvalidChallenge)?;
-            if challenge.public_key != public_key {
+            if challenge.public_key != public_key || challenge.signature_scheme != signature_scheme
+            {
                 return Err(AuthError::InvalidChallenge);
             }
         }
 
-        verify_signature(bytes, self.network, message, signature)?;
+        verify_signature(parsed_key, self.network, message, signature)?;
 
         let mut state = self.state.lock().await;
         let challenge = state
             .challenges
             .remove(message)
             .ok_or(AuthError::InvalidChallenge)?;
-        if challenge.public_key != public_key || challenge.expires_at <= now {
+        if challenge.public_key != public_key
+            || challenge.signature_scheme != signature_scheme
+            || challenge.expires_at <= now
+        {
             return Err(AuthError::InvalidChallenge);
         }
 
@@ -275,6 +368,7 @@ impl AuthService {
             token.clone(),
             ExpiringOperator {
                 public_key,
+                signature_scheme,
                 expires_at,
             },
         );
@@ -283,29 +377,57 @@ impl AuthService {
     }
 
     async fn authenticate_token_at(&self, token: &str, now: u64) -> Result<String, AuthError> {
-        let public_key = {
+        let (public_key, signature_scheme) = {
             let mut state = self.state.lock().await;
             state.cleanup(now);
             state
                 .tokens
                 .get(token)
-                .map(|token| token.public_key.clone())
+                .map(|token| (token.public_key.clone(), token.signature_scheme))
                 .ok_or(AuthError::InvalidToken)?
         };
 
-        let (_, bytes) = parse_public_key(&public_key)?;
-        self.require_operator(bytes).await?;
+        let (_, parsed_key) = parse_public_key(&public_key, signature_scheme)?;
+        self.require_operator(parsed_key).await?;
 
         Ok(public_key)
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     async fn verify_write_at(
         &self,
         public_key: &str,
         timestamp: u64,
         nonce: &str,
         signature: &str,
+        method: &str,
+        path: &str,
+        payload: &[u8],
+        now: u64,
+    ) -> Result<String, AuthError> {
+        self.verify_write_for_scheme_at(
+            public_key,
+            timestamp,
+            nonce,
+            signature,
+            SignatureScheme::Bip322V1,
+            method,
+            path,
+            payload,
+            now,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_write_for_scheme_at(
+        &self,
+        public_key: &str,
+        timestamp: u64,
+        nonce: &str,
+        signature: &str,
+        signature_scheme: SignatureScheme,
         method: &str,
         path: &str,
         payload: &[u8],
@@ -318,11 +440,11 @@ impl AuthService {
             return Err(AuthError::InvalidNonce);
         }
 
-        let (public_key, bytes) = parse_public_key(public_key)?;
-        self.require_operator(bytes).await?;
+        let (public_key, parsed_key) = parse_public_key(public_key, signature_scheme)?;
+        self.require_operator(parsed_key).await?;
 
-        let message = write_message(method, path, timestamp, nonce, payload);
-        verify_signature(bytes, self.network, &message, signature)?;
+        let message = write_message(signature_scheme, method, path, timestamp, nonce, payload);
+        verify_signature(parsed_key, self.network, &message, signature)?;
 
         let mut state = self.state.lock().await;
         state.cleanup(now);
@@ -331,7 +453,10 @@ impl AuthService {
             .saturating_add(1);
         if state
             .nonces
-            .insert((public_key.clone(), nonce.to_string()), nonce_expires_at)
+            .insert(
+                (public_key.clone(), signature_scheme, nonce.to_string()),
+                nonce_expires_at,
+            )
             .is_some()
         {
             return Err(AuthError::ReplayedNonce);
@@ -340,8 +465,17 @@ impl AuthService {
         Ok(public_key)
     }
 
-    async fn require_operator(&self, public_key: [u8; 32]) -> Result<(), AuthError> {
-        if self.operators.contains_xonly(public_key).await? {
+    async fn require_operator(&self, public_key: OperatorPublicKey) -> Result<(), AuthError> {
+        let authorized = match public_key {
+            OperatorPublicKey::XOnly(public_key) => {
+                self.operators.contains_xonly(public_key).await?
+            }
+            OperatorPublicKey::Compressed(public_key) => {
+                self.operators.contains(public_key).await?
+            }
+        };
+
+        if authorized {
             Ok(())
         } else {
             Err(AuthError::Unauthorized)
@@ -353,21 +487,45 @@ pub(super) async fn issue_challenge(
     State(state): State<ExternalApiState>,
     Json(request): Json<ChallengeRequest>,
 ) -> Result<Json<Challenge>, ApiError> {
+    let signature_scheme = SignatureScheme::from_request(request.signature_scheme.as_deref())?;
+
     state
         .auth
-        .issue_challenge(&request.public_key)
+        .issue_challenge_for_scheme_at(&request.public_key, signature_scheme, unix_time()?)
         .await
         .map(Json)
         .map_err(Into::into)
+}
+
+pub(super) async fn get_config(State(state): State<ExternalApiState>) -> Json<AuthConfig> {
+    Json(AuthConfig {
+        network: state.auth.network(),
+        caip2_chain_id: state.auth.network().caip2_chain_id(),
+        signature_scheme: HUMID_ECDSA_SCHEME,
+        descriptor_type: "publicWalletDescriptor",
+        descriptor_format: "bip380-split-branches",
+        identity_derivation: IdentityDerivation {
+            branch: 0,
+            index: 0,
+        },
+    })
 }
 
 pub(super) async fn exchange_token(
     State(state): State<ExternalApiState>,
     Json(request): Json<TokenRequest>,
 ) -> Result<Json<AccessToken>, ApiError> {
+    let signature_scheme = SignatureScheme::from_request(request.signature_scheme.as_deref())?;
+
     state
         .auth
-        .exchange_token(&request.public_key, &request.message, &request.signature)
+        .exchange_token_for_scheme_at(
+            &request.public_key,
+            &request.message,
+            &request.signature,
+            signature_scheme,
+            unix_time()?,
+        )
         .await
         .map(Json)
         .map_err(Into::into)
@@ -394,40 +552,117 @@ impl AuthState {
     }
 }
 
-fn parse_public_key(encoded: &str) -> Result<(String, [u8; 32]), AuthError> {
+#[derive(Clone, Copy)]
+enum OperatorPublicKey {
+    XOnly([u8; 32]),
+    Compressed([u8; 33]),
+}
+
+fn parse_public_key(
+    encoded: &str,
+    signature_scheme: SignatureScheme,
+) -> Result<(String, OperatorPublicKey), AuthError> {
     let bytes = hex::decode(encoded).map_err(|_| AuthError::InvalidPublicKey)?;
-    let public_key = XOnlyPublicKey::from_slice(&bytes).map_err(|_| AuthError::InvalidPublicKey)?;
-    let bytes = public_key.serialize();
-    Ok((hex::encode(bytes), bytes))
+
+    match signature_scheme {
+        SignatureScheme::Bip322V1 => {
+            let public_key =
+                XOnlyPublicKey::from_slice(&bytes).map_err(|_| AuthError::InvalidPublicKey)?;
+            let bytes = public_key.serialize();
+            Ok((hex::encode(bytes), OperatorPublicKey::XOnly(bytes)))
+        }
+        SignatureScheme::HumidEcdsaV1 => {
+            let public_key =
+                PublicKey::from_slice(&bytes).map_err(|_| AuthError::InvalidPublicKey)?;
+            let bytes = public_key.serialize();
+            Ok((hex::encode(bytes), OperatorPublicKey::Compressed(bytes)))
+        }
+    }
 }
 
 fn verify_signature(
-    public_key: [u8; 32],
+    public_key: OperatorPublicKey,
     network: AuthNetwork,
     message: &str,
     signature: &str,
 ) -> Result<(), AuthError> {
-    let public_key =
-        XOnlyPublicKey::from_slice(&public_key).map_err(|_| AuthError::InvalidPublicKey)?;
-    let address = Address::p2tr(
-        &bitcoin::secp256k1::Secp256k1::verification_only(),
-        public_key,
-        None,
-        network.bitcoin_network(),
-    );
-    bip322::verify_simple_encoded(&address.to_string(), message, signature)
-        .map_err(|_| AuthError::InvalidSignature)
+    match public_key {
+        OperatorPublicKey::XOnly(public_key) => {
+            let public_key =
+                XOnlyPublicKey::from_slice(&public_key).map_err(|_| AuthError::InvalidPublicKey)?;
+            let address = Address::p2tr(
+                &Secp256k1::verification_only(),
+                public_key,
+                None,
+                network.bitcoin_network(),
+            );
+            bip322::verify_simple_encoded(&address.to_string(), message, signature)
+                .map_err(|_| AuthError::InvalidSignature)
+        }
+        OperatorPublicKey::Compressed(expected_public_key) => {
+            let signature_bytes: [u8; 65] = hex::decode(signature)
+                .map_err(|_| AuthError::InvalidSignature)?
+                .try_into()
+                .map_err(|_| AuthError::InvalidSignature)?;
+            let recovery_id = RecoveryId::from_i32(i32::from(signature_bytes[64]))
+                .map_err(|_| AuthError::InvalidSignature)?;
+            let signature = RecoverableSignature::from_compact(&signature_bytes[..64], recovery_id)
+                .map_err(|_| AuthError::InvalidSignature)?;
+            let message = Message::from_digest(signed_msg_hash(message).to_byte_array());
+            let recovered = Secp256k1::verification_only()
+                .recover_ecdsa(&message, &signature)
+                .map_err(|_| AuthError::InvalidSignature)?;
+
+            if recovered.serialize() == expected_public_key {
+                Ok(())
+            } else {
+                Err(AuthError::InvalidSignature)
+            }
+        }
+    }
 }
 
-fn write_message(method: &str, path: &str, timestamp: u64, nonce: &str, payload: &[u8]) -> String {
-    format!(
-        "high-storm:operator-write:v1\n{}\n{}\n{}\n{}\n{}",
-        method.to_ascii_uppercase(),
-        path,
-        timestamp,
-        nonce,
-        hex::encode(Sha256::digest(payload))
-    )
+fn challenge_message(signature_scheme: SignatureScheme, public_key: &str, nonce: &str) -> String {
+    match signature_scheme {
+        SignatureScheme::Bip322V1 => {
+            format!("high-storm:operator-auth:v1\n{public_key}\n{nonce}")
+        }
+        SignatureScheme::HumidEcdsaV1 => format!(
+            "high-storm:operator-auth:v2\n{}\n{public_key}\n{nonce}",
+            signature_scheme.as_str()
+        ),
+    }
+}
+
+fn write_message(
+    signature_scheme: SignatureScheme,
+    method: &str,
+    path: &str,
+    timestamp: u64,
+    nonce: &str,
+    payload: &[u8],
+) -> String {
+    let payload_hash = hex::encode(Sha256::digest(payload));
+
+    match signature_scheme {
+        SignatureScheme::Bip322V1 => format!(
+            "high-storm:operator-write:v1\n{}\n{}\n{}\n{}\n{}",
+            method.to_ascii_uppercase(),
+            path,
+            timestamp,
+            nonce,
+            payload_hash
+        ),
+        SignatureScheme::HumidEcdsaV1 => format!(
+            "high-storm:operator-write:v2\n{}\n{}\n{}\n{}\n{}\n{}",
+            signature_scheme.as_str(),
+            method.to_ascii_uppercase(),
+            path,
+            timestamp,
+            nonce,
+            payload_hash
+        ),
+    }
 }
 
 fn canonical_json<T: Serialize>(payload: &T) -> Result<Vec<u8>, serde_json::Error> {
@@ -449,7 +684,11 @@ fn unix_time() -> Result<u64, AuthError> {
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::{Network, PrivateKey, secp256k1};
+    use bitcoin::{
+        Network, PrivateKey,
+        secp256k1::{self, Message, Secp256k1},
+        sign_message::signed_msg_hash,
+    };
 
     use crate::db::Database;
 
@@ -477,6 +716,67 @@ mod tests {
                 .await,
             Err(AuthError::InvalidChallenge)
         ));
+    }
+
+    #[tokio::test]
+    async fn exchanges_a_humid_ecdsa_proof_and_verifies_a_write() {
+        let (auth, private_key, _) = setup().await;
+        let public_key = hex::encode(private_key.public_key(&Secp256k1::new()).inner.serialize());
+        let scheme = SignatureScheme::HumidEcdsaV1;
+        let challenge = auth
+            .issue_challenge_for_scheme_at(&public_key, scheme, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(challenge.signature_scheme, HUMID_ECDSA_SCHEME);
+        assert!(
+            challenge
+                .message
+                .starts_with("high-storm:operator-auth:v2\nbitcoin-signed-message-ecdsa-v1\n")
+        );
+
+        let signature = sign_humid(&private_key, &challenge.message);
+        let access = auth
+            .exchange_token_for_scheme_at(
+                &public_key,
+                &challenge.message,
+                &signature,
+                scheme,
+                1_001,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.authenticate_token_at(&access.token, 1_002)
+                .await
+                .unwrap(),
+            public_key
+        );
+
+        let payload = serde_json::json!({"kind": "split_storm_eye"});
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        let message = write_message(
+            scheme,
+            "POST",
+            "/operators/voting",
+            1_002,
+            "humid-nonce",
+            &encoded,
+        );
+        let signature = sign_humid(&private_key, &message);
+
+        auth.verify_write_for_scheme_at(
+            &public_key,
+            1_002,
+            "humid-nonce",
+            &signature,
+            scheme,
+            "POST",
+            "/operators/voting",
+            &encoded,
+            1_002,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -617,6 +917,16 @@ mod tests {
             private_key,
             hex::encode(public_key),
         )
+    }
+
+    fn sign_humid(private_key: &PrivateKey, message: &str) -> String {
+        let message = Message::from_digest(signed_msg_hash(message).to_byte_array());
+        let signature =
+            Secp256k1::signing_only().sign_ecdsa_recoverable(&message, &private_key.inner);
+        let (recovery_id, compact) = signature.serialize_compact();
+        let mut encoded = Vec::from(compact);
+        encoded.push(recovery_id.to_i32() as u8);
+        hex::encode(encoded)
     }
 
     fn sign(private_key: &PrivateKey, message: &str) -> String {
