@@ -658,6 +658,185 @@ async fn serves_the_rate_it_attested_for_a_feed() {
 }
 
 #[tokio::test]
+async fn lets_an_operator_freeze_and_unfreeze_a_price_source() {
+    let (app, node, private_key, public_key, _) = node_setup().await;
+    node.handle()
+        .register_price_source(LBTC_USD, 0, "coingecko")
+        .await
+        .unwrap();
+
+    let unauthorized = app
+        .clone()
+        .oneshot(get_request("/operators/price-sources"))
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let authorization = bearer(&app, &private_key, &public_key).await;
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/operators/price-sources")
+                .header(header::AUTHORIZATION, &authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = response_json(listed).await;
+    assert_eq!(listed["is_coordinator"], true);
+    // Direct feeds only: a Cross pair has no sources of its own.
+    assert_eq!(listed["feeds"].as_array().unwrap().len(), 5);
+    assert_eq!(listed["feeds"][0]["symbol"], "LBTC/USD");
+    assert_eq!(
+        listed["feeds"][0]["sources"],
+        serde_json::json!([{
+            "name": "coingecko",
+            "state": "active",
+            "failures": 0,
+            "retry_at": null,
+            "frozen_at": null,
+            "observation": null,
+        }])
+    );
+
+    let timestamp = now();
+    let frozen = app
+        .clone()
+        .oneshot(signed_request(
+            &private_key,
+            &public_key,
+            "/operators/price-sources/freeze",
+            timestamp,
+            "freeze-coingecko",
+            serde_json::json!({"feed_id": LBTC_USD, "source": "coingecko"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(frozen.status(), StatusCode::OK);
+    let frozen = response_json(frozen).await;
+    assert_eq!(frozen["feeds"][0]["sources"][0]["state"], "frozen");
+    assert!(frozen["feeds"][0]["sources"][0]["frozen_at"].is_u64());
+    assert_eq!(frozen["feeds"][0]["available"], false);
+
+    let unfrozen = app
+        .clone()
+        .oneshot(signed_request(
+            &private_key,
+            &public_key,
+            "/operators/price-sources/unfreeze",
+            timestamp,
+            "unfreeze-coingecko",
+            serde_json::json!({"feed_id": LBTC_USD, "source": "coingecko"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unfrozen.status(), StatusCode::OK);
+    let unfrozen = response_json(unfrozen).await;
+    assert_eq!(unfrozen["feeds"][0]["sources"][0]["state"], "active");
+    assert_eq!(
+        unfrozen["feeds"][0]["sources"][0]["frozen_at"],
+        serde_json::Value::Null
+    );
+}
+
+#[tokio::test]
+async fn refuses_to_freeze_a_source_a_feed_does_not_have() {
+    let (app, node, private_key, public_key, _) = node_setup().await;
+    node.handle()
+        .register_price_source(LBTC_USD, 0, "coingecko")
+        .await
+        .unwrap();
+    let timestamp = now();
+
+    for (nonce, feed, source, status) in [
+        ("unknown-feed", 99, "coingecko", StatusCode::NOT_FOUND),
+        ("unknown-source", LBTC_USD, "kraken", StatusCode::NOT_FOUND),
+        (
+            "cross-pair",
+            LBTC_USDT,
+            "coingecko",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(signed_request(
+                &private_key,
+                &public_key,
+                "/operators/price-sources/freeze",
+                timestamp,
+                nonce,
+                serde_json::json!({"feed_id": feed, "source": source}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{nonce}");
+    }
+
+    // An unfreeze signature does not freeze: each write is signed for its path.
+    let payload = serde_json::json!({"feed_id": LBTC_USD, "source": "coingecko"});
+    let nonce = "signed-for-unfreeze";
+    let message = AuthService::write_message(
+        "POST",
+        "/operators/price-sources/unfreeze",
+        timestamp,
+        nonce,
+        &payload,
+    )
+    .unwrap();
+    let replayed = app
+        .oneshot(json_request(
+            "/operators/price-sources/freeze",
+            serde_json::json!({
+                "public_key": public_key,
+                "timestamp": timestamp,
+                "nonce": nonce,
+                "signature": sign(&private_key, &message),
+                "payload": payload,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replayed.status(), StatusCode::UNAUTHORIZED);
+    let listed = node.handle().price_sources().await.unwrap();
+    assert_eq!(
+        listed[0].sources[0].status.state,
+        price_feed::SourceState::Active
+    );
+}
+
+/// A bearer token for an operator read.
+async fn bearer(app: &Router, private_key: &PrivateKey, public_key: &str) -> String {
+    let challenge = app
+        .clone()
+        .oneshot(json_request(
+            "/operators/auth/challenge",
+            serde_json::json!({"public_key": public_key}),
+        ))
+        .await
+        .unwrap();
+    let challenge = response_json(challenge).await;
+    let message = challenge["message"].as_str().unwrap();
+    let token = app
+        .clone()
+        .oneshot(json_request(
+            "/operators/auth/token",
+            serde_json::json!({
+                "public_key": public_key,
+                "message": message,
+                "signature": sign(private_key, message),
+            }),
+        ))
+        .await
+        .unwrap();
+    let token = response_json(token).await;
+    format!("Bearer {}", token["token"].as_str().unwrap())
+}
+
+#[tokio::test]
 async fn registers_a_request_issued_at_a_feed_it_prices() {
     let (app, _, _) = setup().await;
 
