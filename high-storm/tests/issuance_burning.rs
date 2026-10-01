@@ -2,12 +2,18 @@ use std::{error::Error, str::FromStr, time::Duration};
 
 use bitcoin::{Amount, Denomination};
 use bitcoincore_rpc::{Auth, Client, RpcApi};
-use contracts::artifacts::account::{AccountProgram, derived_account::AccountArguments};
+use contracts::{
+    artifacts::account::{AccountProgram, derived_account::AccountArguments},
+    voucher::{Voucher, VoucherAuthMethod, VoucherParameters},
+};
 use high_storm::{
     config::Config,
-    db::{Database, network_asset::STORM_EYE_KIND},
+    db::{
+        Database,
+        network_asset::{ORACLE_VERIFIER_KIND, STORM_EYE_KIND, TICK_ASSET_KIND},
+    },
 };
-use secp256k1::{Keypair, SecretKey, schnorr};
+use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, schnorr};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
@@ -26,6 +32,9 @@ use tokio::{
 };
 
 const USER_REQUEST_TAG: &str = "OracleNetworkV1/NetworkUserRequests";
+const PRICE_TAG: &str = "OracleNetworkV1/Price";
+/// LBTC/USD, the Direct feed the bundled CoinGecko source prices.
+const PRICE_FEED_ID: u32 = 0;
 const TICK_LIFETIME_BLOCKS: u64 = 60;
 const RPC_URL: &str = "http://127.0.0.1:18884";
 const WALLET_RPC_URL: &str = "http://127.0.0.1:18884/wallet/funded-key";
@@ -68,6 +77,37 @@ struct RequestStatus {
 }
 
 #[derive(Deserialize)]
+struct ExecutedRequest {
+    results: Vec<IssuedResult>,
+}
+
+#[derive(Deserialize)]
+struct IssuedResult {
+    kind: String,
+    vout: u32,
+    payload: String,
+}
+
+#[derive(Deserialize)]
+struct SignedPriceDataDetails {
+    price_data: String,
+    storm_tree_bloom: StormTreeBloom,
+}
+
+#[derive(Deserialize)]
+struct StormTreeBloom {
+    signature: String,
+    branch: String,
+    proof: Vec<BloomStep>,
+}
+
+#[derive(Deserialize)]
+struct BloomStep {
+    right: bool,
+    hash: String,
+}
+
+#[derive(Deserialize)]
 struct WalletUtxo {
     txid: String,
     vout: u32,
@@ -85,6 +125,8 @@ struct SignedTransaction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IndexedTick {
     output_index: u32,
+    asset_kind: String,
+    internal_key: Option<[u8; 32]>,
     amount: u64,
     owner: [u8; 32],
     reserve_output_index: u32,
@@ -108,6 +150,155 @@ fn burning_time_is_sixty_blocks_for_production_and_docker() {
             "{node} must expire Ticks after 60 blocks"
         );
     }
+}
+
+/// The signed-price path: a priced request gets the rate and a Verifier, a plain one a Tick.
+#[tokio::test]
+#[ignore = "requires the bundled three-node Docker Compose stack"]
+async fn issues_a_price_request_at_a_rate_the_network_signed() -> TestResult<()> {
+    let rpc = rpc_client(RPC_URL)?;
+    let wallet = rpc_client(WALLET_RPC_URL)?;
+    let asset_database = Database::connect(
+        "postgres://high-storm:high-storm@127.0.0.1:5432/high-storm-node-1",
+        1,
+    )
+    .await?;
+    let storm_eye = asset_database
+        .network_assets()
+        .get(STORM_EYE_KIND)
+        .await?
+        .expect("Storm Eye must be initialized");
+    let oracle_verifier = asset_database
+        .network_assets()
+        .get(ORACLE_VERIFIER_KIND)
+        .await?
+        .expect("Oracle Verifier must be initialized");
+    let network = elements_network(&rpc)?;
+    let policy_asset = network.policy_asset();
+    wait_for_priced_feed(PRICE_FEED_ID, Duration::from_secs(180)).await?;
+
+    let users = [
+        user(41, storm_eye.asset_id, &network)?,
+        user(42, storm_eye.asset_id, &network)?,
+    ];
+    let (funding_txid, mining_address) = fund_accounts(
+        &rpc,
+        &wallet,
+        policy_asset,
+        [&users[0].address, &users[1].address],
+    )
+    .await?;
+    mine_blocks(&rpc, 1, &mining_address)?;
+
+    let priced = signed_price_request(
+        &users[0].keypair,
+        users[0].owner,
+        &format!("{funding_txid}:0"),
+        PRICE_FEED_ID,
+    );
+    let plain = signed_tick_request(
+        &users[1].keypair,
+        users[1].owner,
+        &format!("{funding_txid}:1"),
+    );
+    let mut request_hashes = Vec::new();
+    for request in [&priced, &plain] {
+        let (status, body) = http_json("POST", "/users/requests", Some(request)).await?;
+        assert_eq!(status, 201, "request submission failed: {body}");
+        request_hashes.push(serde_json::from_value::<CreatedRequest>(body)?.request_hash);
+    }
+
+    let issuance_txid = wait_for_spender(&rpc, &funding_txid, 0, Duration::from_secs(60)).await?;
+    if transaction_height(&rpc, &issuance_txid)?.is_none() {
+        mine_blocks(&rpc, 1, &mining_address)?;
+    }
+    wait_for_confirmation(&rpc, &issuance_txid).await?;
+
+    let results = wait_for_results(&request_hashes[0], Duration::from_secs(60)).await?;
+    let issued = results.first().ok_or("the priced request issued nothing")?;
+    assert_eq!(issued.kind, "signed-price-data");
+    let details: SignedPriceDataDetails = serde_json::from_str(&issued.payload)?;
+
+    let price_data = hex::decode(&details.price_data)?;
+    assert_eq!(price_data.len(), 32, "price data is the canonical 32 bytes");
+    assert_eq!(
+        u32::from_be_bytes(price_data[0..4].try_into()?),
+        PRICE_FEED_ID,
+        "the rate is the feed the request named"
+    );
+
+    // The point of the whole feature: the aggregate signature the round
+    // collected verifies over the rate, under the branch that signed it.
+    let branch: [u8; 32] = hex::decode(&details.storm_tree_bloom.branch)?
+        .as_slice()
+        .try_into()?;
+    let branch = XOnlyPublicKey::from_byte_array(branch)?;
+    let signature: [u8; 64] = hex::decode(&details.storm_tree_bloom.signature)?
+        .as_slice()
+        .try_into()?;
+    schnorr::verify(
+        &schnorr::Signature::from_byte_array(signature),
+        &price_message(&price_data),
+        &branch,
+    )?;
+
+    // One unit, internal key = signing branch.
+    let issuance = raw_transaction(&rpc, &issuance_txid)?;
+    let verifier_output = issuance
+        .output
+        .get(issued.vout as usize)
+        .ok_or("the Verifier output is missing")?;
+    assert_eq!(
+        verifier_output.asset.explicit(),
+        Some(AssetId::from_byte_array(oracle_verifier.asset_id)),
+        "a signed-price-data request is issued an Oracle Verifier"
+    );
+    assert_eq!(verifier_output.value.explicit(), Some(1));
+    let expected_verifier = Voucher::new_with_taproot_pubkey(
+        VoucherParameters {
+            storm_eye_asset_id: AssetId::from_byte_array(storm_eye.asset_id),
+            auth_method: VoucherAuthMethod::Signature {
+                auth_pubkey: users[0].owner,
+            },
+            network,
+        },
+        simplex::simplicityhl::elements::schnorr::XOnlyPublicKey::from_slice(&branch.serialize())?,
+    );
+    assert_eq!(
+        verifier_output.script_pubkey,
+        expected_verifier.get_script_pubkey()
+    );
+
+    assert!(
+        !details.storm_tree_bloom.proof.is_empty(),
+        "the branch carries an inclusion path"
+    );
+    for step in &details.storm_tree_bloom.proof {
+        assert_eq!(
+            hex::decode(&step.hash)?.len(),
+            32,
+            "the sibling at right={} is a 32-byte hash",
+            step.right
+        );
+    }
+
+    let plain_results = wait_for_results(&request_hashes[1], Duration::from_secs(60)).await?;
+    let plain_issued = plain_results
+        .first()
+        .ok_or("the plain request issued nothing")?;
+    assert_eq!(plain_issued.kind, "tick-utxo");
+    assert_ne!(
+        issuance.output[plain_issued.vout as usize].asset.explicit(),
+        Some(AssetId::from_byte_array(oracle_verifier.asset_id)),
+        "a plain request is still issued a Tick"
+    );
+    assert!(
+        !plain_issued.payload.contains("price_data"),
+        "a plain Tick request receives no rate: {}",
+        plain_issued.payload
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -230,7 +421,7 @@ async fn batches_two_users_and_burns_both_to_one_empty_op_return() -> TestResult
     mine_blocks(&rpc, expiry_height.saturating_sub(tip), &mining_address)?;
 
     let burn_txid =
-        wait_for_common_burn(&databases, issuance_txid, Duration::from_secs(120)).await?;
+        wait_for_common_burn(&databases, issuance_txid, 2, Duration::from_secs(120)).await?;
     let burn = wait_for_raw_transaction(&rpc, &burn_txid, Duration::from_secs(30)).await?;
     for tick in &active[0] {
         assert!(burn.input.iter().any(|input| {
@@ -273,6 +464,171 @@ async fn batches_two_users_and_burns_both_to_one_empty_op_return() -> TestResult
                 && output.script_pubkey == user.script
         }));
     }
+
+    if transaction_height(&rpc, &burn_txid)?.is_none() {
+        mine_blocks(&rpc, 1, &mining_address)?;
+    }
+    wait_for_confirmation(&rpc, &burn_txid).await?;
+    wait_for_no_ticks(&databases, issuance_txid, Duration::from_secs(60)).await?;
+
+    Ok(())
+}
+
+/// Ticks and Verifiers in one round: both tokens are reissued, every node indexes
+/// each Verifier with the branch that signed, and one burn spends them all into
+/// an empty OP_RETURN per asset.
+#[tokio::test]
+#[ignore = "requires the bundled three-node Docker Compose stack"]
+async fn issues_and_burns_ticks_and_verifiers_in_one_round() -> TestResult<()> {
+    let rpc = rpc_client(RPC_URL)?;
+    let wallet = rpc_client(WALLET_RPC_URL)?;
+    let databases = database_pools().await?;
+    let asset_database = Database::connect(
+        "postgres://high-storm:high-storm@127.0.0.1:5432/high-storm-node-1",
+        1,
+    )
+    .await?;
+    let assets = asset_database.network_assets();
+    let storm_eye = assets
+        .get(STORM_EYE_KIND)
+        .await?
+        .expect("Storm Eye must be initialized");
+    let tick_asset = AssetId::from_byte_array(
+        assets
+            .get(TICK_ASSET_KIND)
+            .await?
+            .expect("Tick must be initialized")
+            .asset_id,
+    );
+    let verifier_asset = AssetId::from_byte_array(
+        assets
+            .get(ORACLE_VERIFIER_KIND)
+            .await?
+            .expect("Oracle Verifier must be initialized")
+            .asset_id,
+    );
+    let network = elements_network(&rpc)?;
+    let policy_asset = network.policy_asset();
+    wait_for_priced_feed(PRICE_FEED_ID, Duration::from_secs(180)).await?;
+
+    let users = [
+        user(51, storm_eye.asset_id, &network)?,
+        user(52, storm_eye.asset_id, &network)?,
+    ];
+    let (funding_txid, mining_address) = fund_accounts(
+        &rpc,
+        &wallet,
+        policy_asset,
+        [&users[0].address, &users[1].address],
+    )
+    .await?;
+    mine_blocks(&rpc, 1, &mining_address)?;
+
+    let batches = [
+        signed_batch(
+            &users[0].keypair,
+            users[0].owner,
+            &format!("{funding_txid}:0"),
+            &[None, Some(PRICE_FEED_ID)],
+        ),
+        signed_price_request(
+            &users[1].keypair,
+            users[1].owner,
+            &format!("{funding_txid}:1"),
+            PRICE_FEED_ID,
+        ),
+    ];
+    let mut request_hashes = Vec::new();
+    for batch in &batches {
+        let (status, body) = http_json("POST", "/users/requests", Some(batch)).await?;
+        assert_eq!(status, 201, "request submission failed: {body}");
+        request_hashes.push(serde_json::from_value::<CreatedRequest>(body)?.request_hash);
+    }
+
+    let issuance_txid = wait_for_spender(&rpc, &funding_txid, 0, Duration::from_secs(60)).await?;
+    let issuance = raw_transaction(&rpc, &issuance_txid)?;
+    assert!(
+        spends(&issuance, &funding_txid, 1),
+        "both batches must share one round"
+    );
+    assert!(
+        issuance.input[1].asset_issuance.amount.explicit().is_some()
+            && issuance.input[2].asset_issuance.amount.explicit() == Some(2),
+        "the round reissues Ticks, then two Verifiers"
+    );
+    if transaction_height(&rpc, &issuance_txid)?.is_none() {
+        mine_blocks(&rpc, 1, &mining_address)?;
+    }
+    let issuance_height = wait_for_confirmation(&rpc, &issuance_txid).await?;
+    let issuance_txid = issuance.txid();
+
+    let active = wait_for_all_ticks(
+        &databases,
+        issuance_txid,
+        "active",
+        3,
+        Duration::from_secs(60),
+    )
+    .await?;
+    assert!(active.windows(2).all(|rows| rows[0] == rows[1]));
+    let results = wait_for_results(&request_hashes[0], Duration::from_secs(60)).await?;
+    let signed = results
+        .iter()
+        .find(|result| result.kind == "signed-price-data")
+        .ok_or("the mixed batch received no signed price")?;
+    let details: SignedPriceDataDetails = serde_json::from_str(&signed.payload)?;
+    let branch: [u8; 32] = hex::decode(&details.storm_tree_bloom.branch)?
+        .as_slice()
+        .try_into()?;
+    for issued in &active[0] {
+        let output = &issuance.output[issued.output_index as usize];
+        match issued.asset_kind.as_str() {
+            "oracle-verifier" => {
+                assert_eq!(output.asset.explicit(), Some(verifier_asset));
+                assert_eq!(issued.amount, 1);
+                assert_eq!(issued.internal_key, Some(branch));
+            }
+            "tick-asset" => {
+                assert_eq!(output.asset.explicit(), Some(tick_asset));
+                assert_eq!(issued.internal_key, None);
+            }
+            kind => return Err(format!("unexpected issued kind {kind}").into()),
+        }
+    }
+    for request_hash in &request_hashes {
+        wait_for_request_status(request_hash, "executed").await?;
+    }
+
+    let expiry_height = issuance_height + TICK_LIFETIME_BLOCKS;
+    let tip: u64 = rpc.call("getblockcount", &[])?;
+    mine_blocks(&rpc, expiry_height.saturating_sub(tip), &mining_address)?;
+
+    let burn_txid =
+        wait_for_common_burn(&databases, issuance_txid, 3, Duration::from_secs(120)).await?;
+    let burn = wait_for_raw_transaction(&rpc, &burn_txid, Duration::from_secs(30)).await?;
+    for issued in &active[0] {
+        assert!(burn.input.iter().any(|input| {
+            input.previous_output.txid == issuance_txid
+                && input.previous_output.vout == issued.output_index
+        }));
+    }
+    let burned = |asset: AssetId| {
+        burn.output
+            .iter()
+            .filter(|output| {
+                output.script_pubkey == Script::new_op_return(&[])
+                    && output.asset.explicit() == Some(asset)
+            })
+            .map(|output| output.value.explicit())
+            .collect::<Vec<_>>()
+    };
+    let tick_total = active[0]
+        .iter()
+        .filter(|issued| issued.asset_kind == "tick-asset")
+        .map(|issued| issued.amount)
+        .sum::<u64>();
+    assert_eq!(burned(tick_asset), vec![Some(tick_total)]);
+    assert_eq!(burned(verifier_asset), vec![Some(2)]);
 
     if transaction_height(&rpc, &burn_txid)?.is_none() {
         mine_blocks(&rpc, 1, &mining_address)?;
@@ -369,26 +725,59 @@ async fn fund_accounts(
 }
 
 fn signed_tick_request(keypair: &Keypair, owner: [u8; 32], fee_utxo: &str) -> NetworkUserRequests {
+    signed_batch(keypair, owner, fee_utxo, &[None])
+}
+
+fn signed_price_request(
+    keypair: &Keypair,
+    owner: [u8; 32],
+    fee_utxo: &str,
+    feed_id: u32,
+) -> NetworkUserRequests {
+    signed_batch(keypair, owner, fee_utxo, &[Some(feed_id)])
+}
+
+/// One request per entry: `None` a `tick-utxo`, `Some(feed)` a `signed-price-data`.
+fn signed_batch(
+    keypair: &Keypair,
+    owner: [u8; 32],
+    fee_utxo: &str,
+    requests: &[Option<u32>],
+) -> NetworkUserRequests {
+    let auth = json!({"kind": "signature-auth", "auth_data": hex::encode(owner)});
     let mut request = NetworkUserRequests {
         header: UserRequestHeader {
             signature: String::new(),
             public_key: hex::encode(owner),
             fee_utxos: vec![fee_utxo.to_string()],
         },
-        requests: vec![UserRequest {
-            kind: "tick-utxo".to_string(),
-            payload: json!({
-                "utxo_auth_method": {
-                    "kind": "signature-auth",
-                    "auth_data": hex::encode(owner),
-                }
+        requests: requests
+            .iter()
+            .map(|feed| match feed {
+                None => UserRequest {
+                    kind: "tick-utxo".to_string(),
+                    payload: json!({"utxo_auth_method": auth}).to_string(),
+                },
+                Some(feed_id) => UserRequest {
+                    kind: "signed-price-data".to_string(),
+                    payload: json!({"utxo_auth_method": auth, "price_feed_id": feed_id})
+                        .to_string(),
+                },
             })
-            .to_string(),
-        }],
+            .collect(),
     };
     request.header.signature =
         hex::encode(schnorr::sign(&request_signing_hash(&request), keypair).to_byte_array());
     request
+}
+
+fn price_message(price_data: &[u8]) -> [u8; 32] {
+    let tag_hash = Sha256::digest(PRICE_TAG.as_bytes());
+    let mut hash = Sha256::new();
+    hash.update(tag_hash);
+    hash.update(tag_hash);
+    hash.update(price_data);
+    hash.finalize().into()
 }
 
 fn request_signing_hash(request: &NetworkUserRequests) -> [u8; 32] {
@@ -449,6 +838,40 @@ async fn wait_for_request_status(request_hash: &str, expected: &str) -> TestResu
         }
         if Instant::now() >= deadline {
             return Err(format!("request did not reach {expected}").into());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// A node prices a feed only once its source has been polled, so a request
+/// submitted before that would wait for a round that can price it.
+async fn wait_for_priced_feed(feed_id: u32, timeout: Duration) -> TestResult<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (status, _) =
+            http_json::<Value>("GET", &format!("/price-feeds/{feed_id}"), None).await?;
+        if status == 200 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("the coordinator never priced feed {feed_id}").into());
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// The issued results a request carries once the coordinator has broadcast it.
+async fn wait_for_results(request_hash: &str, timeout: Duration) -> TestResult<Vec<IssuedResult>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (status, body) =
+            http_json::<Value>("GET", &format!("/users/requests/{request_hash}"), None).await?;
+        assert_eq!(status, 200);
+        if let Some(payload) = body.get("payload").and_then(Value::as_str) {
+            return Ok(serde_json::from_str::<ExecutedRequest>(payload)?.results);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("request {request_hash} never carried a result: {body}").into());
         }
         sleep(Duration::from_millis(250)).await;
     }
@@ -618,18 +1041,24 @@ async fn database_pools() -> TestResult<Vec<PgPool>> {
 
 async fn indexed_ticks(pool: &PgPool, txid: Txid) -> TestResult<Vec<IndexedTick>> {
     let rows = sqlx::query(
-		"SELECT output_index, amount, account_owner_pubkey, burning_fee_output_index, status, burn_txid \
+        "SELECT output_index, asset_kind, internal_key, amount, account_owner_pubkey, \
+		 burning_fee_output_index, status, burn_txid \
 		 FROM monitored_utxos WHERE txid = $1 ORDER BY output_index",
-	)
-	.bind(txid.to_byte_array().to_vec())
-	.fetch_all(pool)
-	.await?;
+    )
+    .bind(txid.to_byte_array().to_vec())
+    .fetch_all(pool)
+    .await?;
     rows.into_iter()
         .map(|row| {
             let owner: Vec<u8> = row.try_get("account_owner_pubkey")?;
             let burn_txid: Option<Vec<u8>> = row.try_get("burn_txid")?;
+            let internal_key: Option<Vec<u8>> = row.try_get("internal_key")?;
             Ok(IndexedTick {
                 output_index: u32::try_from(row.try_get::<i64, _>("output_index")?)?,
+                asset_kind: row.try_get("asset_kind")?,
+                internal_key: internal_key
+                    .map(|key| key.try_into().map_err(|_| "invalid internal key length"))
+                    .transpose()?,
                 amount: u64::try_from(row.try_get::<i64, _>("amount")?)?,
                 owner: owner.try_into().map_err(|_| "invalid owner length")?,
                 reserve_output_index: u32::try_from(
@@ -675,6 +1104,7 @@ async fn wait_for_all_ticks(
 async fn wait_for_common_burn(
     pools: &[PgPool],
     issuance_txid: Txid,
+    issued_count: usize,
     timeout: Duration,
 ) -> TestResult<String> {
     let deadline = Instant::now() + timeout;
@@ -684,11 +1114,15 @@ async fn wait_for_common_burn(
             let ticks = indexed_ticks(pool, issuance_txid).await?;
             txids.extend(ticks.into_iter().filter_map(|tick| tick.burn_txid));
         }
-        if txids.len() == pools.len() * 2 && txids.windows(2).all(|pair| pair[0] == pair[1]) {
+        if txids.len() == pools.len() * issued_count
+            && txids.windows(2).all(|pair| pair[0] == pair[1])
+        {
             return Ok(Txid::from_byte_array(txids[0]).to_string());
         }
         if Instant::now() >= deadline {
-            return Err(format!("two users did not enter one burn transaction: {txids:?}").into());
+            return Err(
+                format!("the issued UTXOs did not enter one burn transaction: {txids:?}").into(),
+            );
         }
         sleep(Duration::from_millis(250)).await;
     }

@@ -20,7 +20,10 @@ use url::Url;
 use crate::{
     NetworkAsset, NetworkAssets,
     config::ElementsRpcConfig,
-    db::network_asset::{NetworkAssetStore, PendingNetworkAsset, STORM_EYE_KIND, TICK_ASSET_KIND},
+    db::network_asset::{
+        NetworkAssetStore, ORACLE_VERIFIER_KIND, PendingNetworkAsset, STORM_EYE_KIND,
+        TICK_ASSET_KIND,
+    },
 };
 
 use super::{NodeMessage, NodeMessageKind, SigningError};
@@ -29,10 +32,13 @@ const STORM_EYE_NAME: &str = "Storm Eye";
 const STORM_EYE_SUPPLY: u64 = 10_000;
 const INITIAL_STORM_EYE_UTXO_COUNT: usize = 6;
 const TICK_ASSET_NAME: &str = "Tick Asset";
-const TICK_ASSET_SUPPLY: u64 = 0;
+const ORACLE_VERIFIER_NAME: &str = "Oracle Verifier Asset";
+/// Both the Tick and the Oracle Verifier are issued empty: every unit of them
+/// is reissued later, against the token the Treasury holds.
+const REISSUABLE_ASSET_SUPPLY: u64 = 0;
 const REISSUANCE_TOKEN_SUPPLY: u64 = 1;
 const STORM_EYE_ISSUANCE_FEE_SATS: u64 = 1_000;
-const TICK_ISSUANCE_FEE_SATS: u64 = 1_000;
+const REISSUABLE_ASSET_ISSUANCE_FEE_SATS: u64 = 1_000;
 const MAX_MERGE_UTXOS_COUNT: u8 = 4;
 const MAX_SPLIT_UTXOS_COUNT: u8 = 4;
 pub(crate) const RESCUE_BLOCKS: u64 = 1_576_800;
@@ -340,8 +346,46 @@ impl Assets {
         config: &ElementsRpcConfig,
         storm_eye_asset_id: [u8; 32],
     ) -> Result<NetworkAsset, AssetError> {
+        self.initialize_reissuable_asset(
+            TICK_ASSET_KIND,
+            TICK_ASSET_NAME,
+            storm,
+            config,
+            storm_eye_asset_id,
+        )
+        .await
+    }
+
+    /// The asset a `signed-price-data` request is issued in: one unit whose
+    /// Taproot internal key is the branch that signed the rate.
+    pub(crate) async fn initialize_oracle_verifier_asset(
+        &self,
+        storm: &StormHandle,
+        config: &ElementsRpcConfig,
+        storm_eye_asset_id: [u8; 32],
+    ) -> Result<NetworkAsset, AssetError> {
+        self.initialize_reissuable_asset(
+            ORACLE_VERIFIER_KIND,
+            ORACLE_VERIFIER_NAME,
+            storm,
+            config,
+            storm_eye_asset_id,
+        )
+        .await
+    }
+
+    async fn initialize_reissuable_asset(
+        &self,
+        kind: &'static str,
+        name: &'static str,
+        storm: &StormHandle,
+        config: &ElementsRpcConfig,
+        storm_eye_asset_id: [u8; 32],
+    ) -> Result<NetworkAsset, AssetError> {
         let issuer = ElementsAssetIssuer::new(config)?;
-        let asset = self.ensure_tick_asset(issuer, storm_eye_asset_id).await?;
+        let asset = self
+            .ensure_reissuable_asset(kind, name, issuer, storm_eye_asset_id)
+            .await?;
         self.announce_pending(storm).await?;
 
         Ok(asset)
@@ -390,31 +434,34 @@ impl Assets {
         Ok(pending.asset)
     }
 
-    async fn ensure_tick_asset<I>(
+    async fn ensure_reissuable_asset<I>(
         &self,
+        kind: &'static str,
+        name: &'static str,
         issuer: I,
         storm_eye_asset_id: [u8; 32],
     ) -> Result<NetworkAsset, AssetError>
     where
-        I: TickAssetIssuer + Clone + Send + 'static,
+        I: ReissuableAssetIssuer + Clone + Send + 'static,
     {
-        if let Some(asset) = self.store.get(TICK_ASSET_KIND).await? {
+        if let Some(asset) = self.store.get(kind).await? {
             return Ok(asset);
         }
 
-        let pending = if let Some(pending) = self.store.get_pending(TICK_ASSET_KIND).await? {
+        let pending = if let Some(pending) = self.store.get_pending(kind).await? {
             pending
         } else {
             let issuer = issuer.clone();
-            let pending =
-                tokio::task::spawn_blocking(move || issuer.prepare_tick_asset(storm_eye_asset_id))
-                    .await??;
+            let pending = tokio::task::spawn_blocking(move || {
+                issuer.prepare_reissuable_asset(kind, name, storm_eye_asset_id)
+            })
+            .await??;
 
             if !self.store.insert_pending(&pending).await? {
                 self.store
-                    .get_pending(TICK_ASSET_KIND)
+                    .get_pending(kind)
                     .await?
-                    .ok_or_else(|| AssetError::Conflict(TICK_ASSET_KIND.to_string()))?
+                    .ok_or_else(|| AssetError::Conflict(kind.to_string()))?
             } else {
                 pending
             }
@@ -426,7 +473,7 @@ impl Assets {
         tokio::task::spawn_blocking(move || issuer.broadcast(&issuance_tx, issuance_txid))
             .await??;
 
-        self.store.activate(TICK_ASSET_KIND).await?;
+        self.store.activate(kind).await?;
 
         Ok(pending.asset)
     }
@@ -467,9 +514,13 @@ trait AssetIssuer {
     fn broadcast(&self, transaction: &[u8], expected_txid: [u8; 32]) -> Result<(), AssetError>;
 }
 
-trait TickAssetIssuer: AssetIssuer {
-    fn prepare_tick_asset(
+/// The Tick and the Oracle Verifier are issued the same way: empty, with their
+/// reissuance token locked by the Treasury, so one issuer serves both.
+trait ReissuableAssetIssuer: AssetIssuer {
+    fn prepare_reissuable_asset(
         &self,
+        kind: &str,
+        name: &str,
         storm_eye_asset_id: [u8; 32],
     ) -> Result<PendingNetworkAsset, AssetError>;
 }
@@ -666,8 +717,10 @@ impl ElementsAssetIssuer {
         Ok(())
     }
 
-    fn prepare_tick_asset(
+    fn prepare_reissuable_asset(
         &self,
+        kind: &str,
+        name: &str,
         storm_eye_asset_id: [u8; 32],
     ) -> Result<PendingNetworkAsset, AssetError> {
         let client = self.client()?;
@@ -696,11 +749,11 @@ impl ElementsAssetIssuer {
             .map_err(|_| AssetError::InvalidRpcResponse("funding UTXO amount"))?;
         let change_sats = funding_amount
             .to_sat()
-            .checked_sub(TICK_ISSUANCE_FEE_SATS)
+            .checked_sub(REISSUABLE_ASSET_ISSUANCE_FEE_SATS)
             .ok_or(AssetError::MissingFundingUtxo)?;
         let change_amount = Amount::from_sat(change_sats).to_string_in(Denomination::Bitcoin);
-        let fee_amount =
-            Amount::from_sat(TICK_ISSUANCE_FEE_SATS).to_string_in(Denomination::Bitcoin);
+        let fee_amount = Amount::from_sat(REISSUABLE_ASSET_ISSUANCE_FEE_SATS)
+            .to_string_in(Denomination::Bitcoin);
         let raw: String = client.call(
             "createrawtransaction",
             &[
@@ -725,12 +778,16 @@ impl ElementsAssetIssuer {
         let issuance = issuances
             .into_iter()
             .next()
-            .ok_or(AssetError::InvalidRpcResponse("raw Tick asset issuance"))?;
-        let mut transaction: Transaction = encode::deserialize(
-            &hex::decode(&issuance.hex)
-                .map_err(|_| AssetError::InvalidRpcResponse("raw Tick issuance transaction"))?,
-        )
-        .map_err(|_| AssetError::InvalidRpcResponse("raw Tick issuance transaction"))?;
+            .ok_or(AssetError::InvalidRpcResponse(
+                "raw reissuable asset issuance",
+            ))?;
+        let mut transaction: Transaction =
+            encode::deserialize(&hex::decode(&issuance.hex).map_err(|_| {
+                AssetError::InvalidRpcResponse("raw reissuable asset issuance transaction")
+            })?)
+            .map_err(|_| {
+                AssetError::InvalidRpcResponse("raw reissuable asset issuance transaction")
+            })?;
         let (token_output_index, token_output) = transaction
             .output
             .iter()
@@ -784,14 +841,16 @@ impl ElementsAssetIssuer {
             client.call("signrawtransactionwithwallet", &[blinded.into()])?;
         if !signed.complete {
             return Err(AssetError::InvalidRpcResponse(
-                "complete signed Tick asset transaction",
+                "complete signed reissuable asset transaction",
             ));
         }
-        let transaction: Transaction = encode::deserialize(
-            &hex::decode(&signed.hex)
-                .map_err(|_| AssetError::InvalidRpcResponse("signed Tick issuance transaction"))?,
-        )
-        .map_err(|_| AssetError::InvalidRpcResponse("signed Tick issuance transaction"))?;
+        let transaction: Transaction =
+            encode::deserialize(&hex::decode(&signed.hex).map_err(|_| {
+                AssetError::InvalidRpcResponse("signed reissuable asset issuance transaction")
+            })?)
+            .map_err(|_| {
+                AssetError::InvalidRpcResponse("signed reissuable asset issuance transaction")
+            })?;
         let (signed_token_output_index, token_txout) =
             confidential_token_output(&transaction, &treasury_script)?;
         if signed_token_output_index != token_output_index {
@@ -812,15 +871,21 @@ impl ElementsAssetIssuer {
 
         Ok(PendingNetworkAsset {
             asset: NetworkAsset {
-                kind: TICK_ASSET_KIND.to_string(),
-                name: TICK_ASSET_NAME.to_string(),
-                asset_id: decode_asset_hash(&issuance.asset, "Tick asset id")?,
+                kind: kind.to_string(),
+                name: name.to_string(),
+                asset_id: decode_asset_hash(&issuance.asset, "reissuable asset id")?,
                 reissuance_token_id: Some(decode_asset_hash(
                     &issuance.token,
-                    "Tick reissuance token id",
+                    "reissuance token id",
                 )?),
-                entropy: Some(decode_asset_hash(&issuance.entropy, "Tick asset entropy")?),
-                issuance_txid: decode_hash(&decoded.txid, "Tick issuance transaction id")?,
+                entropy: Some(decode_asset_hash(
+                    &issuance.entropy,
+                    "reissuable asset entropy",
+                )?),
+                issuance_txid: decode_hash(
+                    &decoded.txid,
+                    "reissuable asset issuance transaction id",
+                )?,
                 contract_script: treasury_script,
                 contract_data: Some(
                     postcard::to_stdvec(&TickAssetContractData {
@@ -829,11 +894,11 @@ impl ElementsAssetIssuer {
                     })
                     .map_err(AssetError::Encoding)?,
                 ),
-                supply: TICK_ASSET_SUPPLY,
+                supply: REISSUABLE_ASSET_SUPPLY,
                 created_at_block: block_height,
             },
             issuance_tx: hex::decode(signed.hex).map_err(|_| {
-                AssetError::InvalidRpcResponse("signed Tick issuance transaction hex")
+                AssetError::InvalidRpcResponse("signed reissuable asset issuance transaction hex")
             })?,
         })
     }
@@ -876,12 +941,14 @@ impl AssetIssuer for ElementsAssetIssuer {
     }
 }
 
-impl TickAssetIssuer for ElementsAssetIssuer {
-    fn prepare_tick_asset(
+impl ReissuableAssetIssuer for ElementsAssetIssuer {
+    fn prepare_reissuable_asset(
         &self,
+        kind: &str,
+        name: &str,
         storm_eye_asset_id: [u8; 32],
     ) -> Result<PendingNetworkAsset, AssetError> {
-        self.prepare_tick_asset(storm_eye_asset_id)
+        self.prepare_reissuable_asset(kind, name, storm_eye_asset_id)
     }
 }
 
@@ -1221,7 +1288,7 @@ mod tests {
                         issuance_txid: [8; 32],
                         contract_script: vec![0x51],
                         contract_data: None,
-                        supply: TICK_ASSET_SUPPLY,
+                        supply: REISSUABLE_ASSET_SUPPLY,
                         created_at_block: 43,
                     },
                     issuance_tx: vec![9; 64],
@@ -1236,7 +1303,7 @@ mod tests {
             _storm_tree_root: [u8; 32],
             _initial_members: &[[u8; 32]],
         ) -> Result<PendingNetworkAsset, AssetError> {
-            unreachable!("Tick asset initialization uses prepare_tick_asset")
+            unreachable!("reissuable asset initialization uses prepare_reissuable_asset")
         }
 
         fn broadcast(&self, transaction: &[u8], expected_txid: [u8; 32]) -> Result<(), AssetError> {
@@ -1247,9 +1314,11 @@ mod tests {
         }
     }
 
-    impl TickAssetIssuer for FakeTickAssetIssuer {
-        fn prepare_tick_asset(
+    impl ReissuableAssetIssuer for FakeTickAssetIssuer {
+        fn prepare_reissuable_asset(
             &self,
+            _kind: &str,
+            _name: &str,
             _storm_eye_asset_id: [u8; 32],
         ) -> Result<PendingNetworkAsset, AssetError> {
             self.prepared.fetch_add(1, Ordering::SeqCst);
@@ -1288,11 +1357,11 @@ mod tests {
         let issuer = FakeTickAssetIssuer::new();
 
         let created = assets
-            .ensure_tick_asset(issuer.clone(), [1; 32])
+            .ensure_reissuable_asset(TICK_ASSET_KIND, TICK_ASSET_NAME, issuer.clone(), [1; 32])
             .await
             .unwrap();
         let existing = assets
-            .ensure_tick_asset(issuer.clone(), [2; 32])
+            .ensure_reissuable_asset(TICK_ASSET_KIND, TICK_ASSET_NAME, issuer.clone(), [2; 32])
             .await
             .unwrap();
 

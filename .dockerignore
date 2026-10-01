@@ -1,4 +1,5 @@
 .git
+high-storm/.env
 **/target
 **/dist
 **/node_modules

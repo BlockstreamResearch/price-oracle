@@ -98,7 +98,11 @@ ensure_storm_network() {
 }
 
 compose() {
-    docker compose -f "${compose_file}" "$@"
+    if [[ -f "${script_dir}/.env" ]]; then
+        docker compose --env-file "${script_dir}/.env" -f "${compose_file}" "$@"
+    else
+        docker compose -f "${compose_file}" "$@"
+    fi
 }
 
 require_docker() {
@@ -180,6 +184,7 @@ remove_extra_node_containers() {
 deploy_node() {
     local config_path container_name database database_exists image_name node
     local peer_port api_port address_suffix private_key public_key coordinator_public_key
+    local env_file_args=()
 
     node="$1"
     require_node_number "${node}"
@@ -265,6 +270,9 @@ EOF
     peer_port="$((8999 + node))"
     api_port="$((9099 + node))"
     address_suffix="$((100 + node))"
+    if [[ -f "${script_dir}/.env" ]]; then
+        env_file_args=(--env-file "${script_dir}/.env")
+    fi
 
     docker rm --force "${container_name}" >/dev/null 2>&1 || true
     docker run --detach \
@@ -277,6 +285,7 @@ EOF
         --publish "${peer_port}:9000" \
         --publish "${api_port}:9100" \
         --volume "${config_path}:/etc/high-storm/config.toml:ro" \
+        "${env_file_args[@]}" \
         --env "OPERATOR_PUBLIC_KEY=${public_key}" \
         --env "RUST_LOG=${RUST_LOG:-info,high_storm=debug,storm=debug,sqlx=warn}" \
         --entrypoint /bin/sh \

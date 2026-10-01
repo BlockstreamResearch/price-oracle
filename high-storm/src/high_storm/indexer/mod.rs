@@ -26,7 +26,7 @@ use crate::{
         chain::{CanonicalBlock, ChainStore},
         droplet::{DropletBalance, DropletError, DropletStore, TreasuryTransaction},
         monitored_utxo::{IndexedBlock, MonitoredUtxo, MonitoredUtxoStore},
-        network_asset::{NetworkAssetStore, STORM_EYE_KIND, TICK_ASSET_KIND},
+        network_asset::{NetworkAssetStore, ORACLE_VERIFIER_KIND, STORM_EYE_KIND, TICK_ASSET_KIND},
     },
 };
 
@@ -37,7 +37,7 @@ use super::{
         treasury_blinding_secret,
     },
     droplets::member_from_script,
-    issuance::IssuedTickDescriptor,
+    issuance::IssuedUtxoDescriptor,
     user_requests::asset_id,
 };
 
@@ -128,7 +128,13 @@ impl Indexer {
             .get(TICK_ASSET_KIND)
             .await?
             .ok_or(IndexerError::MissingAsset(TICK_ASSET_KIND))?;
-        let tick_asset_id = AssetId::from_byte_array(tick_asset.asset_id);
+        // Required, or a Verifier-only issuance would be skipped.
+        let verifier_asset = self
+            .assets
+            .get(ORACLE_VERIFIER_KIND)
+            .await?
+            .ok_or(IndexerError::MissingAsset(ORACLE_VERIFIER_KIND))?;
+        let issued_assets = [&tick_asset, &verifier_asset];
         let client = self.client()?;
         let network = network(&client)?;
         let tip: u64 = client.call("getblockcount", &[])?;
@@ -270,13 +276,12 @@ impl Indexer {
                 .transpose()?;
             let block_storm_eye = renewal.as_ref().map_or(&storm_eye, |(_, renewed)| renewed);
             let issued = if height >= issued_height {
-                Some(issued_tick_utxos(
+                Some(issued_utxos(
                     &client,
                     &block.txdata,
                     height,
                     block_storm_eye,
-                    &tick_asset,
-                    tick_asset_id,
+                    &issued_assets,
                     &network,
                 )?)
             } else {
@@ -736,100 +741,126 @@ fn treasury_output_amount(
     Ok(None)
 }
 
-fn issued_tick_utxos(
+fn issued_utxos(
     client: &Client,
     transactions: &[Transaction],
     height: u64,
     storm_eye: &crate::NetworkAsset,
-    tick_asset: &crate::NetworkAsset,
-    tick_asset_id: AssetId,
+    issued_assets: &[&crate::NetworkAsset],
     network: &SimplicityNetwork,
 ) -> Result<Vec<MonitoredUtxo>, IndexerError> {
     let mut issued = Vec::new();
     for transaction in transactions {
-        if !is_tick_issuance(client, transaction, storm_eye, tick_asset)? {
+        let Some(tokens) = issuance_tokens(client, transaction, storm_eye, issued_assets)? else {
             continue;
-        }
-        issued.extend(indexed_tick_outputs(
+        };
+        issued.extend(indexed_issued_outputs(
             transaction,
             height,
             storm_eye,
-            tick_asset_id,
+            &tokens,
             network,
         )?);
     }
     Ok(issued)
 }
 
-fn indexed_tick_outputs(
+/// `tokens`: reissued assets, in input order.
+fn indexed_issued_outputs(
     transaction: &Transaction,
     height: u64,
     storm_eye: &crate::NetworkAsset,
-    tick_asset_id: AssetId,
+    tokens: &[&crate::NetworkAsset],
     network: &SimplicityNetwork,
 ) -> Result<Vec<MonitoredUtxo>, IndexerError> {
     let txid = transaction.txid();
     let mut descriptors = None;
     for output in &transaction.output {
-        let Some(output_descriptors) = IssuedTickDescriptor::from_script(&output.script_pubkey)
+        let Some(output_descriptors) = IssuedUtxoDescriptor::from_script(&output.script_pubkey)
             .map_err(IndexerError::Invalid)?
         else {
             continue;
         };
         if descriptors.is_some() {
             return Err(IndexerError::Invalid(
-                "Tick issuance has multiple descriptor outputs".into(),
+                "issuance has multiple descriptor outputs".into(),
             ));
         }
         if output.asset.explicit() != Some(network.policy_asset())
             || output.value.explicit() != Some(0)
         {
             return Err(IndexerError::Invalid(
-                "issued Tick descriptor output must have zero policy-asset value".into(),
+                "issued UTXO descriptor output must have zero policy-asset value".into(),
             ));
         }
         descriptors = Some(output_descriptors);
     }
-    let descriptors = descriptors.ok_or_else(|| {
-        IndexerError::Invalid("Tick issuance descriptor output is missing".into())
-    })?;
-    let tick_output_count = transaction
-        .output
-        .iter()
-        .filter(|output| output.asset.explicit() == Some(tick_asset_id))
-        .count();
-    if descriptors.len() != tick_output_count {
-        return Err(IndexerError::Invalid(
-            "Tick issuance descriptors do not match Tick outputs".into(),
-        ));
+    let descriptors = descriptors
+        .ok_or_else(|| IndexerError::Invalid("issuance descriptor output is missing".into()))?;
+    // Token index of a descriptor's asset.
+    let token_of = |descriptor: &IssuedUtxoDescriptor| {
+        let kind = if descriptor.is_verifier() {
+            ORACLE_VERIFIER_KIND
+        } else {
+            TICK_ASSET_KIND
+        };
+        tokens
+            .iter()
+            .position(|asset| asset.kind == kind)
+            .ok_or_else(|| {
+                IndexerError::Invalid(format!("issuance describes {kind} it does not reissue"))
+            })
+    };
+    for (position, asset) in tokens.iter().enumerate() {
+        let asset_id = AssetId::from_byte_array(asset.asset_id);
+        let output_count = transaction
+            .output
+            .iter()
+            .filter(|output| output.asset.explicit() == Some(asset_id))
+            .count();
+        let described = descriptors
+            .iter()
+            .map(token_of)
+            .filter(|token| token.as_ref().is_ok_and(|token| *token == position))
+            .count();
+        if described != output_count {
+            return Err(IndexerError::Invalid(format!(
+                "issuance descriptors do not match {} outputs",
+                asset.name
+            )));
+        }
     }
 
     let mut issued = Vec::with_capacity(descriptors.len());
-    let mut described_ticks = std::collections::BTreeSet::new();
-    let mut issued_amount = 0u64;
+    let mut described_outputs = std::collections::BTreeSet::new();
+    let mut issued_amounts = vec![0u64; tokens.len()];
     for descriptor in descriptors {
-        if !described_ticks.insert(descriptor.tick_output_index) {
+        if !described_outputs.insert(descriptor.output_index) {
             return Err(IndexerError::Invalid(
-                "Tick output has duplicate issuance descriptors".into(),
+                "issued output has duplicate descriptors".into(),
             ));
         }
+        let token = token_of(&descriptor)?;
+        let asset = tokens[token];
         let output = transaction
             .output
-            .get(descriptor.tick_output_index as usize)
-            .ok_or_else(|| IndexerError::Invalid("indexed Tick output is missing".into()))?;
+            .get(descriptor.output_index as usize)
+            .ok_or_else(|| IndexerError::Invalid("indexed issued output is missing".into()))?;
         let amount = output
             .value
             .explicit()
-            .ok_or_else(|| IndexerError::Invalid("indexed Tick output is confidential".into()))?;
-        issued_amount = issued_amount
+            .ok_or_else(|| IndexerError::Invalid("indexed issued output is confidential".into()))?;
+        issued_amounts[token] = issued_amounts[token]
             .checked_add(amount)
-            .ok_or_else(|| IndexerError::Invalid("indexed Tick amount overflow".into()))?;
-        if output.asset.explicit() != Some(tick_asset_id)
-            || !descriptor.matches_tick_script(storm_eye.asset_id, network, &output.script_pubkey)
+            .ok_or_else(|| IndexerError::Invalid("indexed issued amount overflow".into()))?;
+        if output.asset.explicit() != Some(AssetId::from_byte_array(asset.asset_id))
+            || (descriptor.is_verifier() && amount != 1)
+            || !descriptor.matches_script(storm_eye.asset_id, network, &output.script_pubkey)
         {
-            return Err(IndexerError::Invalid(
-                "indexed Tick output does not match its descriptor".into(),
-            ));
+            return Err(IndexerError::Invalid(format!(
+                "indexed {} output does not match its descriptor",
+                asset.name
+            )));
         }
         let reserve = transaction
             .output
@@ -851,13 +882,14 @@ fn indexed_tick_outputs(
 
         issued.push(MonitoredUtxo {
             txid: txid.to_byte_array(),
-            output_index: descriptor.tick_output_index,
-            asset_kind: TICK_ASSET_KIND.into(),
+            output_index: descriptor.output_index,
+            asset_kind: asset.kind.clone(),
             amount,
             script_pubkey: output.script_pubkey.as_bytes().to_vec(),
             auth_method: descriptor.auth_method_name().into(),
             auth_data: descriptor.auth_data.to_vec(),
             account_owner_pubkey: descriptor.account_owner_pubkey,
+            internal_key: descriptor.signer,
             burning_fee_txid: txid.to_byte_array(),
             burning_fee_output_index: descriptor.reserve_output_index,
             block_height: height,
@@ -866,40 +898,62 @@ fn indexed_tick_outputs(
             burn_txid: None,
         });
     }
-    if transaction.input[1].asset_issuance.amount.explicit() != Some(issued_amount) {
-        return Err(IndexerError::Invalid(
-            "Tick reissuance amount does not match described outputs".into(),
-        ));
+    for (position, (asset, issued_amount)) in tokens.iter().zip(issued_amounts).enumerate() {
+        if transaction.input[1 + position]
+            .asset_issuance
+            .amount
+            .explicit()
+            != Some(issued_amount)
+        {
+            return Err(IndexerError::Invalid(format!(
+                "{} reissuance amount does not match described outputs",
+                asset.name
+            )));
+        }
     }
     Ok(issued)
 }
 
-fn is_tick_issuance(
+/// Assets an issuance reissues, in input order; `None` if not an issuance.
+fn issuance_tokens<'a>(
     client: &Client,
     transaction: &Transaction,
     storm_eye: &crate::NetworkAsset,
-    tick_asset: &crate::NetworkAsset,
-) -> Result<bool, IndexerError> {
+    issued_assets: &[&'a crate::NetworkAsset],
+) -> Result<Option<Vec<&'a crate::NetworkAsset>>, IndexerError> {
     if transaction.input.len() < 2 || transaction.output.len() < 2 {
-        return Ok(false);
-    }
-    let issuance = transaction.input[1].asset_issuance;
-    if issuance.is_null() {
-        return Ok(false);
+        return Ok(None);
     }
     let txid = transaction.txid();
-    if Some(issuance.asset_entropy) != tick_asset.entropy {
-        tracing::debug!(
-            %txid,
-            actual = %hex::encode(issuance.asset_entropy),
-            expected = %tick_asset.entropy.map(hex::encode).unwrap_or_default(),
-            "rejected Tick issuance candidate: entropy mismatch"
-        );
-        return Ok(false);
+    let mut tokens: Vec<&crate::NetworkAsset> = Vec::with_capacity(issued_assets.len());
+    for input in transaction.input.iter().skip(1) {
+        let issuance = input.asset_issuance;
+        if issuance.is_null() {
+            break;
+        }
+        let Some(asset) = issued_assets
+            .iter()
+            .find(|asset| asset.entropy == Some(issuance.asset_entropy))
+        else {
+            tracing::debug!(
+                %txid,
+                actual = %hex::encode(issuance.asset_entropy),
+                "rejected issuance candidate: entropy of no network asset"
+            );
+            return Ok(None);
+        };
+        if tokens.iter().any(|token| token.kind == asset.kind) {
+            tracing::debug!(%txid, asset = %asset.name, "rejected issuance candidate: asset reissued twice");
+            return Ok(None);
+        }
+        if !issuance.inflation_keys.is_null() {
+            tracing::debug!(%txid, "rejected issuance candidate: inflation keys are not null");
+            return Ok(None);
+        }
+        tokens.push(asset);
     }
-    if !issuance.inflation_keys.is_null() {
-        tracing::debug!(%txid, "rejected Tick issuance candidate: inflation keys are not null");
-        return Ok(false);
+    if tokens.is_empty() {
+        return Ok(None);
     }
     let storm_eye_input = previous_output(client, transaction.input[0].previous_output)?;
     let storm_eye_asset =
@@ -908,47 +962,61 @@ fn is_tick_issuance(
         || storm_eye_input.script_pubkey.as_bytes() != storm_eye.contract_script
         || transaction.output[0] != storm_eye_input
     {
-        tracing::debug!(%txid, "rejected Tick issuance candidate: Storm Eye is not preserved");
-        return Ok(false);
+        tracing::debug!(%txid, "rejected issuance candidate: Storm Eye is not preserved");
+        return Ok(None);
+    }
+    for (offset, asset) in tokens.iter().enumerate() {
+        if !preserves_token(client, transaction, 1 + offset, asset)? {
+            return Ok(None);
+        }
     }
 
-    let token_input = previous_output(client, transaction.input[1].previous_output)?;
-    let token_input_secrets = match token_input
-        .unblind(&Secp256k1::new(), treasury_blinding_secret())
-    {
-        Ok(secrets) => secrets,
-        Err(_) => {
-            tracing::debug!(%txid, "rejected Tick issuance candidate: token input cannot be unblinded");
-            return Ok(false);
-        }
+    Ok(Some(tokens))
+}
+
+/// The token at `index` is returned unchanged.
+fn preserves_token(
+    client: &Client,
+    transaction: &Transaction,
+    index: usize,
+    asset: &crate::NetworkAsset,
+) -> Result<bool, IndexerError> {
+    let txid = transaction.txid();
+    let name = &asset.name;
+    let token_input = previous_output(client, transaction.input[index].previous_output)?;
+    let Ok(token_input_secrets) =
+        token_input.unblind(&Secp256k1::new(), treasury_blinding_secret())
+    else {
+        tracing::debug!(%txid, %name, "rejected issuance candidate: token input cannot be unblinded");
+        return Ok(false);
     };
     let token_id = asset_id(
-        tick_asset
+        asset
             .reissuance_token_id
-            .ok_or_else(|| IndexerError::Invalid("Tick token id is missing".into()))?,
+            .ok_or_else(|| IndexerError::Invalid(format!("{name} token id is missing")))?,
     )
     .map_err(|error| IndexerError::Invalid(error.to_string()))?;
     if token_input_secrets.asset != token_id
-        || token_input.script_pubkey.as_bytes() != tick_asset.contract_script
+        || token_input.script_pubkey.as_bytes() != asset.contract_script
     {
-        tracing::debug!(%txid, "rejected Tick issuance candidate: token input does not match Tick asset");
+        tracing::debug!(%txid, %name, "rejected issuance candidate: token input does not match its asset");
         return Ok(false);
     }
-    let token_output = &transaction.output[1];
-    let token_output_secrets = match token_output
-        .unblind(&Secp256k1::new(), treasury_blinding_secret())
-    {
-        Ok(secrets) => secrets,
-        Err(_) => {
-            tracing::debug!(%txid, "rejected Tick issuance candidate: token output cannot be unblinded");
-            return Ok(false);
-        }
+    let Some(token_output) = transaction.output.get(index) else {
+        tracing::debug!(%txid, %name, "rejected issuance candidate: token output is missing");
+        return Ok(false);
+    };
+    let Ok(token_output_secrets) =
+        token_output.unblind(&Secp256k1::new(), treasury_blinding_secret())
+    else {
+        tracing::debug!(%txid, %name, "rejected issuance candidate: token output cannot be unblinded");
+        return Ok(false);
     };
     let preserved = token_output_secrets.asset == token_input_secrets.asset
         && token_output_secrets.value == token_input_secrets.value
         && token_output.script_pubkey == token_input.script_pubkey;
     if !preserved {
-        tracing::debug!(%txid, "rejected Tick issuance candidate: token is not preserved");
+        tracing::debug!(%txid, %name, "rejected issuance candidate: token is not preserved");
     }
     Ok(preserved)
 }
@@ -1389,105 +1457,157 @@ mod tests {
         assert_eq!(extracted[0].exchange_member, None);
     }
 
+    fn network_asset(kind: &str, asset_id: u8) -> crate::NetworkAsset {
+        crate::NetworkAsset {
+            kind: kind.into(),
+            name: kind.into(),
+            asset_id: [asset_id; 32],
+            reissuance_token_id: None,
+            entropy: Some([asset_id; 32]),
+            issuance_txid: [2; 32],
+            contract_script: vec![0x51],
+            contract_data: None,
+            supply: 0,
+            created_at_block: 1,
+        }
+    }
+
     #[test]
-    fn indexes_confirmed_ticks_with_their_account_reserves() {
-        let tick_asset = AssetId::from_byte_array([9; 32]);
+    fn indexes_confirmed_ticks_and_verifiers_with_their_account_reserves() {
+        /// x of the secp256k1 generator, a valid signing branch.
+        const SIGNER: [u8; 32] = [
+            0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
+            0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b,
+            0x16, 0xf8, 0x17, 0x98,
+        ];
+        let tick = network_asset(TICK_ASSET_KIND, 9);
+        let verifier = network_asset(ORACLE_VERIFIER_KIND, 10);
+        let tick_asset = AssetId::from_byte_array(tick.asset_id);
+        let verifier_asset = AssetId::from_byte_array(verifier.asset_id);
         let network = SimplicityNetwork::ElementsCustom {
             policy_asset: AssetId::from_byte_array([8; 32]),
             genesis_hash: BlockHash::from_byte_array([6; 32]),
         };
-        let storm_eye = crate::NetworkAsset {
-            kind: STORM_EYE_KIND.into(),
-            name: "Storm Eye".into(),
-            asset_id: [7; 32],
-            reissuance_token_id: None,
-            entropy: Some([1; 32]),
-            issuance_txid: [2; 32],
-            contract_script: vec![0x51],
-            contract_data: None,
-            supply: 10_000,
-            created_at_block: 1,
-        };
+        let storm_eye = network_asset(STORM_EYE_KIND, 7);
         let descriptors = [
-            IssuedTickDescriptor {
-                tick_output_index: 2,
-                reserve_output_index: 4,
+            IssuedUtxoDescriptor {
+                output_index: 3,
+                reserve_output_index: 6,
                 account_owner_pubkey: [4; 32],
                 auth_kind: 2,
                 auth_data: [5; 32],
+                signer: None,
             },
-            IssuedTickDescriptor {
-                tick_output_index: 3,
-                reserve_output_index: 5,
+            IssuedUtxoDescriptor {
+                output_index: 4,
+                reserve_output_index: 7,
                 account_owner_pubkey: [6; 32],
                 auth_kind: 2,
                 auth_data: [7; 32],
+                signer: Some(SIGNER),
+            },
+            IssuedUtxoDescriptor {
+                output_index: 5,
+                reserve_output_index: 7,
+                account_owner_pubkey: [6; 32],
+                auth_kind: 2,
+                auth_data: [7; 32],
+                signer: None,
             },
         ];
-        let tick_scripts = descriptors.each_ref().map(|descriptor| {
+        let scripts = descriptors.each_ref().map(|descriptor| {
             descriptor
-                .tick_program(storm_eye.asset_id)
+                .voucher_program(storm_eye.asset_id)
+                .unwrap()
                 .get_script_pubkey(&network)
         });
-        let account_scripts = descriptors.each_ref().map(|descriptor| {
+        let account_scripts = [[4; 32], [6; 32]].map(|owner| {
             AccountProgram::new(&AccountArguments {
                 storm_eye_asset_id: storm_eye.asset_id,
-                account_owner_pubkey: descriptor.account_owner_pubkey,
+                account_owner_pubkey: owner,
             })
             .get_script_pubkey(&network)
         });
-        let mut reissuance_input = simplex::simplicityhl::elements::TxIn::default();
-        reissuance_input.asset_issuance.amount = confidential::Value::Explicit(3_400_000_001);
+        let reissuance = |amount| {
+            let mut input = simplex::simplicityhl::elements::TxIn::default();
+            input.asset_issuance.amount = confidential::Value::Explicit(amount);
+            input
+        };
         let transaction = Transaction {
             version: 2,
             lock_time: simplex::simplicityhl::elements::LockTime::ZERO,
             input: vec![
                 simplex::simplicityhl::elements::TxIn::default(),
-                reissuance_input,
+                reissuance(3_400_000_001),
+                reissuance(1),
             ],
             output: vec![
                 explicit_output(AssetId::from_byte_array([8; 32]), 1, Script::new()),
                 explicit_output(AssetId::from_byte_array([8; 32]), 1, Script::new()),
-                explicit_output(tick_asset, 1_700_000_000, tick_scripts[0].clone()),
-                explicit_output(tick_asset, 1_700_000_001, tick_scripts[1].clone()),
+                explicit_output(AssetId::from_byte_array([8; 32]), 1, Script::new()),
+                explicit_output(tick_asset, 1_700_000_000, scripts[0].clone()),
+                explicit_output(verifier_asset, 1, scripts[1].clone()),
+                explicit_output(tick_asset, 1_700_000_001, scripts[2].clone()),
                 explicit_output(network.policy_asset(), 1_000, account_scripts[0].clone()),
                 explicit_output(network.policy_asset(), 2_000, account_scripts[1].clone()),
                 explicit_output(
                     network.policy_asset(),
                     0,
-                    IssuedTickDescriptor::script_pubkey(&descriptors).unwrap(),
+                    IssuedUtxoDescriptor::script_pubkey(&descriptors).unwrap(),
                 ),
             ],
         };
         let txid = transaction.txid();
+        let tokens = [&tick, &verifier];
 
         let indexed =
-            indexed_tick_outputs(&transaction, 42, &storm_eye, tick_asset, &network).unwrap();
+            indexed_issued_outputs(&transaction, 42, &storm_eye, &tokens, &network).unwrap();
 
-        assert_eq!(indexed.len(), 2);
+        assert_eq!(indexed.len(), 3);
         assert_eq!(indexed[0].txid, txid.to_byte_array());
-        assert_eq!(indexed[0].output_index, 2);
+        assert_eq!(indexed[0].output_index, 3);
+        assert_eq!(indexed[0].asset_kind, TICK_ASSET_KIND);
+        assert_eq!(indexed[0].internal_key, None);
         assert_eq!(indexed[0].account_owner_pubkey, [4; 32]);
         assert_eq!(indexed[0].auth_data, vec![5; 32]);
         assert_eq!(indexed[0].burning_fee_txid, txid.to_byte_array());
-        assert_eq!(indexed[0].burning_fee_output_index, 4);
-        assert_eq!(indexed[1].output_index, 3);
+        assert_eq!(indexed[0].burning_fee_output_index, 6);
+        assert_eq!(indexed[1].output_index, 4);
+        assert_eq!(indexed[1].asset_kind, ORACLE_VERIFIER_KIND);
+        assert_eq!(indexed[1].amount, 1);
+        assert_eq!(indexed[1].internal_key, Some(SIGNER));
         assert_eq!(indexed[1].account_owner_pubkey, [6; 32]);
-        assert_eq!(indexed[1].auth_data, vec![7; 32]);
-        assert_eq!(indexed[1].burning_fee_output_index, 5);
+        assert_eq!(indexed[1].burning_fee_output_index, 7);
+        assert_eq!(indexed[2].output_index, 5);
+        assert_eq!(indexed[2].asset_kind, TICK_ASSET_KIND);
 
         let mut missing_descriptor = transaction.clone();
         missing_descriptor.output.pop();
         assert!(
-            indexed_tick_outputs(&missing_descriptor, 42, &storm_eye, tick_asset, &network)
-                .is_err()
+            indexed_issued_outputs(&missing_descriptor, 42, &storm_eye, &tokens, &network).is_err()
         );
 
-        let mut valued_descriptor = transaction;
-        valued_descriptor.output[6].value = confidential::Value::Explicit(1);
+        let mut valued_descriptor = transaction.clone();
+        valued_descriptor.output[8].value = confidential::Value::Explicit(1);
         assert!(
-            indexed_tick_outputs(&valued_descriptor, 42, &storm_eye, tick_asset, &network).is_err()
+            indexed_issued_outputs(&valued_descriptor, 42, &storm_eye, &tokens, &network).is_err()
         );
+
+        // A Verifier is always one unit.
+        let mut two_unit_verifier = transaction.clone();
+        two_unit_verifier.output[4].value = confidential::Value::Explicit(2);
+        two_unit_verifier.input[2] = reissuance(2);
+        assert!(
+            indexed_issued_outputs(&two_unit_verifier, 42, &storm_eye, &tokens, &network).is_err()
+        );
+
+        // Wrong internal key.
+        let mut foreign_key = transaction.clone();
+        foreign_key.output[4].script_pubkey = scripts[0].clone();
+        assert!(indexed_issued_outputs(&foreign_key, 42, &storm_eye, &tokens, &network).is_err());
+
+        // No Verifier token reissued.
+        assert!(indexed_issued_outputs(&transaction, 42, &storm_eye, &[&tick], &network).is_err());
     }
 
     fn explicit_output(asset: AssetId, amount: u64, script_pubkey: Script) -> TxOut {

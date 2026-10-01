@@ -179,6 +179,7 @@ impl HighStorm {
         &self,
         tx: Vec<u8>,
         signing_hash: [u8; 32],
+        price_hash: Option<[u8; 32]>,
         external_requests: Vec<ExternalRequests>,
     ) -> Result<SigningResult, SigningError> {
         if self.is_transaction_production_blocked() {
@@ -194,7 +195,13 @@ impl HighStorm {
             .map_err(|error| SigningError::InvalidMessage(error.to_string()))?;
         self.state
             .signing()
-            .sign_execute_user_requests(&self.storm, tx, signing_hash, external_requests, chain_tip)
+            .sign_execute_user_requests(
+                &self.storm,
+                move |_| Ok((tx.clone(), signing_hash)),
+                price_hash,
+                external_requests,
+                chain_tip,
+            )
             .await
     }
 
@@ -554,6 +561,29 @@ impl HighStorm {
             .map(Some)
     }
 
+    /// The asset a `signed-price-data` request is issued in. Issued beside the
+    /// Tick, since a priced round mints one of these instead of a Tick.
+    pub async fn initialize_oracle_verifier_asset(
+        &self,
+        config: &crate::config::ElementsRpcConfig,
+    ) -> Result<Option<NetworkAsset>, AssetError> {
+        if !self.is_coordinator().await {
+            return Ok(None);
+        }
+
+        let storm_eye = self
+            .state
+            .assets()
+            .storm_eye()
+            .await?
+            .ok_or_else(|| AssetError::Conflict("Storm Eye is not initialized".to_string()))?;
+        self.state
+            .assets()
+            .initialize_oracle_verifier_asset(&self.storm.handle(), config, storm_eye.asset_id)
+            .await
+            .map(Some)
+    }
+
     pub async fn network_asset(&self, kind: &str) -> Result<Option<NetworkAsset>, AssetError> {
         self.state.assets().get(kind).await
     }
@@ -575,7 +605,11 @@ impl HighStorm {
         let mut prepared = match self
             .state
             .user_requests()
-            .prepare_round(storm_eye_lane, max_transaction_weight)
+            .prepare_round(
+                self.state.block_height(),
+                storm_eye_lane,
+                max_transaction_weight,
+            )
             .await?
         {
             Some(prepared) => prepared,
@@ -588,17 +622,29 @@ impl HighStorm {
             .await
             .map_err(|error| user_requests::UserRequestError::Invalid(error.to_string()))?;
         prepared.request.chain_tip = Some(chain_tip);
-        self.state
+        let instructed = self
+            .state
             .user_requests()
             .validate_execute(&prepared.request)
             .await?;
+        let round = prepared.transaction.clone();
         let signing = self
             .state
             .signing()
             .sign_execute_user_requests(
                 &self.storm,
-                prepared.request.tx.clone(),
-                prepared.request.signing_hash,
+                move |branch| {
+                    round
+                        .for_branch(branch)
+                        .map(|(pset, signing_hash)| {
+                            (
+                                simplex::simplicityhl::elements::encode::serialize(&pset),
+                                signing_hash,
+                            )
+                        })
+                        .map_err(|error| SigningError::InvalidMessage(error.to_string()))
+                },
+                instructed.as_ref().map(prices::price_hash),
                 prepared.request.external_requests.clone(),
                 chain_tip,
             )

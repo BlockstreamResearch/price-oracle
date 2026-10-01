@@ -103,6 +103,45 @@ impl UserRequestStore {
         .collect()
     }
 
+    /// Pending requests in issuance order, resuming after the one `after`
+    /// names. A round walks the queue in pages so that a request it cannot
+    /// issue yet costs one row of the scan instead of a place in the round.
+    pub async fn list_pending_after(
+        &self,
+        limit: u32,
+        after: Option<(u64, [u8; 32])>,
+    ) -> Result<Vec<StoredUserRequest>, Error> {
+        // No cursor scans from the start: heights are never negative, so the
+        // sentinel leaves every row past it. Written as two comparisons rather
+        // than a row value, and without casts, to stay portable across the
+        // backends behind `Any`.
+        let (height, hash) = match after {
+            Some((height, hash)) => (
+                i64::try_from(height)
+                    .map_err(|error| Error::Sqlx(sqlx::Error::Encode(Box::new(error))))?,
+                hash.to_vec(),
+            ),
+            None => (-1, Vec::new()),
+        };
+
+        sqlx::query(
+            "SELECT request_hash, request, block_height, status, payload, execution_tx, \
+                    included_at_block, included_block_hash \
+             FROM network_user_requests WHERE status = 'pending' \
+               AND (block_height > $2 \
+                    OR (block_height = $2 AND request_hash > $3)) \
+             ORDER BY block_height, request_hash LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .bind(height)
+        .bind(hash)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(decode_request)
+        .collect()
+    }
+
     pub async fn list_processing(&self) -> Result<Vec<StoredUserRequest>, Error> {
         sqlx::query(
             "SELECT request_hash, request, block_height, status, payload, execution_tx, \
@@ -291,6 +330,48 @@ mod tests {
     use crate::db::{Database, user_request::InsertPendingResult};
 
     use super::FeeUtxo;
+
+    /// A round reads the queue in pages, so the pages have to cover it exactly
+    /// once: no row read twice, none stepped over, and issuance order kept
+    /// across the page boundary even where one height holds several requests.
+    #[tokio::test]
+    async fn pages_through_every_pending_request_in_issuance_order() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.user_requests();
+        // Two at one height, so paging has to break the tie by request hash.
+        let queued = [(1u64, [1u8; 32]), (1, [2; 32]), (2, [3; 32]), (3, [4; 32])];
+        for (height, hash) in queued {
+            let fee_utxo = FeeUtxo {
+                txid: hash,
+                output_index: 0,
+            };
+            store
+                .insert_pending(hash, b"request", height, std::slice::from_ref(&fee_utxo))
+                .await
+                .unwrap();
+        }
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = store.list_pending_after(2, cursor).await.unwrap();
+            if page.is_empty() {
+                break;
+            }
+            for stored in page {
+                cursor = Some((stored.block_height, stored.request_hash));
+                seen.push((stored.block_height, stored.request_hash));
+            }
+        }
+
+        assert_eq!(seen, queued, "pages must cover the queue in order, once");
+        // The first page alone is what a round used to be limited to.
+        assert_eq!(
+            store.list_pending_after(2, None).await.unwrap().len(),
+            2,
+            "a page is bounded by its limit"
+        );
+    }
 
     #[tokio::test]
     async fn inserts_pending_request_once() {

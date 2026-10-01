@@ -63,6 +63,7 @@ services:
       - -fallbackfee=0.0001
       - -txindex=1
       - -datacarriersize=7400
+      - -multi_data_permitted=1
     volumes:
       - elements-1-data:/home/elements/.elements
     networks:
@@ -105,6 +106,7 @@ services:
       - -fallbackfee=0.0001
       - -txindex=1
       - -datacarriersize=7400
+      - -multi_data_permitted=1
     volumes:
       - elements-2-data:/home/elements/.elements
     ports:
@@ -136,6 +138,7 @@ services:
       - -fallbackfee=0.0001
       - -txindex=1
       - -datacarriersize=7400
+      - -multi_data_permitted=1
     volumes:
       - elements-3-data:/home/elements/.elements
     ports:
@@ -256,6 +259,7 @@ services:
     <<: *node
     environment:
       RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=debug,sqlx=warn}
+      COINGECKO_API_KEY: ${COINGECKO_API_KEY:-}
       OPERATOR_PUBLIC_KEY: 031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f
     depends_on:
       postgres:
@@ -286,6 +290,7 @@ services:
     <<: *node
     environment:
       RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=debug,sqlx=warn}
+      COINGECKO_API_KEY: ${COINGECKO_API_KEY:-}
       OPERATOR_PUBLIC_KEY: 024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766
     depends_on:
       postgres:
@@ -316,6 +321,7 @@ services:
     <<: *node
     environment:
       RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=debug,sqlx=warn}
+      COINGECKO_API_KEY: ${COINGECKO_API_KEY:-}
       OPERATOR_PUBLIC_KEY: 02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337
     depends_on:
       postgres:

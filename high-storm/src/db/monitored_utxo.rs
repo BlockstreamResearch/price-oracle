@@ -18,6 +18,8 @@ pub struct MonitoredUtxo {
     pub auth_method: String,
     pub auth_data: Vec<u8>,
     pub account_owner_pubkey: [u8; 32],
+    /// A Verifier's Taproot internal key; `None` for a Tick.
+    pub internal_key: Option<[u8; 32]>,
     pub burning_fee_txid: [u8; 32],
     pub burning_fee_output_index: u32,
     pub block_height: u64,
@@ -79,8 +81,8 @@ impl MonitoredUtxoStore {
                 "INSERT INTO monitored_utxos \
                  (txid, output_index, asset_kind, amount, script_pubkey, auth_method, auth_data, \
                   account_owner_pubkey, burning_fee_txid, burning_fee_output_index, block_height, \
-                  status, status_block_height, burn_txid) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'active', $11, NULL) \
+                  status, status_block_height, burn_txid, internal_key) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'active', $11, NULL, $12) \
                  ON CONFLICT (txid, output_index) DO NOTHING",
             )
             .bind(utxo.txid.to_vec())
@@ -94,6 +96,7 @@ impl MonitoredUtxoStore {
             .bind(utxo.burning_fee_txid.to_vec())
             .bind(i64::from(utxo.burning_fee_output_index))
             .bind(encode_u64(utxo.block_height)?)
+            .bind(utxo.internal_key.map(|key| key.to_vec()))
             .execute(&mut **transaction)
             .await?;
         }
@@ -146,7 +149,8 @@ impl MonitoredUtxoStore {
         sqlx::query(
             "SELECT txid, output_index, asset_kind, amount, script_pubkey, auth_method, auth_data, \
              account_owner_pubkey, burning_fee_txid, burning_fee_output_index, block_height, status, \
-             status_block_height, burn_txid FROM monitored_utxos WHERE status = 'expired' \
+             status_block_height, burn_txid, internal_key FROM monitored_utxos \
+             WHERE status = 'expired' \
              ORDER BY block_height, txid, output_index LIMIT $1",
         )
         .bind(i64::from(limit))
@@ -240,6 +244,10 @@ fn decode_monitored_utxo(row: sqlx::any::AnyRow) -> Result<MonitoredUtxo, sqlx::
         .try_get::<Option<Vec<u8>>, _>("burn_txid")?
         .map(decode_hash)
         .transpose()?;
+    let internal_key = row
+        .try_get::<Option<Vec<u8>>, _>("internal_key")?
+        .map(decode_hash)
+        .transpose()?;
     Ok(MonitoredUtxo {
         txid: decode_hash(row.try_get("txid")?)?,
         output_index: decode_u32(row.try_get("output_index")?)?,
@@ -249,6 +257,7 @@ fn decode_monitored_utxo(row: sqlx::any::AnyRow) -> Result<MonitoredUtxo, sqlx::
         auth_method: row.try_get("auth_method")?,
         auth_data: row.try_get("auth_data")?,
         account_owner_pubkey: decode_hash(row.try_get("account_owner_pubkey")?)?,
+        internal_key,
         burning_fee_txid: decode_hash(row.try_get("burning_fee_txid")?)?,
         burning_fee_output_index: decode_u32(row.try_get("burning_fee_output_index")?)?,
         block_height: decode_u64(row.try_get("block_height")?)?,
@@ -292,6 +301,7 @@ mod tests {
             auth_method: "signature-auth".into(),
             auth_data: vec![2; 32],
             account_owner_pubkey: [4; 32],
+            internal_key: None,
             burning_fee_txid: [1; 32],
             burning_fee_output_index: 3,
             block_height,

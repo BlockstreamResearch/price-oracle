@@ -181,13 +181,6 @@ impl ApiError {
         }
     }
 
-    pub(super) fn unprocessable(message: impl ToString) -> Self {
-        Self {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            message: message.to_string(),
-        }
-    }
-
     pub(super) fn unavailable(message: impl ToString) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,

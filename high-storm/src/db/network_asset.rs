@@ -4,6 +4,9 @@ use crate::NetworkAsset;
 
 pub const STORM_EYE_KIND: &str = "storm-eye";
 pub const TICK_ASSET_KIND: &str = "tick-asset";
+/// Issued by a `signed-price-data` request, and distinguished from a Tick
+/// on-chain only by its asset id: the covenant is the same Voucher.
+pub const ORACLE_VERIFIER_KIND: &str = "oracle-verifier";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingNetworkAsset {

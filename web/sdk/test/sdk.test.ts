@@ -3,14 +3,23 @@ import { schnorr } from "@noble/curves/secp256k1";
 
 import {
   PriceOracleClient,
+  createSignedPriceRequest,
   createTickRequest,
   createTickSpendPlan,
+  decodePriceData,
   publicKeyFromPrivateKey,
   signSchnorrDigest,
   tickRequestSigningHash,
+  verifySignedPriceData,
 } from "../src";
 
 const PRIVATE_KEY = "1f".repeat(32);
+/** Feed 4 at 100.00000000, as the coordinator encodes and signs it. */
+const PRICE_DATA =
+  "000000040000000800000002540be400000000006553f100000000006553f22c";
+/** The `OracleNetworkV1/Price` message over PRICE_DATA, pinned in Rust too. */
+const PRICE_MESSAGE =
+  "dd5c6a22d1a989ec39cfcd82b64d8e1f43bcca770dc3d2949022a9808b3d6340";
 
 describe("Price Oracle SDK", () => {
   test("derives an x-only key and signs coordinator Tick requests", () => {
@@ -26,6 +35,60 @@ describe("Price Oracle SDK", () => {
         request.header.public_key,
       ),
     ).toBe(true);
+  });
+
+  test("builds a request issued at a price feed that the network accepts", () => {
+    const request = createSignedPriceRequest(
+      PRIVATE_KEY,
+      [`${"ab".repeat(32)}:1`],
+      4,
+    );
+
+    expect(request.requests.map(({ kind }) => kind)).toEqual([
+      "signed-price-data",
+    ]);
+    // The field is spelled as the specification spells it, and nothing else
+    // rides along: the network rejects an unknown field outright, so either
+    // mistake is a 400 rather than a default.
+    expect(request.requests.map(({ payload }) => JSON.parse(payload))).toEqual([
+      {
+        utxo_auth_method: {
+          kind: "signature-auth",
+          auth_data: publicKeyFromPrivateKey(PRIVATE_KEY),
+        },
+        price_feed_id: 4,
+      },
+    ]);
+    // The signing hash covers the payloads, so it covers the feed it names.
+    expect(
+      schnorr.verify(
+        request.header.signature,
+        tickRequestSigningHash(request),
+        request.header.public_key,
+      ),
+    ).toBe(true);
+  });
+
+  test("keeps a plain Tick request free of any price feed", () => {
+    const payloads = createTickRequest(PRIVATE_KEY, [
+      `${"ab".repeat(32)}:1`,
+    ]).requests.map(({ payload }) => JSON.parse(payload) as object);
+
+    // A Tick naming a feed is rejected, so the key is absent entirely rather
+    // than present and empty.
+    expect(payloads.map((payload) => "price_feed_id" in payload)).toEqual([
+      false,
+    ]);
+  });
+
+  test("refuses a feed id the network cannot encode", () => {
+    const feeUtxos = [`${"ab".repeat(32)}:1`];
+
+    expect(() => createSignedPriceRequest(PRIVATE_KEY, feeUtxos, -1)).toThrow();
+    expect(() => createSignedPriceRequest(PRIVATE_KEY, feeUtxos, 1.5)).toThrow();
+    expect(() =>
+      createSignedPriceRequest(PRIVATE_KEY, feeUtxos, 0x1_0000_0000),
+    ).toThrow();
   });
 
   test("signs a covenant digest with the owner key", () => {
@@ -46,6 +109,7 @@ describe("Price Oracle SDK", () => {
           storm_eye_asset_id: "01".repeat(32),
           tick_asset_id: "02".repeat(32),
           tick_script_pubkey: "5120" + "03".repeat(32),
+          oracle_verifier_asset_id: "04".repeat(32),
           network: "elementsregtest",
         });
       },
@@ -120,5 +184,35 @@ describe("Price Oracle SDK", () => {
     });
 
     expect(await rpc.getTransactionConfirmations("ab".repeat(32))).toBe(2);
+  });
+
+  test("reads the canonical price bytes the network signs", () => {
+    expect(decodePriceData(PRICE_DATA)).toEqual({
+      feedId: 4,
+      decimals: 8,
+      price: 10_000_000_000n,
+      receivedAt: 1_700_000_000n,
+      validUntil: 1_700_000_300n,
+    });
+  });
+
+  test("accepts a network signature over the rate and rejects another rate", () => {
+    const branch = publicKeyFromPrivateKey(PRIVATE_KEY);
+    const details = {
+      price_data: PRICE_DATA,
+      storm_tree_bloom: {
+        signature: signSchnorrDigest(PRIVATE_KEY, PRICE_MESSAGE),
+        branch,
+        proof: [{ right: true, hash: "03".repeat(32) }],
+      },
+    };
+
+    expect(verifySignedPriceData(details)).toBe(true);
+    expect(
+      verifySignedPriceData({
+        ...details,
+        price_data: PRICE_DATA.replace(/.$/, "d"),
+      }),
+    ).toBe(false);
   });
 });

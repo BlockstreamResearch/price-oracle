@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::LazyLock};
 
 use axum::{
     Json,
@@ -7,6 +7,7 @@ use axum::{
 };
 use contracts::artifacts::account::{AccountProgram, derived_account::AccountArguments};
 use contracts::voucher::{Voucher, VoucherAuthMethod, VoucherParameters};
+use price_feed::{FeedId, FeedRegistry};
 use secp256k1::{XOnlyPublicKey, schnorr};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,11 +16,16 @@ use simplex::simplicityhl::elements::AssetId;
 use super::{ApiError, ExternalApiState, require_coordinator};
 use crate::crypto::tagged_hash;
 use crate::db::{
-    network_asset::{STORM_EYE_KIND, TICK_ASSET_KIND},
+    network_asset::{ORACLE_VERIFIER_KIND, STORM_EYE_KIND, TICK_ASSET_KIND},
     user_request::{FeeUtxo, InsertPendingResult},
 };
 
 const USER_REQUEST_TAG: &str = "OracleNetworkV1/NetworkUserRequests";
+const TICK_REQUEST_KIND: &str = "tick-utxo";
+pub(crate) const PRICE_REQUEST_KIND: &str = "signed-price-data";
+
+/// The same feeds every node registers, read on the consensus path too.
+static REGISTRY: LazyLock<FeedRegistry> = LazyLock::new(FeedRegistry::default);
 const MAX_REQUESTS_PER_BATCH: usize = 100;
 const MAX_FEE_UTXOS_PER_BATCH: usize = 100;
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -39,6 +45,8 @@ struct OracleAccount {
     storm_eye_asset_id: String,
     tick_asset_id: String,
     tick_script_pubkey: String,
+    /// The asset a `signed-price-data` request is issued in.
+    oracle_verifier_asset_id: String,
     network: super::operators::auth::AuthNetwork,
 }
 
@@ -67,6 +75,12 @@ async fn get_account(
         .await
         .map_err(ApiError::unavailable)?
         .ok_or_else(|| ApiError::unavailable("Tick asset is not active"))?;
+    let oracle_verifier = state
+        .node
+        .network_asset(ORACLE_VERIFIER_KIND)
+        .await
+        .map_err(ApiError::unavailable)?
+        .ok_or_else(|| ApiError::unavailable("Oracle Verifier asset is not active"))?;
     let voucher = Voucher::new(VoucherParameters {
         storm_eye_asset_id: AssetId::from_byte_array(storm_eye.asset_id),
         auth_method: VoucherAuthMethod::Signature {
@@ -84,6 +98,7 @@ async fn get_account(
         storm_eye_asset_id: AssetId::from_byte_array(storm_eye.asset_id).to_string(),
         tick_asset_id: AssetId::from_byte_array(tick.asset_id).to_string(),
         tick_script_pubkey: hex::encode(voucher.get_script_pubkey().into_bytes()),
+        oracle_verifier_asset_id: AssetId::from_byte_array(oracle_verifier.asset_id).to_string(),
         network,
     }))
 }
@@ -114,6 +129,11 @@ pub(crate) struct UserRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TickUtxoRequestDetails {
     pub(crate) utxo_auth_method: UtxoAuthMethod,
+    /// The feed a `signed-price-data` request is issued at; a Tick names none.
+    /// Spelled as the specification spells it, since `deny_unknown_fields`
+    /// makes any other spelling a rejection rather than a field a client omits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) price_feed_id: Option<FeedId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -176,7 +196,7 @@ async fn create_request(
     Json(request): Json<NetworkUserRequests>,
 ) -> Result<(StatusCode, Json<CreatedRequest>), ApiError> {
     require_coordinator(&state).await?;
-    let fee_utxos = validate_request(&request)?;
+    let (fee_utxos, _) = validate_request(&request)?;
     let owner = parse_hex_array::<32>(&request.header.public_key, "user public key")?;
     state
         .fee_utxos
@@ -253,7 +273,10 @@ async fn get_request(
     }))
 }
 
-fn validate_request(request: &NetworkUserRequests) -> Result<Vec<FeeUtxo>, ApiError> {
+/// Its fee UTXOs, and the feed it is issued at, if any.
+fn validate_request(
+    request: &NetworkUserRequests,
+) -> Result<(Vec<FeeUtxo>, Option<FeedId>), ApiError> {
     if request.requests.is_empty() {
         return Err(ApiError::bad_request(
             "at least one user request is required",
@@ -265,22 +288,32 @@ fn validate_request(request: &NetworkUserRequests) -> Result<Vec<FeeUtxo>, ApiEr
         )));
     }
     let fee_utxos = validate_fee_utxos(&request.header.fee_utxos)?;
+    // One message carries one feed, so one batch names one too.
+    let mut instructed = None;
     for user_request in &request.requests {
-        validate_tick_request(user_request)?;
+        if let Some(feed) = validate_user_request(user_request)? {
+            if instructed.is_some_and(|named| named != feed) {
+                return Err(ApiError::bad_request(
+                    "a batch cannot name more than one price feed",
+                ));
+            }
+            instructed = Some(feed);
+        }
     }
     verify_signature(request)?;
 
-    Ok(fee_utxos)
+    Ok((fee_utxos, instructed))
 }
 
+/// The batch, its fee UTXOs, and the feed it is issued at, if any.
 pub(crate) fn validate_encoded_request(
     encoded: &[u8],
-) -> Result<(NetworkUserRequests, Vec<FeeUtxo>), String> {
+) -> Result<(NetworkUserRequests, Vec<FeeUtxo>, Option<FeedId>), String> {
     let request: NetworkUserRequests =
         serde_json::from_slice(encoded).map_err(|error| error.to_string())?;
-    let fee_utxos = validate_request(&request).map_err(|error| error.message)?;
+    let (fee_utxos, feed) = validate_request(&request).map_err(|error| error.message)?;
 
-    Ok((request, fee_utxos))
+    Ok((request, fee_utxos, feed))
 }
 
 fn validate_fee_utxos(fee_utxos: &[String]) -> Result<Vec<FeeUtxo>, ApiError> {
@@ -314,16 +347,12 @@ fn validate_fee_utxos(fee_utxos: &[String]) -> Result<Vec<FeeUtxo>, ApiError> {
     Ok(parsed)
 }
 
-fn validate_tick_request(request: &UserRequest) -> Result<(), ApiError> {
-    if request.kind == "signed-price-data" {
-        return Err(ApiError::unprocessable(
-            "signed-price-data requests are not supported yet",
-        ));
-    }
-    if request.kind != "tick-utxo" {
+/// The feed the request is issued at, for a `signed-price-data` request.
+fn validate_user_request(request: &UserRequest) -> Result<Option<FeedId>, ApiError> {
+    let kind = request.kind.as_str();
+    if kind != TICK_REQUEST_KIND && kind != PRICE_REQUEST_KIND {
         return Err(ApiError::bad_request(format!(
-            "unknown user request kind '{}'",
-            request.kind
+            "unknown user request kind '{kind}'"
         )));
     }
     if request.payload.len() > MAX_PAYLOAD_BYTES {
@@ -332,8 +361,27 @@ fn validate_tick_request(request: &UserRequest) -> Result<(), ApiError> {
         )));
     }
     let details: TickUtxoRequestDetails = serde_json::from_str(&request.payload)
-        .map_err(|error| ApiError::bad_request(format!("invalid tick-utxo payload: {error}")))?;
-    validate_auth_method(&details.utxo_auth_method)
+        .map_err(|error| ApiError::bad_request(format!("invalid {kind} payload: {error}")))?;
+    validate_auth_method(&details.utxo_auth_method)?;
+
+    // The user signs the payload, not the kind, so the two kinds keep payload
+    // shapes that exclude each other: a batch replayed as the other kind fails
+    // here rather than passing as something its signer did not ask for.
+    match (kind, details.price_feed_id) {
+        (TICK_REQUEST_KIND, None) => Ok(None),
+        (TICK_REQUEST_KIND, Some(_)) => Err(ApiError::bad_request(
+            "a tick-utxo request cannot name a price feed",
+        )),
+        (_, None) => Err(ApiError::bad_request(format!(
+            "a {PRICE_REQUEST_KIND} request must name a price feed"
+        ))),
+        (_, Some(feed)) => match REGISTRY.get(feed) {
+            Some(_) => Ok(Some(feed)),
+            None => Err(ApiError::bad_request(format!(
+                "unknown price feed '{feed}'"
+            ))),
+        },
+    }
 }
 
 fn validate_auth_method(method: &UtxoAuthMethod) -> Result<(), ApiError> {

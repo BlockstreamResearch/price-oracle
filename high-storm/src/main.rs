@@ -136,6 +136,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    if let Some(oracle_verifier) = storm
+        .initialize_oracle_verifier_asset(&config.service.elements_rpc)
+        .await?
+    {
+        tracing::info!(
+            asset_id = %hex::encode(oracle_verifier.asset_id),
+            reissuance_token_id = %oracle_verifier.reissuance_token_id.map(hex::encode).unwrap_or_default(),
+            issuance_txid = %hex::encode(oracle_verifier.issuance_txid),
+            "Oracle Verifier asset is initialized"
+        );
+    }
+
     let external_api = ExternalApiServer::bind(
         config.service.external_api_address,
         storm.handle(),

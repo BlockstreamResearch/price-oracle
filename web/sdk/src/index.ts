@@ -3,6 +3,7 @@ import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils";
 
 const REQUEST_TAG = "OracleNetworkV1/NetworkUserRequests";
+const PRICE_TAG = "OracleNetworkV1/Price";
 const HEX_32 = /^[0-9a-f]{64}$/i;
 const OUTPOINT = /^[0-9a-f]{64}:[0-9]+$/i;
 
@@ -14,6 +15,8 @@ export type OracleAccount = {
   storm_eye_asset_id: string;
   tick_asset_id: string;
   tick_script_pubkey: string;
+  /** The asset a `signed-price-data` request is issued in. */
+  oracle_verifier_asset_id: string;
   network: OracleNetwork;
 };
 
@@ -31,13 +34,16 @@ export type TickAuthMethod =
   | { kind: "asset-id-auth"; auth_data: string }
   | { kind: "scriptPubKey-auth"; auth_data: string };
 
+/** `tick-utxo` issues a Tick; `signed-price-data` an Oracle Verifier. */
+export type TickRequestKind = "tick-utxo" | "signed-price-data";
+
 export type TickRequest = {
   header: {
     signature: string;
     public_key: string;
     fee_utxos: string[];
   };
-  requests: Array<{ kind: "tick-utxo"; payload: string }>;
+  requests: Array<{ kind: TickRequestKind; payload: string }>;
 };
 
 export type TickRequestResult = {
@@ -48,8 +54,28 @@ export type TickRequestResult = {
 };
 
 export type TickRequestStatus = {
-  status: "pending" | "processing" | "executed" | "failed";
+  status: "pending" | "processing" | "included" | "executed" | "failed";
   payload: string | null;
+};
+
+export type StormTreeBloom = {
+  signature: string;
+  branch: string;
+  proof: Array<{ right: boolean; hash: string }>;
+};
+
+/** The payload of an executed `signed-price-data` request. */
+export type SignedPriceData = {
+  price_data: string;
+  storm_tree_bloom: StormTreeBloom;
+};
+
+export type PriceFeedData = {
+  feedId: number;
+  decimals: number;
+  price: bigint;
+  receivedAt: bigint;
+  validUntil: bigint;
 };
 
 export type IssuedTick = {
@@ -253,6 +279,42 @@ export function createTickRequest(
   feeUtxos: string[],
   authMethod?: TickAuthMethod,
 ): TickRequest {
+  return buildRequest(privateKey, feeUtxos, "tick-utxo", authMethod);
+}
+
+/**
+ * A priced request: issues an Oracle Verifier and returns the signed rate,
+ * checked by {@link verifySignedPriceData}.
+ */
+export function createSignedPriceRequest(
+  privateKey: string,
+  feeUtxos: string[],
+  priceFeedId: number,
+  authMethod?: TickAuthMethod,
+): TickRequest {
+  if (
+    !Number.isInteger(priceFeedId) ||
+    priceFeedId < 0 ||
+    priceFeedId > 0xffffffff
+  ) {
+    throw new Error("price feed id must be an unsigned 32-bit integer");
+  }
+  return buildRequest(
+    privateKey,
+    feeUtxos,
+    "signed-price-data",
+    authMethod,
+    priceFeedId,
+  );
+}
+
+function buildRequest(
+  privateKey: string,
+  feeUtxos: string[],
+  kind: TickRequestKind,
+  authMethod: TickAuthMethod | undefined,
+  priceFeedId?: number,
+): TickRequest {
   assertPrivateKey(privateKey);
   if (
     feeUtxos.length === 0 ||
@@ -266,14 +328,21 @@ export function createTickRequest(
     auth_data: publicKey,
   };
   validateAuthMethod(selectedAuth);
-  const payload = JSON.stringify({ utxo_auth_method: selectedAuth });
+  // The network rejects a payload carrying any field it does not know, and a
+  // plain Tick must name no feed at all, so the key is present only for a
+  // priced request and spelled as the specification spells it.
+  const payload = JSON.stringify(
+    priceFeedId === undefined
+      ? { utxo_auth_method: selectedAuth }
+      : { utxo_auth_method: selectedAuth, price_feed_id: priceFeedId },
+  );
   const request: TickRequest = {
     header: {
       signature: "",
       public_key: publicKey,
       fee_utxos: [...feeUtxos],
     },
-    requests: [{ kind: "tick-utxo", payload }],
+    requests: [{ kind, payload }],
   };
   request.header.signature = bytesToHex(
     schnorr.sign(tickRequestSigningHash(request), privateKey),
@@ -291,12 +360,49 @@ export function tickRequestSigningHash(request: TickRequest): Uint8Array {
   );
 }
 
+/** The 32 canonical bytes the network signs, as the numbers they encode. */
+export function decodePriceData(priceData: string): PriceFeedData {
+  if (!HEX_32.test(priceData)) {
+    throw new Error("price data must be 32-byte hex");
+  }
+  const bytes = hexToBytes(priceData);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+  return {
+    feedId: view.getUint32(0),
+    decimals: view.getUint32(4),
+    price: view.getBigUint64(8),
+    receivedAt: view.getBigUint64(16),
+    validUntil: view.getBigUint64(24),
+  };
+}
+
+/**
+ * Whether the network signed this rate, under the Storm Tree branch the bloom
+ * names. The caller still has to check that branch against the Storm Eye root
+ * the chain holds, which this cannot see.
+ */
+export function verifySignedPriceData(details: SignedPriceData): boolean {
+  const { signature, branch } = details.storm_tree_bloom;
+  if (!HEX_32.test(branch) || !/^[0-9a-f]{128}$/i.test(signature)) {
+    throw new Error("bloom must carry a 32-byte branch and 64-byte signature");
+  }
+  const tagHash = sha256(utf8ToBytes(PRICE_TAG));
+  const message = sha256(
+    new Uint8Array([...tagHash, ...tagHash, ...hexToBytes(details.price_data)]),
+  );
+
+  return schnorr.verify(hexToBytes(signature), message, hexToBytes(branch));
+}
+
 export function parseExecutedTick(
   status: TickRequestStatus,
 ): { txid: string; results: TickRequestResult[] } | null {
   if (
     status.payload === null ||
-    (status.status !== "processing" && status.status !== "executed")
+    (status.status !== "processing" &&
+      status.status !== "included" &&
+      status.status !== "executed")
   ) {
     return null;
   }

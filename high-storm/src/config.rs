@@ -2,6 +2,8 @@ use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf};
 use url::Url;
 
+const COINGECKO_API_KEY_ENV: &str = "COINGECKO_API_KEY";
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to read config file: {0}")]
@@ -120,10 +122,19 @@ pub struct CoinGeckoConfig {
 impl Config {
     pub fn from_file(path: PathBuf) -> Result<Self, Error> {
         let contents = std::fs::read_to_string(path).map_err(Error::Io)?;
-        let config: Config = toml::from_str(&contents).map_err(Error::Toml)?;
+        let mut config: Config = toml::from_str(&contents).map_err(Error::Toml)?;
+        config.apply_coingecko_api_key_override(std::env::var(COINGECKO_API_KEY_ENV).ok());
         config.validate()?;
 
         Ok(config)
+    }
+
+    fn apply_coingecko_api_key_override(&mut self, api_key: Option<String>) {
+        if let Some(api_key) = api_key.filter(|api_key| !api_key.is_empty()) {
+            self.service.price_sources.coingecko = Some(CoinGeckoConfig {
+                api_key: Some(api_key),
+            });
+        }
     }
 
     fn validate(&self) -> Result<(), Error> {
@@ -197,6 +208,23 @@ max_connections = 5
             toml::from_str(&config_with_protocol_section("user_requests")).unwrap();
 
         assert_eq!(config.service.protocol.operational_fee_sats, 1000);
+    }
+
+    #[test]
+    fn environment_api_key_enables_coingecko() {
+        let mut config: Config = toml::from_str(&config_with_protocol_section("protocol")).unwrap();
+
+        config.apply_coingecko_api_key_override(Some("demo-key".to_string()));
+
+        assert_eq!(
+            config
+                .service
+                .price_sources
+                .coingecko
+                .and_then(|coingecko| coingecko.api_key)
+                .as_deref(),
+            Some("demo-key")
+        );
     }
 
     #[test]
