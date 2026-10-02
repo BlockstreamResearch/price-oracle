@@ -2,8 +2,16 @@ use std::{collections::HashSet, sync::LazyLock};
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
+};
+use bitcoin::{
+    hashes::Hash,
+    secp256k1::{
+        Message, PublicKey, Secp256k1,
+        ecdsa::{RecoverableSignature, RecoveryId},
+    },
+    sign_message::signed_msg_hash,
 };
 use contracts::artifacts::account::{AccountProgram, derived_account::AccountArguments};
 use contracts::voucher::{Voucher, VoucherAuthMethod, VoucherParameters};
@@ -21,6 +29,7 @@ use crate::db::{
 };
 
 const USER_REQUEST_TAG: &str = "OracleNetworkV1/NetworkUserRequests";
+pub(super) const HUMID_USER_SIGNATURE_SCHEME: &str = "bitcoin-signed-message-ecdsa-v1";
 const TICK_REQUEST_KIND: &str = "tick-utxo";
 pub(crate) const PRICE_REQUEST_KIND: &str = "signed-price-data";
 
@@ -50,9 +59,16 @@ struct OracleAccount {
     network: super::operators::auth::AuthNetwork,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountQuery {
+    auth_script_pubkey: Option<String>,
+}
+
 async fn get_account(
     State(state): State<ExternalApiState>,
     Path(public_key): Path<String>,
+    Query(query): Query<AccountQuery>,
 ) -> Result<Json<OracleAccount>, ApiError> {
     let owner = parse_hex_array::<32>(&public_key, "user public key")?;
     let owner = XOnlyPublicKey::from_byte_array(owner)
@@ -81,11 +97,26 @@ async fn get_account(
         .await
         .map_err(ApiError::unavailable)?
         .ok_or_else(|| ApiError::unavailable("Oracle Verifier asset is not active"))?;
-    let voucher = Voucher::new(VoucherParameters {
-        storm_eye_asset_id: AssetId::from_byte_array(storm_eye.asset_id),
-        auth_method: VoucherAuthMethod::Signature {
+    let auth_method = match query.auth_script_pubkey {
+        Some(script) => {
+            validate_auth_method(&UtxoAuthMethod {
+                kind: "scriptPubKey-auth".into(),
+                auth_data: script.clone(),
+            })?;
+            VoucherAuthMethod::Script {
+                auth_script_hash: Sha256::digest(
+                    hex::decode(script).map_err(ApiError::bad_request)?,
+                )
+                .into(),
+            }
+        }
+        None => VoucherAuthMethod::Signature {
             auth_pubkey: owner.serialize(),
         },
+    };
+    let voucher = Voucher::new(VoucherParameters {
+        storm_eye_asset_id: AssetId::from_byte_array(storm_eye.asset_id),
+        auth_method,
         network: simplicity_network,
     });
 
@@ -116,6 +147,10 @@ pub(crate) struct UserRequestHeader {
     pub signature: String,
     pub public_key: String,
     pub fee_utxos: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_scheme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_public_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -417,10 +452,61 @@ fn verify_signature(request: &NetworkUserRequests) -> Result<(), ApiError> {
     let public_key_bytes = parse_hex_array::<32>(&request.header.public_key, "user public key")?;
     let public_key = XOnlyPublicKey::from_byte_array(public_key_bytes)
         .map_err(|_| ApiError::bad_request("invalid user public key"))?;
+    if let Some(scheme) = request.header.signature_scheme.as_deref() {
+        if scheme != HUMID_USER_SIGNATURE_SCHEME {
+            return Err(ApiError::bad_request("unsupported user signature scheme"));
+        }
+        let encoded_key = request
+            .header
+            .signing_public_key
+            .as_deref()
+            .ok_or_else(|| ApiError::bad_request("signing public key is required"))?;
+        let signing_key_bytes = parse_hex_array::<33>(encoded_key, "signing public key")?;
+        let signing_key = PublicKey::from_slice(&signing_key_bytes)
+            .map_err(|_| ApiError::bad_request("invalid signing public key"))?;
+        if signing_key.x_only_public_key().0.serialize() != public_key_bytes {
+            return Err(ApiError::unauthorized(
+                "signing key does not own the oracle account",
+            ));
+        }
+        let signature_bytes = parse_hex_array::<65>(&request.header.signature, "user signature")?;
+        let recovery_id = RecoveryId::from_i32(i32::from(signature_bytes[64]))
+            .map_err(|_| ApiError::unauthorized("invalid user signature"))?;
+        let signature = RecoverableSignature::from_compact(&signature_bytes[..64], recovery_id)
+            .map_err(|_| ApiError::unauthorized("invalid user signature"))?;
+        let message =
+            Message::from_digest(signed_msg_hash(&humid_signing_message(request)?).to_byte_array());
+        let recovered = Secp256k1::verification_only()
+            .recover_ecdsa(&message, &signature)
+            .map_err(|_| ApiError::unauthorized("user signature is invalid"))?;
+        return if recovered == signing_key {
+            Ok(())
+        } else {
+            Err(ApiError::unauthorized("user signature is invalid"))
+        };
+    }
+    if request.header.signing_public_key.is_some() {
+        return Err(ApiError::bad_request(
+            "signing public key requires a signature scheme",
+        ));
+    }
     let signature_bytes = parse_hex_array::<64>(&request.header.signature, "user signature")?;
     let signature = schnorr::Signature::from_byte_array(signature_bytes);
     schnorr::verify(&signature, &signing_hash(request), &public_key)
         .map_err(|_| ApiError::unauthorized("user signature is invalid"))
+}
+
+pub(super) fn humid_signing_message(request: &NetworkUserRequests) -> Result<String, ApiError> {
+    let body = serde_json::to_string(&(
+        &request.header.public_key,
+        &request.header.signing_public_key,
+        &request.header.fee_utxos,
+        &request.requests,
+    ))
+    .map_err(ApiError::internal)?;
+    Ok(format!(
+        "{USER_REQUEST_TAG}\n{HUMID_USER_SIGNATURE_SCHEME}\n{body}"
+    ))
 }
 
 pub(super) fn signing_hash(request: &NetworkUserRequests) -> [u8; 32] {

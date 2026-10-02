@@ -71,9 +71,63 @@ pub enum Error {
     InvalidMigrationPeerTable,
 }
 
+impl Error {
+    pub(crate) fn connection_log_level(&self) -> log::Level {
+        match self {
+            Self::PeerAlreadyConnected => log::Level::Debug,
+            Self::Io(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::NotConnected
+                ) =>
+            {
+                log::Level::Debug
+            }
+            _ => log::Level::Warn,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_disconnect_levels_preserve_actionable_warnings() {
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::NotConnected,
+        ] {
+            assert_eq!(
+                Error::Io(std::io::Error::from(kind)).connection_log_level(),
+                log::Level::Debug
+            );
+        }
+        assert_eq!(
+            Error::PeerAlreadyConnected.connection_log_level(),
+            log::Level::Debug
+        );
+        assert_eq!(
+            Error::UnauthorizedConnection.connection_log_level(),
+            log::Level::Warn
+        );
+        assert_eq!(
+            Error::MessageRateLimit.connection_log_level(),
+            log::Level::Warn
+        );
+        assert_eq!(
+            Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                .connection_log_level(),
+            log::Level::Warn
+        );
+    }
 
     #[test]
     fn peer_errors_use_hex_keys() {

@@ -16,6 +16,7 @@ use storm::{Peer, PeerStatus, Storm, StormContext, StormHandle};
 use storm_tree::{NodePublicKey, StormTree, StormTreeBranch};
 use tokio::{
     sync::{Mutex, oneshot},
+    task::JoinSet,
     time::{Instant, timeout},
 };
 
@@ -326,7 +327,7 @@ impl Signing {
         .await
     }
 
-    /// Tries branches in turn; each attempt builds its own message and hashes.
+    /// Races a bounded number of branches, each with independent nonces.
     async fn sign_per_branch<F>(
         &self,
         storm: &StormHandle,
@@ -337,89 +338,117 @@ impl Signing {
         F: Fn(StormTreeBranch) -> Result<(NodeMessage, Vec<[u8; 32]>), SigningError>,
     {
         let mut attempted = BTreeSet::new();
-
-        loop {
-            let peers = storm.peers().await;
-            let branch = {
-                let mut state = self.state.lock().await;
-                state.refresh_members(&peers)?;
-                state.remove_expired_sessions();
-                let Some(branch) = state.select_branch(&peers, &attempted) else {
-                    return Err(if attempted.is_empty() {
-                        SigningError::NoAvailableBranch
-                    } else {
-                        SigningError::SigningFailed
+        let mut request_hashes = BTreeSet::new();
+        let mut pending = JoinSet::new();
+        let result = async {
+            loop {
+                while pending.len() < 2 {
+                    let peers = storm.peers().await;
+                    let connected = storm.connected_peer_keys().await;
+                    let branch = {
+                        let mut state = self.state.lock().await;
+                        state.refresh_members(&peers)?;
+                        state.remove_expired_sessions();
+                        let Some(branch) = state.select_branch(&peers, &connected, &attempted) else {
+                            break;
+                        };
+                        branch
+                    };
+                    attempted.insert(branch);
+                    // Built outside the lock: an attempt can take a while, and the lock
+                    // also serves every other session's nonces and signatures.
+                    let (initial, message_hashes) = match make_attempt(branch) {
+                        Ok(attempt) => attempt,
+                        Err(error) => {
+                            tracing::warn!(
+                                branch = %hex::encode(branch),
+                                %error,
+                                "skipped a Storm Tree branch the attempt could not be built for"
+                            );
+                            continue;
+                        }
+                    };
+                    let (request_hash, signers, requestor, initial, nonce_message, receiver) = {
+                        let mut state = self.state.lock().await;
+                        // The tree may have changed while the lock was released.
+                        let Ok(signers) = state
+                            .tree
+                            .as_ref()
+                            .ok_or(SigningError::TooFewMembers)
+                            .and_then(|tree| Ok(tree.nodes_for_branch(&branch)?.to_vec()))
+                        else {
+                            continue;
+                        };
+                        let request = SigningRequest {
+                            signing_storm_tree_branch: branch,
+                            message_hashes,
+                        };
+                        let request_hash = initial.hash()?;
+                        let (sender, receiver) = oneshot::channel();
+                        let requestor = state.local_node;
+                        let nonce_message =
+                            state.start_session(request_hash, requestor, request, Some(sender))?;
+                        (
+                            request_hash,
+                            signers,
+                            requestor,
+                            initial,
+                            nonce_message,
+                            receiver,
+                        )
+                    };
+                    request_hashes.insert(request_hash);
+                    let signing = self.clone();
+                    let storm = storm.clone();
+                    pending.spawn(async move {
+                        let result = async {
+                            let recipients = signing.remote_transport_keys(&signers).await?;
+                            send_from_storm(&storm, initial, &recipients).await?;
+                            if let Some(nonce_message) = nonce_message {
+                                let recipients = signing
+                                    .session_recipient_transport_keys(&signers, requestor)
+                                    .await?;
+                                send_from_storm(&storm, nonce_message, &recipients).await?;
+                            }
+                            match timeout(attempt_timeout, receiver).await {
+                                Ok(Ok(result)) => Ok(result),
+                                Ok(Err(_)) | Err(_) => Err(SigningError::SigningFailed),
+                            }
+                        }
+                        .await;
+                        if result.is_err() {
+                            signing.remove_attempt(request_hash).await;
+                        }
+                        (branch, result)
                     });
-                };
-                branch
-            };
-            attempted.insert(branch);
-            // Built outside the lock: an attempt can take a while, and the lock
-            // also serves every other session's nonces and signatures.
-            let (initial, message_hashes) = match make_attempt(branch) {
-                Ok(attempt) => attempt,
-                Err(error) => {
-                    tracing::warn!(
-                        branch = %hex::encode(branch),
-                        %error,
-                        "skipped a Storm Tree branch the attempt could not be built for"
-                    );
-                    continue;
                 }
-            };
-            let (request_hash, signers, requestor, initial, nonce_message, receiver) = {
-                let mut state = self.state.lock().await;
-                // The tree may have changed while the lock was released.
-                let Ok(signers) = state
-                    .tree
-                    .as_ref()
-                    .ok_or(SigningError::TooFewMembers)
-                    .and_then(|tree| Ok(tree.nodes_for_branch(&branch)?.to_vec()))
-                else {
-                    continue;
-                };
-                let request = SigningRequest {
-                    signing_storm_tree_branch: branch,
-                    message_hashes,
-                };
-                let request_hash = initial.hash()?;
-                let (sender, receiver) = oneshot::channel();
-                let requestor = state.local_node;
-                let nonce_message =
-                    state.start_session(request_hash, requestor, request, Some(sender))?;
-                (
-                    request_hash,
-                    signers,
-                    requestor,
-                    initial,
-                    nonce_message,
-                    receiver,
-                )
-            };
-
-            let recipients = self.remote_transport_keys(&signers).await?;
-            if send_from_storm(storm, initial, &recipients).await.is_err() {
-                self.remove_attempt(request_hash).await;
-                continue;
-            }
-            if let Some(nonce_message) = nonce_message {
-                let recipients = self
-                    .session_recipient_transport_keys(&signers, requestor)
-                    .await?;
-                if send_from_storm(storm, nonce_message, &recipients)
-                    .await
-                    .is_err()
-                {
-                    self.remove_attempt(request_hash).await;
-                    continue;
+                match pending.join_next().await {
+                    Some(Ok((_, Ok(result)))) => return Ok(result),
+                    Some(Ok((branch, Err(error)))) => {
+                        tracing::debug!(branch = %hex::encode(branch), %error, "Storm Tree signing branch failed");
+                    }
+                    Some(Err(error)) => {
+                        return Err(SigningError::InvalidMessage(format!(
+                            "signing attempt task failed: {error}"
+                        )));
+                    }
+                    None => {
+                        return Err(if attempted.is_empty() {
+                            SigningError::NoAvailableBranch
+                        } else {
+                            SigningError::SigningFailed
+                        });
+                    }
                 }
-            }
-
-            match timeout(attempt_timeout, receiver).await {
-                Ok(Ok(result)) => return Ok(result),
-                Ok(Err(_)) | Err(_) => self.remove_attempt(request_hash).await,
             }
         }
+        .await;
+        pending.abort_all();
+        let mut state = self.state.lock().await;
+        for request_hash in request_hashes {
+            state.sessions.remove(&request_hash);
+        }
+        result
     }
 
     async fn remove_attempt(&self, request_hash: [u8; 32]) {
@@ -673,11 +702,14 @@ impl Signing {
         let linked_to = required_link(&message)?;
         let payload: SigningNoncesMessage = message.decode_payload()?;
         let sender = node_key(&context.message_context.peer_public_key)?;
-        let outbound = self
-            .state
-            .lock()
-            .await
-            .accept_nonces(linked_to, sender, payload)?;
+        let outbound = {
+            let mut state = self.state.lock().await;
+            if !state.sessions.contains_key(&linked_to) {
+                tracing::debug!(request_hash = %hex::encode(linked_to), "ignored nonce for an inactive signing session");
+                return Ok(());
+            }
+            state.accept_nonces(linked_to, sender, payload)?
+        };
         if let Some((message, recipients)) = outbound {
             send_from_handle(&context.storm_handle, message, recipients).await?;
         }
@@ -692,10 +724,12 @@ impl Signing {
         let linked_to = required_link(&message)?;
         let payload: PartialSignaturesMessage = message.decode_payload()?;
         let sender = node_key(&context.message_context.peer_public_key)?;
-        self.state
-            .lock()
-            .await
-            .accept_partial_signatures(linked_to, sender, payload)
+        let mut state = self.state.lock().await;
+        if !state.sessions.contains_key(&linked_to) {
+            tracing::debug!(request_hash = %hex::encode(linked_to), "ignored partial signature for an inactive signing session");
+            return Ok(());
+        }
+        state.accept_partial_signatures(linked_to, sender, payload)
     }
 
     async fn session_recipients(
@@ -749,12 +783,17 @@ impl SigningState {
     fn select_branch(
         &self,
         peers: &[Peer],
+        connected: &BTreeSet<[u8; 33]>,
         attempted: &BTreeSet<StormTreeBranch>,
     ) -> Option<StormTreeBranch> {
         let tree = self.tree.as_ref()?;
         let active = peers
             .iter()
-            .filter(|peer| matches!(peer.status, PeerStatus::Controlled | PeerStatus::Active))
+            .filter(|peer| {
+                peer.status == PeerStatus::Controlled
+                    || (peer.status == PeerStatus::Active
+                        && connected.contains(&peer.compressed_public_key))
+            })
             .filter_map(|peer| node_key(&peer.compressed_public_key).ok())
             .collect::<BTreeSet<_>>();
         tree.branches().find(|branch| {
@@ -1207,5 +1246,204 @@ mod tests {
             execute_message_hashes([7; 32], Some([8; 32])),
             vec![[7; 32], [8; 32]]
         );
+    }
+
+    #[tokio::test]
+    async fn responsive_threshold_does_not_wait_for_an_unresponsive_branch() {
+        let reservations = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect::<Vec<_>>();
+        let addresses = reservations
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let secrets = [[11; 32], [12; 32], [13; 32]];
+        let public_keys = secrets
+            .iter()
+            .map(|secret| {
+                let secret = secp256k1_zkp::SecretKey::from_slice(secret).unwrap();
+                TransportPublicKey::from_secret_key(&secp256k1_zkp::Secp256k1::new(), &secret)
+            })
+            .collect::<Vec<_>>();
+        let peers = public_keys
+            .iter()
+            .zip(&addresses)
+            .map(|(key, address)| {
+                let mut peer = Peer::new(key.serialize());
+                peer.status = PeerStatus::Active;
+                peer.socket_address = Some(address.clone());
+                peer
+            })
+            .collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        for (index, reservation) in reservations.into_iter().enumerate() {
+            drop(reservation);
+            let mut node = Storm::from_peers(
+                secp256k1_zkp::SecretKey::from_slice(&secrets[index]).unwrap(),
+                peers.clone(),
+            );
+            node.start(Some(addresses[index].clone())).await.unwrap();
+            nodes.push(node);
+        }
+        for node in &mut nodes {
+            node.start(None).await.unwrap();
+        }
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let mut ready = true;
+                for node in &nodes {
+                    ready &= node.handle().connected_peer_keys().await.len() == 2;
+                }
+                if ready {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transport connections did not become ready");
+
+        let mut signings = Vec::new();
+        for (index, node) in nodes.iter().enumerate() {
+            signings.push(Signing::new(node, secrets[index], public_keys[0].serialize()).await);
+        }
+        let unresponsive = {
+            let state = signings[0].state.lock().await;
+            let branch = state
+                .select_branch(
+                    &nodes[0].peers().await,
+                    &nodes[0].handle().connected_peer_keys().await,
+                    &BTreeSet::new(),
+                )
+                .unwrap();
+            *state
+                .tree
+                .as_ref()
+                .unwrap()
+                .nodes_for_branch(&branch)
+                .unwrap()
+                .iter()
+                .find(|key| **key != state.local_node)
+                .unwrap()
+        };
+        for (index, node) in nodes.iter().enumerate() {
+            if node_key(&public_keys[index].serialize()).unwrap() == unresponsive {
+                continue;
+            }
+            let signing = signings[index].clone();
+            node.register_custom_handler(move |custom, context| {
+                let signing = signing.clone();
+                async move {
+                    let Some(message) = NodeMessage::from_custom(&custom).unwrap() else {
+                        return;
+                    };
+                    let result = match message.decoded_kind() {
+                        Some(NodeMessageKind::ExecuteUserRequests) => {
+                            signing
+                                .handle_execute_user_requests(message, &context, None)
+                                .await
+                        }
+                        Some(NodeMessageKind::SigningNonces) => {
+                            signing.handle_signing_nonces(message, &context).await
+                        }
+                        Some(NodeMessageKind::PartialSignatures) => {
+                            signing.handle_partial_signatures(message, &context).await
+                        }
+                        _ => Ok(()),
+                    };
+                    assert!(result.is_ok(), "signing message failed: {result:?}");
+                }
+            })
+            .await;
+        }
+        let result = timeout(
+            Duration::from_secs(5),
+            signings[0].sign_per_branch(&nodes[0].handle(), SIGNING_SESSION_TIMEOUT, |branch| {
+                Ok((
+                    NodeMessage::new(
+                        NodeMessageKind::ExecuteUserRequests,
+                        None,
+                        &ExecuteUserRequests {
+                            tx: vec![1],
+                            signing_hash: [24; 32],
+                            signing_storm_tree_branch: branch,
+                            external_requests: vec![ExternalRequests {
+                                request_hash: [25; 32],
+                                network_user_requests: vec![1],
+                                additional_payload: None,
+                            }],
+                            chain_tip: None,
+                        },
+                    )?,
+                    vec![[24; 32]],
+                ))
+            }),
+        )
+        .await;
+        let unresponsive_index = public_keys
+            .iter()
+            .position(|key| node_key(&key.serialize()).unwrap() == unresponsive)
+            .unwrap();
+        nodes[unresponsive_index].shutdown().await;
+        timeout(Duration::from_secs(5), async {
+            while nodes[0]
+                .handle()
+                .connected_peer_keys()
+                .await
+                .contains(&public_keys[unresponsive_index].serialize())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnected peer remained available");
+        let offline_result = timeout(
+            Duration::from_secs(5),
+            signings[0].sign_per_branch(&nodes[0].handle(), SIGNING_SESSION_TIMEOUT, |branch| {
+                Ok((
+                    NodeMessage::new(
+                        NodeMessageKind::ExecuteUserRequests,
+                        None,
+                        &ExecuteUserRequests {
+                            tx: vec![1],
+                            signing_hash: [26; 32],
+                            signing_storm_tree_branch: branch,
+                            external_requests: vec![ExternalRequests {
+                                request_hash: [27; 32],
+                                network_user_requests: vec![1],
+                                additional_payload: None,
+                            }],
+                            chain_tip: None,
+                        },
+                    )?,
+                    vec![[26; 32]],
+                ))
+            }),
+        )
+        .await;
+        for node in &mut nodes {
+            node.shutdown().await;
+        }
+        let result = result
+            .expect("responsive two-of-three branch waited for the unresponsive peer")
+            .unwrap();
+        let offline_result = offline_result
+            .expect("two connected signers did not complete with the third offline")
+            .unwrap();
+        assert_eq!(
+            offline_result.signing_storm_tree_branch,
+            result.signing_storm_tree_branch
+        );
+        assert_eq!(offline_result.signatures.len(), 1);
+        let state = signings[0].state.lock().await;
+        let signers = state
+            .tree
+            .as_ref()
+            .unwrap()
+            .nodes_for_branch(&result.signing_storm_tree_branch)
+            .unwrap();
+        assert!(!signers.contains(&unresponsive));
+        assert_eq!(result.signatures.len(), 1);
+        assert!(state.sessions.is_empty());
     }
 }
