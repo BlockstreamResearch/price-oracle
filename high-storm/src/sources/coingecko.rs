@@ -30,6 +30,10 @@ struct Coin {
 }
 
 impl CoinGecko {
+    /// What an operator, and a persisted freeze, name this source by. It must
+    /// never change, or a frozen source comes back unfrozen.
+    pub const NAME: &'static str = "coingecko";
+
     pub fn new(config: &CoinGeckoConfig) -> Result<Self, reqwest::Error> {
         let coins = FeedRegistry::default()
             .feeds()
