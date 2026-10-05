@@ -1,4 +1,6 @@
-use sqlx::{Any, AnyPool, Row, Transaction};
+use std::collections::HashSet;
+
+use sqlx::{Any, AnyPool, QueryBuilder, Row, Transaction};
 
 const BURNING_BLOCKS: u64 = 5;
 
@@ -179,6 +181,42 @@ impl MonitoredUtxoStore {
         Ok(reserved.is_some())
     }
 
+    pub async fn burning_reservations(
+        &self,
+        outpoints: &[([u8; 32], u32)],
+    ) -> Result<Vec<bool>, sqlx::Error> {
+        if outpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query = QueryBuilder::<Any>::new("WITH requested (txid, output_index) AS (");
+        query.push_values(outpoints, |mut row, (txid, output_index)| {
+            row.push_bind(txid.to_vec())
+                .push_bind(i64::from(*output_index));
+        });
+        query.push(
+            ") SELECT txid, output_index FROM requested WHERE EXISTS (\
+             SELECT 1 FROM monitored_utxos WHERE burning_fee_txid = requested.txid \
+             AND burning_fee_output_index = requested.output_index \
+             AND status IN ('active', 'expired', 'burning'))",
+        );
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let reserved = rows
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    decode_hash(row.try_get("txid")?)?,
+                    row.try_get::<i64, _>("output_index")?,
+                ))
+            })
+            .collect::<Result<HashSet<_>, sqlx::Error>>()?;
+
+        Ok(outpoints
+            .iter()
+            .map(|(txid, index)| reserved.contains(&(*txid, i64::from(*index))))
+            .collect())
+    }
+
     pub async fn mark_burning(
         &self,
         utxos: &[([u8; 32], u32)],
@@ -309,6 +347,80 @@ mod tests {
             status_block_height: block_height,
             burn_txid: None,
         }
+    }
+
+    #[tokio::test]
+    async fn batched_burning_reservations_preserve_pairs_order_and_statuses() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.monitored_utxos();
+        let first = monitored(10);
+        let mut second = monitored(10);
+        second.output_index = 4;
+        second.burning_fee_txid = [9; 32];
+        second.burning_fee_output_index = 7;
+        store
+            .apply_block(
+                "burning-v1",
+                &IndexedBlock {
+                    height: 10,
+                    hash: [10; 32],
+                },
+                &[first.clone(), second.clone()],
+                &[],
+                60,
+            )
+            .await
+            .unwrap();
+        let mut outpoints = vec![
+            ([1; 32], 7),
+            ([9; 32], 3),
+            ([1; 32], 3),
+            ([9; 32], 7),
+            ([1; 32], 3),
+        ];
+        outpoints.extend((5..100).map(|index| ([index; 32], u32::MAX)));
+        let mut expected = vec![false; 100];
+        expected[2] = true;
+        expected[3] = true;
+        expected[4] = true;
+        assert_eq!(
+            store.burning_reservations(&outpoints).await.unwrap(),
+            expected
+        );
+
+        store
+            .apply_block(
+                "burning-v1",
+                &IndexedBlock {
+                    height: 70,
+                    hash: [70; 32],
+                },
+                &[],
+                &[],
+                60,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_burning(&[(first.txid, first.output_index)], [8; 32], 70)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.burning_reservations(&outpoints).await.unwrap(),
+            expected
+        );
+        store
+            .quarantine_unburnable(&[(second.txid, second.output_index)], 70)
+            .await
+            .unwrap();
+        expected[3] = false;
+        assert_eq!(
+            store.burning_reservations(&outpoints).await.unwrap(),
+            expected
+        );
+
+        store.pool.close().await;
+        assert!(store.burning_reservations(&[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]

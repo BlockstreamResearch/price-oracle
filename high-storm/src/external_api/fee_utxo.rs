@@ -131,16 +131,14 @@ impl FeeUtxoValidator {
         &self,
         fee_utxos: &[FeeUtxo],
     ) -> Result<Vec<bool>, FeeUtxoValidationError> {
-        let mut reservations = Vec::with_capacity(fee_utxos.len());
-        for fee_utxo in fee_utxos {
-            reservations.push(
-                self.monitored_utxos
-                    .is_reserved_for_burning(fee_utxo.txid, fee_utxo.output_index)
-                    .await?,
-            );
-        }
-
-        Ok(reservations)
+        let outpoints = fee_utxos
+            .iter()
+            .map(|utxo| (utxo.txid, utxo.output_index))
+            .collect::<Vec<_>>();
+        Ok(self
+            .monitored_utxos
+            .burning_reservations(&outpoints)
+            .await?)
     }
 }
 
