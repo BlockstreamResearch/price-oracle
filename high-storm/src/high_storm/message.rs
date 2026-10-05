@@ -108,6 +108,14 @@ struct VotingProposal {
     created_at_block_height: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SignedVotingProposal {
+    pub(crate) request: NetworkVoteRequest,
+    pub(crate) created_at_block_height: u64,
+    pub(crate) proposer_public_key: [u8; 32],
+    pub(crate) signature: Vec<u8>,
+}
+
 impl NetworkVoteRequest {
     pub fn new<T: Serialize>(kind: NetworkVoteKind, payload: &T) -> Result<Self, postcard::Error> {
         Ok(Self {
@@ -139,6 +147,9 @@ impl NodeMessage {
     pub(crate) fn decode_voting_proposal(
         &self,
     ) -> Result<(NetworkVoteRequest, Option<u64>), postcard::Error> {
+        if let Ok(proposal) = self.decode_payload::<SignedVotingProposal>() {
+            return Ok((proposal.request, Some(proposal.created_at_block_height)));
+        }
         match self.decode_payload::<VotingProposal>() {
             Ok(proposal) => Ok((proposal.request, Some(proposal.created_at_block_height))),
             Err(_) => self.decode_payload().map(|request| (request, None)),

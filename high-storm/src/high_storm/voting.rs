@@ -14,7 +14,7 @@ use super::message::{
 };
 
 pub const VOTING_TIMEOUT_BLOCKS: u64 = 10_080;
-const MAX_ACTIVE_VOTINGS: usize = 50;
+const MAX_ACTIVE_VOTINGS_PER_PROPOSER: usize = 50;
 const MAX_PROPOSAL_FUTURE_BLOCKS: u64 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,12 +102,21 @@ impl Voting {
         let _guard = self.operations.lock().await;
         let peers = storm.peers().await;
         validate_request(&request, &peers, self.coordinator)?;
-        self.ensure_unique_active_request(&request, block_height)
+        let proposer = controlled_member_key(&peers)?;
+        self.ensure_unique_active_request(&request, Some(proposer), block_height)
             .await?;
-        let message = NodeMessage::new_voting_request(request, block_height)?;
+        let unsigned = NodeMessage::new_voting_request(request.clone(), block_height)?;
+        let proposal = super::message::SignedVotingProposal {
+            request,
+            created_at_block_height: block_height,
+            proposer_public_key: proposer,
+            signature: schnorr::sign(&unsigned.hash()?, &self.keypair)
+                .to_byte_array()
+                .to_vec(),
+        };
+        let message = NodeMessage::new(NodeMessageKind::NetworkVoteRequest, None, &proposal)?;
         let hash = message.hash()?;
         let encoded = postcard::to_stdvec(&message)?;
-        let proposer = controlled_member_key(&peers)?;
         if !self
             .store
             .insert_request(hash, &encoded, proposer, block_height)
@@ -190,12 +199,17 @@ impl Voting {
         let _guard = self.operations.lock().await;
         let peers = context.storm_handle.peers().await;
         validate_request(&request, &peers, self.coordinator)?;
-        self.ensure_unique_active_request(&request, block_height)
+        let proposer = node_key(context.message_context.peer_public_key)?;
+        ensure_current_member(&peers, proposer, "voting request proposer")?;
+        if verified_proposer(&message)?.is_some_and(|origin| origin != proposer) {
+            return Err(VotingError::InvalidRequest(
+                "voting request proposer does not match its sender".into(),
+            ));
+        }
+        self.ensure_unique_active_request(&request, Some(proposer), block_height)
             .await?;
         let hash = message.hash()?;
         let encoded = postcard::to_stdvec(&message)?;
-        let proposer = node_key(context.message_context.peer_public_key)?;
-        ensure_current_member(&peers, proposer, "voting request proposer")?;
         self.store
             .insert_request(hash, &encoded, proposer, block_height)
             .await?;
@@ -317,13 +331,28 @@ impl Voting {
                     }
                     validate_proposal_height(created_at_block_height, block_height)?;
                     validate_synchronized_request(&request, &peers, self.coordinator)?;
-                    self.ensure_unique_active_request(&request, block_height)
+                    let proposer = verified_proposer(&message)?;
+                    if let Some(proposer) = proposer {
+                        ensure_current_member(&peers, proposer, "voting request proposer")?;
+                    }
+                    self.store
+                        .delete_expired(block_height, VOTING_TIMEOUT_BLOCKS)
+                        .await?;
+                    if self
+                        .store
+                        .active_request_count_for_proposer(proposer)
+                        .await?
+                        >= MAX_ACTIVE_VOTINGS_PER_PROPOSER
+                    {
+                        continue;
+                    }
+                    self.ensure_unique_active_request(&request, proposer, block_height)
                         .await?;
                     self.store
                         .insert_synchronized_request(
                             synchronized.message_hash,
                             &synchronized.message,
-                            None,
+                            proposer,
                             block_height,
                         )
                         .await?;
@@ -506,6 +535,7 @@ impl Voting {
     async fn ensure_unique_active_request(
         &self,
         request: &NetworkVoteRequest,
+        proposer: Option<[u8; 32]>,
         block_height: u64,
     ) -> Result<(), VotingError> {
         self.store
@@ -524,14 +554,49 @@ impl Voting {
             }
         }
 
-        if self.store.active_request_count().await? >= MAX_ACTIVE_VOTINGS {
+        if self
+            .store
+            .active_request_count_for_proposer(proposer)
+            .await?
+            >= MAX_ACTIVE_VOTINGS_PER_PROPOSER
+        {
+            let requester = proposer
+                .map(hex::encode)
+                .unwrap_or_else(|| "legacy unattributed bucket".into());
             return Err(VotingError::InvalidRequest(format!(
-                "network already has {MAX_ACTIVE_VOTINGS} active voting requests"
+                "requester {requester} already has {MAX_ACTIVE_VOTINGS_PER_PROPOSER} active voting requests"
             )));
         }
 
         Ok(())
     }
+}
+
+fn verified_proposer(message: &NodeMessage) -> Result<Option<[u8; 32]>, VotingError> {
+    let Ok(proposal) = message.decode_payload::<super::message::SignedVotingProposal>() else {
+        return Ok(None);
+    };
+    let public_key = XOnlyPublicKey::from_byte_array(proposal.proposer_public_key)
+        .map_err(|error| VotingError::InvalidRequest(error.to_string()))?;
+    let signature_bytes: [u8; 64] =
+        proposal
+            .signature
+            .try_into()
+            .map_err(|signature: Vec<u8>| {
+                VotingError::InvalidRequest(format!(
+                    "proposer signature has {} bytes instead of 64",
+                    signature.len()
+                ))
+            })?;
+    let unsigned =
+        NodeMessage::new_voting_request(proposal.request, proposal.created_at_block_height)?;
+    schnorr::verify(
+        &schnorr::Signature::from_byte_array(signature_bytes),
+        &unsigned.hash()?,
+        &public_key,
+    )
+    .map_err(|error| VotingError::InvalidRequest(error.to_string()))?;
+    Ok(Some(proposal.proposer_public_key))
 }
 
 fn validate_proposal_height(
@@ -841,6 +906,252 @@ mod reshape_tests {
         .unwrap()
     }
 
+    fn signed_request(index: u8, height: u64, signer: u8) -> NodeMessage {
+        let request = distinct_request(index);
+        let unsigned = NodeMessage::new_voting_request(request.clone(), height).unwrap();
+        let keypair = Keypair::from_secret_key(
+            &secp256k1::SecretKey::from_secret_bytes([signer; 32]).unwrap(),
+        );
+        NodeMessage::new(
+            NodeMessageKind::NetworkVoteRequest,
+            None,
+            &super::super::message::SignedVotingProposal {
+                request,
+                created_at_block_height: height,
+                proposer_public_key: keypair.x_only_public_key().0.serialize(),
+                signature: schnorr::sign(&unsigned.hash().unwrap(), &keypair)
+                    .to_byte_array()
+                    .to_vec(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn isolates_requester_limits_for_direct_and_relayed_votes() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let secret = SecretKey::from_slice(&[21; 32]).unwrap();
+        let public_keys: Vec<_> = (21..=23)
+            .map(|signer| {
+                SecretKey::from_slice(&[signer; 32])
+                    .unwrap()
+                    .public_key(&Secp256k1::new())
+                    .serialize()
+            })
+            .collect();
+        let storm = Storm::from_peers(secret, public_keys.iter().copied().map(Peer::new).collect());
+        let handle = storm.handle();
+        let voting = Voting::new(secret.secret_bytes(), public_keys[0], database.voting());
+        let height = 100;
+
+        for index in 0..50 {
+            voting
+                .create(&handle, distinct_request(index), height)
+                .await
+                .unwrap();
+        }
+        let first = node_key(public_keys[0]).unwrap();
+        let second = node_key(public_keys[1]).unwrap();
+        let third = node_key(public_keys[2]).unwrap();
+        for index in 50..100 {
+            let message = signed_request(index, height + 1, 22);
+            let context = StormContext {
+                storm_handle: handle.clone(),
+                storm_message: message.clone().into_storm_message().unwrap(),
+                message_context: MessageContext {
+                    peer_public_key: public_keys[1],
+                },
+            };
+            voting
+                .handle_request(message, &context, height + 1)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            voting
+                .store
+                .active_request_count_for_proposer(Some(first))
+                .await
+                .unwrap(),
+            50
+        );
+        assert_eq!(
+            voting
+                .store
+                .active_request_count_for_proposer(Some(second))
+                .await
+                .unwrap(),
+            50
+        );
+
+        let overflow = signed_request(100, height + 1, 22);
+        let context = StormContext {
+            storm_handle: handle.clone(),
+            storm_message: overflow.clone().into_storm_message().unwrap(),
+            message_context: MessageContext {
+                peer_public_key: public_keys[1],
+            },
+        };
+        assert!(
+            matches!(voting.handle_request(overflow, &context, height + 1).await,
+            Err(VotingError::InvalidRequest(reason)) if reason.contains("50 active"))
+        );
+
+        let overflowing = signed_request(101, height + 1, 21);
+        let fresh = signed_request(102, height + 1, 23);
+        let overflow_hash = overflowing.hash().unwrap();
+        let fresh_hash = fresh.hash().unwrap();
+        let records = [overflowing, fresh]
+            .into_iter()
+            .map(|message| VotingSyncRequest {
+                message_hash: message.hash().unwrap(),
+                message: postcard::to_stdvec(&message).unwrap(),
+                approvals: Vec::new(),
+            })
+            .collect();
+        voting
+            .accept_synchronized(records, &handle, public_keys[0], height + 1)
+            .await
+            .unwrap();
+        assert!(voting.get(overflow_hash).await.unwrap().is_none());
+        assert_eq!(
+            voting
+                .get(fresh_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .proposer_public_key,
+            Some(third)
+        );
+        assert_eq!(voting.store.active_request_count().await.unwrap(), 101);
+
+        assert_eq!(
+            voting
+                .remove_expired(height + VOTING_TIMEOUT_BLOCKS)
+                .await
+                .unwrap(),
+            50
+        );
+        voting
+            .create(
+                &handle,
+                distinct_request(103),
+                height + VOTING_TIMEOUT_BLOCKS,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            voting
+                .store
+                .active_request_count_for_proposer(Some(first))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            voting
+                .store
+                .active_request_count_for_proposer(Some(second))
+                .await
+                .unwrap(),
+            50
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_forged_proposer_attribution() {
+        let (voting, storm) = voting_node().await;
+        let handle = storm.handle();
+        let public = handle.peers().await[0].compressed_public_key;
+        let other = signed_request(1, 100, 22);
+        let context = StormContext {
+            storm_handle: handle.clone(),
+            storm_message: other.clone().into_storm_message().unwrap(),
+            message_context: MessageContext {
+                peer_public_key: public,
+            },
+        };
+        assert!(matches!(voting.handle_request(other, &context, 100).await,
+            Err(VotingError::InvalidRequest(reason)) if reason.contains("does not match its sender")));
+
+        let mut proposal: super::super::message::SignedVotingProposal =
+            signed_request(2, 100, 22).decode_payload().unwrap();
+        proposal.proposer_public_key = node_key(public).unwrap();
+        let forged =
+            NodeMessage::new(NodeMessageKind::NetworkVoteRequest, None, &proposal).unwrap();
+        assert!(verified_proposer(&forged).is_err());
+        assert!(
+            voting
+                .accept_synchronized(
+                    vec![VotingSyncRequest {
+                        message_hash: forged.hash().unwrap(),
+                        message: postcard::to_stdvec(&forged).unwrap(),
+                        approvals: Vec::new(),
+                    }],
+                    &handle,
+                    public,
+                    100
+                )
+                .await
+                .is_err()
+        );
+
+        let mut tampered: super::super::message::SignedVotingProposal =
+            signed_request(3, 100, 21).decode_payload().unwrap();
+        tampered.created_at_block_height += 1;
+        let tampered =
+            NodeMessage::new(NodeMessageKind::NetworkVoteRequest, None, &tampered).unwrap();
+        assert!(verified_proposer(&tampered).is_err());
+        assert!(voting.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounds_legacy_sync_without_consuming_member_quota() {
+        let (voting, storm) = voting_node().await;
+        let handle = storm.handle();
+        let public = handle.peers().await[0].compressed_public_key;
+        let mut messages: Vec<_> = (0..51)
+            .map(|index| NodeMessage::new_voting_request(distinct_request(index), 100).unwrap())
+            .collect();
+        messages[0] = NodeMessage::new(
+            NodeMessageKind::NetworkVoteRequest,
+            None,
+            &distinct_request(0),
+        )
+        .unwrap();
+        messages.push(signed_request(51, 100, 21));
+        let records = messages
+            .into_iter()
+            .map(|message| VotingSyncRequest {
+                message_hash: message.hash().unwrap(),
+                message: postcard::to_stdvec(&message).unwrap(),
+                approvals: Vec::new(),
+            })
+            .collect();
+
+        voting
+            .accept_synchronized(records, &handle, public, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            voting
+                .store
+                .active_request_count_for_proposer(None)
+                .await
+                .unwrap(),
+            50
+        );
+        assert_eq!(
+            voting
+                .store
+                .active_request_count_for_proposer(Some(node_key(public).unwrap()))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(voting.store.active_request_count().await.unwrap(), 51);
+    }
+
     #[tokio::test]
     async fn limits_active_votings_across_creation_peers_and_synchronization() {
         let (voting, storm) = voting_node().await;
@@ -882,19 +1193,28 @@ mod reshape_tests {
             voting.handle_request(message.clone(), &context, block_height).await,
             Err(VotingError::InvalidRequest(reason)) if reason.contains("50 active")
         ));
-        assert!(matches!(
-            voting.accept_synchronized(
+        let legacy_hash = message.hash().unwrap();
+        voting
+            .accept_synchronized(
                 vec![VotingSyncRequest {
-                    message_hash: message.hash().unwrap(),
+                    message_hash: legacy_hash,
                     message: postcard::to_stdvec(&message).unwrap(),
                     approvals: Vec::new(),
                 }],
                 &handle,
                 public,
                 block_height,
-            ).await,
-            Err(VotingError::InvalidRequest(reason)) if reason.contains("50 active")
-        ));
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            voting
+                .store
+                .active_request_count_for_proposer(None)
+                .await
+                .unwrap(),
+            1
+        );
 
         let first_hash = first_hash.unwrap();
         voting
@@ -921,7 +1241,7 @@ mod reshape_tests {
             )
             .await
             .unwrap();
-        assert_eq!(voting.store.active_request_count().await.unwrap(), 50);
+        assert_eq!(voting.store.active_request_count().await.unwrap(), 51);
 
         let new_hash = voting
             .create(

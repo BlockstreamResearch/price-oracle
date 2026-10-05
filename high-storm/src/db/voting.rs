@@ -198,6 +198,20 @@ impl VotingStore {
         Ok(count as usize)
     }
 
+    pub async fn active_request_count_for_proposer(
+        &self,
+        proposer: Option<[u8; 32]>,
+    ) -> Result<usize, Error> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM voting_requests WHERE execution_confirmed = 0 \
+             AND (proposer_public_key = $1 OR (proposer_public_key IS NULL AND $1 IS NULL))",
+        )
+        .bind(proposer.map(|key| key.to_vec()))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count as usize)
+    }
+
     pub async fn start_execution(
         &self,
         message_hash: [u8; 32],
@@ -417,6 +431,52 @@ fn bytes_to_array<const N: usize>(bytes: Vec<u8>) -> Result<[u8; N], Error> {
 #[cfg(test)]
 mod tests {
     use crate::db::Database;
+
+    #[tokio::test]
+    async fn counts_active_votings_separately_for_each_proposer() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.voting();
+        let first = [1; 32];
+        let second = [2; 32];
+        store
+            .insert_request([3; 32], &[4], first, 100)
+            .await
+            .unwrap();
+        store
+            .insert_request([5; 32], &[6], second, 100)
+            .await
+            .unwrap();
+        store
+            .insert_synchronized_request([7; 32], &[8], None, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .active_request_count_for_proposer(Some(first))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .active_request_count_for_proposer(Some(second))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.active_request_count_for_proposer(None).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .active_request_count_for_proposer(Some([9; 32]))
+                .await
+                .unwrap(),
+            0
+        );
+    }
 
     #[tokio::test]
     async fn expiry_preserves_in_flight_executions_and_removes_completed_records() {
