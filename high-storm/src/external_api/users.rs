@@ -205,6 +205,7 @@ async fn check_fee_utxos(
     State(state): State<ExternalApiState>,
     Json(request): Json<CheckFeeUtxosRequest>,
 ) -> Result<Json<CheckFeeUtxosResponse>, ApiError> {
+    require_coordinator(&state).await?;
     let fee_utxos = validate_fee_utxos(&request.fee_utxos)?;
     let reservations = state
         .fee_utxos

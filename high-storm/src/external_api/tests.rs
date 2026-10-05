@@ -30,11 +30,383 @@ use crate::{
 };
 
 use super::{
+    API_BODY_READ_TIMEOUT, API_REQUEST_TIMEOUT, ApiClientAddress, ClientLimits, LimitedListener,
+    MAX_API_BODY_BYTES, MAX_API_BODY_READS, MAX_API_CONCURRENCY, MAX_API_REQUESTS_PER_CLIENT,
     fee_utxo::FeeUtxoValidator,
     operators::{AuthService, auth::AuthNetwork},
     router,
     users::{NetworkUserRequests, UserRequest, UserRequestHeader, signing_hash},
+    with_request_limits,
 };
+
+#[tokio::test]
+async fn rejects_fee_checks_on_non_coordinator_nodes() {
+    let elsewhere = SecretKey::from_slice(&[22; 32])
+        .unwrap()
+        .public_key(&Secp256k1::new())
+        .serialize();
+    let (app, ..) = node_setup_with_coordinator(elsewhere).await;
+    let response = app
+        .oneshot(json_request(
+            "/users/check-fee-utxos",
+            serde_json::json!({"fee_utxos": [format!("{}:0", hex::encode([9; 32]))]}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response_json(response).await["error"],
+        "this node is not the coordinator"
+    );
+}
+
+#[tokio::test]
+async fn rejects_oversized_api_bodies_without_a_content_length() {
+    let (app, _, _) = setup().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/users/check-fee-utxos")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(" ".repeat(MAX_API_BODY_BYTES + 1)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn times_out_stalled_api_requests() {
+    let app = with_request_limits(Router::new().route(
+        "/",
+        axum::routing::get(|| async {
+            std::future::pending::<()>().await;
+            StatusCode::OK
+        }),
+    ));
+    let started = tokio::time::Instant::now();
+    let response = app.oneshot(get_request("/")).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(started.elapsed(), API_REQUEST_TIMEOUT);
+}
+
+#[tokio::test]
+async fn stalled_uploads_do_not_take_execution_slots() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (entered, mut arrivals) = tokio::sync::mpsc::channel(MAX_API_BODY_READS + 1);
+    let app = with_request_limits(
+        Router::new().route(
+            "/",
+            axum::routing::get(|| async { StatusCode::OK })
+                .post(|_: axum::body::Bytes| async { StatusCode::OK }),
+        ),
+    )
+    .layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let entered = entered.clone();
+            async move {
+                if request.method() == axum::http::Method::POST {
+                    entered.send(()).await.unwrap();
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut uploads = Vec::new();
+    for _ in 0..MAX_API_BODY_READS {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await
+            .unwrap();
+        uploads.push(stream);
+    }
+    for _ in 0..MAX_API_BODY_READS {
+        tokio::time::timeout(std::time::Duration::from_secs(1), arrivals.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let mut overflow = tokio::net::TcpStream::connect(address).await.unwrap();
+    overflow.write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx").await.unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        overflow.read_to_string(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+
+    let mut healthy = tokio::net::TcpStream::connect(address).await.unwrap();
+    healthy
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        healthy.read_to_string(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    drop(uploads);
+    server.abort();
+}
+
+#[tokio::test]
+async fn times_out_trickled_bodies_and_releases_capacity() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let app = with_request_limits(Router::new().route(
+        "/",
+        axum::routing::post(|_: axum::body::Bytes| async { StatusCode::OK }),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            LimitedListener::new(listener),
+            app.into_make_service_with_connect_info::<ApiClientAddress>(),
+        )
+        .await
+        .unwrap();
+    });
+    let mut upload = tokio::net::TcpStream::connect(address).await.unwrap();
+    let started = tokio::time::Instant::now();
+    upload.write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+    let (mut reader, mut writer) = upload.into_split();
+    let trickle = tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+            ticks.tick().await;
+            if writer.write_all(b"1\r\nx\r\n").await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut response = String::new();
+    let read = tokio::time::timeout(
+        API_BODY_READ_TIMEOUT * 2,
+        reader.read_to_string(&mut response),
+    )
+    .await
+    .unwrap();
+    if let Err(error) = &read {
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+    assert!(
+        response.starts_with("HTTP/1.1 408") || (response.is_empty() && read.is_err()),
+        "{response}"
+    );
+    assert!(started.elapsed() >= API_BODY_READ_TIMEOUT);
+    assert!(started.elapsed() < API_BODY_READ_TIMEOUT * 2);
+    trickle.abort();
+
+    let mut complete = tokio::net::TcpStream::connect(address).await.unwrap();
+    complete.write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\nConnection: close\r\n\r\ncomplete").await.unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        complete.read_to_string(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    server.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn isolates_request_limits_by_socket_ip_and_releases_client_capacity() {
+    let (entered, mut arrivals) = tokio::sync::mpsc::channel(MAX_API_REQUESTS_PER_CLIENT + 1);
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = release.clone();
+    let app = with_request_limits(Router::new().route("/", axum::routing::get(move |axum::extract::ConnectInfo(ApiClientAddress(address)): axum::extract::ConnectInfo<ApiClientAddress>| {
+        let entered = entered.clone();
+        let gate = gate.clone();
+        async move {
+            entered.send(()).await.unwrap();
+            if address.ip() == "192.0.2.1".parse::<std::net::IpAddr>().unwrap() {
+                gate.acquire().await.unwrap().forget();
+            }
+            StatusCode::OK
+        }
+    })));
+    let client_request = |address: &str| {
+        let mut request = get_request("/");
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(ApiClientAddress(
+                address.parse().unwrap(),
+            )));
+        request
+    };
+    let mut requests = Vec::new();
+    for _ in 0..MAX_API_REQUESTS_PER_CLIENT {
+        let app = app.clone();
+        let request = client_request("192.0.2.1:1000");
+        requests.push(tokio::spawn(
+            async move { app.oneshot(request).await.unwrap() },
+        ));
+    }
+    for _ in 0..MAX_API_REQUESTS_PER_CLIENT {
+        arrivals.recv().await.unwrap();
+    }
+
+    let mut spoofed = client_request("192.0.2.1:2000");
+    spoofed
+        .headers_mut()
+        .insert("x-forwarded-for", "192.0.2.2".parse().unwrap());
+    spoofed
+        .headers_mut()
+        .insert("forwarded", "for=192.0.2.2".parse().unwrap());
+    let response = app.clone().oneshot(spoofed).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    assert_eq!(
+        app.clone()
+            .oneshot(client_request("192.0.2.2:1000"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    release.add_permits(MAX_API_REQUESTS_PER_CLIENT);
+    for request in requests {
+        assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+    }
+    release.add_permits(1);
+    assert_eq!(
+        app.oneshot(client_request("192.0.2.1:3000"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[test]
+fn client_limit_state_is_bounded_and_normalizes_mapped_addresses() {
+    let limits = ClientLimits::new(1);
+    let permit = limits.try_acquire("192.0.2.1".parse().unwrap()).unwrap();
+    assert!(
+        limits
+            .try_acquire("::ffff:192.0.2.1".parse().unwrap())
+            .is_err()
+    );
+    for index in 0..10_000u32 {
+        let address = std::net::IpAddr::V4(std::net::Ipv4Addr::from(index));
+        drop(limits.try_acquire(address).unwrap());
+    }
+    assert!(limits.clients.lock().unwrap().len() <= 2);
+    drop(permit);
+    assert!(limits.try_acquire("192.0.2.1".parse().unwrap()).is_ok());
+}
+
+#[tokio::test]
+async fn limits_connections_before_headers_and_recovers_after_disconnect() {
+    use axum::serve::Listener;
+    use tokio::io::AsyncReadExt;
+
+    for (global_limit, client_limit) in [(1, 2), (2, 1)] {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let mut listener = LimitedListener {
+            connections: std::sync::Arc::new(tokio::sync::Semaphore::new(global_limit)),
+            clients: ClientLimits::new(client_limit),
+            ..LimitedListener::new(tcp)
+        };
+        let first = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (accepted, _) = listener.accept().await;
+        let mut rejected = tokio::net::TcpStream::connect(address).await.unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let mut buffer = [0; 1];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            rejected.read(&mut buffer),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(read, Ok(0)) || read.is_err(),
+            "unexpected connection response: {read:?}"
+        );
+
+        drop(accepted);
+        drop(first);
+        let replacement = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (accepted, _) = tokio::time::timeout(std::time::Duration::from_secs(1), accept)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(accepted);
+        drop(replacement);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sheds_api_overload_across_router_clones_and_releases_capacity() {
+    let (entered, mut arrivals) = tokio::sync::mpsc::channel(MAX_API_CONCURRENCY);
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = release.clone();
+    let app = with_request_limits(Router::new().route(
+        "/",
+        axum::routing::get(move || {
+            let entered = entered.clone();
+            let gate = gate.clone();
+            async move {
+                entered.send(()).await.unwrap();
+                gate.acquire().await.unwrap().forget();
+                StatusCode::OK
+            }
+        }),
+    ));
+    let mut requests = Vec::new();
+    for _ in 0..MAX_API_CONCURRENCY {
+        let app = app.clone();
+        requests.push(tokio::spawn(async move {
+            app.oneshot(get_request("/")).await.unwrap()
+        }));
+    }
+    for _ in 0..MAX_API_CONCURRENCY {
+        arrivals.recv().await.unwrap();
+    }
+
+    let rejected = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        app.clone().oneshot(get_request("/")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    release.add_permits(MAX_API_CONCURRENCY);
+    for request in requests {
+        assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+    }
+    release.add_permits(1);
+    assert_eq!(
+        app.oneshot(get_request("/")).await.unwrap().status(),
+        StatusCode::OK
+    );
+}
 
 #[tokio::test]
 async fn permits_browser_preflight_requests() {
