@@ -14,6 +14,7 @@ use super::message::{
 };
 
 pub const VOTING_TIMEOUT_BLOCKS: u64 = 10_080;
+const MAX_ACTIVE_VOTINGS: usize = 50;
 const MAX_PROPOSAL_FUTURE_BLOCKS: u64 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +236,7 @@ impl Voting {
             ));
         }
         let sync: VotingSyncMessage = message.decode_payload()?;
+        self.remove_expired(block_height).await?;
         if sync.is_response {
             self.accept_synchronized(
                 sync.requests,
@@ -308,6 +310,11 @@ impl Voting {
                         "voting synchronization sender",
                     )?;
                     let (request, created_at_block_height) = message.decode_voting_proposal()?;
+                    if created_at_block_height.is_some_and(|created_at| {
+                        created_at.saturating_add(VOTING_TIMEOUT_BLOCKS) <= block_height
+                    }) {
+                        continue;
+                    }
                     validate_proposal_height(created_at_block_height, block_height)?;
                     validate_synchronized_request(&request, &peers, self.coordinator)?;
                     self.ensure_unique_active_request(&request, block_height)
@@ -489,6 +496,7 @@ impl Voting {
     }
 
     pub(crate) async fn remove_expired(&self, block_height: u64) -> Result<u64, VotingError> {
+        let _guard = self.operations.lock().await;
         Ok(self
             .store
             .delete_expired(block_height, VOTING_TIMEOUT_BLOCKS)
@@ -500,6 +508,9 @@ impl Voting {
         request: &NetworkVoteRequest,
         block_height: u64,
     ) -> Result<(), VotingError> {
+        self.store
+            .delete_expired(block_height, VOTING_TIMEOUT_BLOCKS)
+            .await?;
         let canonical_hash = request.canonical_hash()?;
         for (message, created_at, approved_at) in self.store.unconfirmed_request_messages().await? {
             let timeout_start = approved_at.unwrap_or(created_at);
@@ -511,6 +522,12 @@ impl Voting {
             if message.decode_voting_request()?.canonical_hash()? == canonical_hash {
                 return Err(VotingError::DuplicateRequest(hex::encode(canonical_hash)));
             }
+        }
+
+        if self.store.active_request_count().await? >= MAX_ACTIVE_VOTINGS {
+            return Err(VotingError::InvalidRequest(format!(
+                "network already has {MAX_ACTIVE_VOTINGS} active voting requests"
+            )));
         }
 
         Ok(())
@@ -800,7 +817,165 @@ fn transport_keys(keys: &[[u8; 33]]) -> Result<Vec<TransportPublicKey>, VotingEr
 mod reshape_tests {
     use super::*;
     use crate::StormEyeUtxo;
+    use crate::db::Database;
     use secp256k1_zkp::{Secp256k1, SecretKey};
+    use storm::{MessageContext, Storm};
+
+    async fn voting_node() -> (Voting, Storm) {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let secret = SecretKey::from_slice(&[21; 32]).unwrap();
+        let public = secret.public_key(&Secp256k1::new()).serialize();
+        let storm = Storm::from_peers(secret, vec![Peer::new(public)]);
+        let voting = Voting::new(secret.secret_bytes(), public, database.voting());
+        (voting, storm)
+    }
+
+    fn distinct_request(index: u8) -> NetworkVoteRequest {
+        NetworkVoteRequest::new(
+            NetworkVoteKind::SplitStormEye,
+            &SplitStormEye {
+                utxo_to_split: storm_eye(index),
+                number_of_splits: 2,
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn limits_active_votings_across_creation_peers_and_synchronization() {
+        let (voting, storm) = voting_node().await;
+        let handle = storm.handle();
+        let block_height = 100;
+        let mut first_hash = None;
+        for index in 0..49 {
+            let hash = voting
+                .create(&handle, distinct_request(index), block_height)
+                .await
+                .unwrap();
+            first_hash.get_or_insert(hash);
+        }
+
+        let (last_slot, overflow) = tokio::join!(
+            voting.create(&handle, distinct_request(49), block_height),
+            voting.create(&handle, distinct_request(50), block_height),
+        );
+        assert_eq!(
+            usize::from(last_slot.is_ok()) + usize::from(overflow.is_ok()),
+            1
+        );
+        assert!(matches!(
+            last_slot.err().or_else(|| overflow.err()),
+            Some(VotingError::InvalidRequest(reason)) if reason.contains("50 active")
+        ));
+        assert_eq!(voting.store.active_request_count().await.unwrap(), 50);
+
+        let message = NodeMessage::new_voting_request(distinct_request(51), block_height).unwrap();
+        let public = handle.peers().await[0].compressed_public_key;
+        let context = StormContext {
+            storm_handle: handle.clone(),
+            storm_message: message.clone().into_storm_message().unwrap(),
+            message_context: MessageContext {
+                peer_public_key: public,
+            },
+        };
+        assert!(matches!(
+            voting.handle_request(message.clone(), &context, block_height).await,
+            Err(VotingError::InvalidRequest(reason)) if reason.contains("50 active")
+        ));
+        assert!(matches!(
+            voting.accept_synchronized(
+                vec![VotingSyncRequest {
+                    message_hash: message.hash().unwrap(),
+                    message: postcard::to_stdvec(&message).unwrap(),
+                    approvals: Vec::new(),
+                }],
+                &handle,
+                public,
+                block_height,
+            ).await,
+            Err(VotingError::InvalidRequest(reason)) if reason.contains("50 active")
+        ));
+
+        let first_hash = first_hash.unwrap();
+        voting
+            .approve(&handle, first_hash, block_height + 1)
+            .await
+            .unwrap();
+        let known = voting.store.get(first_hash).await.unwrap().unwrap();
+        voting
+            .accept_synchronized(
+                vec![VotingSyncRequest {
+                    message_hash: first_hash,
+                    message: known.message,
+                    approvals: known
+                        .approvals
+                        .into_iter()
+                        .map(|approval| VotingSyncApproval {
+                            message: approval.message,
+                        })
+                        .collect(),
+                }],
+                &handle,
+                public,
+                block_height + 1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(voting.store.active_request_count().await.unwrap(), 50);
+
+        let new_hash = voting
+            .create(
+                &handle,
+                distinct_request(52),
+                block_height + VOTING_TIMEOUT_BLOCKS,
+            )
+            .await
+            .unwrap();
+        assert_eq!(voting.store.active_request_count().await.unwrap(), 2);
+        assert!(voting.get(first_hash).await.unwrap().is_some());
+        assert!(voting.get(new_hash).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn skips_expired_synchronized_votes_without_blocking_fresh_ones() {
+        let (voting, storm) = voting_node().await;
+        let handle = storm.handle();
+        let expired = NodeMessage::new_voting_request(distinct_request(1), 100).unwrap();
+        let height = 100 + VOTING_TIMEOUT_BLOCKS;
+        let fresh = NodeMessage::new_voting_request(distinct_request(2), height).unwrap();
+        let expired_hash = expired.hash().unwrap();
+        let fresh_hash = fresh.hash().unwrap();
+        let requests = [expired, fresh]
+            .into_iter()
+            .map(|message| VotingSyncRequest {
+                message_hash: message.hash().unwrap(),
+                message: postcard::to_stdvec(&message).unwrap(),
+                approvals: Vec::new(),
+            })
+            .collect();
+
+        voting
+            .accept_synchronized(
+                requests,
+                &handle,
+                handle.peers().await[0].compressed_public_key,
+                height,
+            )
+            .await
+            .unwrap();
+
+        assert!(voting.get(expired_hash).await.unwrap().is_none());
+        assert!(voting.get(fresh_hash).await.unwrap().is_some());
+        assert_eq!(voting.store.active_request_count().await.unwrap(), 1);
+        assert_eq!(
+            voting
+                .remove_expired(height + VOTING_TIMEOUT_BLOCKS)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(voting.list().await.unwrap().is_empty());
+    }
 
     #[test]
     fn proposal_heights_are_bounded_by_the_voting_window() {
