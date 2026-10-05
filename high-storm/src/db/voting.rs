@@ -189,6 +189,15 @@ impl VotingStore {
         .collect()
     }
 
+    pub async fn active_request_count(&self) -> Result<usize, Error> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM voting_requests WHERE execution_confirmed = 0",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count as usize)
+    }
+
     pub async fn start_execution(
         &self,
         message_hash: [u8; 32],
@@ -327,8 +336,10 @@ impl VotingStore {
         let timeout = height_to_i64(timeout_blocks)?;
         let result = sqlx::query(
             "DELETE FROM voting_requests WHERE \
-             (approved_at_block_height IS NULL AND block_height + $1 <= $2) OR \
-             (approved_at_block_height IS NOT NULL AND approved_at_block_height + $1 <= $2)",
+               (execution_confirmed = 1 OR \
+                (execution_started = 0 AND execution_txid IS NULL)) AND (\
+               (approved_at_block_height IS NULL AND block_height + $1 <= $2) OR \
+               (approved_at_block_height IS NOT NULL AND approved_at_block_height + $1 <= $2))",
         )
         .bind(timeout)
         .bind(current)
@@ -406,6 +417,64 @@ fn bytes_to_array<const N: usize>(bytes: Vec<u8>) -> Result<[u8; N], Error> {
 #[cfg(test)]
 mod tests {
     use crate::db::Database;
+
+    #[tokio::test]
+    async fn expiry_preserves_in_flight_executions_and_removes_completed_records() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.voting();
+        let timeout = crate::VOTING_TIMEOUT_BLOCKS;
+        let pending = [1; 32];
+        let executing = [2; 32];
+        let proposer = [3; 32];
+        let txid = [4; 32];
+        for hash in [pending, executing] {
+            store
+                .insert_request(hash, &[5], proposer, 100)
+                .await
+                .unwrap();
+            store
+                .insert_approval(hash, proposer, &[6], 100, 1)
+                .await
+                .unwrap();
+        }
+        store.start_execution(executing, &[7]).await.unwrap();
+
+        assert_eq!(
+            store
+                .delete_expired(100 + timeout - 1, timeout)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store.delete_expired(100 + timeout, timeout).await.unwrap(),
+            1
+        );
+        assert!(store.get(pending).await.unwrap().is_none());
+        assert_eq!(store.approval_count(pending).await.unwrap(), 0);
+        assert!(store.get(executing).await.unwrap().is_some());
+        assert_eq!(store.active_request_count().await.unwrap(), 1);
+
+        store
+            .record_broadcast(executing, proposer, &[7], &[8], txid)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.delete_expired(100 + timeout, timeout).await.unwrap(),
+            0
+        );
+        store
+            .mark_execution_included(executing, txid, 101, [9; 32])
+            .await
+            .unwrap();
+        store.confirm_execution(executing, txid).await.unwrap();
+        assert_eq!(store.active_request_count().await.unwrap(), 0);
+        assert_eq!(
+            store.delete_expired(100 + timeout, timeout).await.unwrap(),
+            1
+        );
+        assert_eq!(store.approval_count(executing).await.unwrap(), 0);
+    }
 
     #[tokio::test]
     async fn persists_voting_execution_lifecycle() {

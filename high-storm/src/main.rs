@@ -430,6 +430,15 @@ async fn run_until_shutdown(
                 }
             }
             _ = reconcile_requests.tick() => {
+                match storm.remove_expired_voting_requests(storm.handle().block_height()).await {
+                    Ok(0) => {}
+                    Ok(request_count) => {
+                        tracing::info!(request_count, "removed expired voting requests");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to remove expired voting requests");
+                    }
+                }
                 if let Err(error) = storm.synchronize_voting_requests().await {
                     tracing::warn!(%error, "failed to synchronize voting requests");
                 }
