@@ -114,7 +114,11 @@ impl Storm {
                     tokio::spawn(async move {
                         let _permit = permit;
                         if let Err(e) = Self::handle_connection(stream, peer_address, state).await {
-                            log::error!("Connection with {} failed: {e}", peer_address);
+                            log::log!(
+                                e.connection_log_level(),
+                                "Connection with {} failed: {e}",
+                                peer_address
+                            );
                         }
                     });
                 }

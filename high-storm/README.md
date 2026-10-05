@@ -17,8 +17,24 @@ high-storm/devenv.sh down   # Stop while preserving initialized state.
 high-storm/devenv.sh deploy-node 4 # Deploy a candidate node for a later vote.
 high-storm/devenv.sh public-key 4 # Print its compressed public key.
 high-storm/devenv.sh connections 1 # List node 1's active connections.
+high-storm/devenv.sh fund ADDRESS # Send 100000 sats of LBTC and confirm the payment.
 high-storm/devenv.sh elements 1 getblockchaininfo # Call node 1's Elements RPC.
 ```
+
+`fund ADDRESS` sends exactly 100000 sats (0.001 LBTC) from node 1's bootstrap
+wallet, mines one block, and prints the transaction ID. Transaction fees are paid
+by the sending wallet, not deducted from the recipient's amount. The deployment
+must already be running.
+
+The launcher enters discovery only when `high-storm run` reports an uninitialized
+network (exit code 78). Other failures are logged and restart the normal `run`
+path, preserving the saved peer table. Signing considers live connections and
+races at most two Storm Tree branches with independent MuSig2 nonces, so a
+non-contributing peer does not block a responsive two-of-three quorum.
+
+Expected connection closures are debug-level diagnostics. The default Storm
+log level is `info`; authentication and protocol failures remain warnings.
+Operator registration logs a repeated pending error only when it changes.
 
 To give every development node a CoinGecko Demo API key, create the ignored
 `high-storm/.env` file before starting the deployment:

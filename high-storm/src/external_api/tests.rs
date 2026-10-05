@@ -939,12 +939,66 @@ fn signed_batch(requests: &[(&str, &str, Option<FeedId>)]) -> NetworkUserRequest
             signature: String::new(),
             public_key: hex::encode(public_key),
             fee_utxos: vec![format!("{}:3", hex::encode([8; 32]))],
+            signature_scheme: None,
+            signing_public_key: None,
         },
         requests,
     };
     request.header.signature =
         hex::encode(schnorr::sign(&signing_hash(&request), &keypair).to_byte_array());
     request
+}
+
+#[test]
+fn humid_user_request_verification_binds_request_and_owner() {
+    let private_key = PrivateKey::new(
+        secp256k1::SecretKey::from_slice(&[31; 32]).unwrap(),
+        Network::Regtest,
+    );
+    let mut request = signed_user_request("tick-utxo", "scriptPubKey-auth");
+    request.header.signature_scheme = Some(super::users::HUMID_USER_SIGNATURE_SCHEME.into());
+    request.header.signing_public_key = Some(hex::encode(
+        private_key
+            .public_key(&secp256k1::Secp256k1::new())
+            .inner
+            .serialize(),
+    ));
+    request.header.signature = sign_humid(
+        &private_key,
+        &super::users::humid_signing_message(&request)
+            .map_err(|error| error.message)
+            .unwrap(),
+    );
+    let verify = |value: &NetworkUserRequests| {
+        super::users::validate_encoded_request(&serde_json::to_vec(value).unwrap())
+    };
+    assert!(verify(&request).is_ok());
+    let mut changed = request.clone();
+    changed.header.fee_utxos[0] = format!("{}:4", hex::encode([8; 32]));
+    assert!(verify(&changed).is_err());
+    let mut changed = request.clone();
+    changed.requests[0].payload = changed.requests[0]
+        .payload
+        .replace("scriptPubKey-auth", "asset-id-auth");
+    assert!(verify(&changed).is_err());
+    let mut changed = request.clone();
+    changed.header.signing_public_key = Some(hex::encode(
+        PrivateKey::new(
+            secp256k1::SecretKey::from_slice(&[32; 32]).unwrap(),
+            Network::Regtest,
+        )
+        .public_key(&secp256k1::Secp256k1::new())
+        .inner
+        .serialize(),
+    ));
+    assert!(verify(&changed).is_err());
+    let mut changed = request.clone();
+    changed.header.signature_scheme = Some("unsupported".into());
+    assert!(verify(&changed).is_err());
+    let mut changed = request.clone();
+    changed.header.signature_scheme = None;
+    assert!(verify(&changed).is_err());
+    assert!(verify(&signed_user_request("tick-utxo", "signature-auth")).is_ok());
 }
 
 fn user_request(request: &NetworkUserRequests) -> Request<Body> {

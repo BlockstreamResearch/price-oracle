@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { schnorr } from "@noble/curves/secp256k1";
+import { schnorr, secp256k1 } from "@noble/curves/secp256k1";
 
 import {
   PriceOracleClient,
   createSignedPriceRequest,
   createTickRequest,
+  createWalletTickRequest,
+  walletRequestSigningMessage,
   createTickSpendPlan,
   decodePriceData,
   publicKeyFromPrivateKey,
@@ -22,6 +24,49 @@ const PRICE_MESSAGE =
   "dd5c6a22d1a989ec39cfcd82b64d8e1f43bcca770dc3d2949022a9808b3d6340";
 
 describe("Price Oracle SDK", () => {
+  test("builds a Humid-authorized Tick request without a private key", () => {
+    const publicKey = Buffer.from(secp256k1.getPublicKey(PRIVATE_KEY)).toString(
+      "hex",
+    );
+    const fee = `${"ab".repeat(32)}:1`;
+    const walletScript = `0014${"55".repeat(20)}`;
+    const request = createWalletTickRequest(publicKey, [fee], walletScript);
+    expect(request.header.signature).toBe("");
+    expect(request.header.public_key).toBe(publicKey.slice(2));
+    expect(request.header.signing_public_key).toBe(publicKey);
+    const message = walletRequestSigningMessage(request);
+    expect(message).toBe(
+      `OracleNetworkV1/NetworkUserRequests\nbitcoin-signed-message-ecdsa-v1\n${JSON.stringify(
+        [
+          publicKey.slice(2),
+          publicKey,
+          [fee],
+          [
+            {
+              kind: "tick-utxo",
+              payload: JSON.stringify({
+                utxo_auth_method: {
+                  kind: "scriptPubKey-auth",
+                  auth_data: walletScript,
+                },
+              }),
+            },
+          ],
+        ],
+      )}`,
+    );
+    request.header.signature = "signed-by-wallet";
+    expect(walletRequestSigningMessage(request)).toBe(message);
+    request.header.fee_utxos[0] = `${"ab".repeat(32)}:2`;
+    expect(walletRequestSigningMessage(request)).not.toBe(message);
+    expect(() =>
+      createWalletTickRequest(publicKey.slice(2), [fee], walletScript),
+    ).toThrow();
+    expect(() =>
+      createWalletTickRequest(publicKey, [], walletScript),
+    ).toThrow();
+  });
+
   test("derives an x-only key and signs coordinator Tick requests", () => {
     const request = createTickRequest(PRIVATE_KEY, [`${"ab".repeat(32)}:1`]);
 
@@ -85,7 +130,9 @@ describe("Price Oracle SDK", () => {
     const feeUtxos = [`${"ab".repeat(32)}:1`];
 
     expect(() => createSignedPriceRequest(PRIVATE_KEY, feeUtxos, -1)).toThrow();
-    expect(() => createSignedPriceRequest(PRIVATE_KEY, feeUtxos, 1.5)).toThrow();
+    expect(() =>
+      createSignedPriceRequest(PRIVATE_KEY, feeUtxos, 1.5),
+    ).toThrow();
     expect(() =>
       createSignedPriceRequest(PRIVATE_KEY, feeUtxos, 0x1_0000_0000),
     ).toThrow();

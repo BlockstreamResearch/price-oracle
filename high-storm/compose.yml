@@ -5,7 +5,7 @@ x-node: &node
     context: ..
     dockerfile: high-storm/Dockerfile
   environment:
-    RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=debug,sqlx=warn}
+    RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=info,sqlx=warn}
   restart: unless-stopped
   depends_on:
     postgres:
@@ -258,7 +258,7 @@ services:
   node-1:
     <<: *node
     environment:
-      RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=debug,sqlx=warn}
+      RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=info,sqlx=warn}
       COINGECKO_API_KEY: ${COINGECKO_API_KEY:-}
       OPERATOR_PUBLIC_KEY: 031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f
     depends_on:
@@ -274,8 +274,14 @@ services:
     command:
       - >-
         (while [ ! -S /tmp/high-storm.sock ]; do sleep 1; done;
-        until storm-operator operator add "$${OPERATOR_PUBLIC_KEY}"; do sleep 1; done) &
-        high-storm run --config /etc/high-storm/config.toml ||
+        previous_error="";
+        until registration=$$(storm-operator operator add "$${OPERATOR_PUBLIC_KEY}" 2>&1); do
+        if [ "$$registration" != "$$previous_error" ]; then
+        printf 'Operator registration pending: %s\n' "$$registration" >&2;
+        previous_error="$$registration"; fi; sleep 1; done) &
+        high-storm run --config /etc/high-storm/config.toml;
+        exit_code=$$?;
+        if [ "$$exit_code" -ne 78 ]; then exit "$$exit_code"; fi;
         exec high-storm initialize host --config /etc/high-storm/config.toml
         --public-key 024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766
         --public-key 02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337
@@ -289,7 +295,7 @@ services:
   node-2:
     <<: *node
     environment:
-      RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=debug,sqlx=warn}
+      RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=info,sqlx=warn}
       COINGECKO_API_KEY: ${COINGECKO_API_KEY:-}
       OPERATOR_PUBLIC_KEY: 024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766
     depends_on:
@@ -305,8 +311,14 @@ services:
     command:
       - >-
         (while [ ! -S /tmp/high-storm.sock ]; do sleep 1; done;
-        until storm-operator operator add "$${OPERATOR_PUBLIC_KEY}"; do sleep 1; done) &
-        high-storm run --config /etc/high-storm/config.toml ||
+        previous_error="";
+        until registration=$$(storm-operator operator add "$${OPERATOR_PUBLIC_KEY}" 2>&1); do
+        if [ "$$registration" != "$$previous_error" ]; then
+        printf 'Operator registration pending: %s\n' "$$registration" >&2;
+        previous_error="$$registration"; fi; sleep 1; done) &
+        high-storm run --config /etc/high-storm/config.toml;
+        exit_code=$$?;
+        if [ "$$exit_code" -ne 78 ]; then exit "$$exit_code"; fi;
         exec high-storm initialize join --config /etc/high-storm/config.toml
         --discovery-public-key 031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f
         --discovery-address ${STORM_NETWORK_PREFIX:-172.28.0}.11:9000
@@ -320,7 +332,7 @@ services:
   node-3:
     <<: *node
     environment:
-      RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=debug,sqlx=warn}
+      RUST_LOG: ${RUST_LOG:-info,high_storm=debug,storm=info,sqlx=warn}
       COINGECKO_API_KEY: ${COINGECKO_API_KEY:-}
       OPERATOR_PUBLIC_KEY: 02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337
     depends_on:
@@ -336,8 +348,14 @@ services:
     command:
       - >-
         (while [ ! -S /tmp/high-storm.sock ]; do sleep 1; done;
-        until storm-operator operator add "$${OPERATOR_PUBLIC_KEY}"; do sleep 1; done) &
-        high-storm run --config /etc/high-storm/config.toml ||
+        previous_error="";
+        until registration=$$(storm-operator operator add "$${OPERATOR_PUBLIC_KEY}" 2>&1); do
+        if [ "$$registration" != "$$previous_error" ]; then
+        printf 'Operator registration pending: %s\n' "$$registration" >&2;
+        previous_error="$$registration"; fi; sleep 1; done) &
+        high-storm run --config /etc/high-storm/config.toml;
+        exit_code=$$?;
+        if [ "$$exit_code" -ne 78 ]; then exit "$$exit_code"; fi;
         exec high-storm initialize join --config /etc/high-storm/config.toml
         --discovery-public-key 031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f
         --discovery-address ${STORM_NETWORK_PREFIX:-172.28.0}.11:9000

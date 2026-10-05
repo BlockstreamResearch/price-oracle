@@ -136,6 +136,18 @@ impl StormHandle {
         self.inner.read().await.peers.clone()
     }
 
+    /// Returns remote identities whose outbound connection queues are open.
+    pub async fn connected_peer_keys(&self) -> BTreeSet<[u8; 33]> {
+        self.inner
+            .read()
+            .await
+            .connections
+            .iter()
+            .filter(|(_, connection)| !connection.is_closed())
+            .map(|(public_key, _)| *public_key)
+            .collect()
+    }
+
     /// Returns whether the local transport identity belongs to the active peer table.
     pub async fn is_local_member(&self) -> bool {
         let state = self.inner.read().await;
@@ -353,7 +365,8 @@ impl StormHandle {
             Storm::release_connection(&state, peer_public_key).await;
 
             if let Err(error) = result {
-                log::error!(
+                log::log!(
+                    error.connection_log_level(),
                     "Connection with {} failed: {error}",
                     hex::encode(peer_public_key)
                 );

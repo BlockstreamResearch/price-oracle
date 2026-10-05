@@ -8,6 +8,7 @@ use high_storm::{
     ipc::IpcServer,
     sources,
 };
+use std::process::ExitCode;
 use tokio::{
     sync::Notify,
     time::{Duration, Instant, MissedTickBehavior},
@@ -61,11 +62,34 @@ fn idle_round_deadline() -> Instant {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(%error, "high-storm stopped");
+            startup_exit_code(error.as_ref())
+        }
+    }
+}
+
+fn startup_exit_code(error: &(dyn std::error::Error + 'static)) -> ExitCode {
+    if matches!(
+        error.downcast_ref::<high_storm::Error>(),
+        Some(high_storm::Error::Database(
+            high_storm::db::network::Error::NotInitialized
+        ))
+    ) {
+        ExitCode::from(78)
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,high_storm=debug,storm=debug,sqlx=warn")),
+                .unwrap_or_else(|_| EnvFilter::new("info,high_storm=debug,storm=info,sqlx=warn")),
         )
         .init();
 
@@ -163,6 +187,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_until_shutdown(storm, &store, ipc, external_api, &price_observed).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod startup_exit_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_uninitialized_network_requests_discovery() {
+        assert_eq!(
+            startup_exit_code(&high_storm::Error::Database(
+                high_storm::db::network::Error::NotInitialized,
+            )),
+            ExitCode::from(78),
+        );
+        assert_eq!(
+            startup_exit_code(&high_storm::Error::LocalNodeRemoved),
+            ExitCode::FAILURE,
+        );
+        assert_eq!(
+            startup_exit_code(&std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+            ExitCode::FAILURE,
+        );
+    }
 }
 
 enum Action {

@@ -1,8 +1,10 @@
-import { schnorr } from "@noble/curves/secp256k1";
+import { schnorr, secp256k1 } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils";
 
 const REQUEST_TAG = "OracleNetworkV1/NetworkUserRequests";
+export const WALLET_REQUEST_SIGNATURE_SCHEME =
+  "bitcoin-signed-message-ecdsa-v1";
 const PRICE_TAG = "OracleNetworkV1/Price";
 const HEX_32 = /^[0-9a-f]{64}$/i;
 const OUTPOINT = /^[0-9a-f]{64}:[0-9]+$/i;
@@ -42,6 +44,8 @@ export type TickRequest = {
     signature: string;
     public_key: string;
     fee_utxos: string[];
+    signature_scheme?: string;
+    signing_public_key?: string;
   };
   requests: Array<{ kind: TickRequestKind; payload: string }>;
 };
@@ -222,10 +226,18 @@ export class PriceOracleClient {
     this.#fetch = fetcher.bind(globalThis);
   }
 
-  async getAccount(publicKey: string): Promise<OracleAccount> {
+  async getAccount(
+    publicKey: string,
+    authScriptPubKey?: string,
+  ): Promise<OracleAccount> {
     assertXOnlyPublicKey(publicKey);
+    if (authScriptPubKey !== undefined)
+      validateAuthMethod({
+        kind: "scriptPubKey-auth",
+        auth_data: authScriptPubKey,
+      });
     return this.#json<OracleAccount>(
-      `/users/account/${publicKey.toLowerCase()}`,
+      `/users/account/${publicKey.toLowerCase()}${authScriptPubKey === undefined ? "" : `?auth_script_pubkey=${encodeURIComponent(authScriptPubKey)}`}`,
     );
   }
 
@@ -272,6 +284,56 @@ export function signSchnorrDigest(privateKey: string, digest: string): string {
   }
 
   return bytesToHex(schnorr.sign(hexToBytes(digest), privateKey));
+}
+
+export function createWalletTickRequest(
+  compressedPublicKey: string,
+  feeUtxos: string[],
+  authScriptPubKey: string,
+): TickRequest {
+  if (!/^(02|03)[0-9a-f]{64}$/i.test(compressedPublicKey))
+    throw new Error("wallet public key must be compressed secp256k1 hex");
+  secp256k1.ProjectivePoint.fromHex(compressedPublicKey);
+  if (
+    feeUtxos.length === 0 ||
+    feeUtxos.some((outpoint) => !OUTPOINT.test(outpoint))
+  )
+    throw new Error("fee UTXOs must contain txid:vout outpoints");
+  const authMethod: TickAuthMethod = {
+    kind: "scriptPubKey-auth",
+    auth_data: authScriptPubKey,
+  };
+  validateAuthMethod(authMethod);
+  return {
+    header: {
+      signature: "",
+      public_key: compressedPublicKey.slice(2).toLowerCase(),
+      fee_utxos: [...feeUtxos],
+      signature_scheme: WALLET_REQUEST_SIGNATURE_SCHEME,
+      signing_public_key: compressedPublicKey.toLowerCase(),
+    },
+    requests: [
+      {
+        kind: "tick-utxo",
+        payload: JSON.stringify({ utxo_auth_method: authMethod }),
+      },
+    ],
+  };
+}
+
+export function walletRequestSigningMessage(request: TickRequest): string {
+  if (
+    request.header.signature_scheme !== WALLET_REQUEST_SIGNATURE_SCHEME ||
+    !request.header.signing_public_key
+  ) {
+    throw new Error("request must use wallet message authorization");
+  }
+  return `${REQUEST_TAG}\n${WALLET_REQUEST_SIGNATURE_SCHEME}\n${JSON.stringify([
+    request.header.public_key,
+    request.header.signing_public_key,
+    request.header.fee_utxos,
+    request.requests,
+  ])}`;
 }
 
 export function createTickRequest(
