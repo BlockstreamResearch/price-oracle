@@ -789,6 +789,18 @@ impl HighStormHandle {
         self.state.is_recovering() || self.state.is_spending_paused()
     }
 
+    pub fn is_spending_paused(&self) -> bool {
+        self.state.is_spending_paused()
+    }
+
+    pub async fn member_migration_request(&self) -> Option<[u8; 32]> {
+        self.state.member_migration_request().await
+    }
+
+    pub async fn member_migration_ready(&self) -> bool {
+        self.storm.member_migration_ready().await
+    }
+
     /// Only a Direct feed has sources. Named with a Cross pair, this and the
     /// two below do nothing, since it is priced from the feeds it joins.
     pub async fn record_price_observation(
@@ -1148,6 +1160,12 @@ impl HighStormHandle {
                 .voting_execution()
                 .transaction_confirmation(txid)?
             else {
+                if is_member_migration {
+                    self.state
+                        .set_spending_paused(false)
+                        .await
+                        .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
+                }
                 self.state
                     .voting_execution()
                     .mark_orphaned(request_hash, txid)
@@ -1184,6 +1202,10 @@ impl HighStormHandle {
                     .hash_at(included_at)
                     .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
                 if canonical_hash != inclusion.block_hash {
+                    self.state
+                        .set_spending_paused(false)
+                        .await
+                        .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
                     self.state
                         .voting_execution()
                         .mark_orphaned(request_hash, txid)
