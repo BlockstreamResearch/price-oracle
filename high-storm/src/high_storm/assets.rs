@@ -170,40 +170,39 @@ pub(crate) fn initial_members_from_script(
     Ok(Some(members))
 }
 
-pub(crate) fn migrated_members_proposer_from_script(
-    script: &Script,
-) -> Result<Option<[u8; 32]>, AssetError> {
+/// Parses third-party chain data, so a malformed payload is "not a marker" rather than an error.
+pub(crate) fn migrated_members_proposer_from_script(script: &Script) -> Option<[u8; 32]> {
     let mut instructions = script.instructions_minimal();
     if !matches!(
         instructions.next(),
         Some(Ok(Instruction::Op(opcodes::all::OP_RETURN)))
     ) {
-        return Ok(None);
+        return None;
     }
     let Some(Ok(Instruction::PushBytes(data))) = instructions.next() else {
-        return Ok(None);
+        return None;
     };
     if instructions.next().is_some()
         || data.len() < INITIAL_MEMBERS_MAGIC.len()
         || data[..INITIAL_MEMBERS_MAGIC.len()] != INITIAL_MEMBERS_MAGIC
     {
-        return Ok(None);
+        return None;
     }
     if data.len() < INITIAL_MEMBERS_HEADER_LEN || data[2] != MIGRATED_MEMBERS_VERSION {
-        return Ok(None);
+        return None;
     }
     let count = usize::from(u16::from_be_bytes(data[3..5].try_into().unwrap()));
     let members_end = INITIAL_MEMBERS_HEADER_LEN + count * 32;
     if count == 0 || data.len() != members_end + 32 {
-        return Err(AssetError::InvalidRpcResponse("migrated members marker"));
+        return None;
     }
     let members = data[INITIAL_MEMBERS_HEADER_LEN..members_end]
         .chunks_exact(32)
         .collect::<Vec<_>>();
     if !members.windows(2).all(|pair| pair[0] < pair[1]) {
-        return Err(AssetError::InvalidRpcResponse("migrated member order"));
+        return None;
     }
-    Ok(Some(data[members_end..].try_into().unwrap()))
+    data[members_end..].try_into().ok()
 }
 
 pub(crate) fn treasury_blinding_secret() -> SecretKey {
@@ -1417,10 +1416,41 @@ mod tests {
         let script = migrated_members_script(&[[3; 32], [1; 32], [2; 32]], proposer).unwrap();
 
         assert_eq!(
-            migrated_members_proposer_from_script(&script).unwrap(),
+            migrated_members_proposer_from_script(&script),
             Some(proposer)
         );
         assert!(initial_members_from_script(&script).is_err());
+    }
+
+    #[test]
+    fn malformed_migrated_member_markers_are_not_markers() {
+        let mut count_mismatch = Vec::from(INITIAL_MEMBERS_MAGIC);
+        count_mismatch.push(MIGRATED_MEMBERS_VERSION);
+        count_mismatch.extend_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(
+            migrated_members_proposer_from_script(&Script::new_op_return(&count_mismatch)),
+            None
+        );
+
+        let mut unordered = Vec::from(INITIAL_MEMBERS_MAGIC);
+        unordered.push(MIGRATED_MEMBERS_VERSION);
+        unordered.extend_from_slice(&2u16.to_be_bytes());
+        unordered.extend_from_slice(&[2; 32]);
+        unordered.extend_from_slice(&[1; 32]);
+        unordered.extend_from_slice(&[4; 32]);
+        assert_eq!(
+            migrated_members_proposer_from_script(&Script::new_op_return(&unordered)),
+            None
+        );
+
+        let mut empty_count = Vec::from(INITIAL_MEMBERS_MAGIC);
+        empty_count.push(MIGRATED_MEMBERS_VERSION);
+        empty_count.extend_from_slice(&0u16.to_be_bytes());
+        empty_count.extend_from_slice(&[4; 32]);
+        assert_eq!(
+            migrated_members_proposer_from_script(&Script::new_op_return(&empty_count)),
+            None
+        );
     }
 
     #[test]
