@@ -115,3 +115,34 @@ export type DropletsState = {
   request: DropletExchangeRequest | null;
   history: DropletExchangeRequest[];
 };
+
+export type PriceSourceState = "active" | "dropped" | "frozen";
+
+export type SourceObservation = {
+  price: number;
+  decimals: number;
+  observed_at: number;
+  received_at: number;
+  valid_until: number;
+};
+
+export type PriceSource = {
+  name: string;
+  state: PriceSourceState;
+  failures: number;
+  retry_at: number | null;
+  frozen_at: number | null;
+  observation: SourceObservation | null;
+};
+
+export type FeedSources = {
+  id: number;
+  symbol: string;
+  available: boolean;
+  sources: PriceSource[];
+};
+
+export type PriceSourcesState = {
+  is_coordinator: boolean;
+  feeds: FeedSources[];
+};

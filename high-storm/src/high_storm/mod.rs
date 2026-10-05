@@ -34,7 +34,10 @@ pub use message::{
     NodeMessageKind, PriceAttestation, RenewStormUtxos, SplitStormEye, StormEyeUtxo,
     UpdateNetworkMembers,
 };
-pub use prices::{ExchangeRateInfo, FeedRate, PollOutcome, PriceError};
+pub use prices::{
+    ExchangeRateInfo, FeedRate, FeedSources, PollOutcome, PriceError, PriceSourceError,
+    PriceSourceInfo,
+};
 pub use renewal::RenewalError;
 pub use signing::{SigningError, SigningResult};
 use state::NetworkState;
@@ -826,6 +829,36 @@ impl HighStormHandle {
         source: &S,
     ) -> PollOutcome {
         self.state.prices().poll(feed, index, source).await
+    }
+
+    /// Lists the source under the feed it prices, frozen again if this node's
+    /// operator froze it before a restart.
+    pub async fn register_price_source(
+        &self,
+        feed: price_feed::FeedId,
+        index: usize,
+        name: &'static str,
+    ) -> Result<(), PriceSourceError> {
+        self.state.prices().register_source(feed, index, name).await
+    }
+
+    /// Local to this node: nothing is broadcast, and only the price this node
+    /// attests and signs changes.
+    pub async fn set_price_source_frozen(
+        &self,
+        feed: price_feed::FeedId,
+        source: &str,
+        frozen: bool,
+    ) -> Result<(), PriceSourceError> {
+        self.state
+            .prices()
+            .set_source_frozen(feed, source, frozen)
+            .await
+    }
+
+    /// Every Direct feed with the sources this node prices it from.
+    pub async fn price_sources(&self) -> Result<Vec<FeedSources>, PriceSourceError> {
+        self.state.prices().sources().await
     }
 
     pub async fn price_attestations(

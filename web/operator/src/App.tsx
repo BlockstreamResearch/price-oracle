@@ -6,6 +6,7 @@ import { AppShell } from './components/AppShell'
 import { LoginPage } from './pages/LoginPage'
 import { OverviewPage } from './pages/OverviewPage'
 import { DropletsPage } from './pages/DropletsPage'
+import { PriceSourcesPage } from './pages/PriceSourcesPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { StormEyesPage } from './pages/StormEyesPage'
 import { VotingsPage } from './pages/VotingsPage'
@@ -20,6 +21,7 @@ function OperatorRoutes() {
         <Route index element={<OverviewPage />} />
         <Route path="droplets" element={<DropletsPage />} />
         <Route path="storm-eyes" element={<StormEyesPage />} />
+        <Route path="price-sources" element={<PriceSourcesPage />} />
         <Route path="votings" element={<VotingsPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />

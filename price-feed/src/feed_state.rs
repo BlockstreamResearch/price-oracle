@@ -33,6 +33,29 @@ struct SourceRecord {
     retry_at: Option<u64>,
 }
 
+/// What a node operator sees of one source of a feed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceStatus {
+    pub state: SourceState,
+    /// Failed polls in a row.
+    pub failures: u32,
+    /// The latest one kept, expired or not.
+    pub observation: Option<SourceObservation>,
+    /// When a `Dropped` source is polled again.
+    pub retry_at: Option<u64>,
+}
+
+impl From<&SourceRecord> for SourceStatus {
+    fn from(record: &SourceRecord) -> Self {
+        Self {
+            state: record.state,
+            failures: record.failures,
+            observation: record.observation,
+            retry_at: record.retry_at,
+        }
+    }
+}
+
 /// A Direct feed's sources and what they observed.
 #[derive(Clone, Debug)]
 pub struct FeedState {
@@ -56,6 +79,23 @@ impl FeedState {
         self.sources
             .get(&source)
             .map_or(SourceState::Active, |record| record.state)
+    }
+
+    /// Lists the source before it first reports, so an operator can see it,
+    /// and freeze it, from the start. A known source is left as it is.
+    pub fn register(&mut self, source: usize) {
+        self.sources.entry(source).or_default();
+    }
+
+    pub fn is_registered(&self, source: usize) -> bool {
+        self.sources.contains_key(&source)
+    }
+
+    /// Every source registered or heard from, by index.
+    pub fn sources(&self) -> impl Iterator<Item = (usize, SourceStatus)> + '_ {
+        self.sources
+            .iter()
+            .map(|(source, record)| (*source, SourceStatus::from(record)))
     }
 
     /// What `StaleObservation` compares the source's next observation against.
@@ -434,6 +474,55 @@ mod tests {
             state.record_poll_failure(0);
         }
         assert_eq!(state.state(0), SourceState::Active);
+    }
+
+    #[test]
+    fn lists_a_registered_source_as_active_before_it_reports() {
+        let mut state = feed_state(Clock::Fixed(NOW));
+        assert!(!state.is_registered(0));
+
+        state.register(0);
+
+        assert!(state.is_registered(0));
+        assert_eq!(
+            state.sources().collect::<Vec<_>>(),
+            [(
+                0,
+                SourceStatus {
+                    state: SourceState::Active,
+                    failures: 0,
+                    observation: None,
+                    retry_at: None,
+                }
+            )]
+        );
+        assert!(!state.is_available());
+    }
+
+    #[test]
+    fn registering_a_known_source_again_keeps_its_state() {
+        let mut state = feed_state(Clock::Fixed(NOW));
+        state.record_poll_success(0, observation(100, NOW));
+        state.freeze(0);
+
+        state.register(0);
+
+        let (_, status) = state.sources().next().unwrap();
+        assert_eq!(status.state, SourceState::Frozen);
+        assert_eq!(status.observation, Some(observation(100, NOW)));
+    }
+
+    #[test]
+    fn reports_the_failures_and_retry_of_a_dropped_source() {
+        let mut state = feed_state(Clock::Fixed(NOW));
+        for _ in 0..MAX_POLLING_ERROR_NUM {
+            state.record_poll_failure(0);
+        }
+
+        let (_, status) = state.sources().next().unwrap();
+        assert_eq!(status.state, SourceState::Dropped);
+        assert_eq!(status.failures, MAX_POLLING_ERROR_NUM);
+        assert_eq!(status.retry_at, Some(NOW + POLLING_RETRY_TIME));
     }
 
     fn feed_states(clock: Clock) -> FeedStates {

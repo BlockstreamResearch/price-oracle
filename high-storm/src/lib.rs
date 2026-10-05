@@ -18,11 +18,12 @@ use crate::high_storm::HighStormDependencies;
 pub use high_storm::{
     ApproveVotingRequest, AssetError, AttestPriceMsg, ChainTip, DropletsError, ExchangeRateInfo,
     ExchangeRewards, ExecuteUserRequests, ExecuteVotingRequest, ExternalRequests, FeedRate,
-    HighStorm, HighStormHandle, MergeStormEyes, NetworkAsset, NetworkAssets, NetworkVoteKind,
-    NetworkVoteRequest, NodeMessage, NodeMessageKind, PriceAttestation, PriceError, SigningError,
-    SigningResult, SplitStormEye, StormEyeInventoryItem, StormEyeState, StormEyeUtxo,
-    UpdateNetworkMembers, UserRequestError, VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError,
-    VotingExecutionError, VotingRequest, VotingStatus,
+    FeedSources, HighStorm, HighStormHandle, MergeStormEyes, NetworkAsset, NetworkAssets,
+    NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind, PriceAttestation,
+    PriceError, PriceSourceError, PriceSourceInfo, SigningError, SigningResult, SplitStormEye,
+    StormEyeInventoryItem, StormEyeState, StormEyeUtxo, UpdateNetworkMembers, UserRequestError,
+    VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError, VotingExecutionError, VotingRequest,
+    VotingStatus,
 };
 
 #[derive(Debug, thiserror::Error)]
