@@ -212,7 +212,7 @@ async fn issues_a_price_request_at_a_rate_the_network_signed() -> TestResult<()>
     if transaction_height(&rpc, &issuance_txid)?.is_none() {
         mine_blocks(&rpc, 1, &mining_address)?;
     }
-    wait_for_confirmation(&rpc, &issuance_txid).await?;
+    wait_for_confirmation(&rpc, &issuance_txid, &mining_address).await?;
 
     let results = wait_for_results(&request_hashes[0], Duration::from_secs(60)).await?;
     let issued = results.first().ok_or("the priced request issued nothing")?;
@@ -396,7 +396,7 @@ async fn batches_two_users_and_burns_both_to_one_empty_op_return() -> TestResult
     if transaction_height(&rpc, &issuance_txid)?.is_none() {
         mine_blocks(&rpc, 1, &mining_address)?;
     }
-    let issuance_height = wait_for_confirmation(&rpc, &issuance_txid).await?;
+    let issuance_height = wait_for_confirmation(&rpc, &issuance_txid, &mining_address).await?;
     let issuance_txid = issuance.txid();
     let mut expected_owners = users.iter().map(|user| user.owner).collect::<Vec<_>>();
     expected_owners.sort_unstable();
@@ -479,7 +479,7 @@ async fn batches_two_users_and_burns_both_to_one_empty_op_return() -> TestResult
     if transaction_height(&rpc, &burn_txid)?.is_none() {
         mine_blocks(&rpc, 1, &mining_address)?;
     }
-    wait_for_confirmation(&rpc, &burn_txid).await?;
+    wait_for_confirmation(&rpc, &burn_txid, &mining_address).await?;
     wait_for_no_ticks(&databases, issuance_txid, Duration::from_secs(60)).await?;
 
     Ok(())
@@ -570,7 +570,7 @@ async fn issues_and_burns_ticks_and_verifiers_in_one_round() -> TestResult<()> {
     if transaction_height(&rpc, &issuance_txid)?.is_none() {
         mine_blocks(&rpc, 1, &mining_address)?;
     }
-    let issuance_height = wait_for_confirmation(&rpc, &issuance_txid).await?;
+    let issuance_height = wait_for_confirmation(&rpc, &issuance_txid, &mining_address).await?;
     let issuance_txid = issuance.txid();
 
     let active = wait_for_all_ticks(
@@ -645,7 +645,7 @@ async fn issues_and_burns_ticks_and_verifiers_in_one_round() -> TestResult<()> {
     if transaction_height(&rpc, &burn_txid)?.is_none() {
         mine_blocks(&rpc, 1, &mining_address)?;
     }
-    wait_for_confirmation(&rpc, &burn_txid).await?;
+    wait_for_confirmation(&rpc, &burn_txid, &mining_address).await?;
     wait_for_no_ticks(&databases, issuance_txid, Duration::from_secs(60)).await?;
 
     Ok(())
@@ -963,11 +963,19 @@ fn transaction_height(rpc: &Client, txid: &str) -> TestResult<Option<u64>> {
     Ok(header["height"].as_u64())
 }
 
-async fn wait_for_confirmation(rpc: &Client, txid: &str) -> TestResult<u64> {
+async fn wait_for_confirmation(rpc: &Client, txid: &str, mining_address: &str) -> TestResult<u64> {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let config = Config::from_file(manifest.join("docker/node-1.toml"))?;
+    let required = config.service.protocol.finality_confirmations;
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         if let Some(height) = transaction_height(rpc, txid)? {
-            return Ok(height);
+            let tip: u64 = rpc.call("getblockcount", &[])?;
+            let confirmations = tip.saturating_sub(height) + 1;
+            if confirmations >= required {
+                return Ok(height);
+            }
+            mine_blocks(rpc, required - confirmations, mining_address)?;
         }
         if Instant::now() >= deadline {
             return Err(format!("transaction {txid} did not confirm").into());
