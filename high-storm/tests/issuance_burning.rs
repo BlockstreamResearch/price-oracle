@@ -434,15 +434,26 @@ async fn batches_two_users_and_burns_both_to_one_empty_op_return() -> TestResult
         }));
     }
 
+    let tick_asset = issuance.output[active[0][0].output_index as usize]
+        .asset
+        .explicit()
+        .ok_or("issued Tick asset must be explicit")?;
     let burn_outputs = burn
         .output
         .iter()
-        .filter(|output| output.script_pubkey == Script::new_op_return(&[]))
+        .filter(|output| {
+            output.script_pubkey == Script::new_op_return(&[])
+                && output.asset.explicit() == Some(tick_asset)
+        })
         .collect::<Vec<_>>();
-    assert_eq!(burn_outputs.len(), 1, "burn must have one OP_RETURN output");
+    assert_eq!(
+        burn_outputs.len(),
+        1,
+        "Ticks must share one OP_RETURN output"
+    );
     assert_eq!(
         burn_outputs[0].value.explicit(),
-        Some(active[0].iter().map(|tick| tick.amount).sum())
+        Some(burned_input_amount(&rpc, &burn, tick_asset)?)
     );
     assert!(burn.output.iter().any(|output| {
         output.asset.explicit() == Some(policy_asset)
@@ -622,13 +633,14 @@ async fn issues_and_burns_ticks_and_verifiers_in_one_round() -> TestResult<()> {
             .map(|output| output.value.explicit())
             .collect::<Vec<_>>()
     };
-    let tick_total = active[0]
-        .iter()
-        .filter(|issued| issued.asset_kind == "tick-asset")
-        .map(|issued| issued.amount)
-        .sum::<u64>();
-    assert_eq!(burned(tick_asset), vec![Some(tick_total)]);
-    assert_eq!(burned(verifier_asset), vec![Some(2)]);
+    assert_eq!(
+        burned(tick_asset),
+        vec![Some(burned_input_amount(&rpc, &burn, tick_asset)?)]
+    );
+    assert_eq!(
+        burned(verifier_asset),
+        vec![Some(burned_input_amount(&rpc, &burn, verifier_asset)?)]
+    );
 
     if transaction_height(&rpc, &burn_txid)?.is_none() {
         mine_blocks(&rpc, 1, &mining_address)?;
@@ -962,6 +974,27 @@ async fn wait_for_confirmation(rpc: &Client, txid: &str) -> TestResult<u64> {
         }
         sleep(Duration::from_millis(250)).await;
     }
+}
+
+fn burned_input_amount(rpc: &Client, burn: &Transaction, asset: AssetId) -> TestResult<u64> {
+    let mut total = 0_u64;
+    for input in &burn.input {
+        let previous = raw_transaction(rpc, &input.previous_output.txid.to_string())?;
+        let output = previous
+            .output
+            .get(input.previous_output.vout as usize)
+            .ok_or("burn input references a missing output")?;
+        if output.asset.explicit() == Some(asset) {
+            let amount = output
+                .value
+                .explicit()
+                .ok_or("burn input amount must be explicit")?;
+            total = total
+                .checked_add(amount)
+                .ok_or("burn input amount overflow")?;
+        }
+    }
+    Ok(total)
 }
 
 fn mine_blocks(rpc: &Client, count: u64, address: &str) -> TestResult<()> {

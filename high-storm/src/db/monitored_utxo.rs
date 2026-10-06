@@ -190,9 +190,9 @@ impl MonitoredUtxoStore {
         }
 
         let mut query = QueryBuilder::<Any>::new("WITH requested (txid, output_index) AS (");
-        query.push_values(outpoints, |mut row, (txid, output_index)| {
-            row.push_bind(txid.to_vec())
-                .push_bind(i64::from(*output_index));
+        query.push_values(0..outpoints.len(), |mut row, index| {
+            row.push(format!("${}", index * 2 + 1))
+                .push(format!("${}", index * 2 + 2));
         });
         query.push(
             ") SELECT txid, output_index FROM requested WHERE EXISTS (\
@@ -200,7 +200,12 @@ impl MonitoredUtxoStore {
              AND burning_fee_output_index = requested.output_index \
              AND status IN ('active', 'expired', 'burning'))",
         );
-        let rows = query.build().fetch_all(&self.pool).await?;
+        let mut statement = query.build();
+        for (txid, output_index) in outpoints {
+            statement = statement.bind(txid.to_vec()).bind(i64::from(*output_index));
+        }
+
+        let rows = statement.fetch_all(&self.pool).await?;
         let reserved = rows
             .into_iter()
             .map(|row| {
@@ -347,6 +352,68 @@ mod tests {
             status_block_height: block_height,
             burn_txid: None,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL and TEST_POSTGRES_URL"]
+    async fn postgres_batched_burning_reservations() {
+        sqlx::any::install_default_drivers();
+        let url = std::env::var("TEST_POSTGRES_URL").expect("TEST_POSTGRES_URL must be set");
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TEMPORARY TABLE monitored_utxos \
+             (burning_fee_txid BYTEA, burning_fee_output_index BIGINT, status TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (txid, index, status) in [
+            ([1; 32], 3, "active"),
+            ([9; 32], 7, "expired"),
+            ([8; 32], 5, "burning"),
+            ([7; 32], 6, "unburnable"),
+        ] {
+            sqlx::query(
+                "INSERT INTO monitored_utxos \
+                 (burning_fee_txid, burning_fee_output_index, status) VALUES ($1, $2, $3)",
+            )
+            .bind(txid.to_vec())
+            .bind(i64::from(index))
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let store = MonitoredUtxoStore::new(pool);
+        let mut outpoints = vec![
+            ([1; 32], 7),
+            ([9; 32], 3),
+            ([1; 32], 3),
+            ([9; 32], 7),
+            ([1; 32], 3),
+            ([8; 32], 5),
+            ([7; 32], 6),
+        ];
+        outpoints.extend((10..103).map(|index| ([index; 32], u32::MAX)));
+        let mut expected = vec![false; outpoints.len()];
+        for index in [2, 3, 4, 5] {
+            expected[index] = true;
+        }
+
+        assert_eq!(
+            store.burning_reservations(&outpoints).await.unwrap(),
+            expected
+        );
+        assert_eq!(
+            store.burning_reservations(&outpoints[2..3]).await.unwrap(),
+            vec![true]
+        );
+        store.pool.close().await;
+        assert!(store.burning_reservations(&[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]
