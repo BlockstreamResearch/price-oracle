@@ -39,6 +39,107 @@ fn ordered_key_pair() -> (SecretKey, SecretKey) {
     }
 }
 
+#[tokio::test]
+async fn dns_addresses_survive_inbound_connections_and_overrides() {
+    let (local_secret_key, remote_secret_key) = ordered_key_pair();
+    let remote_public_key = remote_secret_key.public_key(&Secp256k1::new()).serialize();
+    let mut remote_peer = Peer::new(remote_public_key);
+    remote_peer.socket_address = Some("node.storm.svc.cluster.local:9000".to_string());
+    let storm = Storm::from_peers(local_secret_key, vec![remote_peer]);
+
+    let receiver = Storm::claim_connection(
+        &storm.inner,
+        remote_public_key,
+        Some("127.0.0.1:9000".parse().unwrap()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        storm.peers().await[1].socket_address.as_deref(),
+        Some("node.storm.svc.cluster.local:9000")
+    );
+
+    storm
+        .handle()
+        .set_peer_address(remote_public_key, "127.0.0.2:9001".into())
+        .await
+        .unwrap();
+    assert_eq!(storm.peers().await[1].status, PeerStatus::Active);
+    assert!(
+        storm
+            .inner
+            .read()
+            .await
+            .connections
+            .contains_key(&remote_public_key)
+    );
+    drop(receiver);
+    Storm::release_connection(&storm.inner, remote_public_key).await;
+
+    let _receiver = Storm::claim_connection(
+        &storm.inner,
+        remote_public_key,
+        Some("127.0.0.3:9002".parse().unwrap()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        storm.peers().await[1].socket_address.as_deref(),
+        Some("127.0.0.2:9001")
+    );
+}
+
+#[tokio::test]
+async fn dns_address_overrides_do_not_add_members_and_reject_invalid_endpoints() {
+    let (local_secret_key, remote_secret_key) = ordered_key_pair();
+    let remote_public_key = remote_secret_key.public_key(&Secp256k1::new()).serialize();
+    let storm = Storm::from_peers(local_secret_key, vec![]);
+    storm
+        .handle()
+        .set_peer_address(remote_public_key, "node.storm:9000".into())
+        .await
+        .unwrap();
+    assert_eq!(storm.peers().await.len(), 1);
+    assert!(
+        !storm
+            .inner
+            .read()
+            .await
+            .accepts_unregistered_connection(&remote_public_key)
+    );
+    assert!(matches!(
+        storm
+            .handle()
+            .set_peer_address(remote_public_key, "http://node:9000".into())
+            .await,
+        Err(Error::InvalidPeerAddress(_))
+    ));
+}
+
+#[tokio::test]
+async fn advertised_dns_keeps_the_bound_handshake_port() {
+    let (local_secret_key, _) = ordered_key_pair();
+    let local_public_key = local_secret_key.public_key(&Secp256k1::new()).serialize();
+    let mut storm = Storm::from_peers(local_secret_key, vec![]);
+    storm
+        .handle()
+        .set_peer_address(local_public_key, "local.storm:9000".into())
+        .await
+        .unwrap();
+
+    storm.start(Some("127.0.0.1:0".into())).await.unwrap();
+
+    assert_eq!(
+        storm.peers().await[0].socket_address.as_deref(),
+        Some("local.storm:9000")
+    );
+    assert_eq!(
+        storm.inner.read().await.connection_plan().listener_port,
+        Some(storm.listener_address.unwrap().port())
+    );
+    storm.shutdown().await;
+}
+
 async fn connect(
     address: SocketAddr,
     listener: &TcpListener,

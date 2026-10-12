@@ -530,7 +530,7 @@ async fn persists_votes_and_synchronizes_requests_missed_while_offline() {
         .unwrap()
         .unwrap();
     assert_eq!(synchronized.block_height, START_HEIGHT + 5);
-    assert_eq!(synchronized.proposer_public_key, None);
+    assert_eq!(synchronized.proposer_public_key, Some(xonly_key(21)));
     assert_eq!(synchronized.status, VotingStatus::Approved);
 
     network.nodes[2].shutdown().await;

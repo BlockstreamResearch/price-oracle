@@ -299,7 +299,7 @@ EOF
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") {create|up|rebuild|down|deploy-node NODE|public-key NODE|connections NODE|droplets NODE SATS|elements NODE [RPC ARGUMENTS...]}
+Usage: $(basename "$0") {create|up|rebuild|down|deploy-node NODE|public-key NODE|connections NODE|droplets NODE SATS|fund ADDRESS|elements NODE [RPC ARGUMENTS...]}
 
     create             Delete the deployment and data, rebuild, and start fresh.
     up                 Start the deployment while preserving existing data.
@@ -310,6 +310,7 @@ Usage: $(basename "$0") {create|up|rebuild|down|deploy-node NODE|public-key NODE
     connections NODE   List active Storm connections for node 1, 2, or 3.
     droplets NODE SATS
                        Deposit SATS to Treasury and credit all Droplets to NODE.
+    fund ADDRESS       Send 100000 sats of LBTC to ADDRESS and mine one confirmation.
     elements NODE ...  Call Elements RPC on node 1, 2, or 3. Defaults to getblockchaininfo.
 EOF
 }
@@ -450,6 +451,27 @@ case "${1:-}" in
             generatetoaddress 1 "${mining_address}" >/dev/null
 
         echo "Deposited ${amount_sats} sats for node-${2} (${xonly_key}) in ${txid}."
+        ;;
+    fund)
+        if [[ $# -ne 2 || -z "${2:-}" ]]; then
+            echo "Usage: $(basename "$0") fund ADDRESS" >&2
+            exit 2
+        fi
+        if [[ "$(compose ps --status running --services elements-1)" != "elements-1" ]]; then
+            echo "elements-1 is not running; start the deployment first." >&2
+            exit 1
+        fi
+        txid="$(compose exec -T elements-1 elements-cli \
+            -chain=elementsregtest -rpcport=18884 -rpcuser=high-storm -rpcpassword=high-storm \
+            -rpcwallet=bootstrap sendtoaddress "$2" 0.00100000)"
+        mining_address="$(compose exec -T elements-1 elements-cli \
+            -chain=elementsregtest -rpcport=18884 -rpcuser=high-storm -rpcpassword=high-storm \
+            -rpcwallet=bootstrap getnewaddress '' bech32)"
+        compose exec -T elements-1 elements-cli \
+            -chain=elementsregtest -rpcport=18884 -rpcuser=high-storm -rpcpassword=high-storm \
+            generatetoaddress 1 "${mining_address}" >/dev/null
+
+        echo "Sent 100000 sats to $2 in ${txid} (confirmed)."
         ;;
     elements)
         case "${2:-}" in

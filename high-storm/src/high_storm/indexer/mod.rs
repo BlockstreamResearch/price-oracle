@@ -689,14 +689,10 @@ fn treasury_transactions(
                 .output
                 .iter()
                 .filter_map(|output| {
-                    if let Some(member) = member_from_script(&output.script_pubkey) {
-                        return Some(Ok(member));
-                    }
-                    migrated_members_proposer_from_script(&output.script_pubkey)
-                        .map_err(|error| IndexerError::Invalid(error.to_string()))
-                        .transpose()
+                    member_from_script(&output.script_pubkey)
+                        .or_else(|| migrated_members_proposer_from_script(&output.script_pubkey))
                 })
-                .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+                .collect::<std::collections::BTreeSet<_>>();
             let exchange_member = (markers.len() == 1)
                 .then(|| markers.first().copied())
                 .flatten();
@@ -1311,6 +1307,32 @@ mod tests {
         assert_eq!(extracted[1].inputs, vec![(deposit_txid, 0)]);
         assert!(extracted[1].outputs.is_empty());
         assert_eq!(extracted[1].exchange_member, Some(member));
+    }
+
+    #[test]
+    fn skips_malformed_third_party_member_markers() {
+        let policy_asset = AssetId::from_byte_array([8; 32]);
+        let treasury_script = Script::from(vec![0x51]);
+        let mut poisoned = Vec::from(*b"OM");
+        poisoned.push(2);
+        poisoned.extend_from_slice(&u16::MAX.to_be_bytes());
+        let transaction = Transaction {
+            version: 2,
+            lock_time: simplex::simplicityhl::elements::LockTime::ZERO,
+            input: vec![],
+            output: vec![explicit_output(
+                policy_asset,
+                0,
+                Script::new_op_return(&poisoned),
+            )],
+        };
+
+        let extracted =
+            treasury_transactions(&[transaction], &treasury_script, policy_asset).unwrap();
+
+        assert!(extracted[0].outputs.is_empty());
+        assert_eq!(extracted[0].deposit_member, None);
+        assert_eq!(extracted[0].exchange_member, None);
     }
 
     #[test]

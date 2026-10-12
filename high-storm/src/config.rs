@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::{net::SocketAddr, path::PathBuf};
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
 use url::Url;
 
 const COINGECKO_API_KEY_ENV: &str = "COINGECKO_API_KEY";
@@ -16,6 +16,8 @@ pub enum Error {
     InvalidSignerPrivateKey,
     #[error("invalid database configuration: {0}")]
     Database(String),
+    #[error("invalid peer-to-peer configuration: {0}")]
+    P2p(String),
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -26,6 +28,12 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ServiceConfig {
     pub port: u16,
+    #[serde(default)]
+    pub coordinator_address: Option<String>,
+    #[serde(default)]
+    pub advertised_address: Option<String>,
+    #[serde(default)]
+    pub peer_addresses: BTreeMap<String, String>,
     #[serde(default = "default_ipc_path")]
     pub ipc_path: PathBuf,
     #[serde(default = "default_external_api_address")]
@@ -138,6 +146,24 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), Error> {
+        for address in self
+            .service
+            .coordinator_address
+            .iter()
+            .chain(&self.service.advertised_address)
+            .chain(self.service.peer_addresses.values())
+        {
+            storm::validate_socket_address(address)
+                .map_err(|error| Error::P2p(error.to_string()))?;
+        }
+        for key in self.service.peer_addresses.keys() {
+            let bytes =
+                hex::decode(key).map_err(|_| Error::P2p(format!("invalid public key '{key}'")))?;
+            if bytes.len() != 33 || secp256k1_zkp::PublicKey::from_slice(&bytes).is_err() {
+                return Err(Error::P2p(format!("invalid compressed public key '{key}'")));
+            }
+        }
+
         let encoded = &self.service.signer.private_key;
         if encoded.len() != 64 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(Error::InvalidSignerPrivateKey);
@@ -200,6 +226,32 @@ max_connections = 5
         let config: Config = toml::from_str(&config_with_protocol_section("protocol")).unwrap();
 
         assert_eq!(config.service.protocol.operational_fee_sats, 1000);
+        assert!(config.service.coordinator_address.is_none());
+        assert!(config.service.advertised_address.is_none());
+        assert!(config.service.peer_addresses.is_empty());
+    }
+
+    #[test]
+    fn validates_dns_and_ip_p2p_overrides() {
+        let key = "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337";
+        let mut config: Config = toml::from_str(&config_with_protocol_section("protocol")).unwrap();
+        config.service.coordinator_address =
+            Some("coordinator.storm.svc.cluster.local:9000".into());
+        config.service.advertised_address = Some("node-1.storm:9000".into());
+        config
+            .service
+            .peer_addresses
+            .insert(key.into(), "[::1]:9000".into());
+        assert!(config.validate().is_ok());
+
+        config.service.coordinator_address = Some("http://coordinator:9000".into());
+        assert!(matches!(config.validate(), Err(Error::P2p(_))));
+        config.service.coordinator_address = None;
+        config
+            .service
+            .peer_addresses
+            .insert("not-a-key".into(), "node:9000".into());
+        assert!(matches!(config.validate(), Err(Error::P2p(_))));
     }
 
     #[test]

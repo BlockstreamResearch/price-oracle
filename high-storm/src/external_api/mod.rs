@@ -5,16 +5,38 @@ mod prices;
 mod tests;
 pub(crate) mod users;
 
-use std::net::SocketAddr;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
+    body::{Body, HttpBody, to_bytes},
+    extract::{ConnectInfo, Request, State, connect_info::Connected},
     http::StatusCode,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
 };
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use serde::{Deserialize, Serialize};
-use tower_http::cors::{Any, CorsLayer};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError},
+};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    limit::RequestBodyLimitLayer,
+    timeout::TimeoutLayer,
+};
 
 use crate::{
     HighStormHandle, VotingError,
@@ -22,6 +44,160 @@ use crate::{
 };
 use fee_utxo::{FeeUtxoValidationError, FeeUtxoValidator};
 use operators::{AuthError, AuthService, auth::AuthNetwork};
+
+const MAX_API_CONCURRENCY: usize = 32;
+const MAX_API_CONNECTIONS: usize = 256;
+const MAX_API_CONNECTIONS_PER_CLIENT: usize = 16;
+const MAX_API_REQUESTS_PER_CLIENT: usize = 4;
+const MAX_API_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_API_BODY_READS: usize = 128;
+const API_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct ApiRequestLimits {
+    concurrency: Semaphore,
+    body_reads: Semaphore,
+    clients: ClientLimits,
+    overload_rejections: AtomicU64,
+}
+
+struct ClientLimits {
+    concurrency: usize,
+    clients: Mutex<HashMap<IpAddr, Weak<Semaphore>>>,
+}
+
+impl ClientLimits {
+    fn new(concurrency: usize) -> Self {
+        Self {
+            concurrency,
+            clients: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn try_acquire(&self, address: IpAddr) -> Result<OwnedSemaphorePermit, TryAcquireError> {
+        let mut clients = self
+            .clients
+            .lock()
+            .expect("API client limits lock poisoned");
+        clients.retain(|_, limit| limit.strong_count() > 0);
+        let address = address.to_canonical();
+        let limit = clients
+            .get(&address)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let limit = Arc::new(Semaphore::new(self.concurrency));
+                clients.insert(address, Arc::downgrade(&limit));
+                limit
+            });
+        limit.try_acquire_owned()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ApiClientAddress(SocketAddr);
+
+impl Connected<axum::serve::IncomingStream<'_, LimitedListener>> for ApiClientAddress {
+    fn connect_info(stream: axum::serve::IncomingStream<'_, LimitedListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
+struct LimitedListener {
+    listener: TcpListener,
+    connections: Arc<Semaphore>,
+    clients: ClientLimits,
+}
+
+impl LimitedListener {
+    fn new(listener: TcpListener) -> Self {
+        Self {
+            listener,
+            connections: Arc::new(Semaphore::new(MAX_API_CONNECTIONS)),
+            clients: ClientLimits::new(MAX_API_CONNECTIONS_PER_CLIENT),
+        }
+    }
+}
+
+impl axum::serve::Listener for LimitedListener {
+    type Io = LimitedConnection;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, address) = axum::serve::Listener::accept(&mut self.listener).await;
+            let Ok(connection_permit) = self.connections.clone().try_acquire_owned() else {
+                continue;
+            };
+            let Ok(client_permit) = self.clients.try_acquire(address.ip()) else {
+                continue;
+            };
+            return (
+                LimitedConnection {
+                    stream,
+                    _connection_permit: connection_permit,
+                    _client_permit: client_permit,
+                },
+                address,
+            );
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+}
+
+struct LimitedConnection {
+    stream: TcpStream,
+    _connection_permit: OwnedSemaphorePermit,
+    _client_permit: OwnedSemaphorePermit,
+}
+
+impl AsyncRead for LimitedConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for LimitedConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(context)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write_vectored(context, buffers)
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct ExternalApiState {
@@ -69,7 +245,12 @@ impl ExternalApiServer {
     }
 
     pub async fn run(self) -> std::io::Result<()> {
-        axum::serve(self.listener, self.router).await
+        axum::serve(
+            LimitedListener::new(self.listener),
+            self.router
+                .into_make_service_with_connect_info::<ApiClientAddress>(),
+        )
+        .await
     }
 }
 
@@ -86,17 +267,117 @@ pub(crate) fn router(
         user_requests,
         fee_utxos,
     };
-    Router::new()
-        .nest("/users", users::router())
-        .nest("/operators", operators::router())
-        .nest("/price-feeds", prices::router())
-        .with_state(state)
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+    with_request_limits(
+        Router::new()
+            .nest("/users", users::router())
+            .nest("/operators", operators::router())
+            .nest("/price-feeds", prices::router())
+            .with_state(state),
+    )
+    .layer(
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    )
+}
+
+fn with_request_limits(router: Router) -> Router {
+    router
+        .layer(middleware::from_fn_with_state(
+            Arc::new(ApiRequestLimits {
+                concurrency: Semaphore::new(MAX_API_CONCURRENCY),
+                body_reads: Semaphore::new(MAX_API_BODY_READS),
+                clients: ClientLimits::new(MAX_API_REQUESTS_PER_CLIENT),
+                overload_rejections: AtomicU64::new(0),
+            }),
+            limit_concurrency,
+        ))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            API_REQUEST_TIMEOUT,
+        ))
+        .layer(RequestBodyLimitLayer::new(MAX_API_BODY_BYTES))
+}
+
+async fn limit_concurrency(
+    State(limits): State<Arc<ApiRequestLimits>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let _client_permit = match request.extensions().get::<ConnectInfo<ApiClientAddress>>() {
+        Some(ConnectInfo(ApiClientAddress(address))) => {
+            match limits.clients.try_acquire(address.ip()) {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(ErrorBody {
+                            error: "too many in-flight requests from this client".into(),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        None => None,
+    };
+    let body_permit = if request.body().is_end_stream() {
+        None
+    } else {
+        match limits.body_reads.try_acquire() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return ApiError::unavailable("external API body-read limit reached")
+                    .into_response();
+            }
+        }
+    };
+    let (parts, body) = request.into_parts();
+    let bytes =
+        match tokio::time::timeout(API_BODY_READ_TIMEOUT, to_bytes(body, MAX_API_BODY_BYTES)).await
+        {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                use std::error::Error;
+                let mut source = Some(&error as &(dyn Error + 'static));
+                let mut too_large = false;
+                while let Some(error) = source {
+                    if error.is::<http_body_util::LengthLimitError>() {
+                        too_large = true;
+                        break;
+                    }
+                    source = error.source();
+                }
+                let status = if too_large {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                return (
+                    status,
+                    Json(ErrorBody {
+                        error: "invalid request body".into(),
+                    }),
+                )
+                    .into_response();
+            }
+            Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+        };
+    drop(body_permit);
+    let request = Request::from_parts(parts, Body::from(bytes));
+
+    let Ok(_permit) = limits.concurrency.try_acquire() else {
+        let rejected = limits
+            .overload_rejections
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if rejected.is_power_of_two() {
+            tracing::warn!(rejected, "external API concurrency limit reached");
+        }
+        return ApiError::unavailable("external API is busy; retry later").into_response();
+    };
+    next.run(request).await
 }
 
 #[derive(Debug, thiserror::Error)]

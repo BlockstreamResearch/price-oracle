@@ -1,8 +1,10 @@
-import { schnorr } from "@noble/curves/secp256k1";
+import { schnorr, secp256k1 } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils";
 
 const REQUEST_TAG = "OracleNetworkV1/NetworkUserRequests";
+export const WALLET_REQUEST_SIGNATURE_SCHEME =
+  "bitcoin-signed-message-ecdsa-v1";
 const PRICE_TAG = "OracleNetworkV1/Price";
 const HEX_32 = /^[0-9a-f]{64}$/i;
 const OUTPOINT = /^[0-9a-f]{64}:[0-9]+$/i;
@@ -42,6 +44,8 @@ export type TickRequest = {
     signature: string;
     public_key: string;
     fee_utxos: string[];
+    signature_scheme?: string;
+    signing_public_key?: string;
   };
   requests: Array<{ kind: TickRequestKind; payload: string }>;
 };
@@ -76,6 +80,28 @@ export type PriceFeedData = {
   price: bigint;
   receivedAt: bigint;
   validUntil: bigint;
+};
+
+export type PriceFeedInfo = {
+  id: number;
+  symbol: string;
+  decimals: number;
+  base: string;
+  quote: string;
+  kind: string;
+};
+export type PriceFeedRate = {
+  main: {
+    feed: {
+      feed_id: number;
+      decimals: number;
+      price: number;
+      received_at: number;
+      valid_until: number;
+    };
+    signature: string;
+    public_key: string;
+  };
 };
 
 export type IssuedTick = {
@@ -222,10 +248,18 @@ export class PriceOracleClient {
     this.#fetch = fetcher.bind(globalThis);
   }
 
-  async getAccount(publicKey: string): Promise<OracleAccount> {
+  async getAccount(
+    publicKey: string,
+    authScriptPubKey?: string,
+  ): Promise<OracleAccount> {
     assertXOnlyPublicKey(publicKey);
+    if (authScriptPubKey !== undefined)
+      validateAuthMethod({
+        kind: "scriptPubKey-auth",
+        auth_data: authScriptPubKey,
+      });
     return this.#json<OracleAccount>(
-      `/users/account/${publicKey.toLowerCase()}`,
+      `/users/account/${publicKey.toLowerCase()}${authScriptPubKey === undefined ? "" : `?auth_script_pubkey=${encodeURIComponent(authScriptPubKey)}`}`,
     );
   }
 
@@ -244,6 +278,15 @@ export class PriceOracleClient {
       throw new Error("request hash must be 32-byte hex");
     }
     return this.#json(`/users/requests/${requestHash}`);
+  }
+
+  getPriceFeeds(): Promise<PriceFeedInfo[]> {
+    return this.#json("/price-feeds");
+  }
+
+  getPriceFeed(feedId: number): Promise<PriceFeedRate> {
+    assertFeedId(feedId);
+    return this.#json(`/price-feeds/${feedId}`);
   }
 
   async #json<Result>(path: string, init?: RequestInit): Promise<Result> {
@@ -272,6 +315,90 @@ export function signSchnorrDigest(privateKey: string, digest: string): string {
   }
 
   return bytesToHex(schnorr.sign(hexToBytes(digest), privateKey));
+}
+
+export function createWalletTickRequest(
+  compressedPublicKey: string,
+  feeUtxos: string[],
+  authScriptPubKey: string,
+): TickRequest {
+  if (!/^(02|03)[0-9a-f]{64}$/i.test(compressedPublicKey))
+    throw new Error("wallet public key must be compressed secp256k1 hex");
+  secp256k1.ProjectivePoint.fromHex(compressedPublicKey);
+  if (
+    feeUtxos.length === 0 ||
+    feeUtxos.some((outpoint) => !OUTPOINT.test(outpoint))
+  )
+    throw new Error("fee UTXOs must contain txid:vout outpoints");
+  const authMethod: TickAuthMethod = {
+    kind: "scriptPubKey-auth",
+    auth_data: authScriptPubKey,
+  };
+  validateAuthMethod(authMethod);
+  return {
+    header: {
+      signature: "",
+      public_key: compressedPublicKey.slice(2).toLowerCase(),
+      fee_utxos: [...feeUtxos],
+      signature_scheme: WALLET_REQUEST_SIGNATURE_SCHEME,
+      signing_public_key: compressedPublicKey.toLowerCase(),
+    },
+    requests: [
+      {
+        kind: "tick-utxo",
+        payload: JSON.stringify({ utxo_auth_method: authMethod }),
+      },
+    ],
+  };
+}
+
+export function walletRequestSigningMessage(request: TickRequest): string {
+  if (
+    request.header.signature_scheme !== WALLET_REQUEST_SIGNATURE_SCHEME ||
+    !request.header.signing_public_key
+  ) {
+    throw new Error("request must use wallet message authorization");
+  }
+  return `${REQUEST_TAG}\n${WALLET_REQUEST_SIGNATURE_SCHEME}\n${JSON.stringify([
+    request.header.public_key,
+    request.header.signing_public_key,
+    request.header.fee_utxos,
+    request.requests,
+  ])}`;
+}
+
+function assertFeedId(feedId: number): void {
+  if (!Number.isInteger(feedId) || feedId < 0 || feedId > 0xffffffff) {
+    throw new Error("price feed id must be an unsigned 32-bit integer");
+  }
+}
+
+export function createWalletSignedPriceRequest(
+  compressedPublicKey: string,
+  feeUtxos: string[],
+  authScriptPubKey: string,
+  priceFeedId: number,
+  options: { withTick?: boolean } = {},
+): TickRequest {
+  assertFeedId(priceFeedId);
+  const request = createWalletTickRequest(
+    compressedPublicKey,
+    feeUtxos,
+    authScriptPubKey,
+  );
+  const tick = request.requests[0];
+  if (!tick) throw new Error("wallet request has no Tick template");
+  request.requests = [
+    {
+      kind: "signed-price-data",
+      payload: JSON.stringify({
+        ...JSON.parse(tick.payload),
+        price_feed_id: priceFeedId,
+      }),
+    },
+  ];
+  if (options.withTick) request.requests.push(tick);
+  return request;
 }
 
 export function createTickRequest(
@@ -410,6 +537,34 @@ export function parseExecutedTick(
     txid: string;
     results: TickRequestResult[];
   };
+}
+
+export function parseExecutedSignedPrice(
+  status: TickRequestStatus,
+): { txid: string; verifierVout: number; signedPrice: SignedPriceData } | null {
+  if (status.status !== "executed") return null;
+  const executed = parseExecutedTick(status);
+  if (!executed) return null;
+  if (!HEX_32.test(executed.txid) || !Array.isArray(executed.results))
+    throw new Error("invalid issuance result");
+  const results = executed.results.filter(
+    (result) => result.kind === "signed-price-data",
+  );
+  if (results.length !== 1)
+    throw new Error("expected exactly one issued Verifier");
+  const result = results[0];
+  if (!result) throw new Error("issuance result has no Verifier");
+  if (
+    !Number.isInteger(result.vout) ||
+    result.vout < 0 ||
+    result.vout > 0xffffffff
+  )
+    throw new Error("invalid Verifier output index");
+  const signedPrice = JSON.parse(result.payload) as SignedPriceData;
+  decodePriceData(signedPrice.price_data);
+  if (!verifySignedPriceData(signedPrice))
+    throw new Error("oracle price signature does not verify");
+  return { txid: executed.txid, verifierVout: result.vout, signedPrice };
 }
 
 export function createTickSpendPlan(

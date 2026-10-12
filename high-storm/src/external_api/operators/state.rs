@@ -21,6 +21,9 @@ pub(super) struct NetworkStateResponse {
     banned_peers: usize,
     pending_votings: usize,
     approved_votings: usize,
+    spending_paused: bool,
+    member_migration_request: Option<String>,
+    member_migration_ready: bool,
 }
 
 #[derive(Serialize)]
@@ -73,6 +76,9 @@ pub(super) async fn get_network_state(
             .count(),
         pending_votings,
         approved_votings: votings.len() - pending_votings,
+        spending_paused: state.node.is_spending_paused(),
+        member_migration_request: state.node.member_migration_request().await.map(hex::encode),
+        member_migration_ready: state.node.member_migration_ready().await,
     }))
 }
 

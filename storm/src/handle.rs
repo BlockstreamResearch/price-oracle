@@ -11,6 +11,25 @@ use crate::{
 };
 
 impl StormHandle {
+    /// Overrides an identity's endpoint in current and future peer tables.
+    ///
+    /// Existing connections remain open. Reconnection resolves DNS again, and
+    /// configuring an address does not authorize a new network member.
+    pub async fn set_peer_address(
+        &self,
+        public_key: [u8; 33],
+        address: String,
+    ) -> Result<(), Error> {
+        PublicKey::from_slice(&public_key).map_err(|_| Error::UnauthorizedConnection)?;
+        crate::validate_socket_address(&address)?;
+
+        let mut state = self.inner.write().await;
+        state.address_overrides.insert(public_key, address);
+        state.apply_address_overrides();
+
+        Ok(())
+    }
+
     /// Restricts migration peer tables to one Noise-authenticated transport identity.
     pub async fn set_peer_table_authority(&self, authority: [u8; 33]) -> Result<(), Error> {
         PublicKey::from_slice(&authority).map_err(|_| Error::UnauthorizedConnection)?;
@@ -134,6 +153,18 @@ impl StormHandle {
     /// Returns a snapshot of the current peer table.
     pub async fn peers(&self) -> Vec<Peer> {
         self.inner.read().await.peers.clone()
+    }
+
+    /// Returns remote identities whose outbound connection queues are open.
+    pub async fn connected_peer_keys(&self) -> BTreeSet<[u8; 33]> {
+        self.inner
+            .read()
+            .await
+            .connections
+            .iter()
+            .filter(|(_, connection)| !connection.is_closed())
+            .map(|(public_key, _)| *public_key)
+            .collect()
     }
 
     /// Returns whether the local transport identity belongs to the active peer table.
@@ -353,7 +384,8 @@ impl StormHandle {
             Storm::release_connection(&state, peer_public_key).await;
 
             if let Err(error) = result {
-                log::error!(
+                log::log!(
+                    error.connection_log_level(),
                     "Connection with {} failed: {error}",
                     hex::encode(peer_public_key)
                 );

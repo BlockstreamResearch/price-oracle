@@ -1,10 +1,19 @@
 [service]
 # TCP port used for Storm peer-to-peer traffic.
 port = 9000
+# Optional IP or DNS endpoint for the coordinator, overriding its persisted address.
+# coordinator_address = "coordinator.oracle.svc.cluster.local:9000"
+# Optional reachable endpoint for this node, separate from its 0.0.0.0 bind address.
+# advertised_address = "node-1.oracle.svc.cluster.local:9000"
 # Unix socket used by storm-operator. Use a unique path for each local node.
 ipc_path = "/tmp/high-storm.sock"
 # Bind address for the operator and user HTTP API. Keep loopback-only unless remote access is required.
 external_api_address = "127.0.0.1:9001"
+
+# Optional endpoint overrides keyed by members' compressed public keys.
+# Configure the required overrides on each node; this does not add network members.
+# [service.peer_addresses]
+# "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337" = "node-3.oracle.svc.cluster.local:9000"
 
 [service.signer]
 # 32-byte hex-encoded secp256k1 private key that identifies and signs for this node.
