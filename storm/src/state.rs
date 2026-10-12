@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
-    net::SocketAddr,
-};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use secp256k1_zkp::{Parity, PublicKey, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
@@ -48,6 +45,8 @@ pub(crate) struct StormState {
     pub(crate) initializer_secret_key: SecretKey,
     pub(crate) initializer_public_key: [u8; 33],
     pub(crate) peers: Vec<Peer>,
+    pub(crate) address_overrides: HashMap<[u8; 33], String>,
+    pub(crate) listener_port: Option<u16>,
     pub(crate) connections: HashMap<[u8; 33], mpsc::Sender<Vec<u8>>>,
     pub(crate) discovery_table_received: bool,
     pub(crate) custom_handler: Option<CustomHandler>,
@@ -68,6 +67,8 @@ impl StormState {
             initializer_secret_key,
             initializer_public_key,
             peers,
+            address_overrides: HashMap::new(),
+            listener_port: None,
             connections: HashMap::new(),
             discovery_table_received: false,
             custom_handler: None,
@@ -179,6 +180,14 @@ impl StormState {
         self.connection_plan_for(&self.peers)
     }
 
+    pub(crate) fn apply_address_overrides(&mut self) {
+        for peer in self.peers.iter_mut().chain(&mut self.migration_peers) {
+            if let Some(address) = self.address_overrides.get(&peer.compressed_public_key) {
+                peer.socket_address = Some(address.clone());
+            }
+        }
+    }
+
     pub(crate) fn migration_connection_plan(&self) -> Option<ConnectionPlan> {
         self.migration_members
             .as_ref()
@@ -186,13 +195,6 @@ impl StormState {
     }
 
     fn connection_plan_for(&self, peers: &[Peer]) -> ConnectionPlan {
-        let listener_port = self
-            .peers
-            .iter()
-            .find(|peer| peer.compressed_public_key == self.initializer_public_key)
-            .and_then(|peer| peer.socket_address.as_deref())
-            .and_then(|address| address.parse::<SocketAddr>().ok())
-            .map(|address| address.port());
         let targets = peers
             .iter()
             .filter_map(|peer| {
@@ -208,7 +210,7 @@ impl StormState {
         ConnectionPlan {
             initializer_secret_key: self.initializer_secret_key.secret_bytes(),
             initializer_public_key: self.initializer_public_key,
-            listener_port,
+            listener_port: self.listener_port,
             targets,
         }
     }

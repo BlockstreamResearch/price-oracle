@@ -7,7 +7,7 @@ pub mod high_storm;
 pub mod ipc;
 pub mod sources;
 
-use std::{collections::HashSet, net::SocketAddr, time::Duration};
+use std::{collections::HashSet, time::Duration};
 
 use db::network::NetworkStore;
 use secp256k1_zkp::{PublicKey, Secp256k1, SecretKey};
@@ -82,8 +82,12 @@ pub async fn initialize_join(
     discovery_public_key: &str,
     discovery_address: &str,
 ) -> Result<HighStorm, Error> {
-    discovery_address
-        .parse::<SocketAddr>()
+    let discovery_address = config
+        .service
+        .coordinator_address
+        .as_deref()
+        .unwrap_or(discovery_address);
+    storm::validate_socket_address(discovery_address)
         .map_err(|_| Error::DiscoveryAddress(discovery_address.to_string()))?;
     let coordinator_public_key = parse_public_key(discovery_public_key)?;
 
@@ -127,6 +131,7 @@ pub async fn start_initialized(config: &Config, store: &NetworkStore) -> Result<
         return Err(Error::LocalNodeRemoved);
     }
     let mut storm = Storm::from_peers(secret_key, peers);
+    apply_peer_addresses(config, &storm, coordinator_public_key).await?;
 
     let listen_address = listen_address(config);
     tracing::info!(%listen_address, "starting initialized node");
@@ -162,6 +167,8 @@ async fn initialize(
     secret_key: [u8; 32],
     coordinator_public_key: [u8; 33],
 ) -> Result<HighStorm, Error> {
+    apply_peer_addresses(config, &storm, coordinator_public_key).await?;
+
     let listen_address = listen_address(config);
     tracing::info!(%listen_address, "starting Storm discovery listener");
     storm.start(Some(listen_address)).await?;
@@ -238,6 +245,34 @@ fn secret_key(config: &Config) -> Result<SecretKey, Error> {
     let encoded = &config.service.signer.private_key;
     let bytes = hex::decode(encoded).map_err(|error| Error::PrivateKey(error.to_string()))?;
     SecretKey::from_slice(&bytes).map_err(|error| Error::PrivateKey(error.to_string()))
+}
+
+async fn apply_peer_addresses(
+    config: &Config,
+    storm: &Storm,
+    coordinator_public_key: [u8; 33],
+) -> Result<(), Error> {
+    let handle = storm.handle();
+    for (key, address) in &config.service.peer_addresses {
+        handle
+            .set_peer_address(parse_public_key(key)?, address.clone())
+            .await?;
+    }
+    if let Some(address) = &config.service.coordinator_address {
+        handle
+            .set_peer_address(coordinator_public_key, address.clone())
+            .await?;
+    }
+    if let Some(address) = &config.service.advertised_address {
+        let local_public_key = secret_key(config)?
+            .public_key(&Secp256k1::new())
+            .serialize();
+        handle
+            .set_peer_address(local_public_key, address.clone())
+            .await?;
+    }
+
+    Ok(())
 }
 
 fn parse_public_key(encoded: &str) -> Result<[u8; 33], Error> {

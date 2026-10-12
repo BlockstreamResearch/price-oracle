@@ -7,7 +7,7 @@ use high_storm::{
     db::network_asset::{PendingNetworkAsset, STORM_EYE_KIND},
     initialize_host, initialize_join, start_initialized,
 };
-use storm::{PeerStatus, Storm};
+use storm::{Peer, PeerStatus, Storm};
 use tokio::time::timeout;
 
 use common::TestNode;
@@ -60,7 +60,7 @@ async fn initializes_persists_and_restores_a_network() {
             &join_node.config,
             &join_node.store,
             &host_node.public_key,
-            &host_node.address(),
+            &format!("localhost:{}", host_node.config.service.port),
         ),
     )
     .await
@@ -173,4 +173,99 @@ async fn initializes_persists_and_restores_a_network() {
 
     restored_host.shutdown().await;
     restored_join.shutdown().await;
+}
+
+#[tokio::test]
+async fn restored_network_uses_dns_overrides_instead_of_stale_ips() {
+    let mut host_node = TestNode::new(1).await;
+    let mut join_node = TestNode::new(2).await;
+    let host_public_key = hex::decode(&host_node.public_key)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let join_public_key = hex::decode(&join_node.public_key)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let peers = [host_public_key, join_public_key]
+        .into_iter()
+        .map(|key| {
+            let mut peer = Peer::new(key);
+            peer.socket_address = Some("127.0.0.1:0".into());
+            peer
+        })
+        .collect::<Vec<_>>();
+    for store in [&host_node.store, &join_node.store] {
+        store.save(&peers, host_public_key).await.unwrap();
+    }
+
+    let host_dns = format!("localhost:{}", host_node.config.service.port);
+    host_node.config.service.advertised_address = Some(host_dns.clone());
+    host_node
+        .config
+        .service
+        .peer_addresses
+        .insert(join_node.public_key.clone(), join_node.address());
+    join_node.config.service.coordinator_address = Some(host_dns.clone());
+
+    let mut host = start_initialized(&host_node.config, &host_node.store)
+        .await
+        .unwrap();
+    let mut join = start_initialized(&join_node.config, &join_node.store)
+        .await
+        .unwrap();
+    host.start(None).await.unwrap();
+    join.start(None).await.unwrap();
+    wait_until_connected(&[&host, &join]).await;
+
+    for node in [&host, &join] {
+        let peers = node.peers().await;
+        assert_eq!(peers.len(), 2);
+        assert!(peers.iter().all(|peer| !peer.discovery));
+        assert_eq!(
+            peers
+                .iter()
+                .find(|peer| peer.compressed_public_key == host_public_key)
+                .unwrap()
+                .socket_address
+                .as_deref(),
+            Some(host_dns.as_str())
+        );
+    }
+    assert_eq!(host.coordinator_public_key(), join.coordinator_public_key());
+    assert!(host.is_coordinator().await);
+
+    host.shutdown().await;
+    timeout(Duration::from_secs(5), async {
+        while join
+            .peers()
+            .await
+            .iter()
+            .any(|peer| peer.status == PeerStatus::Active)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let mut host = start_initialized(&host_node.config, &host_node.store)
+        .await
+        .unwrap();
+    join.start(None).await.unwrap();
+    host.start(None).await.unwrap();
+    wait_until_connected(&[&host, &join]).await;
+    assert_eq!(
+        join.peers()
+            .await
+            .iter()
+            .find(|peer| peer.compressed_public_key == host_public_key)
+            .unwrap()
+            .socket_address
+            .as_deref(),
+        Some(host_dns.as_str())
+    );
+
+    host.shutdown().await;
+    join.shutdown().await;
 }

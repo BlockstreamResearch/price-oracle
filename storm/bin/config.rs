@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     error::Error,
     io,
     path::{Path, PathBuf},
@@ -7,7 +7,7 @@ use std::{
 
 use secp256k1_zkp::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
-use storm::{Peer, PeerStatus};
+use storm::{Peer, PeerStatus, Storm};
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -21,6 +21,10 @@ pub struct NodeConfig {
     pub domain: String,
     #[serde(default)]
     pub public_keys: Vec<String>,
+    #[serde(default)]
+    pub advertised_address: Option<String>,
+    #[serde(default)]
+    pub peer_addresses: BTreeMap<String, String>,
     pub discoverer: Option<ConfiguredPeer>,
 }
 
@@ -91,9 +95,38 @@ impl NodeConfig {
             .discoverer
             .as_ref()
             .ok_or_else(|| invalid_data("discoverable mode requires a [discoverer] section"))?;
+        storm::validate_socket_address(&configured.socket_address)?;
         let mut peer = Peer::new(parse_public_key(&configured.public_key)?);
         peer.socket_address = Some(configured.socket_address.clone());
         Ok(peer)
+    }
+
+    pub async fn apply_peer_addresses(
+        &self,
+        storm: &Storm,
+        local_public_key: [u8; 33],
+    ) -> Result<(), BoxError> {
+        let handle = storm.handle();
+        for (key, address) in &self.peer_addresses {
+            handle
+                .set_peer_address(parse_public_key(key)?, address.clone())
+                .await?;
+        }
+        if let Some(configured) = &self.discoverer {
+            handle
+                .set_peer_address(
+                    parse_public_key(&configured.public_key)?,
+                    configured.socket_address.clone(),
+                )
+                .await?;
+        }
+        if let Some(address) = &self.advertised_address {
+            handle
+                .set_peer_address(local_public_key, address.clone())
+                .await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -193,6 +226,54 @@ impl From<SavedPeerStatus> for PeerStatus {
 mod tests {
     use super::*;
     use secp256k1_zkp::Secp256k1;
+
+    #[tokio::test]
+    async fn restored_config_overrides_saved_ip_with_dns() {
+        let config: NodeConfig = toml::from_str(
+            r#"
+private_key = "0202020202020202020202020202020202020202020202020202020202020202"
+listen_address = "127.0.0.1:9101"
+peers_file = "peers.toml"
+advertised_address = "node-2.storm:9101"
+
+[discoverer]
+public_key = "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f"
+socket_address = "coordinator.storm:9100"
+
+[peer_addresses]
+"02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337" = "node-3.storm:9102"
+"#,
+        )
+        .unwrap();
+        let secret_key = config.secret_key().unwrap();
+        let local_public_key = secret_key.public_key(&Secp256k1::new()).serialize();
+        let mut coordinator = config.discoverer_peer().unwrap();
+        coordinator.socket_address = Some("127.0.0.1:9100".into());
+        let mut remote =
+            Peer::new(parse_public_key(config.peer_addresses.keys().next().unwrap()).unwrap());
+        remote.socket_address = Some("127.0.0.1:9102".into());
+        let storm = Storm::from_peers(secret_key, vec![coordinator, remote]);
+
+        config
+            .apply_peer_addresses(&storm, local_public_key)
+            .await
+            .unwrap();
+
+        let peers = storm.peers().await;
+        assert_eq!(
+            peers[0].socket_address.as_deref(),
+            Some("node-2.storm:9101")
+        );
+        assert_eq!(
+            peers[1].socket_address.as_deref(),
+            Some("coordinator.storm:9100")
+        );
+        assert_eq!(
+            peers[2].socket_address.as_deref(),
+            Some("node-3.storm:9102")
+        );
+        assert!(peers.iter().all(|peer| !peer.discovery));
+    }
 
     #[test]
     fn config_rejects_unknown_fields() {

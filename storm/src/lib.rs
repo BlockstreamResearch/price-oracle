@@ -36,7 +36,7 @@ mod storm;
 pub use error::Error;
 pub use message::{MAX_MESSAGE_SIZE, MessageError, StormMessage, StormMessageHeader};
 pub use message_handlers::custom::CustomMsg;
-pub use peer::{Peer, PeerStatus};
+pub use peer::{Peer, PeerStatus, validate_socket_address};
 pub(crate) use state::StormState;
 pub(crate) use storm::CustomHandler;
 pub use storm::{MessageContext, Storm, StormContext, StormHandle};
