@@ -1,5 +1,5 @@
 use price_feed::PriceFeedData;
-use simplex::simplicityhl::elements::hashes::{Hash, HashEngine, sha256};
+use simplex::simplicityhl::elements::hashes::{HashEngine, sha256};
 use simplex::simplicityhl::elements::secp256k1_zkp::{
     Message, Secp256k1, XOnlyPublicKey, schnorr::Signature,
 };

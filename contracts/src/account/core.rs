@@ -24,7 +24,7 @@ impl Account {
     #[must_use]
     pub fn new(params: AccountParameters) -> Self {
         let program = AccountProgram::new(&AccountArguments {
-            storm_eye_asset_id: params.storm_eye_asset_id.into_inner().to_byte_array(),
+            storm_eye_asset_id: params.storm_eye_asset_id.to_byte_array(),
             account_owner_pubkey: params.account_owner_pubkey,
         });
 
@@ -51,9 +51,9 @@ impl Account {
             PartialInput::new(account_utxo.clone()),
             ProgramInput::new(
                 Box::new(self.program.as_ref().clone()),
-                Box::new(AccountWitness {
+                AccountWitness {
                     storm_eye_input_index,
-                }),
+                },
             ),
             RequiredSignature::None,
         );

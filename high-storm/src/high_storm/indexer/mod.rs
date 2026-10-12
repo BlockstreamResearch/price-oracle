@@ -13,10 +13,7 @@ use secp256k1_zkp::Secp256k1;
 use serde::Deserialize;
 use simplex::{
     provider::SimplicityNetwork,
-    simplicityhl::{
-        elements::{AssetId, Block, BlockHash, Transaction, TxOut, Txid, encode},
-        simplicity::hashes::Hash,
-    },
+    simplicityhl::elements::{AssetId, Block, BlockHash, Transaction, TxOut, Txid, encode},
 };
 use tokio::sync::Mutex;
 
@@ -929,11 +926,11 @@ fn issuance_tokens<'a>(
         }
         let Some(asset) = issued_assets
             .iter()
-            .find(|asset| asset.entropy == Some(issuance.asset_entropy))
+            .find(|asset| asset.entropy == Some(issuance.asset_entropy.to_byte_array()))
         else {
             tracing::debug!(
                 %txid,
-                actual = %hex::encode(issuance.asset_entropy),
+                actual = %hex::encode(issuance.asset_entropy.to_byte_array()),
                 "rejected issuance candidate: entropy of no network asset"
             );
             return Ok(None);

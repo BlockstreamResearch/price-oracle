@@ -11,9 +11,8 @@ use serde::Deserialize;
 use simplex::{
     either::Either,
     provider::SimplicityNetwork,
-    simplicityhl::{
-        elements::{BlockHash, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction},
-        simplicity::hashes::Hash,
+    simplicityhl::elements::{
+        BlockHash, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction,
     },
     transaction::{
         FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, UTXO,
@@ -240,27 +239,32 @@ impl Renewal {
                 .program_input
                 .as_mut()
                 .expect("Storm Eye is a program input")
-                .witness = Box::new(renewal_witness(
+                .witness = renewal_witness(
                 &data,
                 prepared.request.new_rescue_height,
                 index as u32,
                 *signature.as_ref(),
                 signing.signing_storm_tree_branch,
                 pack_proof(&proof)?,
-            ));
+            )
+            .into();
         }
         for (index, input) in prepared.transaction.inputs().iter().enumerate() {
             let program_input = input
                 .program_input
                 .as_ref()
                 .expect("all renewal inputs are covenant inputs");
-            prepared.pset.inputs_mut()[index].final_script_witness =
-                Some(program_input.program.finalize(
-                    &prepared.pset,
-                    &program_input.witness.build_witness(),
-                    index,
-                    &prepared.network,
-                )?);
+            prepared.pset.inputs_mut()[index].final_script_witness = Some(
+                program_input
+                    .program
+                    .finalize(
+                        &prepared.pset,
+                        &program_input.witness,
+                        index,
+                        &prepared.network,
+                    )?
+                    .into(),
+            );
         }
         if signing_hashes(
             &prepared.pset,
@@ -587,11 +591,7 @@ fn build_transaction(
             PartialInput::new(utxo.clone()),
             ProgramInput::new(
                 Box::new(auth_program.as_ref().clone()),
-                Box::new(placeholder_witness(
-                    &data,
-                    new_rescue_height,
-                    output_index as u32,
-                )),
+                placeholder_witness(&data, new_rescue_height, output_index as u32),
             ),
             RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
         );
@@ -604,9 +604,9 @@ fn build_transaction(
             PartialInput::new(utxo.clone()),
             ProgramInput::new(
                 Box::new(treasury.as_ref().clone()),
-                Box::new(TreasuryWitness {
+                TreasuryWitness {
                     storm_eye_input_index: 0,
-                }),
+                },
             ),
             RequiredSignature::None,
         );
