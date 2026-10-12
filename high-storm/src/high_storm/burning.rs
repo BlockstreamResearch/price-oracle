@@ -16,12 +16,9 @@ use simplex::{
     either::Either,
     program::ProgramTrait,
     provider::SimplicityNetwork,
-    simplicityhl::{
-        elements::{
-            AssetId, BlockHash, Script, Transaction, TxOut, Txid, encode,
-            pset::PartiallySignedTransaction,
-        },
-        simplicity::hashes::Hash,
+    simplicityhl::elements::{
+        AssetId, BlockHash, Script, Transaction, TxOut, Txid, encode,
+        pset::PartiallySignedTransaction,
     },
     transaction::{
         FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
@@ -272,7 +269,7 @@ impl Burning {
             PartialInput::new(storm_eye_utxo.clone()),
             ProgramInput::new(
                 Box::new(auth_program.as_ref().clone()),
-                Box::new(AuthWitness {
+                AuthWitness {
                     path: Either::Left((
                         (contract_data.storm_tree_root, contract_data.rescue_height),
                         (
@@ -282,7 +279,7 @@ impl Burning {
                         ),
                         Either::Left(0),
                     )),
-                }),
+                },
             ),
             RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
         );
@@ -307,9 +304,9 @@ impl Burning {
                     PartialInput::new(tick_utxo.clone()),
                     ProgramInput::new(
                         Box::new(program.as_ref().clone()),
-                        Box::new(VoucherWitness {
+                        VoucherWitness {
                             path: Either::Right(Either::Right(0)),
-                        }),
+                        },
                     ),
                     RequiredSignature::None,
                 );
@@ -330,11 +327,9 @@ impl Burning {
                 PartialInput::new(reserve.clone()),
                 ProgramInput::new(
                     Box::new(account.as_ref().clone()),
-                    Box::new(
-                        contracts::artifacts::account::derived_account::AccountWitness {
-                            storm_eye_input_index: 0,
-                        },
-                    ),
+                    contracts::artifacts::account::derived_account::AccountWitness {
+                        storm_eye_input_index: 0,
+                    },
                 ),
                 RequiredSignature::None,
             );
@@ -584,7 +579,7 @@ impl Burning {
             .program_input
             .as_mut()
             .expect("Storm Eye is a program input")
-            .witness = Box::new(AuthWitness {
+            .witness = AuthWitness {
             path: Either::Left((
                 (contract_data.storm_tree_root, contract_data.rescue_height),
                 (
@@ -594,7 +589,8 @@ impl Burning {
                 ),
                 Either::Left(0),
             )),
-        });
+        }
+        .into();
         let mut pset = prepared.pset;
         for (index, input) in transaction.inputs().iter().enumerate() {
             let Some(program_input) = &input.program_input else {
@@ -602,18 +598,13 @@ impl Burning {
             };
             let final_witness = program_input
                 .program
-                .finalize(
-                    &pset,
-                    &program_input.witness.build_witness(),
-                    index,
-                    &prepared.network,
-                )
+                .finalize(&pset, &program_input.witness, index, &prepared.network)
                 .map_err(|error| {
                     BurningError::Invalid(format!(
                         "failed to finalize burn covenant input {index}: {error}"
                     ))
                 })?;
-            pset.inputs_mut()[index].final_script_witness = Some(final_witness);
+            pset.inputs_mut()[index].final_script_witness = Some(final_witness.into());
         }
         if signing_hash(&pset, &prepared.storm_eye, &prepared.network)?
             != prepared.request.signing_hash

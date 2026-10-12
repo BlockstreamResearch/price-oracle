@@ -16,7 +16,7 @@ impl Voucher {
     #[must_use]
     pub fn new(params: VoucherParameters) -> Self {
         Self {
-            program: VoucherProgram::new(&params.build_arguments()),
+            program: VoucherProgram::new(params.build_arguments()),
             params,
         }
     }
@@ -24,7 +24,7 @@ impl Voucher {
     #[must_use]
     pub fn new_with_taproot_pubkey(params: VoucherParameters, pub_key: XOnlyPublicKey) -> Self {
         Self {
-            program: VoucherProgram::new(&params.build_arguments()).with_taproot_pubkey(pub_key),
+            program: VoucherProgram::new(params.build_arguments()).with_taproot_pubkey(pub_key),
             params,
         }
     }
@@ -58,7 +58,7 @@ impl Voucher {
             PartialInput::new(voucher_utxo.clone()),
             ProgramInput::new(
                 Box::new(self.program.as_ref().clone()),
-                Box::new(path.build_witness()),
+                path.build_witness(),
             ),
             required_signature,
         );

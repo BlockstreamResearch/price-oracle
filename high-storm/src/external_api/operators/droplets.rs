@@ -4,7 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
-use simplex::simplicityhl::{elements::Txid, simplicity::hashes::Hash};
+use simplex::simplicityhl::elements::Txid;
 
 use super::auth::{SignedRequest, authenticate_bearer};
 use crate::{

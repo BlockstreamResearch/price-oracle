@@ -12,10 +12,7 @@ use contracts::artifacts::{
         derived_treasury::{TreasuryArguments, TreasuryWitness},
     },
 };
-use secp256k1_zkp::{
-    Message, PublicKey, RangeProof, Secp256k1, SecretKey, SurjectionProof, XOnlyPublicKey,
-    schnorr::Signature,
-};
+use secp256k1_zkp::{Message, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey, schnorr::Signature};
 use serde::{Deserialize, Serialize};
 use serde_json::Number;
 use sha2::Digest;
@@ -24,10 +21,11 @@ use simplex::{
     program::ProgramTrait,
     provider::SimplicityNetwork,
     simplicityhl::elements::{
-        AssetId, BlindAssetProofs, BlindValueProofs, BlockHash, OutPoint, Script, TxOut,
-        TxOutSecrets, Txid, confidential, encode, pset::PartiallySignedTransaction,
+        AssetId, BlockHash, OutPoint, Script, TxOut, TxOutSecrets, Txid,
+        confidential::{self, RangeProof, SurjectionProof},
+        encode,
+        pset::PartiallySignedTransaction,
     },
-    simplicityhl::simplicity::hashes::Hash,
     transaction::{
         FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
         partial_input::IssuanceInput, utxo::UTXO,
@@ -522,7 +520,7 @@ impl UserRequestProcessor {
             PartialInput::new(storm_eye_utxo.clone()),
             ProgramInput::new(
                 Box::new(auth_program.as_ref().clone()),
-                Box::new(AuthWitness {
+                AuthWitness {
                     path: Either::Left((
                         (contract_data.storm_tree_root, contract_data.rescue_height),
                         (
@@ -532,7 +530,7 @@ impl UserRequestProcessor {
                         ),
                         Either::Left(0),
                     )),
-                }),
+                },
             ),
             RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
         );
@@ -544,9 +542,9 @@ impl UserRequestProcessor {
                 PartialInput::new(token.utxo.clone()),
                 ProgramInput::new(
                     Box::new(treasury.as_ref().clone()),
-                    Box::new(TreasuryWitness {
+                    TreasuryWitness {
                         storm_eye_input_index: 0,
-                    }),
+                    },
                 ),
                 IssuanceInput::new_reissuance(
                     token.issuance_amount,
@@ -584,11 +582,9 @@ impl UserRequestProcessor {
                     PartialInput::new(utxo.clone()),
                     ProgramInput::new(
                         Box::new(account.as_ref().clone()),
-                        Box::new(
-                            contracts::artifacts::account::derived_account::AccountWitness {
-                                storm_eye_input_index: 0,
-                            },
-                        ),
+                        contracts::artifacts::account::derived_account::AccountWitness {
+                            storm_eye_input_index: 0,
+                        },
                     ),
                     RequiredSignature::None,
                 );
@@ -808,13 +804,14 @@ impl UserRequestProcessor {
             .program_input
             .as_mut()
             .expect("Storm Eye is a program input")
-            .witness = Box::new(AuthWitness {
+            .witness = AuthWitness {
             path: Either::Left((
                 (contract_data.storm_tree_root, contract_data.rescue_height),
                 (signature, signing.signing_storm_tree_branch, proof),
                 Either::Left(0),
             )),
-        });
+        }
+        .into();
 
         for (index, input) in transaction.inputs().iter().enumerate() {
             let Some(program_input) = &input.program_input else {
@@ -822,18 +819,13 @@ impl UserRequestProcessor {
             };
             let final_witness = program_input
                 .program
-                .finalize(
-                    &pset,
-                    &program_input.witness.build_witness(),
-                    index,
-                    network,
-                )
+                .finalize(&pset, &program_input.witness, index, network)
                 .map_err(|error| {
                     UserRequestError::Invalid(format!(
                         "failed to finalize covenant input {index}: {error}"
                     ))
                 })?;
-            pset.inputs_mut()[index].final_script_witness = Some(final_witness);
+            pset.inputs_mut()[index].final_script_witness = Some(final_witness.into());
         }
         if issuance_signing_hash(&pset, storm_eye, network)? != signing_hash {
             return Err(UserRequestError::Invalid(
@@ -1191,7 +1183,7 @@ fn reblind_tokens(
             })?;
         token_input.asset = Some(token.secrets.asset);
         token_input.amount = Some(token.secrets.value);
-        token_input.blind_asset_proof = Some(Box::new(
+        token_input.blind_asset_proof = Some(
             SurjectionProof::blind_asset_proof(
                 &mut rng,
                 &secp,
@@ -1201,8 +1193,8 @@ fn reblind_tokens(
             .map_err(|_| {
                 UserRequestError::Invalid(format!("failed to prove {name} token asset"))
             })?,
-        ));
-        token_input.blind_value_proof = Some(Box::new(
+        );
+        token_input.blind_value_proof = Some(
             RangeProof::blind_value_proof(
                 &mut rng,
                 &secp,
@@ -1214,7 +1206,7 @@ fn reblind_tokens(
             .map_err(|_| {
                 UserRequestError::Invalid(format!("failed to prove {name} token value"))
             })?,
-        ));
+        );
     }
 
     Ok(())
@@ -1232,7 +1224,8 @@ pub(crate) fn finalized_dummy_weight(
     storm_eye_input.final_script_witness = Some(
         STORM_EYE_AUTH_WITNESS_TEMPLATE
             .map(|length| vec![0; length])
-            .to_vec(),
+            .to_vec()
+            .into(),
     );
     for (index, input) in transaction.inputs().iter().enumerate() {
         let Some(program_input) = &input.program_input else {
@@ -1243,18 +1236,13 @@ pub(crate) fn finalized_dummy_weight(
         }
         let final_witness = program_input
             .program
-            .finalize(
-                &pset,
-                &program_input.witness.build_witness(),
-                index,
-                network,
-            )
+            .finalize(&pset, &program_input.witness, index, network)
             .map_err(|error| {
                 UserRequestError::Invalid(format!(
                     "failed to estimate covenant input {index} weight: {error}"
                 ))
             })?;
-        pset.inputs_mut()[index].final_script_witness = Some(final_witness);
+        pset.inputs_mut()[index].final_script_witness = Some(final_witness.into());
     }
     let transaction = pset
         .extract_tx()
@@ -1917,7 +1905,10 @@ fn validate_execute_request(
     for (offset, (asset, issued_amount)) in tokens.iter().zip(issued_amounts).enumerate() {
         let issuance_input = &pset.inputs()[1 + offset];
         if issuance_input.issuance_value_amount != Some(issued_amount)
-            || issuance_input.issuance_asset_entropy != asset.entropy
+            || issuance_input
+                .issuance_asset_entropy
+                .map(|entropy| entropy.to_byte_array())
+                != asset.entropy
             || issuance_input.issuance_value_comm.is_some()
             || issuance_input.issuance_value_rangeproof.is_some()
             || issuance_input.in_issuance_blind_value_proof.is_some()
@@ -2832,7 +2823,7 @@ mod tests {
     }
 
     use simplex::simplicityhl::elements::{
-        AssetIssuance, LockTime, Transaction, TxIn, hashes::sha256::Midstate,
+        AssetBlindingNonce, AssetEntropy, AssetIssuance, LockTime, Transaction, TxIn,
     };
 
     fn network() -> SimplicityNetwork {
@@ -3006,8 +2997,8 @@ mod tests {
     /// A reissuance token blinded to the Treasury, as a round finds it.
     fn round_token(entropy: [u8; 32], vout: u32, issuance_amount: u64) -> RoundToken {
         let secp = Secp256k1::new();
-        let midstate = Midstate::from_byte_array(entropy);
-        let token_id = AssetId::reissuance_token_from_entropy(midstate, false);
+        let asset_entropy = AssetEntropy::from_byte_array(entropy);
+        let token_id = AssetId::reissuance_token_from_entropy(asset_entropy, false);
         let script = Script::from(vec![0x51]);
         let (txout, _, _, _) = TxOut::new_last_confidential(
             &mut secp256k1_zkp::rand::thread_rng(),
@@ -3026,8 +3017,8 @@ mod tests {
             asset: NetworkAsset {
                 kind: "token".into(),
                 name: "token".into(),
-                asset_id: AssetId::from_entropy(midstate).into_inner().to_byte_array(),
-                reissuance_token_id: Some(token_id.into_inner().to_byte_array()),
+                asset_id: AssetId::from_entropy(asset_entropy).to_byte_array(),
+                reissuance_token_id: Some(token_id.to_byte_array()),
                 entropy: Some(entropy),
                 issuance_txid: [2; 32],
                 contract_script: vec![0x51],
@@ -3060,8 +3051,10 @@ mod tests {
         };
         for (offset, token) in tokens.iter().enumerate() {
             transaction.input[1 + offset].asset_issuance = AssetIssuance {
-                asset_blinding_nonce: token.secrets.asset_bf.into_inner(),
-                asset_entropy: token.asset.entropy.unwrap(),
+                asset_blinding_nonce: AssetBlindingNonce::from_blinding_factor(
+                    token.secrets.asset_bf,
+                ),
+                asset_entropy: AssetEntropy::from_byte_array(token.asset.entropy.unwrap()),
                 amount: confidential::Value::Explicit(token.issuance_amount),
                 inflation_keys: confidential::Value::Null,
             };

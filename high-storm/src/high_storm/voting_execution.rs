@@ -17,11 +17,8 @@ use simplex::{
     either::Either,
     program::ProgramTrait,
     provider::SimplicityNetwork,
-    simplicityhl::{
-        elements::{
-            AssetId, BlockHash, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction,
-        },
-        simplicity::hashes::Hash,
+    simplicityhl::elements::{
+        AssetId, BlockHash, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction,
     },
     transaction::{
         FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
@@ -447,20 +444,24 @@ impl VotingExecution {
                 .program_input
                 .as_mut()
                 .expect("Storm Eye is a program input")
-                .witness = Box::new(witness);
+                .witness = witness.into();
         }
         for (index, input) in prepared.transaction.inputs().iter().enumerate() {
             let program_input = input
                 .program_input
                 .as_ref()
                 .expect("all voting transaction inputs are covenant inputs");
-            prepared.pset.inputs_mut()[index].final_script_witness =
-                Some(program_input.program.finalize(
-                    &prepared.pset,
-                    &program_input.witness.build_witness(),
-                    index,
-                    &prepared.network,
-                )?);
+            prepared.pset.inputs_mut()[index].final_script_witness = Some(
+                program_input
+                    .program
+                    .finalize(
+                        &prepared.pset,
+                        &program_input.witness,
+                        index,
+                        &prepared.network,
+                    )?
+                    .into(),
+            );
         }
         if signing_hashes(
             &prepared.pset,
@@ -1097,11 +1098,7 @@ fn build_transaction(
             PartialInput::new(utxo.clone()),
             ProgramInput::new(
                 Box::new(auth_program.as_ref().clone()),
-                Box::new(placeholder_witness(
-                    &contract_data,
-                    &operation,
-                    output_index as u32,
-                )),
+                placeholder_witness(&contract_data, &operation, output_index as u32),
             ),
             RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
         );
@@ -1115,9 +1112,9 @@ fn build_transaction(
             PartialInput::new(utxo.clone()),
             ProgramInput::new(
                 Box::new(treasury.as_ref().clone()),
-                Box::new(TreasuryWitness {
+                TreasuryWitness {
                     storm_eye_input_index: 0,
-                }),
+                },
             ),
             RequiredSignature::None,
         );

@@ -68,10 +68,10 @@ fn accepts_a_valid_inclusion_proof(context: simplex::TestContext) -> anyhow::Res
         PartialInput::new(utxo.clone()),
         ProgramInput::new(
             Box::new(program.as_ref().clone()),
-            Box::new(NetworkAuthTestWitness {
+            NetworkAuthTestWitness {
                 merkle_root: storm_tree.root(),
                 storm_tree_bloom: ([0u8; 64], signing_branch, proof),
-            }),
+            },
         ),
         RequiredSignature::witness_tagged(
             "STORM_TREE_BLOOM",

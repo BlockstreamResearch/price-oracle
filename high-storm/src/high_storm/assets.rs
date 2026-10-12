@@ -1092,7 +1092,7 @@ fn decode_hash(encoded: &str, name: &'static str) -> Result<[u8; 32], AssetError
 
 fn decode_asset_hash(encoded: &str, name: &'static str) -> Result<[u8; 32], AssetError> {
     AssetId::from_str(encoded)
-        .map(|asset| asset.into_inner().to_byte_array())
+        .map(|asset| asset.to_byte_array())
         .map_err(|_| AssetError::InvalidRpcResponse(name))
 }
 
@@ -1104,7 +1104,7 @@ mod tests {
     };
 
     use crate::db::Database;
-    use simplex::simplicityhl::elements::hashes::sha256;
+    use simplex::simplicityhl::elements::AssetEntropy;
 
     use super::*;
 
@@ -1134,8 +1134,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            AssetId::from_entropy(sha256::Midstate::from_byte_array(entropy)).into_inner(),
-            AssetId::from_byte_array(asset).into_inner()
+            AssetId::from_entropy(AssetEntropy::from_byte_array(entropy)),
+            AssetId::from_byte_array(asset)
         );
     }
 
@@ -1178,7 +1178,7 @@ mod tests {
 
     #[test]
     fn creates_six_initial_storm_eye_outputs_with_the_full_supply() {
-        let asset_id = AssetId::from_slice(&[1; 32]).unwrap();
+        let asset_id = AssetId::from_byte_array([1; 32]);
         let contract_script = Script::from(vec![0x51]);
         let mut transaction = Transaction {
             version: 2,
