@@ -30,6 +30,7 @@ impl Storm {
         }
         self.listener_address = None;
         let mut state = self.inner.write().await;
+        state.listener_port = None;
         state.connections.clear();
         for peer in &mut state.peers {
             if peer.status == PeerStatus::Active {
@@ -50,14 +51,16 @@ impl Storm {
 
         {
             let mut state = self.inner.write().await;
+            state.listener_port = Some(addr.port());
             let initializer_public_key = state.initializer_public_key;
             if let Some(peer) = state
                 .peers
                 .iter_mut()
                 .find(|peer| peer.compressed_public_key == initializer_public_key)
             {
-                peer.socket_address = Some(addr.to_string());
+                peer.update_observed_address(addr);
             }
+            state.apply_address_overrides();
         }
 
         let state = Arc::clone(&self.inner);
@@ -194,7 +197,7 @@ impl Storm {
 
             peer.status = PeerStatus::Active;
             if let Some(peer_address) = peer_address {
-                peer.socket_address = Some(peer_address.to_string());
+                peer.update_observed_address(peer_address);
             }
 
             if let Some(peer) = state
@@ -204,7 +207,7 @@ impl Storm {
             {
                 peer.status = PeerStatus::Active;
                 if let Some(peer_address) = peer_address {
-                    peer.socket_address = Some(peer_address.to_string());
+                    peer.update_observed_address(peer_address);
                 }
             }
         } else {
@@ -233,7 +236,7 @@ impl Storm {
                 {
                     peer.status = PeerStatus::Active;
                     if let Some(peer_address) = peer_address {
-                        peer.socket_address = Some(peer_address.to_string());
+                        peer.update_observed_address(peer_address);
                     }
                 } else {
                     let mut peer = Peer::new(peer_public_key);
@@ -244,6 +247,7 @@ impl Storm {
             }
         }
 
+        state.apply_address_overrides();
         state.connections.insert(peer_public_key, sender);
 
         Ok(receiver)

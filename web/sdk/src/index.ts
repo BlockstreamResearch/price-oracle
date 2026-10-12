@@ -82,6 +82,28 @@ export type PriceFeedData = {
   validUntil: bigint;
 };
 
+export type PriceFeedInfo = {
+  id: number;
+  symbol: string;
+  decimals: number;
+  base: string;
+  quote: string;
+  kind: string;
+};
+export type PriceFeedRate = {
+  main: {
+    feed: {
+      feed_id: number;
+      decimals: number;
+      price: number;
+      received_at: number;
+      valid_until: number;
+    };
+    signature: string;
+    public_key: string;
+  };
+};
+
 export type IssuedTick = {
   txid: string;
   vout: number;
@@ -258,6 +280,15 @@ export class PriceOracleClient {
     return this.#json(`/users/requests/${requestHash}`);
   }
 
+  getPriceFeeds(): Promise<PriceFeedInfo[]> {
+    return this.#json("/price-feeds");
+  }
+
+  getPriceFeed(feedId: number): Promise<PriceFeedRate> {
+    assertFeedId(feedId);
+    return this.#json(`/price-feeds/${feedId}`);
+  }
+
   async #json<Result>(path: string, init?: RequestInit): Promise<Result> {
     const response = await this.#fetch(`${this.#coordinatorUrl}${path}`, init);
     const body = (await response.json()) as Result | { error: string };
@@ -334,6 +365,40 @@ export function walletRequestSigningMessage(request: TickRequest): string {
     request.header.fee_utxos,
     request.requests,
   ])}`;
+}
+
+function assertFeedId(feedId: number): void {
+  if (!Number.isInteger(feedId) || feedId < 0 || feedId > 0xffffffff) {
+    throw new Error("price feed id must be an unsigned 32-bit integer");
+  }
+}
+
+export function createWalletSignedPriceRequest(
+  compressedPublicKey: string,
+  feeUtxos: string[],
+  authScriptPubKey: string,
+  priceFeedId: number,
+  options: { withTick?: boolean } = {},
+): TickRequest {
+  assertFeedId(priceFeedId);
+  const request = createWalletTickRequest(
+    compressedPublicKey,
+    feeUtxos,
+    authScriptPubKey,
+  );
+  const tick = request.requests[0];
+  if (!tick) throw new Error("wallet request has no Tick template");
+  request.requests = [
+    {
+      kind: "signed-price-data",
+      payload: JSON.stringify({
+        ...JSON.parse(tick.payload),
+        price_feed_id: priceFeedId,
+      }),
+    },
+  ];
+  if (options.withTick) request.requests.push(tick);
+  return request;
 }
 
 export function createTickRequest(
@@ -472,6 +537,34 @@ export function parseExecutedTick(
     txid: string;
     results: TickRequestResult[];
   };
+}
+
+export function parseExecutedSignedPrice(
+  status: TickRequestStatus,
+): { txid: string; verifierVout: number; signedPrice: SignedPriceData } | null {
+  if (status.status !== "executed") return null;
+  const executed = parseExecutedTick(status);
+  if (!executed) return null;
+  if (!HEX_32.test(executed.txid) || !Array.isArray(executed.results))
+    throw new Error("invalid issuance result");
+  const results = executed.results.filter(
+    (result) => result.kind === "signed-price-data",
+  );
+  if (results.length !== 1)
+    throw new Error("expected exactly one issued Verifier");
+  const result = results[0];
+  if (!result) throw new Error("issuance result has no Verifier");
+  if (
+    !Number.isInteger(result.vout) ||
+    result.vout < 0 ||
+    result.vout > 0xffffffff
+  )
+    throw new Error("invalid Verifier output index");
+  const signedPrice = JSON.parse(result.payload) as SignedPriceData;
+  decodePriceData(signedPrice.price_data);
+  if (!verifySignedPriceData(signedPrice))
+    throw new Error("oracle price signature does not verify");
+  return { txid: executed.txid, verifierVout: result.vout, signedPrice };
 }
 
 export function createTickSpendPlan(

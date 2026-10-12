@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -198,6 +197,7 @@ fn replace_migration_peers(
             peer
         })
         .collect();
+    state.apply_address_overrides();
 }
 
 fn validate_known_peer_keys(
@@ -243,7 +243,7 @@ fn validate(
                 "PeersSocketInfo contains an invalid public key".to_string(),
             )
         })?;
-        info.socket_address.parse::<SocketAddr>().map_err(|_| {
+        crate::peer::socket_address_port(&info.socket_address).ok_or_else(|| {
             (
                 StormErrorCode::InvalidPayload,
                 format!("Invalid peer socket address: {}", info.socket_address),
@@ -321,6 +321,7 @@ fn replace_discovered_peers(
             peer
         })
         .collect();
+    state.apply_address_overrides();
     state.discovery_table_received = true;
 
     Ok(())
@@ -343,6 +344,64 @@ mod tests {
         ValidatedPeerSocketInfo {
             compressed_public_key: peer.compressed_public_key,
             socket_address: socket_address.to_string(),
+        }
+    }
+
+    #[test]
+    fn dns_peer_table_round_trip_accepts_mixed_endpoints() {
+        let mut peers = Vec::new();
+        for address in [
+            "127.0.0.1:9000",
+            "[::1]:9000",
+            "node.storm.svc.cluster.local:9000",
+        ] {
+            let (_, mut peer) = generated_peer();
+            peer.socket_address = Some(address.into());
+            peers.push(peer);
+        }
+        let encoded = message(&peers).unwrap();
+        let decoded = validate(postcard::from_bytes(&encoded.payload).unwrap()).unwrap();
+
+        for (info, peer) in decoded.iter().zip(&peers) {
+            assert_eq!(info.compressed_public_key, peer.compressed_public_key);
+            assert_eq!(Some(&info.socket_address), peer.socket_address.as_ref());
+        }
+    }
+
+    #[test]
+    fn dns_overrides_survive_discovery_and_migration_tables() {
+        let (local_secret_key, local_peer) = generated_peer();
+        let (_, discovery_peer) = generated_peer();
+        let mut state = StormState::new(
+            local_secret_key,
+            vec![local_peer.clone(), discovery_peer.clone()],
+        );
+        state
+            .address_overrides
+            .insert(local_peer.compressed_public_key, "local.storm:9000".into());
+        state.address_overrides.insert(
+            discovery_peer.compressed_public_key,
+            "coordinator.storm:9000".into(),
+        );
+        let table = vec![
+            socket_info(&local_peer, "127.0.0.1:1000"),
+            socket_info(&discovery_peer, "127.0.0.1:2000"),
+        ];
+
+        replace_discovered_peers(
+            &mut state,
+            table.clone(),
+            discovery_peer.compressed_public_key,
+        )
+        .unwrap();
+        replace_migration_peers(&mut state, table);
+
+        for peers in [&state.peers, &state.migration_peers] {
+            assert_eq!(peers[0].socket_address.as_deref(), Some("local.storm:9000"));
+            assert_eq!(
+                peers[1].socket_address.as_deref(),
+                Some("coordinator.storm:9000")
+            );
         }
     }
 
@@ -715,7 +774,7 @@ mod tests {
 
         let unavailable_secret_key = SecretKey::from_slice(&[3; 32]).unwrap();
         let mut unavailable_peer = Peer::new(unavailable_secret_key.public_key(&secp).serialize());
-        unavailable_peer.socket_address = Some("127.0.0.1:0".to_string());
+        unavailable_peer.socket_address = Some("not-yet-deployed.invalid:9000".to_string());
 
         let state = Arc::new(RwLock::new(StormState::new(
             local_secret_key,

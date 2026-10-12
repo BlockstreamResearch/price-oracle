@@ -57,6 +57,9 @@ pub enum Error {
     /// The configured discovery peer has no socket address.
     #[error("Discovery peer has no socket address")]
     DiscoveryPeerAddressMissing,
+    /// A configured TCP endpoint is neither an IP socket address nor a hostname and port.
+    #[error("Invalid peer socket address: {0}")]
+    InvalidPeerAddress(String),
     /// A different member migration is already staged.
     #[error("A different member migration is already staged")]
     MigrationAlreadyStaged,

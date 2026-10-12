@@ -64,6 +64,9 @@ async fn run(args: RunArgs) -> Result<(), BoxError> {
         Mode::Discoverable => Storm::discoverable(secret_key, config.discoverer_peer()?)?,
         Mode::Restored => Storm::from_peers(secret_key, load_peers(&config.peers_file).await?),
     };
+    config
+        .apply_peer_addresses(&storm, local_public_key)
+        .await?;
 
     let mut app = App::new()?;
     register_custom_logger(&storm).await;

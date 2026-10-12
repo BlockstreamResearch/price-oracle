@@ -73,6 +73,27 @@ export type PriceFeedData = {
     receivedAt: bigint;
     validUntil: bigint;
 };
+export type PriceFeedInfo = {
+    id: number;
+    symbol: string;
+    decimals: number;
+    base: string;
+    quote: string;
+    kind: string;
+};
+export type PriceFeedRate = {
+    main: {
+        feed: {
+            feed_id: number;
+            decimals: number;
+            price: number;
+            received_at: number;
+            valid_until: number;
+        };
+        signature: string;
+        public_key: string;
+    };
+};
 export type IssuedTick = {
     txid: string;
     vout: number;
@@ -134,11 +155,16 @@ export declare class PriceOracleClient {
         request_hash: string;
     }>;
     getTickRequest(requestHash: string): Promise<TickRequestStatus>;
+    getPriceFeeds(): Promise<PriceFeedInfo[]>;
+    getPriceFeed(feedId: number): Promise<PriceFeedRate>;
 }
 export declare function publicKeyFromPrivateKey(privateKey: string): string;
 export declare function signSchnorrDigest(privateKey: string, digest: string): string;
 export declare function createWalletTickRequest(compressedPublicKey: string, feeUtxos: string[], authScriptPubKey: string): TickRequest;
 export declare function walletRequestSigningMessage(request: TickRequest): string;
+export declare function createWalletSignedPriceRequest(compressedPublicKey: string, feeUtxos: string[], authScriptPubKey: string, priceFeedId: number, options?: {
+    withTick?: boolean;
+}): TickRequest;
 export declare function createTickRequest(privateKey: string, feeUtxos: string[], authMethod?: TickAuthMethod): TickRequest;
 /**
  * A priced request: issues an Oracle Verifier and returns the signed rate,
@@ -157,5 +183,10 @@ export declare function verifySignedPriceData(details: SignedPriceData): boolean
 export declare function parseExecutedTick(status: TickRequestStatus): {
     txid: string;
     results: TickRequestResult[];
+} | null;
+export declare function parseExecutedSignedPrice(status: TickRequestStatus): {
+    txid: string;
+    verifierVout: number;
+    signedPrice: SignedPriceData;
 } | null;
 export declare function createTickSpendPlan(tick: IssuedTick, resolution: PredictionResolution): TickSpendPlan;

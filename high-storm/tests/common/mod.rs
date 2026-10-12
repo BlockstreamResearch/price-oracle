@@ -37,6 +37,9 @@ impl TestNode {
         let config = Config {
             service: ServiceConfig {
                 port,
+                coordinator_address: None,
+                advertised_address: None,
+                peer_addresses: Default::default(),
                 ipc_path: std::env::temp_dir().join(format!("high-storm-{port}.sock")),
                 external_api_address: "127.0.0.1:0".parse().unwrap(),
                 signer: SignerConfig {

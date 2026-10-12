@@ -71,11 +71,12 @@ docker compose -f high-storm/compose.yml logs -f node-1 node-2 node-3
 Elements RPC is exposed on host ports `18884`, `18885`, and `18886`. Port `18884`
 uses a localhost-only CORS gateway so browser clients can call node 1 directly. Every High
 Storm node uses its matching Elements daemon through `service.elements_rpc`.
-Elements `29.4.1rc1` is built from its release tag and verified against commit
-`a4d4c96ac7a7a9171b6f777e287ee4df18d779e1` and the checked-in source archive
-checksum.
+Elements uses `blockstream/elementsd:23.3.4`, pinned to image digest
+`sha256:f3b4037de5e8378af5cb9ccf8bdba88e2437d330d6cf3638fe666420ba70a9f8`.
+The local image adds Python for bootstrap funding. Issuance falls back to scanning
+mempool inputs when the daemon does not provide `gettxspendingprevout`.
 
-The Elements nodes use the stock `29.4.1rc1` regtest genesis and a development-only
+The Elements nodes use the stock `23.3.4` regtest genesis and a development-only
 50 LBTC block subsidy. On a fresh chain, the bootstrap service mines 102 blocks so
 100 LBTC matures, then sends exactly 50 LBTC to node 1's development key. It mines
 one additional block every 60 seconds. The coordinator waits for this funding to
@@ -126,6 +127,47 @@ defaults to `127.0.0.1:9001`. Elements must run with `txindex=1` so HighStorm ca
 reconcile confirmed request transactions after they leave the mempool. Protocol-wide
 fee budgets, burn reserves, and Tick lifetime are grouped under `service.protocol`.
 The legacy `service.user_requests` section remains accepted for existing deployments.
+
+### IP/DNS endpoints and rolling migration
+
+Storm accepts IPv4, bracketed IPv6, and DNS endpoints with a port. DNS is resolved
+on every connection attempt, including automatic reconnection after an IP change.
+Temporary lookup failures are retried; hostnames are not replaced by observed IPs.
+
+Add optional keys to the existing `[service]` section:
+
+```toml
+[service]
+coordinator_address = "coordinator.oracle.svc.cluster.local:9000"
+advertised_address = "node-2.oracle.svc.cluster.local:9000"
+
+[service.peer_addresses]
+# Replace this example key with the target member's compressed public key.
+"02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337" = "node-3.oracle.svc.cluster.local:9000"
+```
+
+`coordinator_address` overrides the address of the coordinator identity already
+stored in the database. It also overrides `--discovery-address` during initial
+joining. `peer_addresses` overrides other saved or subsequently discovered
+endpoints without admitting new members. `advertised_address` sets this node's
+peer-table endpoint; the listener still binds to `0.0.0.0:service.port`.
+Specific coordinator and advertised settings take precedence over `peer_addresses`.
+Config overrides are local: configure remote endpoints on each node that must
+connect to them. An advertised name alone does not update other restored nodes.
+
+For an existing network:
+
+1. Create reachable per-node DNS records or Kubernetes Services. Each endpoint
+  must route to the matching Storm public key, not balance across different members.
+2. Roll out the updated binary to all nodes while retaining their current configs
+  and the required quorum. Older binaries reject DNS in discovery peer tables.
+3. Add `coordinator_address` and any required `peer_addresses` on each node, then
+  restart nodes one at a time with `high-storm run --config ...`. Keep the same
+  signer keys and databases; do not reinitialize the network or reset its state.
+
+IPv4, IPv6, and DNS endpoints can coexist throughout migration. Config changes
+apply on startup, not by hot reload. Existing connections remain usable until
+they close; reconnects use the configured endpoint and its current DNS result.
 
 ## Initialize a network
 

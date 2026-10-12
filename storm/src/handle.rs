@@ -11,6 +11,25 @@ use crate::{
 };
 
 impl StormHandle {
+    /// Overrides an identity's endpoint in current and future peer tables.
+    ///
+    /// Existing connections remain open. Reconnection resolves DNS again, and
+    /// configuring an address does not authorize a new network member.
+    pub async fn set_peer_address(
+        &self,
+        public_key: [u8; 33],
+        address: String,
+    ) -> Result<(), Error> {
+        PublicKey::from_slice(&public_key).map_err(|_| Error::UnauthorizedConnection)?;
+        crate::validate_socket_address(&address)?;
+
+        let mut state = self.inner.write().await;
+        state.address_overrides.insert(public_key, address);
+        state.apply_address_overrides();
+
+        Ok(())
+    }
+
     /// Restricts migration peer tables to one Noise-authenticated transport identity.
     pub async fn set_peer_table_authority(&self, authority: [u8; 33]) -> Result<(), Error> {
         PublicKey::from_slice(&authority).map_err(|_| Error::UnauthorizedConnection)?;

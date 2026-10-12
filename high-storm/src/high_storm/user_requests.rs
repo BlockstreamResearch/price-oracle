@@ -1400,22 +1400,9 @@ fn follow_mempool_token_chain(
     expected_script: &[u8],
 ) -> Result<UTXO, UserRequestError> {
     for _ in 0..MAX_MEMPOOL_TOKEN_CHAIN_LENGTH {
-        let results: Vec<SpendingPrevout> = client.call(
-            "gettxspendingprevout",
-            &[serde_json::json!([{
-                "txid": token.outpoint.txid.to_string(),
-                "vout": token.outpoint.vout,
-            }])],
-        )?;
-        let Some(spending_txid) = results
-            .into_iter()
-            .next()
-            .and_then(|result| result.spending_txid)
-        else {
+        let Some(spending_txid) = find_mempool_spender(client, token.outpoint)? else {
             return Ok(token);
         };
-        let spending_txid = Txid::from_str(&spending_txid)
-            .map_err(|_| UserRequestError::Invalid("invalid token spender txid".into()))?;
         let transaction = get_raw_transaction(client, spending_txid, None)?;
         if !transaction
             .input
@@ -1449,6 +1436,57 @@ fn follow_mempool_token_chain(
     Err(UserRequestError::Invalid(format!(
         "unconfirmed token chain exceeds {MAX_MEMPOOL_TOKEN_CHAIN_LENGTH} transactions"
     )))
+}
+
+fn find_mempool_spender(
+    client: &Client,
+    outpoint: OutPoint,
+) -> Result<Option<Txid>, UserRequestError> {
+    match client.call::<Vec<SpendingPrevout>>(
+        "gettxspendingprevout",
+        &[serde_json::json!([{
+            "txid": outpoint.txid.to_string(),
+            "vout": outpoint.vout,
+        }])],
+    ) {
+        Ok(results) => {
+            return results
+                .into_iter()
+                .next()
+                .and_then(|result| result.spending_txid)
+                .map(|txid| {
+                    Txid::from_str(&txid)
+                        .map_err(|_| UserRequestError::Invalid("invalid token spender txid".into()))
+                })
+                .transpose();
+        }
+        Err(bitcoincore_rpc::Error::JsonRpc(bitcoincore_rpc::jsonrpc::error::Error::Rpc(
+            error,
+        ))) if error.code == -32601 => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let mempool: Vec<String> = client.call("getrawmempool", &[])?;
+    for txid in mempool {
+        let txid = Txid::from_str(&txid)
+            .map_err(|_| UserRequestError::Invalid("invalid mempool txid".into()))?;
+        let transaction = match get_raw_transaction(client, txid, None) {
+            Ok(transaction) => transaction,
+            Err(UserRequestError::Rpc(bitcoincore_rpc::Error::JsonRpc(
+                bitcoincore_rpc::jsonrpc::error::Error::Rpc(error),
+            ))) if error.code == -5 => continue,
+            Err(error) => return Err(error),
+        };
+        if transaction
+            .input
+            .iter()
+            .any(|input| input.previous_output == outpoint)
+        {
+            return Ok(Some(txid));
+        }
+    }
+
+    Ok(None)
 }
 
 fn token_candidate(
@@ -2403,6 +2441,131 @@ mod tests {
     const NOW: u64 = 1_700_000_000;
     const LBTC_USDT: FeedId = 4;
     const SIBLING: [u8; 32] = [3; 32];
+
+    #[tokio::test]
+    async fn mempool_spender_supports_missing_rpc_without_hiding_other_errors() {
+        use simplex::simplicityhl::elements::{LockTime, Transaction, TxIn};
+        use std::{
+            collections::VecDeque,
+            sync::{Arc, Mutex},
+        };
+
+        let outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 2);
+        let transaction = Transaction {
+            version: 2,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                ..Default::default()
+            }],
+            output: vec![],
+        };
+        let txid = transaction.txid();
+        let missing = serde_json::json!({"code": -32601, "message": "Method not found"});
+        let unavailable = serde_json::json!({"code": -5, "message": "No such mempool transaction"});
+        let failure = serde_json::json!({"code": -1, "message": "RPC failure"});
+        let cases = vec![
+            (
+                vec![
+                    (
+                        "gettxspendingprevout",
+                        serde_json::Value::Null,
+                        missing.clone(),
+                    ),
+                    (
+                        "getrawmempool",
+                        serde_json::json!([txid]),
+                        serde_json::Value::Null,
+                    ),
+                    (
+                        "getrawtransaction",
+                        serde_json::json!(hex::encode(encode::serialize(&transaction))),
+                        serde_json::Value::Null,
+                    ),
+                ],
+                Ok(Some(txid)),
+            ),
+            (
+                vec![
+                    (
+                        "gettxspendingprevout",
+                        serde_json::Value::Null,
+                        missing.clone(),
+                    ),
+                    (
+                        "getrawmempool",
+                        serde_json::json!([]),
+                        serde_json::Value::Null,
+                    ),
+                ],
+                Ok(None),
+            ),
+            (
+                vec![
+                    ("gettxspendingprevout", serde_json::Value::Null, missing),
+                    (
+                        "getrawmempool",
+                        serde_json::json!([txid]),
+                        serde_json::Value::Null,
+                    ),
+                    ("getrawtransaction", serde_json::Value::Null, unavailable),
+                ],
+                Ok(None),
+            ),
+            (
+                vec![(
+                    "gettxspendingprevout",
+                    serde_json::json!([{"spendingtxid": txid}]),
+                    serde_json::Value::Null,
+                )],
+                Ok(Some(txid)),
+            ),
+            (
+                vec![(
+                    "gettxspendingprevout",
+                    serde_json::json!([{}]),
+                    serde_json::Value::Null,
+                )],
+                Ok(None),
+            ),
+            (
+                vec![("gettxspendingprevout", serde_json::Value::Null, failure)],
+                Err(()),
+            ),
+        ];
+
+        for (responses, expected) in cases {
+            let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+            let pending = responses.clone();
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                    let (method, result, error) = responses.lock().unwrap().pop_front().unwrap();
+                    assert_eq!(request["method"], method);
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "id": request["id"], "result": result, "error": error,
+                        }))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let result = tokio::task::spawn_blocking(move || {
+                let client = Client::new(&format!("http://{address}"), Auth::None).unwrap();
+                find_mempool_spender(&client, outpoint).map_err(|_| ())
+            })
+            .await
+            .unwrap();
+            server.abort();
+
+            assert_eq!(result, expected);
+            assert!(pending.lock().unwrap().is_empty());
+        }
+    }
 
     /// A round whose second signature covers `price`, as the signers produce it.
     fn round_signed_over(price: &PriceFeedData) -> SigningResult {
