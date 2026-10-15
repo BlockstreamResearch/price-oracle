@@ -15,11 +15,13 @@ use crate::{HighStormHandle, config::PriceSourcesConfig, high_storm::PollOutcome
 
 use blockstream::Blockstream;
 use coingecko::CoinGecko;
+use sideswap::SideSwap;
 
 /// Each source's index in every feed's state, for this run only: a persisted
 /// freeze names the source by its `NAME`, so an index may change.
 const COINGECKO: usize = 0;
 const BLOCKSTREAM: usize = 1;
+const SIDESWAP: usize = 2;
 
 /// CoinGecko's edge refuses a request that names no client.
 const USER_AGENT: &str = concat!("high-storm/", env!("CARGO_PKG_VERSION"));
@@ -33,7 +35,7 @@ pub fn spawn(
     node: HighStormHandle,
 ) -> Result<Arc<Notify>, reqwest::Error> {
     let observed = Arc::new(Notify::new());
-    if config.coingecko.is_none() && config.blockstream.is_none() {
+    if config.coingecko.is_none() && config.blockstream.is_none() && config.sideswap.is_none() {
         tracing::warn!("no price source is configured, so this node attests no prices");
     }
     if let Some(coingecko) = &config.coingecko {
@@ -52,6 +54,11 @@ pub fn spawn(
             &node,
             &observed,
         );
+    }
+    if let Some(sideswap) = &config.sideswap {
+        let source = SideSwap::new(sideswap, node.clone());
+        let feeds: Vec<_> = source.feeds().collect();
+        spawn_source(source, SIDESWAP, SideSwap::NAME, feeds, &node, &observed);
     }
     Ok(observed)
 }
