@@ -1,5 +1,6 @@
 pub mod blockstream;
 pub mod coingecko;
+pub mod sideswap;
 
 use std::{future::Future, sync::Arc, time::Duration};
 

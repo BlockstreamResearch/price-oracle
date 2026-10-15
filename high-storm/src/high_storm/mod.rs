@@ -822,6 +822,14 @@ impl HighStormHandle {
         self.state.prices().record_failure(feed, source).await
     }
 
+    /// This node's own reduced value for the feed, before any attestation.
+    pub async fn price_feed_value(
+        &self,
+        feed: price_feed::FeedId,
+    ) -> Option<price_feed::PriceFeedData> {
+        self.state.prices().value(feed).await
+    }
+
     pub async fn poll_price_source<S: price_feed::PriceSource>(
         &self,
         feed: price_feed::FeedId,
