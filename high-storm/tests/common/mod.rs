@@ -11,6 +11,7 @@ use secp256k1_zkp::{Secp256k1, SecretKey};
 
 pub struct TestNode {
     pub config: Config,
+    #[allow(dead_code)]
     pub public_key: String,
     pub store: NetworkStore,
     #[allow(dead_code)]
@@ -86,6 +87,7 @@ impl TestNode {
         }
     }
 
+    #[allow(dead_code)]
     pub fn address(&self) -> String {
         format!("127.0.0.1:{}", self.config.service.port)
     }
