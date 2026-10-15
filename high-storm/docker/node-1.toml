@@ -38,6 +38,10 @@ finality_confirmations = 2
 # without one they soon exhaust the public rate limit.
 # api_key = ""
 
+[service.price_sources.blockstream]
+
+[service.price_sources.sideswap]
+
 [service.db]
 # PostgreSQL host and port on the Compose network.
 url = "postgres:5432"

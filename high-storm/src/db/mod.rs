@@ -5,6 +5,7 @@ pub mod network;
 pub mod network_asset;
 pub mod node_operator;
 pub mod price_attestation;
+pub mod price_source;
 pub mod user_request;
 pub mod voting;
 
@@ -17,6 +18,7 @@ use monitored_utxo::MonitoredUtxoStore;
 use network::NetworkStore;
 use network_asset::NetworkAssetStore;
 use price_attestation::PriceAttestationStore;
+use price_source::FrozenPriceSourceStore;
 use user_request::UserRequestStore;
 use voting::VotingStore;
 
@@ -74,6 +76,10 @@ impl Database {
 
     pub fn price_attestations(&self) -> PriceAttestationStore {
         PriceAttestationStore::new(self.pool.clone())
+    }
+
+    pub fn frozen_price_sources(&self) -> FrozenPriceSourceStore {
+        FrozenPriceSourceStore::new(self.pool.clone())
     }
 
     pub fn user_requests(&self) -> UserRequestStore {

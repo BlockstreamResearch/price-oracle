@@ -51,6 +51,15 @@ finality_confirmations = 2
 # Optional CoinGecko Demo API key. Without one, the public per-IP rate limit applies.
 # api_key = ""
 
+# Blockstream's Liquid asset price API. It needs no credentials. It starts frozen:
+# the API refreshes hourly, too seldom for the 5-minute source data validity
+# duration. Unfreeze it per feed from the operator app once it refreshes faster.
+[service.price_sources.blockstream]
+
+# SideSwap's Liquid order books, which price LBTC, EURx and DePix in USDt. They are
+# converted to USD with the USDT/USD price, so another source must price USDT.
+[service.price_sources.sideswap]
+
 [service.db]
 # PostgreSQL host and optional port, without a URL scheme.
 url = "localhost:5432"
