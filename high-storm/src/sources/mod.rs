@@ -1,9 +1,10 @@
+pub mod blockstream;
 pub mod coingecko;
 
 use std::{future::Future, sync::Arc, time::Duration};
 
 use price_feed::{
-    FeedId,
+    Asset, FeedId,
     constants::{BACKOFF_CAP, POLLING_INTERVAL},
 };
 use rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
@@ -77,6 +78,18 @@ fn tls() -> ClientConfig {
         .expect("aws-lc-rs supports the default protocol versions")
         .with_root_certificates(roots)
         .with_no_client_auth()
+}
+
+/// The id an asset is issued under on Liquid, for the sources that name
+/// assets by it. USD is no Liquid asset, and USDC is not issued there.
+fn liquid_asset_id(asset: Asset) -> Option<&'static str> {
+    match asset {
+        Asset::Lbtc => Some("6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d"),
+        Asset::Usdt => Some("ce091c998b83c78bb71a632313ba3760f1763d9cfcffae02258ffa9865a37bd2"),
+        Asset::Eurx => Some("18729918ab4bca843656f08d4dd877bed6641fbd596a0a963abbf199cfeb3cec"),
+        Asset::DePix => Some("02f22f8d9c76ab41661a2729e4752e2c5d1a263012141b86ea98af5472df5189"),
+        Asset::Usd | Asset::Usdc => None,
+    }
 }
 
 /// A price that is missing or not a usable number becomes zero, which

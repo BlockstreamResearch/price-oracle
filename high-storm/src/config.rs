@@ -119,7 +119,13 @@ pub struct DbConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct PriceSourcesConfig {
     pub coingecko: Option<CoinGeckoConfig>,
+    pub blockstream: Option<BlockstreamConfig>,
 }
+
+/// The Blockstream price API needs no credentials; the section's presence is
+/// what enables the source.
+#[derive(Clone, Debug, Deserialize)]
+pub struct BlockstreamConfig {}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct CoinGeckoConfig {
