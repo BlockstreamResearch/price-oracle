@@ -26,6 +26,16 @@ impl SourceObservation {
             valid_until: received_at.saturating_add(VALIDITY_WINDOW),
         }
     }
+
+    /// Caps how long the observation stays valid, for a source that composes
+    /// its price from a value of its own: the result is no fresher than its
+    /// stalest input, the rule `cross::compute` applies to a Cross pair. Only
+    /// `valid_until` moves, so `observed_at` keeps saying when the source
+    /// itself last saw the price change.
+    pub fn valid_no_later_than(mut self, valid_until: u64) -> Self {
+        self.valid_until = self.valid_until.min(valid_until);
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -121,6 +131,26 @@ mod tests {
             SourceObservation::new(100, 8, NOW, u64::MAX).valid_until,
             u64::MAX
         );
+    }
+
+    #[test]
+    fn caps_the_window_at_a_composed_price_stalest_input() {
+        let leg = NOW + 10;
+
+        let capped = observation().valid_no_later_than(leg);
+
+        assert_eq!(capped.valid_until, leg);
+        // A later input never extends the window past the source's own.
+        assert_eq!(
+            observation()
+                .valid_no_later_than(NOW + 2 * VALIDITY_WINDOW)
+                .valid_until,
+            NOW + VALIDITY_WINDOW
+        );
+        // The capped observation is still as fresh as the source says, so a
+        // composed price that moved is not mistaken for a stale one.
+        assert_eq!(capped.observed_at, observation().observed_at);
+        assert_eq!(Source::validate(&capped, None), Ok(()));
     }
 
     #[test]
