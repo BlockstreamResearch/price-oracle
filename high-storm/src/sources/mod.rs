@@ -6,6 +6,7 @@ use price_feed::{
     FeedId,
     constants::{BACKOFF_CAP, POLLING_INTERVAL},
 };
+use rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
 use tokio::{sync::Notify, time::MissedTickBehavior};
 
 use crate::{
@@ -20,6 +21,11 @@ use coingecko::CoinGecko;
 /// freeze names the source by `CoinGecko::NAME`, so an index may change.
 const COINGECKO: usize = 0;
 const COINGECKO_NAME: &str = "coingecko";
+
+/// CoinGecko's edge refuses a request that names no client.
+const USER_AGENT: &str = concat!("high-storm/", env!("CARGO_PKG_VERSION"));
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Polls every configured source, each feed on its own task. The returned
 /// `Notify` fires on every new observation, which is when the node attests.
@@ -75,6 +81,38 @@ async fn register(node: &HighStormHandle, feed: FeedId, index: usize, name: &'st
                 return;
             }
         }
+    }
+}
+
+fn http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .use_preconfigured_tls(tls())
+        .user_agent(USER_AGENT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+}
+
+/// reqwest's rustls backend brings no crypto of its own, so the client carries
+/// its TLS configuration instead of relying on a process-wide default.
+fn tls() -> ClientConfig {
+    let roots = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("aws-lc-rs supports the default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth()
+}
+
+/// A price that is missing or not a usable number becomes zero, which
+/// `validate` rejects as `InvalidPrice`.
+fn base_units(price: Option<f64>, decimals: u32) -> u64 {
+    let scaled = price.unwrap_or_default() * 10f64.powi(decimals as i32);
+    if (0.0..u64::MAX as f64).contains(&scaled) {
+        scaled.round() as u64
+    } else {
+        0
     }
 }
 
