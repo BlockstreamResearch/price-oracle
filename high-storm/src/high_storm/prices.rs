@@ -1103,6 +1103,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_new_node_starts_with_blockstream_frozen_until_it_is_unfrozen() {
+        let prices = prices().await;
+        for feed in [LBTC_USD, 1, 2, 3] {
+            prices.register_source(feed, 0, COINGECKO).await.unwrap();
+            prices
+                .register_source(feed, 1, "blockstream")
+                .await
+                .unwrap();
+        }
+
+        let listed = prices.sources().await.unwrap();
+        for feed in [LBTC_USD, 1, 2, 3] {
+            assert_eq!(
+                source_state(&listed, feed, "blockstream"),
+                SourceState::Frozen
+            );
+            assert_eq!(source_state(&listed, feed, COINGECKO), SourceState::Active);
+        }
+
+        prices
+            .set_source_frozen(LBTC_USD, "blockstream", false)
+            .await
+            .unwrap();
+        let listed = prices.sources().await.unwrap();
+        assert_eq!(
+            source_state(&listed, LBTC_USD, "blockstream"),
+            SourceState::Active
+        );
+    }
+
+    #[tokio::test]
     async fn stops_polling_a_frozen_source_and_its_feed_goes_unavailable() {
         let prices = prices().await;
         let source = Fake::answering(Ok(SourceObservation::new(100, 8, NOW, NOW)));
