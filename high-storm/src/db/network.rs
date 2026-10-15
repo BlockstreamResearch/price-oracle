@@ -10,7 +10,7 @@ use storm::{Peer, PeerStatus};
 use super::{
     chain::ChainStore, droplet::DropletStore, monitored_utxo::MonitoredUtxoStore,
     network_asset::NetworkAssetStore, price_attestation::PriceAttestationStore,
-    user_request::UserRequestStore, voting::VotingStore,
+    price_source::FrozenPriceSourceStore, user_request::UserRequestStore, voting::VotingStore,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +72,10 @@ impl NetworkStore {
 
     pub(crate) fn price_attestations(&self) -> PriceAttestationStore {
         PriceAttestationStore::new(self.pool.clone())
+    }
+
+    pub(crate) fn frozen_price_sources(&self) -> FrozenPriceSourceStore {
+        FrozenPriceSourceStore::new(self.pool.clone())
     }
 
     pub(crate) fn user_requests(&self) -> UserRequestStore {

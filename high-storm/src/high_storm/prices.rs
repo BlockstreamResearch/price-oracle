@@ -1,8 +1,12 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use price_feed::{
-    Clock, FeedAvailability, FeedId, FeedRegistry, FeedStates, PriceFeedData, PriceSource,
-    RejectionReason, SourceObservation, ValidationError, instruction,
+    Clock, FeedAvailability, FeedDefinition, FeedId, FeedRegistry, FeedStates, PriceFeedData,
+    PriceSource, RejectionReason, SourceObservation, SourceState, SourceStatus, ValidationError,
+    instruction,
 };
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, schnorr};
 use secp256k1_zkp::PublicKey as TransportPublicKey;
@@ -10,7 +14,7 @@ use storm::{StormContext, StormHandle};
 use tokio::sync::Mutex;
 
 use crate::crypto::tagged_hash;
-use crate::db::price_attestation::PriceAttestationStore;
+use crate::db::{price_attestation::PriceAttestationStore, price_source::FrozenPriceSourceStore};
 
 use super::{
     AttestPriceMsg, NodeMessage, NodeMessageKind, PriceAttestation,
@@ -49,6 +53,43 @@ pub enum PriceError {
     NotAMember(String),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum PriceSourceError {
+    #[error("frozen price source database operation failed: {0}")]
+    Database(#[from] crate::db::price_source::Error),
+    #[error("feed {0} is not in the registry")]
+    UnknownFeed(FeedId),
+    #[error("feed {0} is a cross pair, which is priced from other feeds and has no sources")]
+    CrossPair(FeedId),
+    #[error("feed {feed} has no source '{name}'")]
+    UnknownSource { feed: FeedId, name: String },
+    #[error("price source {index} is already registered as '{registered}', not '{name}'")]
+    RenamedSource {
+        index: usize,
+        registered: &'static str,
+        name: &'static str,
+    },
+}
+
+/// One source of a Direct feed, as this node's operator sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PriceSourceInfo {
+    /// What a freeze is persisted by, and the operator names it by.
+    pub name: &'static str,
+    pub status: SourceStatus,
+    /// When the operator froze it, `None` while it is not frozen.
+    pub frozen_at: Option<u64>,
+}
+
+/// A Direct feed and the sources this node prices it from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeedSources {
+    pub feed: FeedDefinition,
+    /// Whether this node holds a price of its own for the feed.
+    pub available: bool,
+    pub sources: Vec<PriceSourceInfo>,
+}
+
 /// What a client reads for one feed: this node's own attestation, and the
 /// ones it holds from the other members.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,14 +123,23 @@ pub enum PollOutcome {
 #[derive(Clone)]
 pub(crate) struct Prices {
     store: PriceAttestationStore,
+    frozen: FrozenPriceSourceStore,
     registry: FeedRegistry,
     keypair: Keypair,
     clock: Clock,
     feeds: Arc<Mutex<FeedStates>>,
+    /// The name of the source at each index of a feed's state. An index is
+    /// where this run polls a source; only a name outlives a restart.
+    source_names: Arc<Mutex<BTreeMap<usize, &'static str>>>,
 }
 
 impl Prices {
-    pub(crate) fn new(secret_key: [u8; 32], store: PriceAttestationStore, clock: Clock) -> Self {
+    pub(crate) fn new(
+        secret_key: [u8; 32],
+        store: PriceAttestationStore,
+        frozen: FrozenPriceSourceStore,
+        clock: Clock,
+    ) -> Self {
         let secret_key = SecretKey::from_secret_bytes(secret_key)
             .expect("the transport signer key was already validated");
         let registry = FeedRegistry::default();
@@ -98,7 +148,9 @@ impl Prices {
                 FeedStates::new(&registry, clock)
                     .expect("the built-in registry routes every Cross pair"),
             )),
+            source_names: Arc::default(),
             store,
+            frozen,
             registry,
             clock,
             keypair: Keypair::from_secret_key(&secret_key),
@@ -122,6 +174,112 @@ impl Prices {
         if let Some(state) = feeds.get_mut(feed) {
             state.record_poll_failure(source);
         }
+    }
+
+    /// Lists the source at `index` under `feed` before it first reports,
+    /// frozen again if this node's operator froze it, by `name`, before a
+    /// restart.
+    pub(crate) async fn register_source(
+        &self,
+        feed: FeedId,
+        index: usize,
+        name: &'static str,
+    ) -> Result<(), PriceSourceError> {
+        let mut feeds = self.feeds.lock().await;
+        let state = direct_feed(&self.registry, &mut feeds, feed)?;
+        {
+            let mut names = self.source_names.lock().await;
+            match names.get(&index) {
+                Some(registered) if *registered != name => {
+                    return Err(PriceSourceError::RenamedSource {
+                        index,
+                        registered,
+                        name,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    names.insert(index, name);
+                }
+            }
+        }
+        state.register(index);
+        if self.frozen.frozen_at(feed, name).await?.is_some() {
+            state.freeze(index);
+        }
+        Ok(())
+    }
+
+    /// Freezing is this node's own decision and is not broadcast: it changes
+    /// only the price this node attests and signs. The freeze is persisted
+    /// first, and under the lock, so a restart freezes exactly what is frozen.
+    pub(crate) async fn set_source_frozen(
+        &self,
+        feed: FeedId,
+        name: &str,
+        frozen: bool,
+    ) -> Result<(), PriceSourceError> {
+        let mut feeds = self.feeds.lock().await;
+        let state = direct_feed(&self.registry, &mut feeds, feed)?;
+        let index = self
+            .source_names
+            .lock()
+            .await
+            .iter()
+            .find_map(|(index, registered)| (*registered == name).then_some(*index))
+            .filter(|index| state.is_registered(*index))
+            .ok_or_else(|| PriceSourceError::UnknownSource {
+                feed,
+                name: name.to_string(),
+            })?;
+        if frozen {
+            self.frozen.freeze(feed, name, self.clock.now()).await?;
+            state.freeze(index);
+        } else {
+            self.frozen.unfreeze(feed, name).await?;
+            state.unfreeze(index);
+        }
+        Ok(())
+    }
+
+    /// Every Direct feed in id order, with the sources registered for it.
+    pub(crate) async fn sources(&self) -> Result<Vec<FeedSources>, PriceSourceError> {
+        let mut listed: Vec<FeedSources> = {
+            let feeds = self.feeds.lock().await;
+            let names = self.source_names.lock().await;
+            self.registry
+                .feeds()
+                .filter_map(|definition| {
+                    let state = feeds.get(definition.id)?;
+                    Some(FeedSources {
+                        feed: *definition,
+                        available: state.is_available(),
+                        // A source is listed once it is registered, which
+                        // is what names it.
+                        sources: state
+                            .sources()
+                            .filter_map(|(index, status)| {
+                                Some(PriceSourceInfo {
+                                    name: names.get(&index)?,
+                                    status,
+                                    frozen_at: None,
+                                })
+                            })
+                            .collect(),
+                    })
+                })
+                .collect()
+        };
+        // The freeze times are read from the database once the lock is
+        // released, so listing never holds up polling.
+        for feed in &mut listed {
+            for source in &mut feed.sources {
+                if source.status.state == SourceState::Frozen {
+                    source.frozen_at = self.frozen.frozen_at(feed.feed.id, source.name).await?;
+                }
+            }
+        }
+        Ok(listed)
     }
 
     /// Polls `source`, the one at `index` in the feed's state, if that state
@@ -329,6 +487,18 @@ impl Prices {
             feed,
         }
     }
+}
+
+/// Only a Direct feed has sources of its own.
+fn direct_feed<'a>(
+    registry: &FeedRegistry,
+    feeds: &'a mut FeedStates,
+    feed: FeedId,
+) -> Result<&'a mut price_feed::FeedState, PriceSourceError> {
+    if registry.get(feed).is_none() {
+        return Err(PriceSourceError::UnknownFeed(feed));
+    }
+    feeds.get_mut(feed).ok_or(PriceSourceError::CrossPair(feed))
 }
 
 async fn send(
@@ -742,11 +912,15 @@ mod tests {
     }
 
     async fn prices() -> Prices {
-        let store = crate::db::Database::connect("sqlite::memory:", 1)
+        let database = crate::db::Database::connect("sqlite::memory:", 1)
             .await
-            .unwrap()
-            .price_attestations();
-        Prices::new([7; 32], store, Clock::Fixed(NOW))
+            .unwrap();
+        Prices::new(
+            [7; 32],
+            database.price_attestations(),
+            database.frozen_price_sources(),
+            Clock::Fixed(NOW),
+        )
     }
 
     /// `prices()` signs with this key, so this is its own attestation.
@@ -874,6 +1048,229 @@ mod tests {
             PollOutcome::Skipped
         );
         assert_eq!(unreachable.polls(), MAX_POLLING_ERROR_NUM as usize);
+    }
+
+    const USDT_USD: FeedId = 1;
+    const LBTC_USDT: FeedId = 4;
+
+    async fn database() -> crate::db::Database {
+        crate::db::Database::connect("sqlite::memory:", 1)
+            .await
+            .unwrap()
+    }
+
+    fn prices_on(database: &crate::db::Database) -> Prices {
+        Prices::new(
+            [7; 32],
+            database.price_attestations(),
+            database.frozen_price_sources(),
+            Clock::Fixed(NOW),
+        )
+    }
+
+    const COINGECKO: &str = "coingecko";
+    const KRAKEN: &str = "kraken";
+
+    fn source_state(listed: &[FeedSources], feed: FeedId, name: &str) -> SourceState {
+        listed
+            .iter()
+            .find(|listed| listed.feed.id == feed)
+            .and_then(|listed| listed.sources.iter().find(|source| source.name == name))
+            .unwrap()
+            .status
+            .state
+    }
+
+    #[tokio::test]
+    async fn lists_every_direct_feed_with_its_registered_sources() {
+        let prices = prices().await;
+        prices
+            .register_source(LBTC_USD, 0, COINGECKO)
+            .await
+            .unwrap();
+
+        let listed = prices.sources().await.unwrap();
+
+        let ids: Vec<_> = listed.iter().map(|feed| feed.feed.id).collect();
+        assert_eq!(ids, [0, 1, 2, 3, 7]);
+        assert_eq!(listed[0].sources.len(), 1);
+        assert_eq!(
+            source_state(&listed, LBTC_USD, COINGECKO),
+            SourceState::Active
+        );
+        assert!(listed[1].sources.is_empty());
+        assert!(!listed[0].available);
+    }
+
+    #[tokio::test]
+    async fn stops_polling_a_frozen_source_and_its_feed_goes_unavailable() {
+        let prices = prices().await;
+        let source = Fake::answering(Ok(SourceObservation::new(100, 8, NOW, NOW)));
+        prices
+            .register_source(LBTC_USD, 0, COINGECKO)
+            .await
+            .unwrap();
+        prices.poll(LBTC_USD, 0, &source).await;
+        assert!(prices.value(LBTC_USD).await.is_some());
+
+        prices
+            .set_source_frozen(LBTC_USD, COINGECKO, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prices.poll(LBTC_USD, 0, &source).await,
+            PollOutcome::Skipped
+        );
+        assert_eq!(source.polls(), 1);
+        assert_eq!(prices.value(LBTC_USD).await, None);
+        // A Cross pair with the frozen leg goes with it.
+        assert_eq!(prices.value(LBTC_USDT).await, None);
+        let listed = prices.sources().await.unwrap();
+        assert_eq!(listed[0].sources[0].frozen_at, Some(NOW));
+    }
+
+    #[tokio::test]
+    async fn unfreezing_resumes_polling_the_source() {
+        let prices = prices().await;
+        let source = Fake::answering(Ok(SourceObservation::new(100, 8, NOW, NOW)));
+        prices
+            .register_source(LBTC_USD, 0, COINGECKO)
+            .await
+            .unwrap();
+        prices
+            .set_source_frozen(LBTC_USD, COINGECKO, true)
+            .await
+            .unwrap();
+
+        prices
+            .set_source_frozen(LBTC_USD, COINGECKO, false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prices.poll(LBTC_USD, 0, &source).await,
+            PollOutcome::Observed
+        );
+        let listed = prices.sources().await.unwrap();
+        assert_eq!(
+            source_state(&listed, LBTC_USD, COINGECKO),
+            SourceState::Active
+        );
+        assert_eq!(listed[0].sources[0].frozen_at, None);
+    }
+
+    #[tokio::test]
+    async fn freezes_a_source_again_when_it_registers_after_a_restart() {
+        let database = database().await;
+        let before = prices_on(&database);
+        before
+            .register_source(LBTC_USD, 0, COINGECKO)
+            .await
+            .unwrap();
+        before
+            .register_source(USDT_USD, 0, COINGECKO)
+            .await
+            .unwrap();
+        before
+            .set_source_frozen(LBTC_USD, COINGECKO, true)
+            .await
+            .unwrap();
+
+        let after = prices_on(&database);
+        after.register_source(LBTC_USD, 0, COINGECKO).await.unwrap();
+        after.register_source(USDT_USD, 0, COINGECKO).await.unwrap();
+
+        let listed = after.sources().await.unwrap();
+        assert_eq!(
+            source_state(&listed, LBTC_USD, COINGECKO),
+            SourceState::Frozen
+        );
+        assert_eq!(
+            source_state(&listed, USDT_USD, COINGECKO),
+            SourceState::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_a_source_frozen_when_a_restart_polls_it_at_another_index() {
+        let database = database().await;
+        let before = prices_on(&database);
+        before
+            .register_source(LBTC_USD, 0, COINGECKO)
+            .await
+            .unwrap();
+        before
+            .set_source_frozen(LBTC_USD, COINGECKO, true)
+            .await
+            .unwrap();
+
+        // A new version polls another source first, so CoinGecko moves to 1.
+        let after = prices_on(&database);
+        after.register_source(LBTC_USD, 0, KRAKEN).await.unwrap();
+        after.register_source(LBTC_USD, 1, COINGECKO).await.unwrap();
+
+        let listed = after.sources().await.unwrap();
+        assert_eq!(
+            source_state(&listed, LBTC_USD, COINGECKO),
+            SourceState::Frozen
+        );
+        assert_eq!(source_state(&listed, LBTC_USD, KRAKEN), SourceState::Active);
+        let skipped = Fake::answering(Ok(SourceObservation::new(100, 8, NOW, NOW)));
+        assert_eq!(
+            after.poll(LBTC_USD, 1, &skipped).await,
+            PollOutcome::Skipped
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_one_index_registered_under_two_names() {
+        let prices = prices().await;
+        prices
+            .register_source(LBTC_USD, 0, COINGECKO)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            prices.register_source(USDT_USD, 0, KRAKEN).await,
+            Err(PriceSourceError::RenamedSource { index: 0, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn refuses_to_freeze_what_has_no_source() {
+        let prices = prices().await;
+        prices
+            .register_source(LBTC_USD, 0, COINGECKO)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            prices.set_source_frozen(99, COINGECKO, true).await,
+            Err(PriceSourceError::UnknownFeed(99))
+        ));
+        assert!(matches!(
+            prices.set_source_frozen(LBTC_USDT, COINGECKO, true).await,
+            Err(PriceSourceError::CrossPair(LBTC_USDT))
+        ));
+        assert!(matches!(
+            prices.set_source_frozen(LBTC_USD, KRAKEN, true).await,
+            Err(PriceSourceError::UnknownSource { feed: LBTC_USD, .. })
+        ));
+        // A source registered for one feed is not one of another's.
+        assert!(matches!(
+            prices.set_source_frozen(USDT_USD, COINGECKO, true).await,
+            Err(PriceSourceError::UnknownSource { feed: USDT_USD, .. })
+        ));
+        // Nothing was persisted for any of them.
+        for (feed, source) in [
+            (99, COINGECKO),
+            (LBTC_USDT, COINGECKO),
+            (LBTC_USD, KRAKEN),
+            (USDT_USD, COINGECKO),
+        ] {
+            assert_eq!(prices.frozen.frozen_at(feed, source).await.unwrap(), None);
+        }
     }
 
     #[tokio::test]

@@ -117,7 +117,12 @@ impl NetworkState {
             .map_or(true, |state| state.migration_paused);
 
         // An issuance round instructs a rate from these, and checks one.
-        let prices = Prices::new(secret_key, price_attestations, price_feed::Clock::System);
+        let prices = Prices::new(
+            secret_key,
+            price_attestations,
+            network_store.frozen_price_sources(),
+            price_feed::Clock::System,
+        );
 
         Self {
             network_store,
