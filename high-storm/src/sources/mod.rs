@@ -4,7 +4,7 @@ pub mod coingecko;
 use std::{future::Future, sync::Arc, time::Duration};
 
 use price_feed::{
-    Asset, FeedId,
+    Asset, FeedId, PriceSource,
     constants::{BACKOFF_CAP, POLLING_INTERVAL},
 };
 use rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
@@ -16,12 +16,13 @@ use crate::{
     high_storm::{PollOutcome, PriceSourceError},
 };
 
+use blockstream::Blockstream;
 use coingecko::CoinGecko;
 
-/// The source's index in every feed's state, for this run only: a persisted
-/// freeze names the source by `CoinGecko::NAME`, so an index may change.
+/// Each source's index in every feed's state, for this run only: a persisted
+/// freeze names the source by its `NAME`, so an index may change.
 const COINGECKO: usize = 0;
-const COINGECKO_NAME: &str = "coingecko";
+const BLOCKSTREAM: usize = 1;
 
 /// CoinGecko's edge refuses a request that names no client.
 const USER_AGENT: &str = concat!("high-storm/", env!("CARGO_PKG_VERSION"));
@@ -35,28 +36,52 @@ pub fn spawn(
     node: HighStormHandle,
 ) -> Result<Arc<Notify>, reqwest::Error> {
     let observed = Arc::new(Notify::new());
-    let Some(coingecko) = &config.coingecko else {
+    if config.coingecko.is_none() && config.blockstream.is_none() {
         tracing::warn!("no price source is configured, so this node attests no prices");
-        return Ok(observed);
-    };
-    let source = Arc::new(CoinGecko::new(coingecko)?);
-    for feed in source.feeds() {
-        crate::monitoring::register_price_source(feed, COINGECKO, COINGECKO_NAME);
-        let (node, source) = (node.clone(), source.clone());
-        let observed = observed.clone();
+    }
+    if let Some(coingecko) = &config.coingecko {
+        let source = CoinGecko::new(coingecko)?;
+        let feeds: Vec<_> = source.feeds().collect();
+        spawn_source(source, COINGECKO, CoinGecko::NAME, feeds, &node, &observed);
+    }
+    if let Some(blockstream) = &config.blockstream {
+        let source = Blockstream::new(blockstream)?;
+        let feeds: Vec<_> = source.feeds().collect();
+        spawn_source(
+            source,
+            BLOCKSTREAM,
+            Blockstream::NAME,
+            feeds,
+            &node,
+            &observed,
+        );
+    }
+    Ok(observed)
+}
+
+fn spawn_source<S>(
+    source: S,
+    index: usize,
+    name: &'static str,
+    feeds: Vec<FeedId>,
+    node: &HighStormHandle,
+    observed: &Arc<Notify>,
+) where
+    S: PriceSource + Send + Sync + 'static,
+{
+    let source = Arc::new(source);
+    for feed in feeds {
+        crate::monitoring::register_price_source(feed, index, name);
+        let (node, source, observed) = (node.clone(), source.clone(), observed.clone());
         tokio::spawn(async move {
-            register(&node, feed, COINGECKO, CoinGecko::NAME).await;
+            register(&node, feed, index, name).await;
             let poll = move || {
                 let (node, source) = (node.clone(), source.clone());
-                async move {
-                    node.poll_price_source(feed, COINGECKO, COINGECKO_NAME, &*source)
-                        .await
-                }
+                async move { node.poll_price_source(feed, index, name, &*source).await }
             };
             run(poll, observed).await
         });
     }
-    Ok(observed)
 }
 
 /// A source the operator froze must not be polled after a restart, so it is
