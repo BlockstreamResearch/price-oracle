@@ -153,8 +153,9 @@ async fn sideswap_drops_out_once_its_usdt_usd_source_is_frozen() {
         .unwrap();
     assert_eq!(node.price_feed_value(USDT_USD).await, None);
 
-    // The price SideSwap already gave stays in the median, as a frozen
-    // source's own does, until SideSwap is dropped for failing to convert.
+    // Freezing CoinGecko on USDT/USD leaves SideSwap itself active, so the
+    // price it already gave for LBTC stays in the median until it is dropped
+    // for failing to convert. Only the frozen source's own price goes at once.
     assert_eq!(
         node.price_feed_value(LBTC_USD).await.unwrap().price,
         83_600 * DOLLAR
