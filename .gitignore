@@ -1,6 +1,7 @@
 **/target
 /storm/config/*-peers.toml
 .vscode/
+*.code-workspace
 .DS_Store
 high-storm/.devenv-network.env
 high-storm/.devenv-nodes/
@@ -11,3 +12,4 @@ contracts/deps
 contracts/src/artifacts
 
 node_modules/
+.vite/
