@@ -8,7 +8,11 @@ use price_feed::{
 };
 use tokio::{sync::Notify, time::MissedTickBehavior};
 
-use crate::{HighStormHandle, config::PriceSourcesConfig, high_storm::PollOutcome};
+use crate::{
+    HighStormHandle,
+    config::PriceSourcesConfig,
+    high_storm::{PollOutcome, PriceSourceError},
+};
 
 use coingecko::CoinGecko;
 
@@ -46,9 +50,26 @@ pub fn spawn(
 /// A source the operator froze must not be polled after a restart, so it is
 /// not polled until the node has read whether it is frozen.
 async fn register(node: &HighStormHandle, feed: FeedId, index: usize, name: &'static str) {
-    while let Err(error) = node.register_price_source(feed, index, name).await {
-        tracing::warn!(feed, source = name, %error, "failed to register a price source; retrying");
-        tokio::time::sleep(backoff()).await;
+    loop {
+        match node.register_price_source(feed, index, name).await {
+            Ok(()) => return,
+            // Only a database failure can pass on a retry. The rest say this
+            // build asked for a feed or an index the registry does not have,
+            // which no amount of retrying changes.
+            Err(error @ PriceSourceError::Database(_)) => {
+                tracing::warn!(feed, source = name, %error, "failed to register a price source; retrying");
+                tokio::time::sleep(backoff()).await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    feed,
+                    source = name,
+                    %error,
+                    "cannot register a price source, so this feed is not polled for it",
+                );
+                return;
+            }
+        }
     }
 }
 

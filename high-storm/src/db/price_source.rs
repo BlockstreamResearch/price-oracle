@@ -7,6 +7,8 @@ pub enum Error {
     Sqlx(#[from] sqlx::Error),
     #[error("value {0} does not fit in the database integer type")]
     OutOfRange(u64),
+    #[error("stored timestamp {0} is negative")]
+    NegativeTimestamp(i64),
 }
 
 /// The sources this node's operator froze, which a restart freezes again.
@@ -52,10 +54,12 @@ impl FrozenPriceSourceStore {
         .bind(source)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row
-            .map(|row| row.try_get::<i64, _>("frozen_at"))
+        row.map(|row| row.try_get::<i64, _>("frozen_at"))
             .transpose()?
-            .map(|frozen_at| frozen_at as u64))
+            .map(|frozen_at| {
+                u64::try_from(frozen_at).map_err(|_| Error::NegativeTimestamp(frozen_at))
+            })
+            .transpose()
     }
 }
 
