@@ -33,6 +33,29 @@ struct SourceRecord {
     retry_at: Option<u64>,
 }
 
+/// What a node operator sees of one source of a feed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceStatus {
+    pub state: SourceState,
+    /// Failed polls in a row.
+    pub failures: u32,
+    /// The latest one kept, expired or not.
+    pub observation: Option<SourceObservation>,
+    /// When a `Dropped` source is polled again.
+    pub retry_at: Option<u64>,
+}
+
+impl From<&SourceRecord> for SourceStatus {
+    fn from(record: &SourceRecord) -> Self {
+        Self {
+            state: record.state,
+            failures: record.failures,
+            observation: record.observation,
+            retry_at: record.retry_at,
+        }
+    }
+}
+
 /// A Direct feed's sources and what they observed.
 #[derive(Clone, Debug)]
 pub struct FeedState {
@@ -58,6 +81,23 @@ impl FeedState {
             .map_or(SourceState::Active, |record| record.state)
     }
 
+    /// Lists the source before it first reports, so an operator can see it,
+    /// and freeze it, from the start. A known source is left as it is.
+    pub fn register(&mut self, source: usize) {
+        self.sources.entry(source).or_default();
+    }
+
+    pub fn is_registered(&self, source: usize) -> bool {
+        self.sources.contains_key(&source)
+    }
+
+    /// Every source registered or heard from, by index.
+    pub fn sources(&self) -> impl Iterator<Item = (usize, SourceStatus)> + '_ {
+        self.sources
+            .iter()
+            .map(|(source, record)| (*source, SourceStatus::from(record)))
+    }
+
     /// What `StaleObservation` compares the source's next observation against.
     pub fn last_observed_at(&self, source: usize) -> Option<u64> {
         self.sources
@@ -79,15 +119,24 @@ impl FeedState {
             })
     }
 
-    /// Freezing keeps the source's observations, which expire on their own.
+    /// Freezing keeps the source's observation, so unfreezing restores it, but
+    /// `valid_observations` leaves it out: an operator freezes a source to stop
+    /// it pricing the feed, which a kept observation would otherwise go on
+    /// doing until it expired.
     pub fn freeze(&mut self, source: usize) {
         let record = self.sources.entry(source).or_default();
         record.state = SourceState::Frozen;
         record.retry_at = None;
     }
 
+    /// Only a frozen source is returned to active. Unfreezing anything else
+    /// would clear a dropped source's `retry_at`, putting it back in the
+    /// cycle before `POLLING_RETRY_TIME`, and reset a failing source's count.
     pub fn unfreeze(&mut self, source: usize) {
         let record = self.sources.entry(source).or_default();
+        if record.state != SourceState::Frozen {
+            return;
+        }
         record.state = SourceState::Active;
         record.failures = 0;
         record.retry_at = None;
@@ -97,6 +146,7 @@ impl FeedState {
         let now = self.clock.now();
         self.sources
             .values()
+            .filter(|record| record.state != SourceState::Frozen)
             .filter_map(|record| record.observation)
             .filter(|observation| observation.valid_until >= now)
             .collect()
@@ -434,6 +484,108 @@ mod tests {
             state.record_poll_failure(0);
         }
         assert_eq!(state.state(0), SourceState::Active);
+    }
+
+    #[test]
+    fn a_frozen_source_does_not_price_the_feed() {
+        let mut state = feed_state(Clock::Fixed(NOW));
+        state.record_poll_success(0, observation(100, NOW));
+        state.record_poll_success(1, observation(1_000_000, NOW));
+
+        state.freeze(1);
+
+        // Priced by source 0 alone, not the median of the two.
+        assert!(state.is_available());
+        assert_eq!(state.value().unwrap().price, 100);
+
+        // The observation is kept, so unfreezing brings it back.
+        state.unfreeze(1);
+        assert_eq!(state.value().unwrap().price, 500_050);
+    }
+
+    #[test]
+    fn a_feed_whose_only_reporting_source_is_frozen_is_unavailable() {
+        let mut state = feed_state(Clock::Fixed(NOW));
+        state.register(0);
+        state.record_poll_success(1, observation(1_000_000, NOW));
+
+        state.freeze(1);
+
+        assert!(!state.is_available());
+        assert_eq!(state.value(), None);
+    }
+
+    #[test]
+    fn unfreezing_a_source_that_is_not_frozen_keeps_its_drop_back_off() {
+        let mut state = feed_state(Clock::Fixed(NOW));
+        for _ in 0..MAX_POLLING_ERROR_NUM {
+            state.record_poll_failure(0);
+        }
+        assert_eq!(state.state(0), SourceState::Dropped);
+
+        state.unfreeze(0);
+
+        // Still dropped, and still waiting out POLLING_RETRY_TIME.
+        assert_eq!(state.state(0), SourceState::Dropped);
+        assert!(!state.is_pollable(0));
+
+        // An active source keeps the failures it has run up, too.
+        let mut state = feed_state(Clock::Fixed(NOW));
+        state.record_poll_failure(0);
+        state.unfreeze(0);
+        for _ in 0..MAX_POLLING_ERROR_NUM - 1 {
+            state.record_poll_failure(0);
+        }
+        assert_eq!(state.state(0), SourceState::Dropped);
+    }
+
+    #[test]
+    fn lists_a_registered_source_as_active_before_it_reports() {
+        let mut state = feed_state(Clock::Fixed(NOW));
+        assert!(!state.is_registered(0));
+
+        state.register(0);
+
+        assert!(state.is_registered(0));
+        assert_eq!(
+            state.sources().collect::<Vec<_>>(),
+            [(
+                0,
+                SourceStatus {
+                    state: SourceState::Active,
+                    failures: 0,
+                    observation: None,
+                    retry_at: None,
+                }
+            )]
+        );
+        assert!(!state.is_available());
+    }
+
+    #[test]
+    fn registering_a_known_source_again_keeps_its_state() {
+        let mut state = feed_state(Clock::Fixed(NOW));
+        state.record_poll_success(0, observation(100, NOW));
+        state.freeze(0);
+
+        state.register(0);
+
+        let (_, status) = state.sources().next().unwrap();
+        assert_eq!(status.state, SourceState::Frozen);
+        assert_eq!(status.observation, Some(observation(100, NOW)));
+    }
+
+    #[test]
+    fn reports_the_failures_and_retry_of_a_dropped_source() {
+        let mut state = feed_state(Clock::Fixed(NOW));
+        for _ in 0..MAX_POLLING_ERROR_NUM {
+            state.record_poll_failure(0);
+        }
+
+        let (_, status) = state.sources().next().unwrap();
+        assert_eq!(status.state, SourceState::Dropped);
+        assert_eq!(status.failures, MAX_POLLING_ERROR_NUM);
+        assert_eq!(status.retry_at, Some(NOW + POLLING_RETRY_TIME));
     }
 
     fn feed_states(clock: Clock) -> FeedStates {

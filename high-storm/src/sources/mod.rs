@@ -2,14 +2,22 @@ pub mod coingecko;
 
 use std::{future::Future, sync::Arc, time::Duration};
 
-use price_feed::constants::{BACKOFF_CAP, POLLING_INTERVAL};
+use price_feed::{
+    FeedId,
+    constants::{BACKOFF_CAP, POLLING_INTERVAL},
+};
 use tokio::{sync::Notify, time::MissedTickBehavior};
 
-use crate::{HighStormHandle, config::PriceSourcesConfig, high_storm::PollOutcome};
+use crate::{
+    HighStormHandle,
+    config::PriceSourcesConfig,
+    high_storm::{PollOutcome, PriceSourceError},
+};
 
 use coingecko::CoinGecko;
 
-/// The source's index in every feed's state.
+/// The source's index in every feed's state, for this run only: a persisted
+/// freeze names the source by `CoinGecko::NAME`, so an index may change.
 const COINGECKO: usize = 0;
 
 /// Polls every configured source, each feed on its own task. The returned
@@ -26,13 +34,43 @@ pub fn spawn(
     let source = Arc::new(CoinGecko::new(coingecko)?);
     for feed in source.feeds() {
         let (node, source) = (node.clone(), source.clone());
-        let poll = move || {
-            let (node, source) = (node.clone(), source.clone());
-            async move { node.poll_price_source(feed, COINGECKO, &*source).await }
-        };
-        tokio::spawn(run(poll, observed.clone()));
+        let observed = observed.clone();
+        tokio::spawn(async move {
+            register(&node, feed, COINGECKO, CoinGecko::NAME).await;
+            let poll = move || {
+                let (node, source) = (node.clone(), source.clone());
+                async move { node.poll_price_source(feed, COINGECKO, &*source).await }
+            };
+            run(poll, observed).await
+        });
     }
     Ok(observed)
+}
+
+/// A source the operator froze must not be polled after a restart, so it is
+/// not polled until the node has read whether it is frozen.
+async fn register(node: &HighStormHandle, feed: FeedId, index: usize, name: &'static str) {
+    loop {
+        match node.register_price_source(feed, index, name).await {
+            Ok(()) => return,
+            // Only a database failure can pass on a retry. The rest say this
+            // build asked for a feed or an index the registry does not have,
+            // which no amount of retrying changes.
+            Err(error @ PriceSourceError::Database(_)) => {
+                tracing::warn!(feed, source = name, %error, "failed to register a price source; retrying");
+                tokio::time::sleep(backoff()).await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    feed,
+                    source = name,
+                    %error,
+                    "cannot register a price source, so this feed is not polled for it",
+                );
+                return;
+            }
+        }
+    }
 }
 
 /// Polls once per `POLLING_INTERVAL`. A failed poll is retried after

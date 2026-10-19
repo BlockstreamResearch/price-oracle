@@ -238,6 +238,9 @@ migration period. New clients send
 | `GET` | `/operators/voting/{hash}` | `Authorization: Bearer <token>` |
 | `POST` | `/operators/voting` | Signed request envelope |
 | `POST` | `/operators/voting/{hash}/approve` | Signed request envelope |
+| `GET` | `/operators/price-sources` | `Authorization: Bearer <token>` |
+| `POST` | `/operators/price-sources/freeze` | Signed request envelope |
+| `POST` | `/operators/price-sources/unfreeze` | Signed request envelope |
 | `POST` | `/users/requests` | User Schnorr signature in JSON |
 | `GET` | `/users/requests/{request_hash}` | None; coordinator node only |
 | `GET` | `/price-feeds` | None; coordinator node only |
@@ -419,6 +422,32 @@ unverified until you do.
 An attestation says that the member saw that price, not that the price is
 right. A feed with no source of its own never becomes available and answers
 `503` permanently, and so does a Cross pair whose legs have none.
+
+A node's operator can freeze a source the node polls, for example one that
+publishes wrong prices. `GET /operators/price-sources` lists every Direct feed
+with the sources the node polls for it, each `active`, `dropped`, or `frozen`,
+with its failure count and last observation. `POST
+/operators/price-sources/freeze` and `/unfreeze` take
+`{"feed_id":0,"source":"coingecko"}` in the signed envelope and answer with the
+same listing. Freezing is local to the node: nothing is broadcast, the source is
+not polled or retried, and the freeze is persisted by the source's name, so a
+restart keeps the source frozen whatever order a later version polls sources
+in. A frozen source stops pricing the feed at once; its last observation is
+kept so that unfreezing restores it, but it is left out of the median while the
+freeze lasts. A feed whose sources are all frozen or dropped is unavailable on
+that node, so the node stops attesting it and refuses to sign rates for it, and
+so for every Cross pair priced from it. On the coordinator that stops priced
+issuance at those feeds for the whole network.
+
+Freezing does not retract what the node has already said. `GET
+/price-feeds/{id}` serves this node's stored attestations, and peers relay
+them, so the last attestation made before the freeze stays current until its
+`valid_until` passes, up to `VALIDITY_WINDOW` seconds later. Unfreezing returns
+the source to `active` with its failure count reset, and the observation kept
+from before the freeze prices the feed again as soon as it does, so a feed can
+become available again on that older price if it has not yet expired. A source
+that is not frozen is unaffected by an unfreeze: a dropped one keeps waiting
+out `POLLING_RETRY_TIME`.
 
 Each node indexes confirmed Tick outputs and their dedicated Account burn
 reserves. A Tick expires after 60 blocks, or one hour at the target one-minute
