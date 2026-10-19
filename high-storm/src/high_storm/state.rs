@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -35,6 +35,8 @@ pub(crate) struct NetworkState {
     migration_paused: Arc<AtomicBool>,
     member_migration: Arc<Mutex<Option<MemberMigrationAttempt>>>,
     voting_execution_attempts: VotingExecutionAttempts,
+    protocol_settings: super::message::ProtocolSettings,
+    peer_setting_mismatches: Arc<StdMutex<BTreeMap<[u8; 33], Vec<String>>>>,
 }
 
 #[derive(Clone, Default)]
@@ -79,6 +81,20 @@ struct MemberMigrationAttempt {
 
 pub(crate) const MEMBER_MIGRATION_TIMEOUT_BLOCKS: u64 = 5;
 
+/// Stores a peer's settings mismatches; returns them only when they differ from last time.
+fn record_mismatches(
+    recorded: &mut BTreeMap<[u8; 33], Vec<String>>,
+    peer: [u8; 33],
+    mismatches: Vec<String>,
+) -> Option<Vec<String>> {
+    let previous = if mismatches.is_empty() {
+        recorded.remove(&peer)
+    } else {
+        recorded.insert(peer, mismatches.clone())
+    };
+    (previous.unwrap_or_default() != mismatches).then_some(mismatches)
+}
+
 impl NetworkState {
     pub(crate) async fn new(
         storm: &Storm,
@@ -118,6 +134,7 @@ impl NetworkState {
 
         // An issuance round instructs a rate from these, and checks one.
         let prices = Prices::new(secret_key, price_attestations, price_feed::Clock::System);
+        let protocol_settings = super::message::ProtocolSettings::of(&protocol_config);
 
         Self {
             network_store,
@@ -179,7 +196,29 @@ impl NetworkState {
             migration_paused: Arc::new(AtomicBool::new(migration_paused)),
             member_migration: Arc::new(Mutex::new(None)),
             voting_execution_attempts: VotingExecutionAttempts::default(),
+            protocol_settings,
+            peer_setting_mismatches: Arc::default(),
         }
+    }
+
+    pub(crate) fn protocol_settings(&self) -> super::message::ProtocolSettings {
+        self.protocol_settings
+    }
+
+    /// Compares a peer's settings with ours; returns its mismatches if they changed.
+    pub(crate) fn record_peer_settings(
+        &self,
+        peer: [u8; 33],
+        settings: &super::message::ProtocolSettings,
+    ) -> Option<Vec<String>> {
+        record_mismatches(
+            &mut self
+                .peer_setting_mismatches
+                .lock()
+                .expect("peer setting mismatches lock is not poisoned"),
+            peer,
+            self.protocol_settings.mismatches(settings),
+        )
     }
 
     pub(crate) fn coordinator_public_key(&self) -> [u8; 33] {
@@ -328,6 +367,52 @@ mod tests {
     };
 
     use super::{NetworkState, VotingExecutionAttempts};
+
+    #[test]
+    fn reports_peer_setting_mismatches_only_when_they_change() {
+        use crate::high_storm::message::{NodeMessage, NodeMessageKind, ProtocolSettings};
+
+        let local = ProtocolSettings {
+            tick_lifetime_blocks: 60,
+            burn_transaction_fee_sats: 500,
+            tick_burn_reserve_sats: 1_000,
+            operational_fee_sats: 1_000,
+            issuance_transaction_fee_sats: 1_000,
+            exchange_transaction_fee_sats: 500,
+        };
+        let drifted = ProtocolSettings {
+            tick_lifetime_blocks: 30,
+            burn_transaction_fee_sats: 600,
+            ..local
+        };
+        let expected = vec![
+            "tick_lifetime_blocks: 60 != 30".to_string(),
+            "burn_transaction_fee_sats: 500 != 600".to_string(),
+        ];
+        assert_eq!(local.mismatches(&drifted), expected);
+        assert!(local.mismatches(&local).is_empty());
+
+        let message = NodeMessage::new(NodeMessageKind::ProtocolSettings, None, &drifted).unwrap();
+        assert_eq!(
+            message.decoded_kind(),
+            Some(NodeMessageKind::ProtocolSettings)
+        );
+        assert_eq!(
+            message.decode_payload::<ProtocolSettings>().unwrap(),
+            drifted
+        );
+
+        let mut recorded = std::collections::BTreeMap::new();
+        let peer = [2; 33];
+        let mut record = |settings: &ProtocolSettings| {
+            super::record_mismatches(&mut recorded, peer, local.mismatches(settings))
+        };
+        assert_eq!(record(&local), None);
+        assert_eq!(record(&drifted), Some(expected));
+        assert_eq!(record(&drifted), None);
+        assert_eq!(record(&local), Some(Vec::new()));
+        assert_eq!(record(&local), None);
+    }
 
     #[test]
     fn voting_execution_attempts_are_exclusive_and_released_on_drop() {

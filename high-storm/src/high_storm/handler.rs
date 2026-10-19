@@ -7,7 +7,7 @@ use super::{
     leader,
     message::{
         BurnExpiredUtxos, ChainTip, ExecuteVotingRequest, ExpiredUtxosBurned, NodeMessage,
-        NodeMessageKind, RenewStormUtxos,
+        NodeMessageKind, ProtocolSettings, RenewStormUtxos,
     },
     prices::price_hash,
     signing::SigningError,
@@ -268,6 +268,25 @@ pub(crate) async fn handle(
                 .signing()
                 .handle_execute_voting_request(message, &context)
                 .await?;
+            Ok(())
+        }
+        NodeMessageKind::ProtocolSettings => {
+            let settings: ProtocolSettings = message.decode_payload()?;
+            let sender = context.message_context.peer_public_key;
+            let peer = hex::encode(sender);
+            match state.record_peer_settings(sender, &settings) {
+                Some(mismatches) if mismatches.is_empty() => {
+                    tracing::info!(%peer, "peer protocol settings now match");
+                }
+                Some(mismatches) => {
+                    tracing::error!(
+                        %peer,
+                        mismatches = %mismatches.join(", "),
+                        "peer protocol settings differ; rounds involving it will be rejected"
+                    );
+                }
+                None => {}
+            }
             Ok(())
         }
         NodeMessageKind::RenewStormUtxos => {

@@ -37,7 +37,8 @@ operational_fee_sats = 1000
 tick_burn_reserve_sats = 1000
 # Fee budget for an aggregate Tick issuance transaction, in satoshis.
 issuance_transaction_fee_sats = 1000
-# Fee budget for a Tick burn transaction, in satoshis. Defaults to 500 when omitted.
+# Minimum fee for a Tick burn transaction, in satoshis; larger burns pay Elements' default
+# 0.1 sat/vB relay floor on a bounded weight instead. Defaults to 500 when omitted.
 burn_transaction_fee_sats = 500
 # Fee budget for a Droplets LBTC exchange transaction, in satoshis. Defaults to 500 when omitted.
 exchange_transaction_fee_sats = 500

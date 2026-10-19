@@ -860,6 +860,33 @@ async fn classifies_fee_utxos_reserved_for_burning() {
 }
 
 #[tokio::test]
+async fn exposes_network_metadata_without_an_account() {
+    let (app, _, public_key) = setup().await;
+    let response = app
+        .clone()
+        .oneshot(get_request("/users/network"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let metadata = response_json(response).await;
+    assert_eq!(metadata.as_object().unwrap().len(), 4);
+    let response = app
+        .oneshot(get_request(&format!("/users/account/{public_key}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let account = response_json(response).await;
+    for field in [
+        "network",
+        "storm_eye_asset_id",
+        "tick_asset_id",
+        "oracle_verifier_asset_id",
+    ] {
+        assert_eq!(metadata[field], account[field]);
+    }
+}
+
+#[tokio::test]
 async fn derives_oracle_account_from_the_active_storm_eye() {
     let (app, _, public_key) = setup().await;
 

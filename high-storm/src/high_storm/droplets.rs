@@ -275,7 +275,7 @@ impl Droplets {
             &client,
             &storm_eye.contract_script,
             Some(storm_eye.asset_id),
-            StormEyePool::NetworkLeader(0),
+            StormEyePool::AnyNetworkLeader,
         )?;
         let contract_data: StormEyeContractData =
             postcard::from_bytes(storm_eye.contract_data.as_deref().ok_or_else(|| {
@@ -416,6 +416,11 @@ impl Droplets {
         signing_hash: [u8; 32],
         expected_leader: [u8; 33],
     ) -> Result<ValidatedExchange, DropletsError> {
+        if let Some((height, reason)) = self.store.ledger_halt().await? {
+            return Err(DropletsError::Invalid(format!(
+                "Droplets ledger is halted at block {height}: {reason}"
+            )));
+        }
         let storm_eye = self
             .assets
             .get(STORM_EYE_KIND)
