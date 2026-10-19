@@ -19,6 +19,8 @@ use crate::{
     message, message_handlers, state::StormState,
 };
 
+pub(crate) const HANDSHAKE_KEY_CONFIRMATION: &[u8] = b"Storm/key-confirmation/v1";
+
 impl Storm {
     /// Stops the listener, closes all connections, and marks active peers inactive.
     pub async fn shutdown(&mut self) {
@@ -474,11 +476,14 @@ impl Storm {
         .map_err(|_| Error::UnauthorizedConnection)?
         .serialize();
 
-        Ok((
-            noise.into_transport_mode()?,
-            remote_public_key,
-            advertised_port,
-        ))
+        let mut transport = noise.into_transport_mode()?;
+        let confirmation = read_frame(stream).await?;
+        let payload_length = transport.read_message(&confirmation, &mut buffer)?;
+        if &buffer[..payload_length] != HANDSHAKE_KEY_CONFIRMATION {
+            return Err(Error::UnauthorizedConnection);
+        }
+
+        Ok((transport, remote_public_key, advertised_port))
     }
 
     pub(crate) async fn perform_initiator_handshake(
@@ -508,7 +513,11 @@ impl Storm {
         let response = read_frame(stream).await?;
         noise.read_message(&response, &mut buffer)?;
 
-        Ok(noise.into_transport_mode()?)
+        let mut transport = noise.into_transport_mode()?;
+        let length = transport.write_message(HANDSHAKE_KEY_CONFIRMATION, &mut buffer)?;
+        write_frame(stream, &buffer[..length]).await?;
+
+        Ok(transport)
     }
 }
 

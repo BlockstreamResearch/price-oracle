@@ -178,7 +178,7 @@ impl StormHandle {
 
     /// Queues a message for each connected peer in `peers`.
     ///
-    /// Returns an error if any requested peer has no active connection.
+    /// Every reachable peer is tried; the first unreachable or full peer is then reported.
     pub async fn send_message(
         &self,
         message: StormMessage,
@@ -204,40 +204,40 @@ impl StormHandle {
         peers: &[[u8; 33]],
     ) -> Result<(), Error> {
         let framed_message = message.to_framed_bytes()?;
+        let mut first_error = None;
         let connections = {
             let state = self.inner.read().await;
             let mut connections = Vec::with_capacity(peers.len());
 
             for peer_public_key in peers {
-                let connection = state
-                    .connections
-                    .get(peer_public_key)
-                    .ok_or_else(|| Error::PeerNotConnected(hex::encode(peer_public_key)))?;
-
-                if connection.is_closed() {
-                    return Err(Error::PeerNotConnected(hex::encode(peer_public_key)));
+                match state.connections.get(peer_public_key) {
+                    Some(connection) if !connection.is_closed() => {
+                        connections.push((*peer_public_key, connection.clone()));
+                    }
+                    _ => {
+                        first_error
+                            .get_or_insert(Error::PeerNotConnected(hex::encode(peer_public_key)));
+                    }
                 }
-
-                connections.push((*peer_public_key, connection.clone()));
             }
 
             connections
         };
 
         for (peer_public_key, connection) in connections {
-            connection
-                .try_send(framed_message.clone())
-                .map_err(|error| match error {
+            if let Err(error) = connection.try_send(framed_message.clone()) {
+                first_error.get_or_insert(match error {
                     tokio::sync::mpsc::error::TrySendError::Full(_) => {
                         Error::PeerQueueFull(hex::encode(peer_public_key))
                     }
                     tokio::sync::mpsc::error::TrySendError::Closed(_) => {
                         Error::PeerConnectionClosed(hex::encode(peer_public_key))
                     }
-                })?;
+                });
+            }
         }
 
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     pub(crate) async fn connect_to_peers(&self) -> Result<(), Error> {

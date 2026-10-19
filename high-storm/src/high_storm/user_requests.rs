@@ -57,7 +57,7 @@ use super::{
         StormEyeContractData, TickAssetContractData, storm_eye_program, treasury_blinding_secret,
     },
     issuance::{IssuedUtxoDescriptor, MAX_ISSUED_DESCRIPTORS},
-    message::{ExecuteUserRequests, ExternalRequests},
+    message::{ChainTip, ExecuteUserRequests, ExternalRequests},
     prices::{Prices, price_hash},
     signing::{SIGNING_SESSION_TIMEOUT, SigningError},
 };
@@ -90,6 +90,8 @@ pub(crate) type PackedStormTreeProof =
 pub(crate) enum StormEyePool {
     UserRequests(usize),
     NetworkLeader(usize),
+    /// The last leader-half Storm Eye not yet spent this block.
+    AnyNetworkLeader,
 }
 
 pub(crate) struct PreparedRound {
@@ -255,6 +257,23 @@ impl UserRequestProcessor {
             &self.config,
             &network,
         )?;
+        let fee_utxos = request
+            .external_requests
+            .iter()
+            .map(|external| {
+                validate_encoded_request(&external.network_user_requests)
+                    .map(|(_, fee_utxos, _)| fee_utxos)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(UserRequestError::Invalid)?
+            .concat();
+        require_unreserved_anchored_fee_utxos(
+            &self.monitored_utxos,
+            &self.client()?,
+            request.chain_tip,
+            &fee_utxos,
+        )
+        .await?;
         if let Some(instructed) = instructed {
             self.prices.validate_instruction(&instructed).await?;
         }
@@ -1263,6 +1282,7 @@ fn elements_regtest_network(
     })
 }
 
+/// Lanes index the block's confirmed Storm Eyes, so one lane's broadcast never shifts another's.
 pub(crate) fn find_contract_utxo(
     client: &Client,
     script: &[u8],
@@ -1270,20 +1290,33 @@ pub(crate) fn find_contract_utxo(
     pool: StormEyePool,
 ) -> Result<UTXO, UserRequestError> {
     let candidates = scan_contract_utxos(client, script, expected_asset)?;
-    let selected = storm_eye_pool_index(candidates.len(), pool)
+    let unavailable = || UserRequestError::Invalid("required Storm Eye pool is unavailable".into());
+    if let StormEyePool::AnyNetworkLeader = pool {
+        return candidates[candidates.len() / 2..]
+            .iter()
+            .rev()
+            .find(|(_, spent_in_mempool)| !spent_in_mempool)
+            .map(|(utxo, _)| utxo.clone())
+            .ok_or_else(unavailable);
+    }
+    let (selected, spent_in_mempool) = storm_eye_pool_index(candidates.len(), pool)
         .and_then(|index| candidates.get(index))
-        .ok_or_else(|| {
-            UserRequestError::Invalid("required Storm Eye pool is unavailable".into())
-        })?;
+        .ok_or_else(unavailable)?;
+    if *spent_in_mempool {
+        return Err(UserRequestError::Invalid(
+            "Storm Eye lane was already used in this block".into(),
+        ));
+    }
 
     Ok(selected.clone())
 }
 
+/// Confirmed contract UTXOs in outpoint order, each flagged if spent in the mempool.
 fn scan_contract_utxos(
     client: &Client,
     script: &[u8],
     expected_asset: Option<[u8; 32]>,
-) -> Result<Vec<UTXO>, UserRequestError> {
+) -> Result<Vec<(UTXO, bool)>, UserRequestError> {
     let descriptor = format!("raw({})", hex::encode(script));
     let scan: ScanResult = client.call(
         "scantxoutset",
@@ -1296,16 +1329,20 @@ fn scan_contract_utxos(
         }
         let txid = Txid::from_str(&unspent.txid)
             .map_err(|_| UserRequestError::Invalid("invalid scanned UTXO txid".into()))?;
-        let Some(utxo) = get_optional_explicit_outpoint(client, txid, unspent.vout)? else {
+        let Some(utxo) =
+            get_optional_explicit_outpoint_ignoring_mempool(client, txid, unspent.vout)?
+        else {
             continue;
         };
         if matches_expected_asset(utxo.asset(), expected_asset) {
-            candidates.push(utxo);
+            let spent_in_mempool =
+                get_optional_explicit_outpoint(client, txid, unspent.vout)?.is_none();
+            candidates.push((utxo, spent_in_mempool));
         }
     }
 
     candidates
-        .sort_unstable_by_key(|utxo| (utxo.outpoint.txid.to_byte_array(), utxo.outpoint.vout));
+        .sort_unstable_by_key(|(utxo, _)| (utxo.outpoint.txid.to_byte_array(), utxo.outpoint.vout));
 
     Ok(candidates)
 }
@@ -1610,6 +1647,56 @@ fn explicit_outpoint(
         },
         secrets: None,
     })
+}
+
+/// Signers sync their index to the anchor first, so every reserve at or below it is known.
+async fn require_unreserved_anchored_fee_utxos(
+    monitored_utxos: &MonitoredUtxoStore,
+    client: &Client,
+    chain_tip: Option<ChainTip>,
+    fee_utxos: &[FeeUtxo],
+) -> Result<(), UserRequestError> {
+    let chain_tip = chain_tip
+        .ok_or_else(|| UserRequestError::Invalid("issuance round has no chain anchor".into()))?;
+    let outpoint =
+        |fee_utxo: &FeeUtxo| format!("{}:{}", hex::encode(fee_utxo.txid), fee_utxo.output_index);
+
+    let reserved = monitored_utxos
+        .burning_reservations(
+            &fee_utxos
+                .iter()
+                .map(|fee_utxo| (fee_utxo.txid, fee_utxo.output_index))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+    if let Some(index) = reserved.iter().position(|reserved| *reserved) {
+        return Err(UserRequestError::Invalid(format!(
+            "fee UTXO '{}' is reserved for burning issued UTXOs",
+            outpoint(&fee_utxos[index])
+        )));
+    }
+
+    let mut confirmations = Vec::with_capacity(fee_utxos.len());
+    for fee_utxo in fee_utxos {
+        let txid = Txid::from_str(&hex::encode(fee_utxo.txid))
+            .map_err(|_| UserRequestError::Invalid("invalid fee UTXO txid".into()))?;
+        let output = get_txout_optional(client, txid, fee_utxo.output_index, false)?;
+        confirmations.push(output.map_or(0, |output| output.confirmations));
+    }
+    // Read last: a tip that moved meanwhile can only overstate an output's height.
+    let tip: u64 = client.call("getblockcount", &[])?;
+    for (fee_utxo, confirmations) in fee_utxos.iter().zip(confirmations) {
+        if confirmations < MIN_FEE_UTXO_CONFIRMATIONS
+            || (tip + 1).saturating_sub(confirmations) > chain_tip.height
+        {
+            return Err(UserRequestError::Invalid(format!(
+                "fee UTXO '{}' is not confirmed at the round's anchored block",
+                outpoint(fee_utxo)
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn get_confirmed_fee_outpoint(
@@ -2711,6 +2798,76 @@ mod tests {
         assert!(!matches_scanned_asset(None, Some(expected)));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lanes_keep_their_storm_eye_after_earlier_lanes_broadcast() {
+        use serde_json::json;
+        use std::sync::{Arc, Mutex};
+
+        let asset = AssetId::from_byte_array([7; 32]);
+        let txids = (1..=6)
+            .map(|byte| Txid::from_byte_array([byte; 32]))
+            .collect::<Vec<_>>();
+        let spent = Arc::new(Mutex::new(vec![txids[3], txids[4]]));
+        let mempool = spent.clone();
+        let scanned = txids.clone();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let result = match request["method"].as_str().unwrap() {
+                    "scantxoutset" => json!({ "unspents": scanned.iter().map(|txid| json!({
+                        "txid": txid.to_string(), "vout": 0, "asset": asset.to_string(),
+                    })).collect::<Vec<_>>() }),
+                    "gettxout" => {
+                        let txid = Txid::from_str(request["params"][0].as_str().unwrap()).unwrap();
+                        let include_mempool = request["params"][2] == json!(true);
+                        if include_mempool && mempool.lock().unwrap().contains(&txid) {
+                            json!(null)
+                        } else {
+                            json!({
+                                "confirmations": 1,
+                                "asset": asset.to_string(),
+                                "value": 0.00000001,
+                                "scriptPubKey": { "hex": "51" },
+                            })
+                        }
+                    }
+                    method => panic!("unexpected RPC method: {method}"),
+                };
+                async move {
+                    axum::Json(json!({ "id": request["id"], "result": result, "error": null }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = tokio::task::spawn_blocking(move || {
+            let client = Client::new(&format!("http://{address}"), Auth::None).unwrap();
+            let find = |pool| {
+                find_contract_utxo(&client, &[0x51], Some([7; 32]), pool)
+                    .map(|utxo| utxo.outpoint.txid)
+                    .map_err(|error| error.to_string())
+            };
+
+            // Burn lanes 0 and 1 already broadcast; lane 2 still owns its Storm Eye.
+            assert_eq!(find(StormEyePool::NetworkLeader(2)), Ok(txids[5]));
+            assert!(
+                find(StormEyePool::NetworkLeader(0))
+                    .unwrap_err()
+                    .contains("already used")
+            );
+            assert_eq!(find(StormEyePool::UserRequests(0)), Ok(txids[0]));
+            assert_eq!(find(StormEyePool::AnyNetworkLeader), Ok(txids[5]));
+
+            spent.lock().unwrap().push(txids[5]);
+            assert!(find(StormEyePool::NetworkLeader(2)).is_err());
+            assert!(find(StormEyePool::AnyNetworkLeader).is_err());
+        })
+        .await;
+        server.abort();
+        result.unwrap();
+    }
+
     #[test]
     fn maps_every_storm_eye_lane_into_its_pool() {
         assert_eq!(
@@ -2996,16 +3153,24 @@ mod tests {
 
     /// A reissuance token blinded to the Treasury, as a round finds it.
     fn round_token(entropy: [u8; 32], vout: u32, issuance_amount: u64) -> RoundToken {
+        round_token_with_script(entropy, vout, issuance_amount, Script::from(vec![0x51]))
+    }
+
+    fn round_token_with_script(
+        entropy: [u8; 32],
+        vout: u32,
+        issuance_amount: u64,
+        script: Script,
+    ) -> RoundToken {
         let secp = Secp256k1::new();
         let asset_entropy = AssetEntropy::from_byte_array(entropy);
         let token_id = AssetId::reissuance_token_from_entropy(asset_entropy, false);
-        let script = Script::from(vec![0x51]);
         let (txout, _, _, _) = TxOut::new_last_confidential(
             &mut secp256k1_zkp::rand::thread_rng(),
             &secp,
             1,
             token_id,
-            script,
+            script.clone(),
             PublicKey::from_secret_key(&secp, &treasury_blinding_secret()),
             &[explicit_txout_secrets(&explicit(token_id, 1, Script::new())).unwrap()],
             &[],
@@ -3021,7 +3186,7 @@ mod tests {
                 reissuance_token_id: Some(token_id.to_byte_array()),
                 entropy: Some(entropy),
                 issuance_txid: [2; 32],
-                contract_script: vec![0x51],
+                contract_script: script.into_bytes(),
                 contract_data: None,
                 supply: 0,
                 created_at_block: 1,
@@ -3096,6 +3261,376 @@ mod tests {
                 ],
             )
             .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn shrinking_the_confirmed_pool_exhausts_the_third_six_eye_burn_lane() {
+        let mut remaining = 6;
+        let mut selected = Vec::new();
+        for lane in 0..3 {
+            let index = storm_eye_pool_index(remaining, StormEyePool::NetworkLeader(lane));
+            selected.push(index);
+            if index.is_some() {
+                remaining -= 1;
+            }
+        }
+
+        assert_eq!(selected, vec![Some(3), Some(3), None]);
+        assert_eq!(remaining, 4);
+        assert_eq!(
+            storm_eye_pool_index(4, StormEyePool::NetworkLeader(0)),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn signer_layout_accepts_a_fee_input_that_is_already_a_burn_reserve() {
+        use crate::db::{
+            Database,
+            monitored_utxo::{IndexedBlock, MonitoredUtxo},
+        };
+        use crate::high_storm::message::ExternalRequests;
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+
+        for count in [1usize, 99] {
+            let network = network();
+            let storm_eye = storm_eye();
+            let config = config();
+            let keypair = Keypair::from_secret_key(&SecretKey::from_secret_bytes([9; 32]).unwrap());
+            let owner = keypair.x_only_public_key().0.serialize();
+            let account_script = AccountProgram::new(&AccountArguments {
+                storm_eye_asset_id: storm_eye.asset_id,
+                account_owner_pubkey: owner,
+            })
+            .get_script_pubkey(&network);
+            let treasury_script = TreasuryProgram::new(&TreasuryArguments {
+                storm_eye_asset_id: storm_eye.asset_id,
+            })
+            .get_script_pubkey(&network);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let mut token =
+                round_token_with_script([21; 32], 1, now * count as u64, treasury_script.clone());
+            token.asset.kind = TICK_ASSET_KIND.into();
+            token.asset.contract_data = Some(
+                postcard::to_stdvec(&TickAssetContractData {
+                    issuance_tx: encode::serialize(&Transaction {
+                        version: 2,
+                        lock_time: LockTime::ZERO,
+                        input: vec![],
+                        output: vec![token.utxo.txout.clone()],
+                    }),
+                    token_output_index: 0,
+                })
+                .unwrap(),
+            );
+            let fee_amount = count as u64
+                * (config.operational_fee_sats + config.tick_burn_reserve_sats)
+                + config.issuance_transaction_fee_sats;
+            let fee_input = explicit(network.policy_asset(), fee_amount, account_script.clone());
+            let storm_eye_input = explicit(
+                AssetId::from_byte_array(storm_eye.asset_id),
+                1,
+                Script::from(storm_eye.contract_script.clone()),
+            );
+            let auth = UtxoAuthMethod {
+                kind: "signature-auth".into(),
+                auth_data: hex::encode(owner),
+            };
+            let descriptors = (0..count)
+                .map(|offset| {
+                    IssuedUtxoDescriptor::from_request(
+                        2 + offset as u32,
+                        2 + count as u32,
+                        owner,
+                        &auth,
+                        None,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut transaction = Transaction {
+                version: 2,
+                lock_time: LockTime::ZERO,
+                input: vec![input(0), input(1), input(3)],
+                output: vec![storm_eye_input.clone(), token.utxo.txout.clone()],
+            };
+            transaction.input[1].asset_issuance = AssetIssuance {
+                asset_blinding_nonce: AssetBlindingNonce::from_blinding_factor(
+                    token.secrets.asset_bf,
+                ),
+                asset_entropy: AssetEntropy::from_byte_array(token.asset.entropy.unwrap()),
+                amount: confidential::Value::Explicit(token.issuance_amount),
+                inflation_keys: confidential::Value::Null,
+            };
+            for descriptor in &descriptors {
+                transaction.output.push(explicit(
+                    AssetId::from_byte_array(token.asset.asset_id),
+                    now,
+                    descriptor
+                        .voucher_program(storm_eye.asset_id)
+                        .unwrap()
+                        .get_script_pubkey(&network),
+                ));
+            }
+            transaction.output.extend([
+                explicit(
+                    network.policy_asset(),
+                    count as u64 * config.tick_burn_reserve_sats,
+                    account_script,
+                ),
+                explicit(
+                    network.policy_asset(),
+                    0,
+                    IssuedUtxoDescriptor::script_pubkey(&descriptors).unwrap(),
+                ),
+                explicit(
+                    network.policy_asset(),
+                    count as u64 * config.operational_fee_sats,
+                    treasury_script,
+                ),
+                explicit(
+                    network.policy_asset(),
+                    config.issuance_transaction_fee_sats,
+                    Script::new(),
+                ),
+            ]);
+            let mut pset = PartiallySignedTransaction::from_tx(transaction);
+            pset.inputs_mut()[0].witness_utxo = Some(storm_eye_input.clone());
+            pset.inputs_mut()[1].witness_utxo = Some(token.utxo.txout.clone());
+            pset.inputs_mut()[2].witness_utxo = Some(fee_input.clone());
+            let mut spent_secrets = vec![explicit_txout_secrets(&storm_eye_input).unwrap()];
+            spent_secrets.extend(token_input_secrets(std::slice::from_ref(&token)).unwrap());
+            spent_secrets.push(explicit_txout_secrets(&fee_input).unwrap());
+            reblind_tokens(&mut pset, std::slice::from_ref(&token), &spent_secrets).unwrap();
+            let mut verifiable = pset.extract_tx().unwrap();
+            verifiable.output.retain(|output| {
+                output.value.explicit() != Some(0)
+                    || !output.script_pubkey.is_provably_unspendable()
+            });
+            verifiable
+                .verify_tx_amt_proofs(
+                    &Secp256k1::new(),
+                    &[storm_eye_input, token.utxo.txout.clone(), fee_input],
+                )
+                .unwrap();
+
+            let payload = json!({ "utxo_auth_method": {
+                "kind": "signature-auth", "auth_data": hex::encode(owner),
+            }})
+            .to_string();
+            let fee_outpoint = format!("{}:3", hex::encode([10; 32]));
+            let mut signed_message = payload.repeat(count).into_bytes();
+            signed_message.extend_from_slice(fee_outpoint.as_bytes());
+            let signature = schnorr::sign(
+                &crate::crypto::tagged_hash("OracleNetworkV1/NetworkUserRequests", &signed_message),
+                &keypair,
+            );
+            let encoded = serde_json::to_vec(&json!({
+                "header": { "public_key": hex::encode(owner),
+                    "signature": hex::encode(signature.to_byte_array()),
+                    "fee_utxos": [fee_outpoint] },
+                "requests": (0..count).map(|_| json!({
+                    "kind": "tick-utxo", "payload": payload,
+                })).collect::<Vec<_>>(),
+            }))
+            .unwrap();
+            let request = ExecuteUserRequests {
+                signing_hash: issuance_signing_hash(&pset, &storm_eye, &network).unwrap(),
+                tx: encode::serialize(&pset),
+                signing_storm_tree_branch: PLACEHOLDER_SIGNER,
+                external_requests: vec![ExternalRequests {
+                    request_hash: Sha256::digest(&encoded).into(),
+                    network_user_requests: encoded,
+                    additional_payload: None,
+                }],
+                chain_tip: None,
+            };
+            let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+            let store = database.monitored_utxos();
+            store
+                .apply_block(
+                    "burning-v1",
+                    &IndexedBlock {
+                        height: 1,
+                        hash: [1; 32],
+                    },
+                    &[MonitoredUtxo {
+                        txid: [10; 32],
+                        output_index: 0,
+                        asset_kind: TICK_ASSET_KIND.into(),
+                        amount: now,
+                        script_pubkey: descriptors[0]
+                            .voucher_program(storm_eye.asset_id)
+                            .unwrap()
+                            .get_script_pubkey(&network)
+                            .into_bytes(),
+                        auth_method: auth.kind.clone(),
+                        auth_data: owner.to_vec(),
+                        account_owner_pubkey: owner,
+                        internal_key: None,
+                        burning_fee_txid: [10; 32],
+                        burning_fee_output_index: 3,
+                        block_height: 1,
+                        status: "active".into(),
+                        status_block_height: 1,
+                        burn_txid: None,
+                    }],
+                    &[],
+                    60,
+                )
+                .await
+                .unwrap();
+
+            assert!(store.is_reserved_for_burning([10; 32], 3).await.unwrap());
+            assert_eq!(
+                validate_execute_request(
+                    &request,
+                    &storm_eye,
+                    Some(&token.asset),
+                    None,
+                    &config,
+                    &network
+                )
+                .unwrap(),
+                None
+            );
+
+            let mut tampered = request;
+            tampered.signing_hash = [0; 32];
+            assert!(
+                validate_execute_request(
+                    &tampered,
+                    &storm_eye,
+                    Some(&token.asset),
+                    None,
+                    &config,
+                    &network
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rounds_reject_reserved_or_unanchored_fee_utxos() {
+        use crate::db::{
+            Database,
+            monitored_utxo::{IndexedBlock, MonitoredUtxo},
+        };
+
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.monitored_utxos();
+        store
+            .apply_block(
+                "burning-v1",
+                &IndexedBlock {
+                    height: 10,
+                    hash: [10; 32],
+                },
+                &[MonitoredUtxo {
+                    txid: [1; 32],
+                    output_index: 2,
+                    asset_kind: TICK_ASSET_KIND.into(),
+                    amount: 1,
+                    script_pubkey: vec![0x51],
+                    auth_method: "signature-auth".into(),
+                    auth_data: vec![2; 32],
+                    account_owner_pubkey: [3; 32],
+                    internal_key: None,
+                    burning_fee_txid: [4; 32],
+                    burning_fee_output_index: 5,
+                    block_height: 10,
+                    status: "active".into(),
+                    status_block_height: 10,
+                    burn_txid: None,
+                }],
+                &[],
+                60,
+            )
+            .await
+            .unwrap();
+
+        // Output [6;32]:0 confirmed at 10, [7;32]:0 at 11; the node's tip is 11.
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(
+                |axum::Json(request): axum::Json<serde_json::Value>| async move {
+                    let result = match request["method"].as_str().unwrap() {
+                        "getblockcount" => serde_json::json!(11),
+                        "gettxout" => {
+                            assert_eq!(request["params"][2], serde_json::json!(false));
+                            let confirmations = match request["params"][0].as_str().unwrap() {
+                                txid if txid == Txid::from_byte_array([6; 32]).to_string() => 2,
+                                txid if txid == Txid::from_byte_array([7; 32]).to_string() => 1,
+                                _ => 0,
+                            };
+                            if confirmations == 0 {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::json!({
+                                    "confirmations": confirmations,
+                                    "scriptPubKey": { "hex": "51" },
+                                })
+                            }
+                        }
+                        method => panic!("unexpected RPC method: {method}"),
+                    };
+                    axum::Json(serde_json::json!({
+                        "id": request["id"], "result": result, "error": null,
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = Client::new(&format!("http://{address}"), Auth::None).unwrap();
+        let fee = |txid: u8, output_index: u32| FeeUtxo {
+            txid: [txid; 32],
+            output_index,
+        };
+        let anchor = |height: u64| {
+            Some(ChainTip {
+                height,
+                hash: [height as u8; 32],
+            })
+        };
+
+        let check = async |chain_tip: Option<ChainTip>, fee_utxos: &[FeeUtxo]| {
+            require_unreserved_anchored_fee_utxos(&store, &client, chain_tip, fee_utxos)
+                .await
+                .map_err(|error| error.to_string())
+        };
+        assert_eq!(check(anchor(10), &[fee(6, 0)]).await, Ok(()));
+        assert_eq!(check(anchor(11), &[fee(6, 0), fee(7, 0)]).await, Ok(()));
+        for (chain_tip, fee_utxos, reason) in [
+            (
+                anchor(11),
+                vec![fee(6, 0), fee(4, 5)],
+                "reserved for burning",
+            ),
+            (
+                anchor(10),
+                vec![fee(7, 0)],
+                "not confirmed at the round's anchored block",
+            ),
+            (
+                anchor(11),
+                vec![fee(8, 0)],
+                "not confirmed at the round's anchored block",
+            ),
+            (None, vec![fee(6, 0)], "no chain anchor"),
+        ] {
+            let error = check(chain_tip, &fee_utxos).await.unwrap_err();
+            assert!(error.contains(reason), "{error}");
+        }
+        server.abort();
     }
 
     #[test]

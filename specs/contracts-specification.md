@@ -172,6 +172,8 @@ This spending path will include the following checks:
 4. `assert(jet::output_asset(output_index) == jet::current_asset())`
 5. `assert(jet::output_amount(output_index) == jet::current_amount())`
 
+This path is intentional. Contracts that authorize on Storm Eye presence (Treasury, Account and the Voucher network path) also accept a rescued Storm Eye input, so a rescued transaction can spend Treasury and Account UTXOs and reissue Tick and Oracle Verifier assets. Reaching the rescue height means the network has failed to renew and is considered dead; whoever rescues it inherits its authority and can resurrect the network. The coordinator keeps live networks clear of this by renewing every Storm Eye UTXO before its rescue height.
+
 ## 1.5. Contract creation transaction
 
 In the transaction to create Storm Eye, the whole supply is issued at once, with no reissuance token, straight into the covenant. These conditions must be verified by the network before Storm Eye can be used.

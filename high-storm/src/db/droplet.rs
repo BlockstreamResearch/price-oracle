@@ -2,6 +2,15 @@ use sqlx::{Any, AnyPool, Row, Transaction};
 
 use super::monitored_utxo::{IndexedBlock, MonitoredUtxoStore};
 
+/// A credit repays any deficit before it adds to the balance.
+const CREDIT_SQL: &str = "INSERT INTO droplets (xonly_pubkey, amount, block_height) VALUES ($1, $2, $3) \
+     ON CONFLICT (xonly_pubkey) DO UPDATE SET \
+     amount = droplets.amount + CASE WHEN excluded.amount > droplets.deficit \
+         THEN excluded.amount - droplets.deficit ELSE 0 END, \
+     deficit = CASE WHEN excluded.amount > droplets.deficit \
+         THEN 0 ELSE droplets.deficit - excluded.amount END, \
+     block_height = excluded.block_height";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreasuryTransaction {
     pub txid: [u8; 32],
@@ -62,15 +71,44 @@ impl DropletStore {
         amount: u64,
         block_height: u64,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "INSERT INTO droplets (xonly_pubkey, amount, block_height) VALUES ($1, $2, $3) \
-             ON CONFLICT (xonly_pubkey) DO UPDATE SET \
-             amount = droplets.amount + excluded.amount, block_height = excluded.block_height",
+        sqlx::query(CREDIT_SQL)
+            .bind(xonly_pubkey.to_vec())
+            .bind(encode_u64(amount)?)
+            .bind(encode_u64(block_height)?)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The block whose Droplets accounting failed, and why; exchanges stay refused until a rebuild.
+    pub async fn ledger_halt(&self) -> Result<Option<(u64, String)>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT droplets_halt_height, droplets_halt_reason FROM chain_recovery_state WHERE id = 1",
         )
-        .bind(xonly_pubkey.to_vec())
-        .bind(encode_u64(amount)?)
+        .fetch_one(&self.pool)
+        .await?;
+        let Some(height) = row.try_get::<Option<i64>, _>("droplets_halt_height")? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            decode_u64(height)?,
+            row.try_get::<Option<String>, _>("droplets_halt_reason")?
+                .unwrap_or_default(),
+        )))
+    }
+
+    pub(crate) async fn halt_ledger_in(
+        transaction: &mut Transaction<'_, Any>,
+        block_height: u64,
+        reason: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE chain_recovery_state SET droplets_halt_height = $1, droplets_halt_reason = $2 \
+             WHERE id = 1",
+        )
         .bind(encode_u64(block_height)?)
-        .execute(&self.pool)
+        .bind(reason)
+        .execute(&mut **transaction)
         .await?;
         Ok(())
     }
@@ -362,22 +400,45 @@ impl DropletStore {
             let exchanged = spent_amount.checked_sub(output_amount).ok_or_else(|| {
                 DropletError::Invalid("Treasury spend increases Treasury value".into())
             })?;
-            let updated = sqlx::query(
-                "UPDATE droplets SET amount = amount - $1, block_height = $2, \
-                 exchange_locked = 0, last_tx = NULL, exchange_amount = 0 \
-                 WHERE xonly_pubkey = $3 AND amount >= $1",
-            )
-            .bind(encode_u64(exchanged)?)
-            .bind(encode_u64(block.height)?)
-            .bind(member.to_vec())
-            .execute(&mut **transaction)
-            .await?
-            .rows_affected();
-            if updated != 1 {
-                return Err(DropletError::Invalid(
-                    "Treasury spend exceeds the member Droplets balance".into(),
-                ));
+            let balance =
+                sqlx::query("SELECT amount, deficit FROM droplets WHERE xonly_pubkey = $1")
+                    .bind(member.to_vec())
+                    .fetch_optional(&mut **transaction)
+                    .await?
+                    .map(|row| {
+                        Ok::<_, sqlx::Error>((
+                            decode_u64(row.try_get("amount")?)?,
+                            decode_u64(row.try_get("deficit")?)?,
+                        ))
+                    })
+                    .transpose()?;
+            let (amount, deficit) = balance.unwrap_or((0, 0));
+            // The spend is final on chain, so the ledger records any overdraw instead of failing.
+            let shortfall = exchanged.saturating_sub(amount);
+            let deficit = deficit
+                .checked_add(shortfall)
+                .ok_or_else(|| DropletError::Invalid("Droplets deficit overflow".into()))?;
+            if shortfall > 0 {
+                tracing::warn!(
+                    member = %hex::encode(member),
+                    txid = %hex::encode(treasury_transaction.txid),
+                    shortfall,
+                    "Treasury spend exceeds the member Droplets balance; recorded a deficit"
+                );
             }
+            sqlx::query(
+                "INSERT INTO droplets (xonly_pubkey, amount, block_height, deficit) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (xonly_pubkey) DO UPDATE SET amount = excluded.amount, \
+                 block_height = excluded.block_height, deficit = excluded.deficit, \
+                 exchange_locked = 0, last_tx = NULL, exchange_amount = 0",
+            )
+            .bind(member.to_vec())
+            .bind(encode_u64(amount.saturating_sub(exchanged))?)
+            .bind(encode_u64(block.height)?)
+            .bind(encode_u64(deficit)?)
+            .execute(&mut **transaction)
+            .await?;
         }
 
         Ok(())
@@ -449,16 +510,12 @@ async fn credit_deposit(
     };
 
     for (member, amount) in allocations {
-        sqlx::query(
-            "INSERT INTO droplets (xonly_pubkey, amount, block_height) VALUES ($1, $2, $3) \
-             ON CONFLICT (xonly_pubkey) DO UPDATE SET \
-             amount = droplets.amount + excluded.amount, block_height = excluded.block_height",
-        )
-        .bind(member.to_vec())
-        .bind(encode_u64(amount)?)
-        .bind(encode_u64(block_height)?)
-        .execute(&mut **transaction)
-        .await?;
+        sqlx::query(CREDIT_SQL)
+            .bind(member.to_vec())
+            .bind(encode_u64(amount)?)
+            .bind(encode_u64(block_height)?)
+            .execute(&mut **transaction)
+            .await?;
     }
     Ok(())
 }
@@ -696,6 +753,168 @@ mod tests {
                 amount: 401,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn an_overdrawn_spend_records_a_deficit_that_credits_repay() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.droplets();
+        let member = [1; 32];
+        let deficit = async || -> i64 {
+            sqlx::query_scalar("SELECT deficit FROM droplets WHERE xonly_pubkey = $1")
+                .bind(member.to_vec())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap()
+        };
+        let block = |height: u64| IndexedBlock {
+            height,
+            hash: [height as u8; 32],
+        };
+        let deposit = TreasuryTransaction {
+            txid: [4; 32],
+            inputs: vec![],
+            outputs: vec![(0, 1_000), (1, 1_000)],
+            deposit_member: Some(member),
+            exchange_member: None,
+        };
+        let spend = |txid: u8, vout: u32| TreasuryTransaction {
+            txid: [txid; 32],
+            inputs: vec![([4; 32], vout)],
+            outputs: vec![],
+            deposit_member: None,
+            exchange_member: Some(member),
+        };
+        store
+            .apply_block("droplets-v1", &block(10), &[deposit], &[member])
+            .await
+            .unwrap();
+        store.lock_exchange(member, 1_000, 10, &[1]).await.unwrap();
+
+        // The second confirmed spend overdraws a balance already reduced to 500.
+        store
+            .apply_block("droplets-v1", &block(11), &[spend(5, 0)], &[member])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE droplets SET amount = 500 WHERE xonly_pubkey = $1")
+            .bind(member.to_vec())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        store
+            .apply_block("droplets-v1", &block(12), &[spend(6, 1)], &[member])
+            .await
+            .unwrap();
+        let balance = store.balance(member).await.unwrap().unwrap();
+        assert_eq!(balance.amount, 0);
+        assert!(!balance.exchange_locked);
+        assert_eq!(deficit().await, 500);
+        assert_eq!(
+            store.cursor("droplets-v1").await.unwrap().unwrap().height,
+            12
+        );
+
+        store.credit(member, 300, 13).await.unwrap();
+        assert_eq!(store.balance(member).await.unwrap().unwrap().amount, 0);
+        assert_eq!(deficit().await, 200);
+        store.credit(member, 450, 14).await.unwrap();
+        assert_eq!(store.balance(member).await.unwrap().unwrap().amount, 250);
+        assert_eq!(deficit().await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_droplets_block_rolls_back_only_its_savepoint() {
+        use crate::db::monitored_utxo::MonitoredUtxo;
+
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.droplets();
+        let members = [[1; 32]];
+        let block = IndexedBlock {
+            height: 61,
+            hash: [61; 32],
+        };
+        let tick = MonitoredUtxo {
+            txid: [9; 32],
+            output_index: 0,
+            asset_kind: "tick".into(),
+            amount: 1,
+            script_pubkey: vec![0x51],
+            auth_method: "signature-auth".into(),
+            auth_data: vec![2; 32],
+            account_owner_pubkey: [3; 32],
+            internal_key: None,
+            burning_fee_txid: [4; 32],
+            burning_fee_output_index: 5,
+            block_height: 1,
+            status: "active".into(),
+            status_block_height: 1,
+            burn_txid: None,
+        };
+        let deposit = TreasuryTransaction {
+            txid: [6; 32],
+            inputs: vec![],
+            outputs: vec![(0, 900)],
+            deposit_member: None,
+            exchange_member: None,
+        };
+        store
+            .apply_block(
+                "droplets-v1",
+                &IndexedBlock {
+                    height: 60,
+                    hash: [60; 32],
+                },
+                &[deposit],
+                &members,
+            )
+            .await
+            .unwrap();
+        let unmarked_spend = TreasuryTransaction {
+            txid: [7; 32],
+            inputs: vec![([6; 32], 0)],
+            outputs: vec![],
+            deposit_member: None,
+            exchange_member: None,
+        };
+
+        let mut transaction = store.pool.begin().await.unwrap();
+        MonitoredUtxoStore::apply_block_in(&mut transaction, &block, &[tick], &[], 60)
+            .await
+            .unwrap();
+        let mut savepoint = sqlx::Acquire::begin(&mut transaction).await.unwrap();
+        let error =
+            DropletStore::apply_block_in(&mut savepoint, &block, &[unmarked_spend], &members)
+                .await
+                .unwrap_err();
+        let DropletError::Invalid(reason) = error else {
+            panic!("expected an invalid Treasury spend");
+        };
+        savepoint.rollback().await.unwrap();
+        DropletStore::halt_ledger_in(&mut transaction, block.height, &reason)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        assert_eq!(
+            database
+                .monitored_utxos()
+                .list_expired(10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.balance(members[0]).await.unwrap().unwrap().amount,
+            900
+        );
+        assert_eq!(store.treasury_utxos().await.unwrap().len(), 1);
+        assert_eq!(
+            store.ledger_halt().await.unwrap(),
+            Some((61, "Treasury spend has no member marker".into()))
+        );
+        database.chain().reset_projections().await.unwrap();
+        assert_eq!(store.ledger_halt().await.unwrap(), None);
     }
 
     #[tokio::test]

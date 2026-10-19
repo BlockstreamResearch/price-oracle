@@ -327,6 +327,9 @@ async fn run_until_shutdown(
                     }
                 }
                 if indexed.as_ref().is_ok_and(|block_count| *block_count > 0) {
+                    if let Err(error) = storm.announce_protocol_settings().await {
+                        tracing::warn!(%error, "protocol settings announcement failed");
+                    }
                     match storm.storm_eye_utxo_count().await {
                         Ok(storm_eye_count) => {
                             round_schedule = BlockRoundSchedule::new(storm_eye_count);

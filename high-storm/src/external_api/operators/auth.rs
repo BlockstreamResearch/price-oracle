@@ -643,26 +643,21 @@ fn write_message(
     payload: &[u8],
 ) -> String {
     let payload_hash = hex::encode(Sha256::digest(payload));
+    let payload_json: serde_json::Value =
+        serde_json::from_slice(payload).expect("canonical payload is valid JSON");
+    let payload_display =
+        serde_json::to_string_pretty(&payload_json).expect("JSON payload can be serialized");
 
-    match signature_scheme {
-        SignatureScheme::Bip322V1 => format!(
-            "high-storm:operator-write:v1\n{}\n{}\n{}\n{}\n{}",
-            method.to_ascii_uppercase(),
-            path,
-            timestamp,
-            nonce,
-            payload_hash
-        ),
-        SignatureScheme::HumidEcdsaV1 => format!(
-            "high-storm:operator-write:v2\n{}\n{}\n{}\n{}\n{}\n{}",
-            signature_scheme.as_str(),
-            method.to_ascii_uppercase(),
-            path,
-            timestamp,
-            nonce,
-            payload_hash
-        ),
-    }
+    format!(
+        "high-storm:operator-write:v3\nSignature scheme: {}\nMethod: {}\nPath: {}\nTimestamp (Unix seconds): {}\nNonce: {}\nPayload SHA-256: {}\n\nPayload JSON:\n{}",
+        signature_scheme.as_str(),
+        method.to_ascii_uppercase(),
+        path,
+        timestamp,
+        nonce,
+        payload_hash,
+        payload_display
+    )
 }
 
 fn canonical_json<T: Serialize>(payload: &T) -> Result<Vec<u8>, serde_json::Error> {
@@ -693,6 +688,89 @@ mod tests {
     use crate::db::Database;
 
     use super::*;
+
+    #[test]
+    fn signed_writes_display_the_full_canonical_payload_for_both_schemes() {
+        let payload = canonical_json(&serde_json::json!({"b": 2, "a": 1})).unwrap();
+
+        for scheme in [SignatureScheme::Bip322V1, SignatureScheme::HumidEcdsaV1] {
+            let message =
+                write_message(scheme, "post", "/operators/voting", 123, "nonce", &payload);
+
+            assert_eq!(
+                message,
+                format!(
+                    "high-storm:operator-write:v3\nSignature scheme: {}\nMethod: POST\nPath: /operators/voting\nTimestamp (Unix seconds): 123\nNonce: nonce\nPayload SHA-256: 43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777\n\nPayload JSON:\n{{\n  \"a\": 1,\n  \"b\": 2\n}}",
+                    scheme.as_str()
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_changed_display_fields_and_hash_only_signatures() {
+        let (auth, private_key, xonly_public_key) = setup().await;
+        let payload = canonical_json(&serde_json::json!({
+            "amount": 100,
+            "withdrawal_address": "operator-destination"
+        }))
+        .unwrap();
+
+        for scheme in [SignatureScheme::Bip322V1, SignatureScheme::HumidEcdsaV1] {
+            let public_key = match scheme {
+                SignatureScheme::Bip322V1 => xonly_public_key.clone(),
+                SignatureScheme::HumidEcdsaV1 => {
+                    hex::encode(private_key.public_key(&Secp256k1::new()).inner.serialize())
+                }
+            };
+            let message = write_message(
+                scheme,
+                "POST",
+                "/operators/droplets/exchange",
+                1_000,
+                "nonce",
+                &payload,
+            );
+            let hash_only = match scheme {
+                SignatureScheme::Bip322V1 => format!(
+                    "high-storm:operator-write:v1\nPOST\n/operators/droplets/exchange\n1000\nnonce\n{}",
+                    hex::encode(Sha256::digest(&payload))
+                ),
+                SignatureScheme::HumidEcdsaV1 => format!(
+                    "high-storm:operator-write:v2\n{}\nPOST\n/operators/droplets/exchange\n1000\nnonce\n{}",
+                    scheme.as_str(),
+                    hex::encode(Sha256::digest(&payload))
+                ),
+            };
+
+            for altered in [
+                message.replace("operator-destination", "attacker-destination"),
+                message.replace("\"amount\": 100", "\"amount\": 999"),
+                hash_only,
+            ] {
+                let signature = match scheme {
+                    SignatureScheme::Bip322V1 => sign(&private_key, &altered),
+                    SignatureScheme::HumidEcdsaV1 => sign_humid(&private_key, &altered),
+                };
+
+                assert!(matches!(
+                    auth.verify_write_for_scheme_at(
+                        &public_key,
+                        1_000,
+                        "nonce",
+                        &signature,
+                        scheme,
+                        "POST",
+                        "/operators/droplets/exchange",
+                        &payload,
+                        1_000,
+                    )
+                    .await,
+                    Err(AuthError::InvalidSignature)
+                ));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn exchanges_a_real_bip322_proof_for_a_one_time_token() {

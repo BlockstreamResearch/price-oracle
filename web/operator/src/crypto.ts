@@ -19,15 +19,20 @@ export async function createWriteMessage(
   nonce: string,
   payload: unknown,
 ): Promise<string> {
-  const payloadHash = await sha256Hex(canonicalJson(payload));
+  const payloadJson = canonicalJson(payload);
+  const payloadHash = await sha256Hex(payloadJson);
+  const payloadDisplay = JSON.stringify(JSON.parse(payloadJson), null, 2);
   return [
-    "high-storm:operator-write:v2",
-    "bitcoin-signed-message-ecdsa-v1",
-    method.toUpperCase(),
-    path,
-    timestamp,
-    nonce,
-    payloadHash,
+    "high-storm:operator-write:v3",
+    "Signature scheme: bitcoin-signed-message-ecdsa-v1",
+    `Method: ${method.toUpperCase()}`,
+    `Path: ${path}`,
+    `Timestamp (Unix seconds): ${timestamp}`,
+    `Nonce: ${nonce}`,
+    `Payload SHA-256: ${payloadHash}`,
+    "",
+    "Payload JSON:",
+    payloadDisplay,
   ].join("\n");
 }
 

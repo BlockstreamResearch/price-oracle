@@ -676,7 +676,7 @@ async fn creates_and_approves_voting_with_signed_requests() {
             "/operators/voting",
             timestamp,
             "create-voting",
-            proposal,
+            proposal.clone(),
         ))
         .await
         .unwrap();
@@ -684,6 +684,24 @@ async fn creates_and_approves_voting_with_signed_requests() {
     let created: serde_json::Value = response_json(create).await;
     let hash = created["message_hash"].as_str().unwrap();
     let approval_path = format!("/operators/voting/{hash}/approve");
+
+    let mut altered_proposal = proposal.clone();
+    altered_proposal["number_of_splits"] = serde_json::json!(3);
+    for action in ["approve", "execute"] {
+        let response = app
+            .clone()
+            .oneshot(signed_request(
+                &private_key,
+                &public_key,
+                &format!("/operators/voting/{hash}/{action}"),
+                timestamp,
+                &format!("mismatched-{action}"),
+                altered_proposal.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 
     let approve = app
         .clone()
@@ -693,7 +711,7 @@ async fn creates_and_approves_voting_with_signed_requests() {
             &approval_path,
             timestamp,
             "approve-voting",
-            serde_json::json!({}),
+            proposal.clone(),
         ))
         .await
         .unwrap();
@@ -706,7 +724,7 @@ async fn creates_and_approves_voting_with_signed_requests() {
             &approval_path,
             timestamp,
             "approve-voting-retry",
-            serde_json::json!({}),
+            proposal,
         ))
         .await
         .unwrap();
@@ -857,6 +875,78 @@ async fn classifies_fee_utxos_reserved_for_burning() {
             "usable": [usable_first, usable_second],
         })
     );
+}
+
+#[tokio::test]
+async fn exposes_network_metadata_without_an_account() {
+    let (app, _, public_key) = setup().await;
+    let response = app
+        .clone()
+        .oneshot(get_request("/users/network"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let metadata = response_json(response).await;
+    assert_eq!(metadata.as_object().unwrap().len(), 5);
+    assert_eq!(metadata["storm_tree_root"], hex::encode([7; 32]));
+    let response = app
+        .oneshot(get_request(&format!("/users/account/{public_key}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let account = response_json(response).await;
+    for field in [
+        "network",
+        "storm_eye_asset_id",
+        "tick_asset_id",
+        "oracle_verifier_asset_id",
+    ] {
+        assert_eq!(metadata[field], account[field]);
+    }
+}
+
+#[tokio::test]
+async fn network_metadata_tracks_the_active_root_and_rejects_missing_contract_data() {
+    let (app, _, _, database) = setup_with_database().await;
+    let assets = database.network_assets();
+    let mut storm_eye = assets.get(STORM_EYE_KIND).await.unwrap().unwrap();
+    let current = storm_eye.clone();
+    let mut data = crate::high_storm::storm_eye_contract_data(&storm_eye).unwrap();
+    data.storm_tree_root = [9; 32];
+    storm_eye.contract_data = Some(postcard::to_stdvec(&data).unwrap());
+    assert!(
+        assets
+            .index_storm_eye_renewal(&current, &storm_eye)
+            .await
+            .unwrap()
+    );
+    let response = app
+        .clone()
+        .oneshot(get_request("/users/network"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await["storm_tree_root"],
+        hex::encode([9; 32])
+    );
+
+    for contract_data in [None, Some(vec![0])] {
+        let current = storm_eye.clone();
+        storm_eye.contract_data = contract_data;
+        assert!(
+            assets
+                .index_storm_eye_renewal(&current, &storm_eye)
+                .await
+                .unwrap()
+        );
+        let response = app
+            .clone()
+            .oneshot(get_request("/users/network"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
 
 #[tokio::test]
@@ -1139,7 +1229,14 @@ async fn node_setup_with_coordinator(
             entropy: None,
             issuance_txid: [2; 32],
             contract_script: vec![0x51],
-            contract_data: None,
+            contract_data: Some(
+                postcard::to_stdvec(&crate::high_storm::StormEyeContractData {
+                    storm_tree_root: [7; 32],
+                    rescue_height: 100,
+                    rescue_output_script_hash: [8; 32],
+                })
+                .unwrap(),
+            ),
             supply: 10_000,
             created_at_block: 1,
         })

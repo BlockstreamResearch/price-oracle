@@ -13,14 +13,19 @@ use secp256k1_zkp::Secp256k1;
 use serde::Deserialize;
 use simplex::{
     provider::SimplicityNetwork,
-    simplicityhl::elements::{AssetId, Block, BlockHash, Transaction, TxOut, Txid, encode},
+    simplicityhl::elements::{
+        AssetId, Block, BlockHash, Transaction, TxOut, Txid, encode,
+        pset::PartiallySignedTransaction,
+    },
 };
+use storm_tree::StormTree;
 use tokio::sync::Mutex;
 
 use crate::{
+    NetworkAsset,
     config::{ElementsRpcConfig, ProtocolConfig},
     db::{
-        chain::{CanonicalBlock, ChainStore},
+        chain::{CanonicalBlock, ChainStore, FinalizedMemberMigration},
         droplet::{DropletBalance, DropletError, DropletStore, TreasuryTransaction},
         monitored_utxo::{IndexedBlock, MonitoredUtxo, MonitoredUtxoStore},
         network_asset::{NetworkAssetStore, ORACLE_VERIFIER_KIND, STORM_EYE_KIND, TICK_ASSET_KIND},
@@ -31,7 +36,7 @@ use super::{
     ChainTip,
     assets::{
         initial_members_from_script, migrated_members_proposer_from_script, renewed_storm_eye,
-        treasury_blinding_secret,
+        storm_eye_contract_data, treasury_blinding_secret,
     },
     droplets::member_from_script,
     issuance::IssuedUtxoDescriptor,
@@ -48,11 +53,20 @@ enum ExchangeRecovery {
     Rebroadcast { transaction: Vec<u8>, txid: String },
 }
 
+/// Where a locked exchange's transaction stands on chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExchangeChainState {
+    /// In the mempool or confirmed; indexing settles it.
+    Known,
+    /// An input is spent by another confirmed transaction, so it can never confirm.
+    Conflicted,
+    Pending,
+}
+
 #[derive(Deserialize)]
-struct MempoolAcceptance {
-    allowed: bool,
-    #[serde(rename = "reject-reason")]
-    reject_reason: Option<String>,
+struct ConfirmationInfo {
+    #[serde(default)]
+    confirmations: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -182,9 +196,19 @@ impl Indexer {
             }
         }
 
+        let migration_ahead_of_cursor = member_migration_requires_replay(
+            &storm_eye,
+            &member_migrations,
+            issued_cursor.as_ref().map(|cursor| cursor.height),
+            droplets_cursor.as_ref().map(|cursor| cursor.height),
+            self.droplets.ledger_halt().await?.is_some(),
+        );
         let mut recovered_locks = Vec::new();
-        let recovering =
-            persisted_recovery.recovering || missing_journal || journal_mismatch || cursor_mismatch;
+        let recovering = persisted_recovery.recovering
+            || missing_journal
+            || journal_mismatch
+            || cursor_mismatch
+            || migration_ahead_of_cursor;
         if recovering {
             self.recovering.store(true, Ordering::Release);
             let ancestor = common_ancestor(&client, tip, &journal)?;
@@ -208,10 +232,21 @@ impl Indexer {
         let issued_height = issued_cursor
             .as_ref()
             .map_or(tick_asset.created_at_block, |cursor| cursor.height + 1);
-        let droplets_height = droplets_cursor
-            .as_ref()
-            .map_or(storm_eye.created_at_block, |cursor| cursor.height + 1);
-        let first_height = issued_height.min(droplets_height);
+        // A halted ledger stops Droplets accounting only; vouchers keep being indexed.
+        let mut droplets_height = if let Some((height, reason)) =
+            self.droplets.ledger_halt().await?
+        {
+            tracing::warn!(height, %reason, "Droplets ledger is halted; indexing issued UTXOs only");
+            None
+        } else {
+            Some(
+                droplets_cursor
+                    .as_ref()
+                    .map_or(storm_eye.created_at_block, |cursor| cursor.height + 1),
+            )
+        };
+        let first_height =
+            droplets_height.map_or(issued_height, |height| height.min(issued_height));
         let mut active_members = member_migrations.first().map_or_else(
             || self.initial_members.clone(),
             |migration| migration.previous_members.clone(),
@@ -287,7 +322,7 @@ impl Indexer {
             let spent = issued
                 .as_ref()
                 .map(|_| spent_monitored_outpoints(&block.txdata));
-            let treasury_transactions = if height >= droplets_height {
+            let treasury_transactions = if droplets_height.is_some_and(|start| height >= start) {
                 verify_initial_members(&block.txdata, block_storm_eye, &active_members)?;
                 Some(treasury_transactions(
                     &block.txdata,
@@ -349,19 +384,36 @@ impl Indexer {
                 .await?;
             }
             if let Some(treasury_transactions) = &treasury_transactions {
-                DropletStore::apply_block_in(
-                    &mut transaction,
+                let mut savepoint = sqlx::Acquire::begin(&mut transaction).await?;
+                match DropletStore::apply_block_in(
+                    &mut savepoint,
                     &indexed_block,
                     treasury_transactions,
                     &active_members,
                 )
-                .await?;
-                MonitoredUtxoStore::record_cursor(
-                    &mut transaction,
-                    DROPLETS_RULE_SET,
-                    &indexed_block,
-                )
-                .await?;
+                .await
+                {
+                    Ok(()) => {
+                        savepoint.commit().await?;
+                        MonitoredUtxoStore::record_cursor(
+                            &mut transaction,
+                            DROPLETS_RULE_SET,
+                            &indexed_block,
+                        )
+                        .await?;
+                    }
+                    Err(DropletError::Invalid(reason)) => {
+                        savepoint.rollback().await?;
+                        DropletStore::halt_ledger_in(&mut transaction, height, &reason).await?;
+                        tracing::error!(
+                            height,
+                            %reason,
+                            "halted the Droplets ledger; issued UTXOs and burns continue"
+                        );
+                        droplets_height = None;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
             ChainStore::record_block(&mut transaction, &canonical_block).await?;
             transaction.commit().await?;
@@ -446,45 +498,37 @@ impl Indexer {
         let client = self.client()?;
         let mempool: Vec<String> = client.call("getrawmempool", &[])?;
         for balance in self.droplets.locked().await? {
-            match exchange_recovery(&balance, block_height, is_leader, &mempool) {
+            let exchange = balance.last_tx.as_deref().and_then(locked_exchange);
+            let chain = match &exchange {
+                Some((transaction, _)) => {
+                    match exchange_chain_state(&client, transaction, &mempool) {
+                        Ok(chain) => chain,
+                        Err(error) => {
+                            tracing::warn!(%error, "could not check a locked Droplets exchange");
+                            continue;
+                        }
+                    }
+                }
+                None => ExchangeChainState::Pending,
+            };
+            match exchange_recovery(&balance, block_height, is_leader, exchange.as_ref(), chain) {
                 ExchangeRecovery::Keep => {}
                 ExchangeRecovery::Unlock => {
                     self.droplets
                         .unlock_exchange(balance.xonly_pubkey, block_height)
                         .await?;
+                    tracing::info!(
+                        member = %hex::encode(balance.xonly_pubkey),
+                        "released a Droplets exchange that can no longer confirm"
+                    );
                 }
                 ExchangeRecovery::Rebroadcast { transaction, txid } => {
-                    let encoded = hex::encode(&transaction);
-                    let acceptance = client.call::<Vec<MempoolAcceptance>>(
-                        "testmempoolaccept",
-                        &[serde_json::json!([encoded])],
-                    );
-                    let Ok(mut acceptance) = acceptance else {
-                        tracing::warn!(%txid, "could not preflight recovered Droplets transaction");
-                        continue;
-                    };
-                    let Some(acceptance) = acceptance.pop() else {
-                        tracing::warn!(%txid, "empty mempool preflight for recovered Droplets transaction");
-                        continue;
-                    };
-                    if !acceptance.allowed {
-                        let reason = acceptance.reject_reason.unwrap_or_default();
-                        if mempool_rejection_is_permanent(&reason) {
-                            self.droplets
-                                .unlock_exchange(balance.xonly_pubkey, block_height)
-                                .await?;
-                            tracing::warn!(%txid, %reason, "released invalid recovered Droplets transaction");
-                        }
-                        continue;
-                    }
                     match client
                         .call::<String>("sendrawtransaction", &[hex::encode(transaction).into()])
                     {
                         Ok(broadcast_txid) if broadcast_txid == txid => {}
                         Ok(broadcast_txid) => {
-                            return Err(IndexerError::Invalid(format!(
-                                "rebroadcast Droplets transaction id mismatch: expected {txid}, got {broadcast_txid}"
-                            )));
+                            tracing::warn!(%txid, %broadcast_txid, "rebroadcast Droplets transaction id mismatch");
                         }
                         Err(error) => {
                             tracing::warn!(%txid, %error, "recovered Droplets rebroadcast failed");
@@ -537,6 +581,7 @@ fn indexed_storm_eye_renewal(
         let spent = transaction
             .input
             .iter()
+            .filter(|input| !input.is_pegin)
             .map(|input| previous_output(client, input.previous_output))
             .collect::<Result<Vec<_>, _>>()?;
         if !matches_storm_eye_supply(&spent, current)? {
@@ -578,44 +623,82 @@ fn matches_storm_eye_supply(
     Ok(found && amount == storm_eye.supply)
 }
 
+/// The locked transaction and whether it is final: signers hold only the unsigned PSET
+/// until the leader announces the broadcast.
+fn locked_exchange(bytes: &[u8]) -> Option<(Transaction, bool)> {
+    if let Ok(transaction) = encode::deserialize::<Transaction>(bytes) {
+        return Some((transaction, true));
+    }
+    let pset: PartiallySignedTransaction = encode::deserialize(bytes).ok()?;
+    pset.extract_tx()
+        .ok()
+        .map(|transaction| (transaction, false))
+}
+
+fn exchange_chain_state(
+    client: &Client,
+    transaction: &Transaction,
+    mempool: &[String],
+) -> Result<ExchangeChainState, IndexerError> {
+    let mut conflicted = false;
+    for input in &transaction.input {
+        let unspent: Option<serde_json::Value> = client.call(
+            "gettxout",
+            &[
+                input.previous_output.txid.to_string().into(),
+                input.previous_output.vout.into(),
+                false.into(),
+            ],
+        )?;
+        conflicted |= unspent.is_none();
+    }
+    // Checked after the inputs, so an exchange confirming meanwhile is not taken for a conflict.
+    let txid = transaction.txid().to_string();
+    if mempool.contains(&txid) {
+        return Ok(ExchangeChainState::Known);
+    }
+    match client.call::<ConfirmationInfo>("getrawtransaction", &[txid.into(), true.into()]) {
+        Ok(info) if info.confirmations > 0 => return Ok(ExchangeChainState::Known),
+        Ok(_) => {}
+        Err(bitcoincore_rpc::Error::JsonRpc(bitcoincore_rpc::jsonrpc::error::Error::Rpc(
+            error,
+        ))) if error.code == -5 => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    Ok(if conflicted {
+        ExchangeChainState::Conflicted
+    } else {
+        ExchangeChainState::Pending
+    })
+}
+
 fn exchange_recovery(
     balance: &DropletBalance,
     block_height: u64,
     is_leader: bool,
-    mempool: &[String],
+    exchange: Option<&(Transaction, bool)>,
+    chain: ExchangeChainState,
 ) -> ExchangeRecovery {
     let Some(last_tx) = balance.last_tx.as_ref() else {
         return ExchangeRecovery::Unlock;
     };
-    let Ok(transaction) = encode::deserialize::<Transaction>(last_tx) else {
+    let Some((transaction, is_final)) = exchange else {
         return if balance.block_height < block_height {
             ExchangeRecovery::Unlock
         } else {
             ExchangeRecovery::Keep
         };
     };
-    let txid = transaction.txid().to_string();
-    if !is_leader || mempool.contains(&txid) {
-        ExchangeRecovery::Keep
-    } else {
-        ExchangeRecovery::Rebroadcast {
+    match chain {
+        ExchangeChainState::Known => ExchangeRecovery::Keep,
+        ExchangeChainState::Conflicted => ExchangeRecovery::Unlock,
+        ExchangeChainState::Pending if *is_final && is_leader => ExchangeRecovery::Rebroadcast {
             transaction: last_tx.clone(),
-            txid,
-        }
+            txid: transaction.txid().to_string(),
+        },
+        ExchangeChainState::Pending => ExchangeRecovery::Keep,
     }
-}
-
-fn mempool_rejection_is_permanent(reason: &str) -> bool {
-    let reason = reason.to_ascii_lowercase();
-    [
-        "missing inputs",
-        "missingorspent",
-        "mempool conflict",
-        "mempool-conflict",
-        "already spent",
-    ]
-    .iter()
-    .any(|marker| reason.contains(marker))
 }
 
 fn verify_initial_members(
@@ -625,7 +708,8 @@ fn verify_initial_members(
 ) -> Result<(), IndexerError> {
     let Some(transaction) = transactions
         .iter()
-        .find(|transaction| transaction.txid().to_byte_array() == storm_eye.issuance_txid)
+        // `issuance_txid` is stored in display byte order.
+        .find(|transaction| transaction.txid().to_string() == hex::encode(storm_eye.issuance_txid))
     else {
         return Ok(());
     };
@@ -642,6 +726,18 @@ fn verify_initial_members(
         return Err(IndexerError::Invalid(
             "Storm Eye issuance must contain one initial-members marker".into(),
         ));
+    }
+    let marker_root = StormTree::new(markers[0].clone())
+        .map_err(|error| IndexerError::Invalid(error.to_string()))?
+        .root();
+    let replayed_root = storm_eye_contract_data(storm_eye)
+        .map_err(|error| IndexerError::Invalid(error.to_string()))?
+        .storm_tree_root;
+    if replayed_root != marker_root {
+        tracing::warn!(
+            "skipped the initial-members check: this node has no history of a later member migration"
+        );
+        return Ok(());
     }
     let mut expected_members = expected_members.to_vec();
     expected_members.sort_unstable();
@@ -918,11 +1014,21 @@ fn issuance_tokens<'a>(
         return Ok(None);
     }
     let txid = transaction.txid();
+    // Peg-ins have no previous Liquid transaction to look up; network issuances never use them.
+    if transaction.input.iter().any(|input| input.is_pegin) {
+        tracing::debug!(%txid, "rejected issuance candidate: spends a peg-in");
+        return Ok(None);
+    }
     let mut tokens: Vec<&crate::NetworkAsset> = Vec::with_capacity(issued_assets.len());
     for input in transaction.input.iter().skip(1) {
         let issuance = input.asset_issuance;
         if issuance.is_null() {
             break;
+        }
+        // A null nonce is a new issuance, whose entropy field is a free contract hash.
+        if issuance.asset_blinding_nonce.is_null() {
+            tracing::debug!(%txid, "rejected issuance candidate: not a reissuance");
+            return Ok(None);
         }
         let Some(asset) = issued_assets
             .iter()
@@ -1098,6 +1204,23 @@ fn require_parent_hash(
     Ok(())
 }
 
+fn member_migration_requires_replay(
+    storm_eye: &NetworkAsset,
+    migrations: &[FinalizedMemberMigration],
+    issued_cursor: Option<u64>,
+    droplets_cursor: Option<u64>,
+    droplets_halted: bool,
+) -> bool {
+    migrations.iter().any(|migration| {
+        migration.asset_kind == storm_eye.kind
+            && migration.next_script == storm_eye.contract_script
+            && migration.next_data == storm_eye.contract_data
+            && (issued_cursor.is_none_or(|height| height < migration.block_height)
+                || (!droplets_halted
+                    && droplets_cursor.is_none_or(|height| height < migration.block_height)))
+    })
+}
+
 fn target_tip_is_canonical(
     current_tip: u64,
     target_tip: u64,
@@ -1123,6 +1246,366 @@ mod tests {
         Script, TxOut, TxOutSecrets, Txid,
         confidential::{self, AssetBlindingFactor, ValueBlindingFactor},
     };
+
+    #[test]
+    fn finalized_member_migration_replays_only_for_lagging_active_cursors() {
+        let asset = NetworkAsset {
+            kind: STORM_EYE_KIND.into(),
+            name: "Storm Eye".into(),
+            asset_id: [1; 32],
+            reissuance_token_id: None,
+            entropy: None,
+            issuance_txid: [2; 32],
+            contract_script: vec![0x52],
+            contract_data: Some(vec![4; 32]),
+            supply: 10_000,
+            created_at_block: 1,
+        };
+        let migration = FinalizedMemberMigration {
+            request_hash: [5; 32],
+            block_height: 387,
+            block_hash: [6; 32],
+            asset_kind: STORM_EYE_KIND.into(),
+            previous_script: vec![0x51],
+            previous_data: Some(vec![3; 32]),
+            next_script: asset.contract_script.clone(),
+            next_data: asset.contract_data.clone(),
+            previous_members: vec![],
+            next_members: vec![],
+        };
+        for (issued, droplets, halted, expected) in [
+            (Some(386), Some(386), false, true),
+            (None, Some(387), false, true),
+            (Some(387), None, false, true),
+            (Some(387), Some(386), false, true),
+            (Some(386), Some(387), true, true),
+            (Some(387), Some(387), false, false),
+            (Some(388), Some(388), false, false),
+            (Some(387), Some(386), true, false),
+            (Some(387), None, true, false),
+        ] {
+            assert_eq!(
+                member_migration_requires_replay(
+                    &asset,
+                    std::slice::from_ref(&migration),
+                    issued,
+                    droplets,
+                    halted,
+                ),
+                expected,
+                "issued={issued:?}, droplets={droplets:?}, halted={halted}",
+            );
+        }
+        for mismatched in [
+            NetworkAsset {
+                kind: TICK_ASSET_KIND.into(),
+                ..asset.clone()
+            },
+            NetworkAsset {
+                contract_script: migration.previous_script.clone(),
+                ..asset.clone()
+            },
+            NetworkAsset {
+                contract_data: migration.previous_data.clone(),
+                ..asset.clone()
+            },
+        ] {
+            assert!(!member_migration_requires_replay(
+                &mismatched,
+                std::slice::from_ref(&migration),
+                Some(386),
+                Some(386),
+                false,
+            ));
+        }
+    }
+
+    #[test]
+    fn verifies_initial_members_of_the_storm_eye_issuance() {
+        use crate::high_storm::assets::{StormEyeContractData, initial_members_script};
+        use simplex::simplicityhl::elements::LockTime;
+
+        let members = [1u8, 2, 3]
+            .map(|byte| {
+                secp256k1_zkp::Keypair::from_seckey_slice(&Secp256k1::new(), &[byte; 32])
+                    .unwrap()
+                    .x_only_public_key()
+                    .0
+                    .serialize()
+            })
+            .to_vec();
+        let issuance = Transaction {
+            version: 2,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![TxOut {
+                script_pubkey: initial_members_script(&members).unwrap(),
+                ..Default::default()
+            }],
+        };
+        let with_root = |root| crate::NetworkAsset {
+            kind: STORM_EYE_KIND.into(),
+            name: "Storm Eye".into(),
+            asset_id: [1; 32],
+            reissuance_token_id: None,
+            entropy: None,
+            issuance_txid: hex::decode(issuance.txid().to_string())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            contract_script: vec![0x51],
+            contract_data: Some(
+                postcard::to_stdvec(&StormEyeContractData {
+                    storm_tree_root: root,
+                    rescue_height: 1,
+                    rescue_output_script_hash: [0; 32],
+                })
+                .unwrap(),
+            ),
+            supply: 10_000,
+            created_at_block: 1,
+        };
+        let genesis = with_root(StormTree::new(members.clone()).unwrap().root());
+        let transactions = std::slice::from_ref(&issuance);
+
+        verify_initial_members(transactions, &genesis, &members).unwrap();
+        assert!(verify_initial_members(transactions, &genesis, &members[..2]).is_err());
+        // A member that joined after a migration it holds no record of.
+        verify_initial_members(transactions, &with_root([7; 32]), &members[..2]).unwrap();
+    }
+
+    #[test]
+    fn public_entropy_matching_does_not_require_a_network_reissuance() {
+        use simplex::simplicityhl::elements::{AssetEntropy, AssetIssuance, TxIn};
+
+        let public_entropy = [21; 32];
+        let input = TxIn {
+            asset_issuance: AssetIssuance {
+                asset_entropy: AssetEntropy::from_byte_array(public_entropy),
+                amount: confidential::Value::Explicit(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            input.asset_issuance.asset_entropy.to_byte_array(),
+            public_entropy
+        );
+        assert_ne!(
+            input.issuance_ids().0,
+            AssetId::from_entropy(AssetEntropy::from_byte_array(public_entropy))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pegin_and_new_issuance_candidates_are_rejected_without_rpc() {
+        use serde_json::json;
+        use simplex::simplicityhl::elements::{
+            AssetBlindingNonce, AssetEntropy, AssetIssuance, LockTime, TxIn,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let network = SimplicityNetwork::LiquidTestnet;
+        let asset = crate::NetworkAsset {
+            kind: TICK_ASSET_KIND.into(),
+            name: "Tick".into(),
+            asset_id: [8; 32],
+            reissuance_token_id: Some([9; 32]),
+            entropy: Some([21; 32]),
+            issuance_txid: [2; 32],
+            contract_script: vec![0x51],
+            contract_data: None,
+            supply: 0,
+            created_at_block: 1,
+        };
+        let storm_eye = crate::NetworkAsset {
+            kind: STORM_EYE_KIND.into(),
+            asset_id: [7; 32],
+            ..asset.clone()
+        };
+        let previous = Transaction {
+            version: 2,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![explicit_output(
+                network.policy_asset(),
+                1_000,
+                Script::new(),
+            )],
+        };
+        let candidate = Transaction {
+            version: 2,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    is_pegin: true,
+                    ..Default::default()
+                },
+                TxIn {
+                    asset_issuance: AssetIssuance {
+                        asset_entropy: AssetEntropy::from_byte_array(asset.entropy.unwrap()),
+                        amount: confidential::Value::Explicit(1),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            output: vec![previous.output[0].clone(), previous.output[0].clone()],
+        };
+        let previous_hex = hex::encode(encode::serialize(&previous));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = calls.clone();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(request["method"], "getrawtransaction");
+                let response = if request["params"][0] == Txid::from_byte_array([0; 32]).to_string()
+                {
+                    json!({ "result": null, "error": { "code": -5,
+                        "message": "No such mempool or blockchain transaction" } })
+                } else {
+                    json!({ "result": previous_hex, "error": null })
+                };
+                async move {
+                    axum::Json(json!({ "id": request["id"],
+                    "result": response["result"], "error": response["error"] }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = tokio::task::spawn_blocking(move || {
+            let client = Client::new(&format!("http://{address}"), Auth::None).unwrap();
+            let mut unrelated = candidate.clone();
+            unrelated.input[1].asset_issuance.asset_entropy =
+                AssetEntropy::from_byte_array([22; 32]);
+            assert!(
+                issuance_tokens(&client, &unrelated, &storm_eye, &[&asset])
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                issuance_tokens(&client, &candidate, &storm_eye, &[&asset])
+                    .unwrap()
+                    .is_none()
+            );
+
+            let mut ordinary = candidate;
+            ordinary.input[0].is_pegin = false;
+            ordinary.input[0].previous_output.txid = previous.txid();
+            ordinary.input[0].previous_output.vout = 0;
+            assert!(
+                issuance_tokens(&client, &ordinary, &storm_eye, &[&asset])
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            let mut reissuance = ordinary.clone();
+            reissuance.input[1].asset_issuance.asset_blinding_nonce =
+                AssetBlindingNonce::from_byte_array([1; 32]);
+            assert!(
+                issuance_tokens(&client, &reissuance, &storm_eye, &[&asset])
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let mut pegin_reissuance = reissuance;
+            pegin_reissuance.input[0].is_pegin = true;
+            assert!(
+                issuance_tokens(&client, &pegin_reissuance, &storm_eye, &[&asset])
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        })
+        .await;
+        server.abort();
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn classifies_a_locked_exchange_from_its_inputs_and_confirmations() {
+        use serde_json::json;
+        use simplex::simplicityhl::elements::{LockTime, OutPoint, TxIn};
+
+        let spent_input = Txid::from_byte_array([1; 32]);
+        let exchange = |input: Txid, vout: u32| Transaction {
+            version: 2,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: input, vout },
+                ..Default::default()
+            }],
+            output: vec![],
+        };
+        let confirmed = exchange(spent_input, 1);
+        let confirmed_txid = confirmed.txid().to_string();
+        let observed_txid = confirmed_txid.clone();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let (result, error) = match request["method"].as_str().unwrap() {
+                    "gettxout" => {
+                        assert_eq!(request["params"][2], json!(false));
+                        if request["params"][0] == spent_input.to_string() {
+                            (json!(null), json!(null))
+                        } else {
+                            (json!({ "confirmations": 3 }), json!(null))
+                        }
+                    }
+                    "getrawtransaction" if request["params"][0] == observed_txid => {
+                        (json!({ "confirmations": 1 }), json!(null))
+                    }
+                    "getrawtransaction" => (
+                        json!(null),
+                        json!({ "code": -5, "message": "No such mempool or blockchain transaction" }),
+                    ),
+                    method => panic!("unexpected RPC method: {method}"),
+                };
+                async move {
+                    axum::Json(json!({ "id": request["id"], "result": result, "error": error }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = tokio::task::spawn_blocking(move || {
+            let client = Client::new(&format!("http://{address}"), Auth::None).unwrap();
+            let pending = exchange(Txid::from_byte_array([3; 32]), 0);
+            let conflicted = exchange(spent_input, 0);
+            let in_mempool = vec![conflicted.txid().to_string()];
+
+            assert_eq!(
+                exchange_chain_state(&client, &pending, &[]).unwrap(),
+                ExchangeChainState::Pending
+            );
+            assert_eq!(
+                exchange_chain_state(&client, &conflicted, &[]).unwrap(),
+                ExchangeChainState::Conflicted
+            );
+            // Its own confirmation spent the input: settled by indexing, not a conflict.
+            assert_eq!(
+                exchange_chain_state(&client, &confirmed, &[]).unwrap(),
+                ExchangeChainState::Known
+            );
+            assert_eq!(
+                exchange_chain_state(&client, &conflicted, &in_mempool).unwrap(),
+                ExchangeChainState::Known
+            );
+        })
+        .await;
+        server.abort();
+        result.unwrap();
+    }
 
     #[test]
     fn collects_spent_outpoints_from_a_block() {
@@ -1199,7 +1682,9 @@ mod tests {
     }
 
     #[test]
-    fn recovers_locked_exchanges_according_to_leadership_and_mempool_state() {
+    fn recovers_locked_exchanges_according_to_leadership_and_chain_state() {
+        use ExchangeChainState::{Conflicted, Known, Pending};
+
         let transaction = Transaction {
             version: 2,
             lock_time: simplex::simplicityhl::elements::LockTime::ZERO,
@@ -1207,6 +1692,8 @@ mod tests {
             output: vec![],
         };
         let transaction_bytes = encode::serialize(&transaction);
+        let pset_bytes =
+            encode::serialize(&PartiallySignedTransaction::from_tx(transaction.clone()));
         let txid = transaction.txid().to_string();
         let balance = |last_tx| DropletBalance {
             xonly_pubkey: [1; 32],
@@ -1215,49 +1702,66 @@ mod tests {
             exchange_locked: true,
             last_tx,
         };
+        let recover = |last_tx: &Vec<u8>, block_height, is_leader, chain| {
+            let exchange = locked_exchange(last_tx);
+            exchange_recovery(
+                &balance(Some(last_tx.clone())),
+                block_height,
+                is_leader,
+                exchange.as_ref(),
+                chain,
+            )
+        };
 
         assert_eq!(
-            exchange_recovery(&balance(None), 10, true, &[]),
+            exchange_recovery(&balance(None), 10, true, None, Pending),
             ExchangeRecovery::Unlock
         );
         assert_eq!(
-            exchange_recovery(&balance(Some(vec![1, 2])), 10, true, &[]),
+            recover(&vec![1, 2], 10, true, Pending),
             ExchangeRecovery::Keep
         );
         assert_eq!(
-            exchange_recovery(&balance(Some(vec![1, 2])), 11, true, &[]),
+            recover(&vec![1, 2], 11, true, Pending),
             ExchangeRecovery::Unlock
         );
+
         assert_eq!(
-            exchange_recovery(
-                &balance(Some(transaction_bytes.clone())),
-                11,
-                true,
-                std::slice::from_ref(&txid),
-            ),
+            locked_exchange(&pset_bytes),
+            Some((transaction.clone(), false))
+        );
+        assert_eq!(
+            locked_exchange(&transaction_bytes),
+            Some((transaction, true))
+        );
+        for is_leader in [false, true] {
+            // A signer that never saw the broadcast keeps its lock while the exchange can confirm.
+            assert_eq!(
+                recover(&pset_bytes, 50, is_leader, Pending),
+                ExchangeRecovery::Keep
+            );
+            for last_tx in [&pset_bytes, &transaction_bytes] {
+                assert_eq!(
+                    recover(last_tx, 50, is_leader, Known),
+                    ExchangeRecovery::Keep
+                );
+                assert_eq!(
+                    recover(last_tx, 50, is_leader, Conflicted),
+                    ExchangeRecovery::Unlock
+                );
+            }
+        }
+        assert_eq!(
+            recover(&transaction_bytes, 11, false, Pending),
             ExchangeRecovery::Keep
         );
         assert_eq!(
-            exchange_recovery(&balance(Some(transaction_bytes.clone())), 11, false, &[],),
-            ExchangeRecovery::Keep
-        );
-        assert_eq!(
-            exchange_recovery(&balance(Some(transaction_bytes.clone())), 11, true, &[]),
+            recover(&transaction_bytes, 11, true, Pending),
             ExchangeRecovery::Rebroadcast {
-                transaction: transaction_bytes,
+                transaction: transaction_bytes.clone(),
                 txid,
             }
         );
-    }
-
-    #[test]
-    fn unlocks_only_permanently_conflicted_recovered_exchanges() {
-        assert!(mempool_rejection_is_permanent(
-            "bad-txns-inputs-missingorspent"
-        ));
-        assert!(mempool_rejection_is_permanent("txn-mempool-conflict"));
-        assert!(!mempool_rejection_is_permanent("min relay fee not met"));
-        assert!(!mempool_rejection_is_permanent("txn-already-in-mempool"));
     }
 
     #[test]

@@ -296,6 +296,54 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_script_sizes_match_serialized_batches() {
+        for (count, expected_payload_len, expected_script_len) in [
+            (1, 111, 114),
+            (2, 185, 188),
+            (99, 7_363, 7_367),
+            (100, 7_437, 7_441),
+        ] {
+            for signer in [None, Some(SIGNER)] {
+                let descriptors = (0..count)
+                    .map(|output_index| descriptor(output_index, signer))
+                    .collect::<Vec<_>>();
+                let script = IssuedUtxoDescriptor::script_pubkey(&descriptors).unwrap();
+                let mut instructions = script.instructions_minimal();
+
+                assert!(matches!(
+                    instructions.next(),
+                    Some(Ok(Instruction::Op(opcodes::all::OP_RETURN)))
+                ));
+                let Some(Ok(Instruction::PushBytes(payload))) = instructions.next() else {
+                    panic!("descriptor must contain a data push");
+                };
+                assert_eq!(payload.len(), expected_payload_len);
+                assert!(instructions.next().is_none());
+                assert_eq!(script.len(), expected_script_len);
+                assert_eq!(
+                    IssuedUtxoDescriptor::from_script(&script).unwrap(),
+                    Some(descriptors)
+                );
+
+                println!(
+                    "descriptor count={count} verifier={} payload_bytes={} script_bytes={}",
+                    signer.is_some(),
+                    payload.len(),
+                    script.len(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn descriptor_count_boundaries_are_enforced() {
+        assert!(IssuedUtxoDescriptor::script_pubkey(&[]).is_err());
+
+        let descriptors = vec![descriptor(2, None); MAX_ISSUED_DESCRIPTORS + 1];
+        assert!(IssuedUtxoDescriptor::script_pubkey(&descriptors).is_err());
+    }
+
+    #[test]
     fn reads_tick_descriptors_written_before_the_verifier() {
         let mut data = Vec::new();
         data.extend_from_slice(&DESCRIPTOR_MAGIC);

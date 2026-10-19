@@ -7,12 +7,12 @@ use super::{
     leader,
     message::{
         BurnExpiredUtxos, ChainTip, ExecuteVotingRequest, ExpiredUtxosBurned, NodeMessage,
-        NodeMessageKind, RenewStormUtxos,
+        NodeMessageKind, ProtocolSettings, RenewStormUtxos,
     },
     prices::price_hash,
     signing::SigningError,
     state::NetworkState,
-    voting::VotingError,
+    voting::{VotingError, VotingStatus},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -181,9 +181,10 @@ pub(crate) async fn handle(
             Ok(())
         }
         NodeMessageKind::NetworkAssets => {
+            let storm_tree_root = state.signing().storm_tree_root().await.ok();
             state
                 .assets()
-                .handle_announcement(message, &context)
+                .handle_announcement(message, &context, storm_tree_root)
                 .await?;
             Ok(())
         }
@@ -215,18 +216,31 @@ pub(crate) async fn handle(
                 )
             })?;
             let request: ExecuteVotingRequest = message.decode_payload()?;
-            require_chain_tip(&state, required_chain_tip(request.chain_tip)?).await?;
-            authorize_voting_proposer(
-                request.proposer_public_key,
-                context.message_context.peer_public_key,
-            )?;
+            let chain_tip = required_chain_tip(request.chain_tip)?;
+            if request.final_tx.is_none() {
+                require_chain_tip(&state, chain_tip).await?;
+            }
             let peers = context.storm_handle.peers().await;
             let current_members = super::voting_member_keys(&peers)?;
-            let vote = state.voting().get(request_hash).await?.ok_or_else(|| {
-                super::voting_execution::VotingExecutionError::UnknownRequest(hex::encode(
-                    request_hash,
-                ))
-            })?;
+            authorize_voting_executor(&current_members, context.message_context.peer_public_key)?;
+            let Some(vote) = state.voting().get(request_hash).await? else {
+                if request.final_tx.is_some() {
+                    tracing::debug!(request_hash = %hex::encode(request_hash), "ignored execution notice for an unknown vote");
+                    return Ok(());
+                }
+                return Err(
+                    super::voting_execution::VotingExecutionError::UnknownRequest(hex::encode(
+                        request_hash,
+                    ))
+                    .into(),
+                );
+            };
+            if request.final_tx.is_some() {
+                if vote.status == VotingStatus::Executed {
+                    return Ok(());
+                }
+                require_canonical_anchor(&state, chain_tip)?;
+            }
             if let Some(target_members) =
                 super::member_migration_target(&vote.request, &current_members)?
             {
@@ -270,6 +284,25 @@ pub(crate) async fn handle(
                 .await?;
             Ok(())
         }
+        NodeMessageKind::ProtocolSettings => {
+            let settings: ProtocolSettings = message.decode_payload()?;
+            let sender = context.message_context.peer_public_key;
+            let peer = hex::encode(sender);
+            match state.record_peer_settings(sender, &settings) {
+                Some(mismatches) if mismatches.is_empty() => {
+                    tracing::info!(%peer, "peer protocol settings now match");
+                }
+                Some(mismatches) => {
+                    tracing::error!(
+                        %peer,
+                        mismatches = %mismatches.join(", "),
+                        "peer protocol settings differ; rounds involving it will be rejected"
+                    );
+                }
+                None => {}
+            }
+            Ok(())
+        }
         NodeMessageKind::RenewStormUtxos => {
             let request: RenewStormUtxos = message.decode_payload()?;
             require_chain_tip(&state, required_chain_tip(request.chain_tip)?).await?;
@@ -301,15 +334,18 @@ pub(crate) async fn handle(
     }
 }
 
-fn authorize_voting_proposer(proposer: [u8; 32], sender: [u8; 33]) -> Result<(), SigningError> {
+pub(super) fn authorize_voting_executor(
+    current_members: &std::collections::BTreeSet<[u8; 32]>,
+    sender: [u8; 33],
+) -> Result<(), SigningError> {
     let sender = secp256k1::PublicKey::from_slice(&sender)
         .map_err(|error| SigningError::UnauthorizedMessage(error.to_string()))?
         .x_only_public_key()
         .0
         .serialize();
-    if sender != proposer {
+    if !current_members.contains(&sender) {
         return Err(SigningError::UnauthorizedMessage(
-            "only the node that proposed a voting request may execute it".into(),
+            "only a current network member may execute a voting request".into(),
         ));
     }
     Ok(())
@@ -353,10 +389,32 @@ async fn require_chain_tip(state: &NetworkState, chain_tip: ChainTip) -> Result<
     Ok(())
 }
 
+fn require_canonical_anchor(state: &NetworkState, chain_tip: ChainTip) -> Result<(), HandlerError> {
+    let local_hash = if chain_tip.height <= state.indexer().tip()? {
+        Some(state.indexer().hash_at(chain_tip.height)?)
+    } else {
+        None
+    };
+    canonical_anchor(chain_tip, local_hash)?;
+    Ok(())
+}
+
+fn canonical_anchor(chain_tip: ChainTip, local_hash: Option<[u8; 32]>) -> Result<(), SigningError> {
+    match local_hash {
+        None => Err(SigningError::UnauthorizedMessage(
+            "finalized execution anchors a block this node has not seen".into(),
+        )),
+        Some(hash) if hash != chain_tip.hash => Err(SigningError::UnauthorizedMessage(
+            "finalized execution anchors a block outside the canonical chain".into(),
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 fn require_current_tip(block_height: u64, tip: u64) -> Result<(), SigningError> {
     if block_height != tip {
         return Err(SigningError::UnauthorizedMessage(
-            "leader message does not target the current block".into(),
+            "message does not target the current block".into(),
         ));
     }
 
@@ -402,6 +460,37 @@ mod tests {
 
     const COORDINATOR: [u8; 33] = [1; 33];
     const MEMBER: [u8; 33] = [2; 33];
+
+    #[test]
+    fn current_member_can_execute_another_members_voting_request() {
+        let proposer = secp256k1::PublicKey::from_secret_key(
+            &secp256k1::SecretKey::from_secret_bytes([1; 32]).unwrap(),
+        );
+        let executor = secp256k1::PublicKey::from_secret_key(
+            &secp256k1::SecretKey::from_secret_bytes([2; 32]).unwrap(),
+        );
+        let current_members = [
+            proposer.x_only_public_key().0.serialize(),
+            executor.x_only_public_key().0.serialize(),
+        ]
+        .into_iter()
+        .collect();
+
+        authorize_voting_executor(&current_members, proposer.serialize()).unwrap();
+        authorize_voting_executor(&current_members, executor.serialize()).unwrap();
+    }
+
+    #[test]
+    fn non_member_cannot_execute_a_voting_request() {
+        let outsider = secp256k1::PublicKey::from_secret_key(
+            &secp256k1::SecretKey::from_secret_bytes([3; 32]).unwrap(),
+        );
+        let error =
+            authorize_voting_executor(&Default::default(), outsider.serialize()).unwrap_err();
+
+        assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
+        assert!(authorize_voting_executor(&Default::default(), [0; 33]).is_err());
+    }
 
     #[test]
     fn coordinator_can_send_user_request_messages() {
@@ -468,6 +557,26 @@ mod tests {
 
         let error = require_current_tip(43, 42).unwrap_err();
         assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
+    }
+
+    #[test]
+    fn finalized_executions_accept_any_seen_canonical_anchor() {
+        let anchor = ChainTip {
+            height: 40,
+            hash: [4; 32],
+        };
+
+        canonical_anchor(anchor, Some([4; 32])).unwrap();
+
+        let fork = canonical_anchor(anchor, Some([5; 32])).unwrap_err();
+        assert!(
+            matches!(fork, SigningError::UnauthorizedMessage(reason) if reason.contains("outside"))
+        );
+
+        let unseen = canonical_anchor(anchor, None).unwrap_err();
+        assert!(
+            matches!(unseen, SigningError::UnauthorizedMessage(reason) if reason.contains("not seen"))
+        );
     }
 
     #[test]

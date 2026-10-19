@@ -33,11 +33,8 @@ const PRICE_TAG: &str = "OracleNetworkV1/Price";
 /// LBTC/USD, the Direct feed the bundled CoinGecko source prices.
 const PRICE_FEED_ID: u32 = 0;
 const TICK_LIFETIME_BLOCKS: u64 = 60;
-const RPC_URL: &str = "http://127.0.0.1:18884";
-const WALLET_RPC_URL: &str = "http://127.0.0.1:18884/wallet/funded-key";
 const RPC_USER: &str = "high-storm";
 const RPC_PASSWORD: &str = "high-storm";
-const API_ADDRESS: &str = "127.0.0.1:9100";
 const ACCOUNT_FUNDING_SATS: u64 = 10_000;
 const FUNDING_FEE_SATS: u64 = 1_000;
 const BURN_FEE_SATS: u64 = 500;
@@ -153,13 +150,9 @@ fn burning_time_is_sixty_blocks_for_production_and_docker() {
 #[tokio::test]
 #[ignore = "requires the bundled three-node Docker Compose stack"]
 async fn issues_a_price_request_at_a_rate_the_network_signed() -> TestResult<()> {
-    let rpc = rpc_client(RPC_URL)?;
-    let wallet = rpc_client(WALLET_RPC_URL)?;
-    let asset_database = Database::connect(
-        "postgres://high-storm:high-storm@127.0.0.1:5432/high-storm-node-1",
-        1,
-    )
-    .await?;
+    let rpc = rpc_client(&rpc_url())?;
+    let wallet = rpc_client(&format!("{}/wallet/funded-key", rpc_url()))?;
+    let asset_database = Database::connect(&database_url("high-storm-node-1"), 1).await?;
     let storm_eye = asset_database
         .network_assets()
         .get(STORM_EYE_KIND)
@@ -185,7 +178,7 @@ async fn issues_a_price_request_at_a_rate_the_network_signed() -> TestResult<()>
         [&users[0].address, &users[1].address],
     )
     .await?;
-    mine_blocks(&rpc, 1, &mining_address)?;
+    mine_blocks(&rpc, 2, &mining_address)?;
 
     let priced = signed_price_request(
         &users[0].keypair,
@@ -301,8 +294,8 @@ async fn issues_a_price_request_at_a_rate_the_network_signed() -> TestResult<()>
 #[tokio::test]
 #[ignore = "requires the bundled three-node Docker Compose stack"]
 async fn rebuilds_all_chain_projections_after_a_block_reorganization() -> TestResult<()> {
-    let rpc = rpc_client(RPC_URL)?;
-    let wallet = rpc_client(WALLET_RPC_URL)?;
+    let rpc = rpc_client(&rpc_url())?;
+    let wallet = rpc_client(&format!("{}/wallet/funded-key", rpc_url()))?;
     let databases = database_pools().await?;
     let old_height: u64 = rpc.call("getblockcount", &[])?;
     let old_tip: String = rpc.call("getblockhash", &[old_height.into()])?;
@@ -338,14 +331,10 @@ async fn rebuilds_all_chain_projections_after_a_block_reorganization() -> TestRe
 #[tokio::test]
 #[ignore = "requires the bundled three-node Docker Compose stack"]
 async fn batches_two_users_and_burns_both_to_one_empty_op_return() -> TestResult<()> {
-    let rpc = rpc_client(RPC_URL)?;
-    let wallet = rpc_client(WALLET_RPC_URL)?;
+    let rpc = rpc_client(&rpc_url())?;
+    let wallet = rpc_client(&format!("{}/wallet/funded-key", rpc_url()))?;
     let databases = database_pools().await?;
-    let asset_database = Database::connect(
-        "postgres://high-storm:high-storm@127.0.0.1:5432/high-storm-node-1",
-        1,
-    )
-    .await?;
+    let asset_database = Database::connect(&database_url("high-storm-node-1"), 1).await?;
     let storm_eye = asset_database
         .network_assets()
         .get(STORM_EYE_KIND)
@@ -365,7 +354,7 @@ async fn batches_two_users_and_burns_both_to_one_empty_op_return() -> TestResult
         [&users[0].address, &users[1].address],
     )
     .await?;
-    mine_blocks(&rpc, 1, &mining_address)?;
+    mine_blocks(&rpc, 2, &mining_address)?;
 
     let mut request_hashes = Vec::new();
     for (vout, user) in users.iter().enumerate() {
@@ -452,11 +441,23 @@ async fn batches_two_users_and_burns_both_to_one_empty_op_return() -> TestResult
         burn_outputs[0].value.explicit(),
         Some(burned_input_amount(&rpc, &burn, tick_asset)?)
     );
-    assert!(burn.output.iter().any(|output| {
-        output.asset.explicit() == Some(policy_asset)
-            && output.value.explicit() == Some(BURN_FEE_SATS)
-            && output.script_pubkey.is_empty()
-    }));
+    let fee = burn
+        .output
+        .iter()
+        .find(|output| {
+            output.asset.explicit() == Some(policy_asset) && output.script_pubkey.is_empty()
+        })
+        .and_then(|output| output.value.explicit())
+        .ok_or("burn transaction has no explicit fee")?;
+    assert!(fee >= BURN_FEE_SATS);
+    let mut reserves = Vec::new();
+    for input in &burn.input {
+        let previous = raw_transaction(&rpc, &input.previous_output.txid.to_string())?;
+        let output = &previous.output[input.previous_output.vout as usize];
+        if output.asset.explicit() == Some(policy_asset) {
+            reserves.push(input.previous_output);
+        }
+    }
     for tick in &active[0] {
         let user = users
             .iter()
@@ -466,9 +467,17 @@ async fn batches_two_users_and_burns_both_to_one_empty_op_return() -> TestResult
             .value
             .explicit()
             .expect("burn reserves are explicit");
+        let reserve_index = reserves
+            .iter()
+            .position(|outpoint| {
+                outpoint.txid == issuance_txid && outpoint.vout == tick.reserve_output_index
+            })
+            .ok_or("burn does not spend the user's reserve")?;
+        let share = fee / reserves.len() as u64
+            + u64::from((reserve_index as u64) < fee % reserves.len() as u64);
         assert!(burn.output.iter().any(|output| {
             output.asset.explicit() == Some(policy_asset)
-                && output.value.explicit() == Some(reserve - BURN_FEE_SATS / 2)
+                && output.value.explicit() == Some(reserve - share)
                 && output.script_pubkey == user.script
         }));
     }
@@ -488,14 +497,10 @@ async fn batches_two_users_and_burns_both_to_one_empty_op_return() -> TestResult
 #[tokio::test]
 #[ignore = "requires the bundled three-node Docker Compose stack"]
 async fn issues_and_burns_ticks_and_verifiers_in_one_round() -> TestResult<()> {
-    let rpc = rpc_client(RPC_URL)?;
-    let wallet = rpc_client(WALLET_RPC_URL)?;
+    let rpc = rpc_client(&rpc_url())?;
+    let wallet = rpc_client(&format!("{}/wallet/funded-key", rpc_url()))?;
     let databases = database_pools().await?;
-    let asset_database = Database::connect(
-        "postgres://high-storm:high-storm@127.0.0.1:5432/high-storm-node-1",
-        1,
-    )
-    .await?;
+    let asset_database = Database::connect(&database_url("high-storm-node-1"), 1).await?;
     let assets = asset_database.network_assets();
     let storm_eye = assets
         .get(STORM_EYE_KIND)
@@ -530,7 +535,7 @@ async fn issues_and_burns_ticks_and_verifiers_in_one_round() -> TestResult<()> {
         [&users[0].address, &users[1].address],
     )
     .await?;
-    mine_blocks(&rpc, 1, &mining_address)?;
+    mine_blocks(&rpc, 2, &mining_address)?;
 
     let batches = [
         signed_batch(
@@ -648,6 +653,427 @@ async fn issues_and_burns_ticks_and_verifiers_in_one_round() -> TestResult<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires registered development operators on an isolated three-node stack"]
+async fn splits_and_merges_storm_eyes_without_changing_supply() -> TestResult<()> {
+    let rpc = rpc_client(&rpc_url())?;
+    let wallet = rpc_client(&format!("{}/wallet/funded-key", rpc_url()))?;
+    let databases = chain_databases().await?;
+    let storm_eye = databases[0]
+        .network_assets()
+        .get(STORM_EYE_KIND)
+        .await?
+        .unwrap();
+    let before = storm_eye_outputs(&rpc, &storm_eye)?;
+    assert!(!before.is_empty());
+    let total: u64 = before.iter().map(|(_, amount)| amount).sum();
+    assert_eq!(total, 10_000);
+    let (selected, amount) = before.iter().find(|(_, amount)| *amount >= 2).unwrap();
+    let split = vote_and_confirm(
+        json!({
+            "kind": "split_storm_eye",
+            "utxo_to_split": {"txid": hex::encode(selected.txid.to_byte_array()), "output_index": selected.vout},
+            "number_of_splits": 2,
+        }),
+        &databases,
+        &rpc,
+        &wallet,
+    )
+    .await?;
+    let split_txid = split.txid();
+    assert!(
+        split
+            .input
+            .iter()
+            .any(|input| input.previous_output == *selected)
+    );
+    let split_outputs = storm_eye_outputs(&rpc, &storm_eye)?;
+    assert_eq!(split_outputs.len(), before.len() + 1);
+    assert_eq!(
+        split_outputs.iter().map(|(_, amount)| amount).sum::<u64>(),
+        total
+    );
+    let children = split_outputs
+        .iter()
+        .filter(|(outpoint, _)| outpoint.txid == split_txid)
+        .collect::<Vec<_>>();
+    assert_eq!(children.len(), 2);
+    assert_eq!(
+        children.iter().map(|(_, amount)| amount).sum::<u64>(),
+        *amount
+    );
+
+    let merged = vote_and_confirm(
+        json!({
+            "kind": "merge_storm_eyes",
+            "utxos_to_merge": children.iter().map(|(outpoint, _)| json!({
+                "txid": hex::encode(outpoint.txid.to_byte_array()), "output_index": outpoint.vout,
+            })).collect::<Vec<_>>(),
+        }),
+        &databases,
+        &rpc,
+        &wallet,
+    )
+    .await?;
+    for (child, _) in children {
+        assert!(
+            merged
+                .input
+                .iter()
+                .any(|input| input.previous_output == *child)
+        );
+    }
+    let after = storm_eye_outputs(&rpc, &storm_eye)?;
+    assert_eq!(after.len(), before.len());
+    assert_eq!(after.iter().map(|(_, amount)| amount).sum::<u64>(), total);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "replaces development member three with four; requires HIGH_STORM_TEST_ALLOW_MEMBER_REMOVAL=1"]
+async fn migrates_every_storm_eye_after_a_member_replacement() -> TestResult<()> {
+    if std::env::var("HIGH_STORM_TEST_ALLOW_MEMBER_REMOVAL").as_deref() != Ok("1") {
+        return Err("member removal is allowed only on a disposable test network".into());
+    }
+    let rpc = rpc_client(&rpc_url())?;
+    let wallet = rpc_client(&format!("{}/wallet/funded-key", rpc_url()))?;
+    let databases = chain_databases().await?;
+    let previous = databases[0]
+        .network_assets()
+        .get(STORM_EYE_KIND)
+        .await?
+        .unwrap();
+    let before = storm_eye_outputs(&rpc, &previous)?;
+    let removed = bitcoin::PrivateKey::new(
+        bitcoin::secp256k1::SecretKey::from_slice(&[3; 32])?,
+        bitcoin::Network::Regtest,
+    )
+    .public_key(&bitcoin::secp256k1::Secp256k1::new())
+    .inner
+    .x_only_public_key()
+    .0;
+    let (status, _) = operator_post(
+        1,
+        "/operators/voting",
+        json!({
+            "kind": "update_network_members", "to_accept": [], "to_remove": [removed.to_string()],
+        }),
+    )
+    .await?;
+    assert_eq!(status, 400, "membership must not drop below three nodes");
+    let accepted = bitcoin::PrivateKey::new(
+        bitcoin::secp256k1::SecretKey::from_slice(&[4; 32])?,
+        bitcoin::Network::Regtest,
+    )
+    .public_key(&bitcoin::secp256k1::Secp256k1::new())
+    .inner
+    .x_only_public_key()
+    .0;
+    let migration = vote_and_confirm(
+        json!({"kind": "update_network_members", "to_accept": [accepted.to_string()], "to_remove": [removed.to_string()]}),
+        &databases[..2],
+        &rpc,
+        &wallet,
+    )
+    .await?;
+    for (outpoint, _) in &before {
+        assert!(
+            migration
+                .input
+                .iter()
+                .any(|input| input.previous_output == *outpoint)
+        );
+    }
+    let candidate = Database::connect(&database_url("high-storm-node-4"), 1).await?;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let next = databases[0]
+            .network_assets()
+            .get(STORM_EYE_KIND)
+            .await?
+            .unwrap();
+        let peer = databases[1]
+            .network_assets()
+            .get(STORM_EYE_KIND)
+            .await?
+            .unwrap();
+        if next.contract_script != previous.contract_script
+            && next.contract_script == peer.contract_script
+            && candidate
+                .network_assets()
+                .get(STORM_EYE_KIND)
+                .await?
+                .is_some_and(|asset| asset.contract_script == next.contract_script)
+        {
+            assert_eq!(next.asset_id, previous.asset_id);
+            assert_eq!(next.supply, previous.supply);
+            let after = storm_eye_outputs(&rpc, &next)?;
+            assert_eq!(after.len(), before.len());
+            assert_eq!(after.iter().map(|(_, amount)| amount).sum::<u64>(), 10_000);
+            assert!(storm_eye_outputs(&rpc, &previous)?.is_empty());
+            let pools = database_pools_for(&["1".into(), "2".into(), "4".into()]).await?;
+            let height: u64 = rpc.call("getblockcount", &[])?;
+            let hash: String = rpc.call("getblockhash", &[height.into()])?;
+            wait_for_indexed_tip(&pools, height, &hash, Duration::from_secs(180)).await?;
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("target members did not converge on the migrated Storm Eye script".into());
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a finalized member migration and active HIGH_STORM_TEST_DATABASE_NODES"]
+async fn indexes_past_a_finalized_member_migration() -> TestResult<()> {
+    let rpc = rpc_client(&rpc_url())?;
+    let databases = chain_databases().await?;
+    let migrations = databases[0].chain().finalized_member_migrations().await?;
+    let migration_height = migrations
+        .iter()
+        .map(|migration| migration.block_height)
+        .max()
+        .ok_or("requires an existing finalized member migration")?;
+    let height: u64 = rpc.call("getblockcount", &[])?;
+    assert!(height >= migration_height);
+    let hash: String = rpc.call("getblockhash", &[height.into()])?;
+    let pools = database_pools().await?;
+    wait_for_indexed_tip(&pools, height, &hash, Duration::from_secs(180)).await?;
+
+    let expected = databases[0]
+        .network_assets()
+        .get(STORM_EYE_KIND)
+        .await?
+        .unwrap();
+    for database in &databases {
+        assert_eq!(
+            database.network_assets().get(STORM_EYE_KIND).await?,
+            Some(expected.clone())
+        );
+    }
+    assert_eq!(
+        storm_eye_outputs(&rpc, &expected)?
+            .iter()
+            .map(|(_, amount)| amount)
+            .sum::<u64>(),
+        10_000
+    );
+    Ok(())
+}
+
+async fn chain_databases() -> TestResult<Vec<Database>> {
+    let mut databases = Vec::new();
+    for node in database_nodes() {
+        databases
+            .push(Database::connect(&database_url(&format!("high-storm-node-{node}")), 1).await?);
+    }
+    Ok(databases)
+}
+
+fn database_nodes() -> Vec<String> {
+    std::env::var("HIGH_STORM_TEST_DATABASE_NODES")
+        .unwrap_or_else(|_| "1,2,3".into())
+        .split(',')
+        .map(str::to_owned)
+        .collect()
+}
+
+fn storm_eye_outputs(
+    rpc: &Client,
+    asset: &high_storm::NetworkAsset,
+) -> TestResult<Vec<(simplex::simplicityhl::elements::OutPoint, u64)>> {
+    let scan: Value = rpc.call(
+        "scantxoutset",
+        &[
+            "start".into(),
+            json!([format!("raw({})", hex::encode(&asset.contract_script))]),
+        ],
+    )?;
+    let mut outputs = Vec::new();
+    for unspent in scan["unspents"].as_array().ok_or("missing scan results")? {
+        let txid = Txid::from_str(unspent["txid"].as_str().ok_or("missing txid")?)?;
+        let vout = u32::try_from(unspent["vout"].as_u64().ok_or("missing vout")?)?;
+        let transaction = raw_transaction(rpc, &txid.to_string())?;
+        let output = &transaction.output[vout as usize];
+        assert_eq!(
+            output.asset.explicit(),
+            Some(AssetId::from_byte_array(asset.asset_id))
+        );
+        outputs.push((
+            simplex::simplicityhl::elements::OutPoint::new(txid, vout),
+            output.value.explicit().ok_or("confidential Storm Eye")?,
+        ));
+    }
+    Ok(outputs)
+}
+
+async fn operator_post(node: u8, path: &str, payload: Value) -> TestResult<(u16, Value)> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let private_key = bitcoin::PrivateKey::new(
+        bitcoin::secp256k1::SecretKey::from_slice(&[node; 32])?,
+        bitcoin::Network::Regtest,
+    );
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let public_key = private_key.public_key(&secp).inner.x_only_public_key().0;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let nonce = format!(
+        "oracle-validation-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    );
+    let message = format!(
+        "high-storm:operator-write:v3\nSignature scheme: bip322-v1\nMethod: POST\nPath: {path}\nTimestamp (Unix seconds): {timestamp}\nNonce: {nonce}\nPayload SHA-256: {}\n\nPayload JSON:\n{}",
+        hex::encode(Sha256::digest(serde_json::to_vec(&payload)?)),
+        serde_json::to_string_pretty(&payload)?
+    );
+    let address = bitcoin::Address::p2tr(&secp, public_key, None, bitcoin::Network::Regtest);
+    let signature = bip322::sign_simple_encoded(
+        &address.to_string(),
+        &message,
+        &[private_key.to_wif()],
+        None,
+    )?;
+    let mut api: std::net::SocketAddr = std::env::var("HIGH_STORM_TEST_API_ADDRESS")
+        .unwrap_or_else(|_| "127.0.0.1:9100".into())
+        .parse()?;
+    api.set_port(
+        api.port()
+            .checked_add(u16::from(node - 1))
+            .ok_or("API port overflow")?,
+    );
+    let response = reqwest::Client::new()
+        .post(format!("http://{api}{path}"))
+        .json(&json!({
+            "public_key": public_key.to_string(), "timestamp": timestamp, "nonce": nonce,
+            "signature": signature, "payload": payload,
+        }))
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let bytes = response.bytes().await?;
+    Ok((
+        status,
+        if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes)?
+        },
+    ))
+}
+
+async fn vote_and_confirm(
+    proposal: Value,
+    databases: &[Database],
+    rpc: &Client,
+    wallet: &Client,
+) -> TestResult<Transaction> {
+    let pools = database_pools().await?;
+    let height: u64 = rpc.call("getblockcount", &[])?;
+    let hash: String = rpc.call("getblockhash", &[height.into()])?;
+    wait_for_indexed_tip(&pools, height, &hash, Duration::from_secs(60)).await?;
+    let (status, response) = operator_post(1, "/operators/voting", proposal.clone()).await?;
+    assert_eq!(status, 201, "vote creation failed: {response}");
+    let hash = response["message_hash"]
+        .as_str()
+        .ok_or("missing vote hash")?;
+    let hash_bytes: [u8; 32] = hex::decode(hash)?
+        .try_into()
+        .map_err(|_| "invalid vote hash")?;
+    let approval_path = format!("/operators/voting/{hash}/approve");
+    for node in 1..=2 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (status, response) = operator_post(node, &approval_path, proposal.clone()).await?;
+            if status == 204 {
+                break;
+            }
+            if status != 404 || Instant::now() >= deadline {
+                return Err(format!("vote approval failed: {status} {response}").into());
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut approved = true;
+        for database in databases {
+            approved &= database
+                .voting()
+                .get(hash_bytes)
+                .await?
+                .is_some_and(|vote| vote.approved_at_block_height.is_some());
+        }
+        if approved {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("vote approval did not propagate".into());
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let txid = loop {
+        if let Some(txid) = databases[0]
+            .voting()
+            .get(hash_bytes)
+            .await?
+            .and_then(|vote| vote.execution_txid)
+        {
+            break Txid::from_byte_array(txid);
+        }
+        let (status, response) = operator_post(
+            1,
+            &format!("/operators/voting/{hash}/execute"),
+            proposal.clone(),
+        )
+        .await?;
+        if status == 200 {
+            let bytes = hex::decode(
+                response["execution_txid"]
+                    .as_str()
+                    .ok_or("missing execution txid")?,
+            )?;
+            break Txid::from_byte_array(bytes.try_into().map_err(|_| "invalid execution txid")?);
+        }
+        if !matches!(status, 408 | 409) || Instant::now() >= deadline {
+            return Err(format!("vote execution failed: {status} {response}").into());
+        }
+        sleep(Duration::from_millis(500)).await;
+    };
+
+    let mining_address = wallet
+        .call::<Vec<WalletUtxo>>("listunspent", &[1.into(), 9_999_999.into()])?
+        .into_iter()
+        .next()
+        .ok_or("funded wallet has no confirmed mining address")?
+        .address;
+    mine_blocks(rpc, 2, &mining_address)?;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let mut confirmed = true;
+        for database in databases {
+            confirmed &= database
+                .voting()
+                .get(hash_bytes)
+                .await?
+                .is_some_and(|vote| vote.execution_confirmed);
+        }
+        if confirmed {
+            return raw_transaction(rpc, &txid.to_string());
+        }
+        if Instant::now() >= deadline {
+            return Err("vote execution did not finalize on every target member".into());
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
 struct TestUser {
     keypair: Keypair,
     owner: [u8; 32],
@@ -670,7 +1096,22 @@ fn user(key_byte: u8, storm_eye: [u8; 32], network: &SimplicityNetwork) -> TestR
     })
 }
 
+fn rpc_url() -> String {
+    std::env::var("HIGH_STORM_TEST_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:18884".into())
+}
+
+fn database_url(database: &str) -> String {
+    let base = std::env::var("HIGH_STORM_TEST_DATABASE_BASE_URL")
+        .unwrap_or_else(|_| "postgres://high-storm:high-storm@127.0.0.1:5432".into());
+    format!("{base}/{database}")
+}
+
 fn rpc_client(url: &str) -> TestResult<Client> {
+    if std::env::var("HIGH_STORM_TEST_ALLOW_CHAIN_WRITES").as_deref() != Ok("1") {
+        return Err(
+            "set HIGH_STORM_TEST_ALLOW_CHAIN_WRITES=1 only for an isolated regtest stack".into(),
+        );
+    }
     Ok(Client::new(
         url,
         Auth::UserPass(RPC_USER.to_string(), RPC_PASSWORD.to_string()),
@@ -814,9 +1255,11 @@ async fn http_json<T: Serialize>(
         .map(serde_json::to_vec)
         .transpose()?
         .unwrap_or_default();
-    let mut stream = TcpStream::connect(API_ADDRESS).await?;
+    let api_address =
+        std::env::var("HIGH_STORM_TEST_API_ADDRESS").unwrap_or_else(|_| "127.0.0.1:9100".into());
+    let mut stream = TcpStream::connect(&api_address).await?;
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {API_ADDRESS}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {api_address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(request.as_bytes()).await?;
@@ -1059,18 +1502,17 @@ async fn wait_for_indexed_tip(
 }
 
 async fn database_pools() -> TestResult<Vec<PgPool>> {
+    database_pools_for(&database_nodes()).await
+}
+
+async fn database_pools_for(nodes: &[String]) -> TestResult<Vec<PgPool>> {
     let mut pools = Vec::new();
-    for database in [
-        "high-storm-node-1",
-        "high-storm-node-2",
-        "high-storm-node-3",
-    ] {
+    for node in nodes {
+        let database = format!("high-storm-node-{node}");
         pools.push(
             PgPoolOptions::new()
                 .max_connections(1)
-                .connect(&format!(
-                    "postgres://high-storm:high-storm@127.0.0.1:5432/{database}"
-                ))
+                .connect(&database_url(&database))
                 .await?,
         );
     }
@@ -1152,9 +1594,7 @@ async fn wait_for_common_burn(
             let ticks = indexed_ticks(pool, issuance_txid).await?;
             txids.extend(ticks.into_iter().filter_map(|tick| tick.burn_txid));
         }
-        if txids.len() == pools.len() * issued_count
-            && txids.windows(2).all(|pair| pair[0] == pair[1])
-        {
+        if txids.len() >= issued_count && txids.windows(2).all(|pair| pair[0] == pair[1]) {
             return Ok(Txid::from_byte_array(txids[0]).to_string());
         }
         if Instant::now() >= deadline {

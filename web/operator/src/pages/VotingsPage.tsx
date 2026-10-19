@@ -121,7 +121,7 @@ export function VotingsPage() {
     if (!session) return
     setActionBusy(true); setError('')
     try {
-      await signedPost<void>(session, `/operators/voting/${voting.message_hash}/approve`, {})
+      await signedPost<void>(session, `/operators/voting/${voting.message_hash}/approve`, voting.proposal)
       setSelected(null); await load()
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not approve voting.')
@@ -135,7 +135,7 @@ export function VotingsPage() {
     setVotings((current) => current.map((item) => item.message_hash === voting.message_hash ? executing : item))
     setSelected((current) => current?.message_hash === voting.message_hash ? executing : current)
     try {
-      await signedPost<{ execution_txid: string }>(session, `/operators/voting/${voting.message_hash}/execute`, {})
+      await signedPost<{ execution_txid: string }>(session, `/operators/voting/${voting.message_hash}/execute`, voting.proposal)
       setSelected(null); await load()
     } catch (cause) {
       await load()

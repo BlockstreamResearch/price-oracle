@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { schnorr, secp256k1 } from "@noble/curves/secp256k1";
+import { sha256 } from "@noble/hashes/sha256";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 
 import {
+  ElementsRpcClient,
   PriceOracleClient,
+  deriveAccount,
   createSignedPriceRequest,
   createTickRequest,
   createWalletTickRequest,
@@ -15,6 +19,8 @@ import {
   signSchnorrDigest,
   tickRequestSigningHash,
   verifySignedPriceData,
+  verifyExecutedSignedPrice,
+  type AccountVerification,
 } from "../src";
 
 const PRIVATE_KEY = "1f".repeat(32);
@@ -25,11 +31,43 @@ const PRICE_DATA =
 const PRICE_MESSAGE =
   "dd5c6a22d1a989ec39cfcd82b64d8e1f43bcca770dc3d2949022a9808b3d6340";
 
+const BRANCH = publicKeyFromPrivateKey(PRIVATE_KEY);
+const ACCOUNT_VERIFICATION = {
+  ownerPublicKey: BRANCH,
+  network: "elementsregtest" as const,
+  stormEyeAssetId: "01".repeat(32),
+  tickAssetId: "02".repeat(32),
+  verifierAssetId: "04".repeat(32),
+  accountTapleafHash:
+    "78f352902bd0a539848dad38389f9d5ead152d49bb494b220765bb0ff7ad8c35",
+  tickTapleafHash:
+    "cb926f0b19654c6513e4bd89f8a354a8ab313c6b190c5541ae3da22e14edd8a8",
+};
+const ACCOUNT = {
+  address: "ert1pnewh9rcdzyqx65srv3cp4pxahxh6yjvvwtaw85fckdekqdm3utts0yqwxr",
+  script_pubkey:
+    "51209e5d728f0d11006d520364701a84ddb9afa2498c72fae3d138b373603771e2d7",
+  storm_eye_asset_id: "01".repeat(32),
+  tick_asset_id: "02".repeat(32),
+  tick_script_pubkey:
+    "5120265faf88d7ee1325f627a1720ecb0d939e135ceab9b928c235cc6f911229e563",
+  oracle_verifier_asset_id: "04".repeat(32),
+  network: "elementsregtest",
+};
+const PROOF = [{ right: true, hash: "03".repeat(32) }];
+const VERIFICATION = {
+  stormTreeRoot:
+    "18b14ea9ec5e0932131a6d2b421c992b9cdde6a15059e14da69388174a6b2098",
+  feedId: 4,
+  decimals: 8,
+  now: 1_700_000_100n,
+};
+
 describe("Price Oracle SDK", () => {
   test("reads the deployed price-feed endpoints", async () => {
     const urls: string[] = [];
     const client = new PriceOracleClient(
-      "http://coordinator.test",
+      "https://coordinator.test",
       async (request) => {
         urls.push(String(request));
         return Response.json({});
@@ -38,8 +76,8 @@ describe("Price Oracle SDK", () => {
     await client.getPriceFeeds();
     await client.getPriceFeed(0);
     expect(urls).toEqual([
-      "http://coordinator.test/price-feeds",
-      "http://coordinator.test/price-feeds/0",
+      "https://coordinator.test/price-feeds",
+      "https://coordinator.test/price-feeds/0",
     ]);
   });
 
@@ -85,7 +123,7 @@ describe("Price Oracle SDK", () => {
       storm_tree_bloom: {
         branch: publicKeyFromPrivateKey(PRIVATE_KEY),
         signature: signSchnorrDigest(PRIVATE_KEY, PRICE_MESSAGE),
-        proof: [],
+        proof: PROOF,
       },
     };
     const payload = JSON.stringify({
@@ -99,22 +137,49 @@ describe("Price Oracle SDK", () => {
       ],
     });
     for (const status of ["pending", "processing", "included"] as const)
-      expect(parseExecutedSignedPrice({ status, payload })).toBeNull();
+      expect(
+        parseExecutedSignedPrice({ status, payload }, VERIFICATION),
+      ).toBeNull();
     expect(
-      parseExecutedSignedPrice({ status: "executed", payload })?.verifierVout,
+      parseExecutedSignedPrice({ status: "executed", payload }, VERIFICATION)
+        ?.verifierVout,
     ).toBe(3);
     expect(() =>
-      parseExecutedSignedPrice({
-        status: "executed",
-        payload: payload.replace(PRICE_DATA, "00".repeat(32)),
-      }),
+      parseExecutedSignedPrice(
+        {
+          status: "executed",
+          payload: payload.replace(PRICE_DATA, "00".repeat(32)),
+        },
+        VERIFICATION,
+      ),
     ).toThrow();
     expect(() =>
-      parseExecutedSignedPrice({
-        status: "executed",
-        payload: JSON.stringify({ txid: "ab".repeat(32), results: [] }),
-      }),
+      parseExecutedSignedPrice(
+        {
+          status: "executed",
+          payload: JSON.stringify({ txid: "ab".repeat(32), results: [] }),
+        },
+        VERIFICATION,
+      ),
     ).toThrow();
+    expect(() =>
+      parseExecutedSignedPrice(
+        { status: "executed", payload },
+        {
+          ...VERIFICATION,
+          stormTreeRoot: "00".repeat(32),
+        },
+      ),
+    ).toThrow("trusted context");
+    expect(() =>
+      parseExecutedSignedPrice(
+        { status: "executed", payload },
+        {
+          ...VERIFICATION,
+          now: 1_700_000_300n,
+        },
+      ),
+    ).toThrow("trusted context");
   });
 
   test("builds a Humid-authorized Tick request without a private key", () => {
@@ -238,25 +303,18 @@ describe("Price Oracle SDK", () => {
   test("fetches the canonical account from the coordinator", async () => {
     const publicKey = publicKeyFromPrivateKey(PRIVATE_KEY);
     const client = new PriceOracleClient(
-      "http://coordinator.test/",
+      "https://coordinator.test/",
       async (request) => {
         expect(String(request)).toBe(
-          `http://coordinator.test/users/account/${publicKey}`,
+          `https://coordinator.test/users/account/${publicKey}`,
         );
-        return Response.json({
-          address: "ert1ptest",
-          script_pubkey: "5120" + "00".repeat(32),
-          storm_eye_asset_id: "01".repeat(32),
-          tick_asset_id: "02".repeat(32),
-          tick_script_pubkey: "5120" + "03".repeat(32),
-          oracle_verifier_asset_id: "04".repeat(32),
-          network: "elementsregtest",
-        });
+        return Response.json(ACCOUNT);
       },
     );
 
-    expect((await client.getAccount(publicKey)).network).toBe(
-      "elementsregtest",
+    expect(deriveAccount(ACCOUNT_VERIFICATION)).toEqual(ACCOUNT);
+    expect(await client.getAccount(publicKey, ACCOUNT_VERIFICATION)).toEqual(
+      ACCOUNT,
     );
   });
 
@@ -264,17 +322,160 @@ describe("Price Oracle SDK", () => {
     const publicKey = publicKeyFromPrivateKey(PRIVATE_KEY);
     const fetcher = function (this: typeof globalThis) {
       expect(this).toBe(globalThis);
-      return Promise.resolve(Response.json({ network: "elementsregtest" }));
+      return Promise.resolve(Response.json(ACCOUNT));
     } as typeof globalThis.fetch;
 
     expect(
       (
         await new PriceOracleClient(
-          "http://coordinator.test",
+          "https://coordinator.test",
           fetcher,
-        ).getAccount(publicKey)
+        ).getAccount(publicKey, ACCOUNT_VERIFICATION)
       ).network,
     ).toBe("elementsregtest");
+  });
+
+  test("matches Rust-derived Account addresses on all supported networks", () => {
+    for (const [network, address] of [
+      [
+        "liquidv1",
+        "ex1pnewh9rcdzyqx65srv3cp4pxahxh6yjvvwtaw85fckdekqdm3uttscflvq5",
+      ],
+      [
+        "liquidtestnet",
+        "tex1pnewh9rcdzyqx65srv3cp4pxahxh6yjvvwtaw85fckdekqdm3uttsesdt3m",
+      ],
+      ["elementsregtest", ACCOUNT.address],
+    ] as const) {
+      expect(deriveAccount({ ...ACCOUNT_VERIFICATION, network })).toEqual({
+        ...ACCOUNT,
+        address,
+        network,
+      });
+    }
+  });
+
+  test("verifies the full script-authorized Tick and preserves the auth query", async () => {
+    const authScriptPubKey = `0014${"55".repeat(20)}`;
+    const verification = {
+      ...ACCOUNT_VERIFICATION,
+      authScriptPubKey,
+      tickTapleafHash:
+        "b51543ae57064fae1439ed2c355ea46a92e6141716491c439ae31b813c42a71e",
+    };
+    const expected = {
+      ...ACCOUNT,
+      tick_script_pubkey:
+        "5120d594a98b24b870a07995f993898ef58731d3ee48813f70f26f00e996688e6ab1",
+    };
+    const client = new PriceOracleClient(
+      "https://coordinator.test",
+      async (request) => {
+        expect(String(request)).toBe(
+          `https://coordinator.test/users/account/${BRANCH}?auth_script_pubkey=${authScriptPubKey}`,
+        );
+        return Response.json(expected);
+      },
+    );
+
+    expect(deriveAccount(verification)).toEqual(expected);
+    expect(await client.getAccount(BRANCH, verification)).toEqual(expected);
+
+    const wrongAuth = new PriceOracleClient(
+      "https://coordinator.test",
+      async () => Response.json(ACCOUNT),
+    );
+    await expect(wrongAuth.getAccount(BRANCH, verification)).rejects.toThrow(
+      "tick_script_pubkey",
+    );
+  });
+
+  test("rejects coordinator substitutions for every Account response field", async () => {
+    const substitutions = {
+      address: "ert1pattacker",
+      script_pubkey: `5120${"99".repeat(32)}`,
+      tick_script_pubkey: `5120${"98".repeat(32)}`,
+      storm_eye_asset_id: "97".repeat(32),
+      tick_asset_id: "96".repeat(32),
+      oracle_verifier_asset_id: "95".repeat(32),
+      network: "liquidv1",
+    };
+
+    for (const [field, value] of Object.entries(substitutions)) {
+      const client = new PriceOracleClient(
+        "https://coordinator.test",
+        async () => Response.json({ ...ACCOUNT, [field]: value }),
+      );
+      await expect(
+        client.getAccount(BRANCH, ACCOUNT_VERIFICATION),
+      ).rejects.toThrow(field);
+    }
+
+    for (const body of [
+      null,
+      {},
+      { ...ACCOUNT, script_pubkey: 123 },
+      { ...ACCOUNT, tick_asset_id: null },
+    ]) {
+      const client = new PriceOracleClient(
+        "https://coordinator.test",
+        async () => Response.json(body),
+      );
+      await expect(
+        client.getAccount(BRANCH, ACCOUNT_VERIFICATION),
+      ).rejects.toThrow("trusted derivation");
+    }
+  });
+
+  test("rejects malformed trust context and owner mismatches before fetching", async () => {
+    let fetched = false;
+    const client = new PriceOracleClient(
+      "https://coordinator.test",
+      async () => {
+        fetched = true;
+        return Response.json(ACCOUNT);
+      },
+    );
+    const invalid = [
+      undefined,
+      {},
+      { ...ACCOUNT_VERIFICATION, ownerPublicKey: "00".repeat(32) },
+      {
+        ...ACCOUNT_VERIFICATION,
+        ownerPublicKey: publicKeyFromPrivateKey("02".repeat(32)),
+      },
+      { ...ACCOUNT_VERIFICATION, network: "bitcoin" },
+      { ...ACCOUNT_VERIFICATION, authScriptPubKey: "not-hex" },
+      ...[
+        "stormEyeAssetId",
+        "tickAssetId",
+        "verifierAssetId",
+        "accountTapleafHash",
+        "tickTapleafHash",
+      ].map((field) => ({ ...ACCOUNT_VERIFICATION, [field]: "not-hex" })),
+    ];
+
+    for (const verification of invalid)
+      await expect(
+        client.getAccount(BRANCH, verification as AccountVerification),
+      ).rejects.toThrow();
+
+    expect(fetched).toBe(false);
+  });
+
+  test("rejects internally consistent coordinator data with untrusted contract leaves", async () => {
+    const attacker = deriveAccount({
+      ...ACCOUNT_VERIFICATION,
+      accountTapleafHash: "99".repeat(32),
+      tickTapleafHash: "98".repeat(32),
+    });
+    const client = new PriceOracleClient("https://coordinator.test", async () =>
+      Response.json(attacker),
+    );
+
+    await expect(
+      client.getAccount(BRANCH, ACCOUNT_VERIFICATION),
+    ).rejects.toThrow("trusted derivation");
   });
 
   test("requires a Tick after the signed occurrence time", () => {
@@ -347,12 +548,258 @@ describe("Price Oracle SDK", () => {
       },
     };
 
-    expect(verifySignedPriceData(details)).toBe(true);
+    expect(verifySignedPriceData(details, VERIFICATION)).toBe(true);
     expect(
-      verifySignedPriceData({
-        ...details,
-        price_data: PRICE_DATA.replace(/.$/, "d"),
+      verifySignedPriceData(
+        {
+          ...details,
+          price_data: PRICE_DATA.replace("540be4", "540be5"),
+        },
+        VERIFICATION,
+      ),
+    ).toBe(false);
+  });
+
+  test("rejects self-signed attacker prices and incorrect proofs", () => {
+    const details = {
+      price_data: PRICE_DATA,
+      storm_tree_bloom: {
+        signature: signSchnorrDigest(PRIVATE_KEY, PRICE_MESSAGE),
+        branch: BRANCH,
+        proof: PROOF,
+      },
+    };
+    const attackerKey = "20".repeat(32);
+    const attacker = {
+      ...details,
+      storm_tree_bloom: {
+        ...details.storm_tree_bloom,
+        branch: publicKeyFromPrivateKey(attackerKey),
+        signature: signSchnorrDigest(attackerKey, PRICE_MESSAGE),
+      },
+    };
+    expect(verifySignedPriceData(attacker, VERIFICATION)).toBe(false);
+    for (const proof of [
+      [],
+      [{ right: false, hash: PROOF[0].hash }],
+      [{ right: true, hash: "04".repeat(32) }],
+      Array(21).fill(PROOF[0]),
+      [{ right: true, hash: "xx".repeat(32) }],
+    ]) {
+      expect(
+        verifySignedPriceData(
+          {
+            ...details,
+            storm_tree_bloom: { ...details.storm_tree_bloom, proof },
+          },
+          VERIFICATION,
+        ),
+      ).toBe(false);
+    }
+    expect(
+      verifySignedPriceData(details, {
+        ...VERIFICATION,
+        stormTreeRoot: "00".repeat(32),
       }),
     ).toBe(false);
+  });
+
+  test("requires the expected feed, decimals and a currently valid price", () => {
+    const details = {
+      price_data: PRICE_DATA,
+      storm_tree_bloom: {
+        signature: signSchnorrDigest(PRIVATE_KEY, PRICE_MESSAGE),
+        branch: BRANCH,
+        proof: PROOF,
+      },
+    };
+    for (const override of [
+      { feedId: 5 },
+      { decimals: 9 },
+      { now: 1_699_999_999n },
+      { now: 1_700_000_300n },
+      { now: -1n },
+    ]) {
+      expect(
+        verifySignedPriceData(details, {
+          ...VERIFICATION,
+          ...override,
+        }),
+      ).toBe(false);
+    }
+    expect(
+      verifySignedPriceData(details, {
+        ...VERIFICATION,
+        now: 1_700_000_000n,
+      }),
+    ).toBe(true);
+    expect(
+      verifySignedPriceData(details, {
+        ...VERIFICATION,
+        now: 1_700_000_299n,
+      }),
+    ).toBe(true);
+  });
+
+  test("requires HTTPS outside loopback and refuses redirects", async () => {
+    for (const url of ["http://coordinator.test", "ftp://coordinator.test"])
+      expect(() => new PriceOracleClient(url)).toThrow("HTTPS");
+    for (const url of [
+      "http://localhost:9100",
+      "http://127.0.0.1:9100",
+      "http://[::1]:9100",
+    ])
+      expect(() => new PriceOracleClient(url)).not.toThrow();
+    const oracle = new PriceOracleClient(
+      "https://coordinator.test",
+      async (_, init) => {
+        expect(init?.redirect).toBe("error");
+        return Response.json([]);
+      },
+    );
+    await oracle.getPriceFeeds();
+  });
+
+  test("fails closed without trusted context or with malformed response data", () => {
+    const details = {
+      price_data: PRICE_DATA,
+      storm_tree_bloom: {
+        signature: signSchnorrDigest(PRIVATE_KEY, PRICE_MESSAGE),
+        branch: BRANCH,
+        proof: PROOF,
+      },
+    };
+    expect(Reflect.apply(verifySignedPriceData, undefined, [details])).toBe(
+      false,
+    );
+    for (const malformed of [
+      null,
+      {},
+      { ...details, price_data: "zz".repeat(32) },
+      { ...details, price_data: "00" },
+      { ...details, storm_tree_bloom: null },
+      {
+        ...details,
+        storm_tree_bloom: { ...details.storm_tree_bloom, proof: [null] },
+      },
+      {
+        ...details,
+        storm_tree_bloom: { ...details.storm_tree_bloom, signature: "00" },
+      },
+      {
+        ...details,
+        storm_tree_bloom: {
+          ...details.storm_tree_bloom,
+          branch: "ff".repeat(32),
+        },
+      },
+    ]) {
+      expect(
+        Reflect.apply(verifySignedPriceData, undefined, [
+          malformed,
+          VERIFICATION,
+        ]),
+      ).toBe(false);
+    }
+  });
+
+  test("rejects invalid validity windows even with an authentic signature", () => {
+    const tagHash = sha256(new TextEncoder().encode("OracleNetworkV1/Price"));
+    for (const validUntil of [1_700_000_000n, 1_699_999_999n, 1_700_000_301n]) {
+      const bytes = hexToBytes(PRICE_DATA);
+      new DataView(
+        bytes.buffer,
+        bytes.byteOffset,
+        bytes.byteLength,
+      ).setBigUint64(24, validUntil);
+      const message = sha256(
+        new Uint8Array([...tagHash, ...tagHash, ...bytes]),
+      );
+      const details = {
+        price_data: bytesToHex(bytes),
+        storm_tree_bloom: {
+          signature: signSchnorrDigest(PRIVATE_KEY, bytesToHex(message)),
+          branch: BRANCH,
+          proof: PROOF,
+        },
+      };
+      expect(verifySignedPriceData(details, VERIFICATION)).toBe(false);
+    }
+  });
+
+  test("checks a confirmed unspent Verifier with the right asset and branch-committed script", async () => {
+    const verification = {
+      ...VERIFICATION,
+      verifierAssetId: "04".repeat(32),
+      verifierTapleafHash: "05".repeat(32),
+    };
+    const signedPrice = {
+      price_data: PRICE_DATA,
+      storm_tree_bloom: {
+        branch: BRANCH,
+        signature: signSchnorrDigest(PRIVATE_KEY, PRICE_MESSAGE),
+        proof: PROOF,
+      },
+    };
+    const status = {
+      status: "executed" as const,
+      payload: JSON.stringify({
+        txid: "ab".repeat(32),
+        results: [
+          {
+            kind: "signed-price-data",
+            vout: 3,
+            payload: JSON.stringify(signedPrice),
+          },
+        ],
+      }),
+    };
+    const utxo = {
+      confirmations: 2,
+      asset: verification.verifierAssetId,
+      value: 0.00000001,
+      scriptPubKey: {
+        hex: "512048bd0653a96f933e9132843281a8d981037ca8342a6a8941039293c69d0b8e91",
+      },
+    };
+    let rpcResult: unknown = utxo;
+    const rpc = new ElementsRpcClient({
+      url: "http://127.0.0.1:18884",
+      fetch: async (_, init) => {
+        const request = JSON.parse(String(init?.body));
+        expect(request.method).toBe("gettxout");
+        expect(request.params).toEqual(["ab".repeat(32), 3, true]);
+        return Response.json({ result: rpcResult, error: null });
+      },
+    });
+    expect(
+      (await verifyExecutedSignedPrice(status, verification, rpc))
+        ?.verifierVout,
+    ).toBe(3);
+    for (const result of [
+      null,
+      { ...utxo, confirmations: 0 },
+      { ...utxo, asset: "06".repeat(32) },
+      { ...utxo, asset: undefined },
+      { ...utxo, value: 0.00000002 },
+      { ...utxo, value: undefined },
+      { ...utxo, scriptPubKey: { hex: `5120${BRANCH}` } },
+    ]) {
+      rpcResult = result;
+      await expect(
+        verifyExecutedSignedPrice(status, verification, rpc),
+      ).rejects.toThrow("Verifier");
+    }
+    rpcResult = utxo;
+    await expect(
+      verifyExecutedSignedPrice(
+        status,
+        {
+          ...verification,
+          verifierTapleafHash: "06".repeat(32),
+        },
+        rpc,
+      ),
+    ).rejects.toThrow("Verifier");
   });
 });

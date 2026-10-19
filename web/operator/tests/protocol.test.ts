@@ -174,7 +174,7 @@ describe("Humid authentication protocol", () => {
     expect(descriptorChecksum(descriptor)).toBe("cch6wrnp");
   });
 
-  test("constructs the canonical v2 signed-write message", async () => {
+  test("constructs the canonical v3 signed-write message with the full payload", async () => {
     await expect(
       createWriteMessage("post", "/operators/voting", 123, "nonce", {
         b: 2,
@@ -182,15 +182,56 @@ describe("Humid authentication protocol", () => {
       }),
     ).resolves.toBe(
       [
-        "high-storm:operator-write:v2",
-        "bitcoin-signed-message-ecdsa-v1",
-        "POST",
-        "/operators/voting",
-        "123",
-        "nonce",
-        "43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777",
+        "high-storm:operator-write:v3",
+        "Signature scheme: bitcoin-signed-message-ecdsa-v1",
+        "Method: POST",
+        "Path: /operators/voting",
+        "Timestamp (Unix seconds): 123",
+        "Nonce: nonce",
+        "Payload SHA-256: 43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777",
+        "",
+        "Payload JSON:",
+        '{\n  "a": 1,\n  "b": 2\n}',
       ].join("\n"),
     );
+  });
+
+  test("displays withdrawal amounts and the full destination address", async () => {
+    const address = `tex1q${"a".repeat(60)}`;
+    const message = await createWriteMessage(
+      "POST",
+      "/operators/droplets/exchange",
+      123,
+      "nonce",
+      { amount: 123456789, address },
+    );
+
+    expect(message).toContain(`"address": "${address}"`);
+    expect(message).toContain('"amount": 123456789');
+  });
+
+  test("displays every nested proposal input without truncation", async () => {
+    const firstTxid = "12".repeat(32);
+    const secondTxid = "34".repeat(32);
+    const message = await createWriteMessage(
+      "POST",
+      "/operators/voting",
+      123,
+      "nonce",
+      {
+        kind: "merge_storm_eyes",
+        utxos_to_merge: [
+          { txid: firstTxid, output_index: 1 },
+          { txid: secondTxid, output_index: 2 },
+        ],
+      },
+    );
+
+    expect(message).toContain('"kind": "merge_storm_eyes"');
+    expect(message).toContain(`"txid": "${firstTxid}"`);
+    expect(message).toContain(`"txid": "${secondTxid}"`);
+    expect(message).toContain('"output_index": 1');
+    expect(message).toContain('"output_index": 2');
   });
 
   test("sends a signed voting action with the approved Humid message", async () => {
@@ -199,6 +240,11 @@ describe("Humid authentication protocol", () => {
       "0321da398ca2ddc09be89caa26e6730ae84751b6ea3a1ca46aa365bb5e1c3d9620";
     let signedMessage = "";
     let sentBody: Record<string, unknown> = {};
+    const proposal = {
+      kind: "update_network_members",
+      to_accept: ["12".repeat(32)],
+      to_remove: ["34".repeat(32)],
+    };
     globalThis.fetch = async (input, init) => {
       expect(input).toBe("/operators/voting/test-hash/approve");
       sentBody = JSON.parse(String(init?.body));
@@ -223,7 +269,7 @@ describe("Humid authentication protocol", () => {
           },
         },
         "/operators/voting/test-hash/approve",
-        {},
+        proposal,
       );
 
       expect(signedMessage).toBe(
@@ -232,16 +278,19 @@ describe("Humid authentication protocol", () => {
           "/operators/voting/test-hash/approve",
           sentBody.timestamp as number,
           sentBody.nonce as string,
-          {},
+          proposal,
         ),
       );
+      expect(signedMessage).toContain('"kind": "update_network_members"');
+      expect(signedMessage).toContain("12".repeat(32));
+      expect(signedMessage).toContain("34".repeat(32));
       expect(sentBody).toEqual({
         public_key: publicKey,
         signature_scheme: "bitcoin-signed-message-ecdsa-v1",
         timestamp: sentBody.timestamp,
         nonce: sentBody.nonce,
         signature: "ab".repeat(65),
-        payload: {},
+        payload: proposal,
       });
     } finally {
       globalThis.fetch = originalFetch;

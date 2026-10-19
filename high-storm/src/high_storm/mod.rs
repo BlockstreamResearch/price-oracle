@@ -23,6 +23,7 @@ mod voting;
 mod voting_execution;
 
 pub use assets::AssetError;
+pub(crate) use assets::{StormEyeContractData, storm_eye_contract_data};
 pub use burning::BurningError;
 pub use droplets::DropletsError;
 pub(crate) use droplets::exchange_recipient_amount;
@@ -347,6 +348,32 @@ impl HighStorm {
         }
     }
 
+    pub async fn announce_protocol_settings(&self) -> Result<(), SigningError> {
+        let recipients = self
+            .peers()
+            .await
+            .into_iter()
+            .filter(|peer| peer.status == PeerStatus::Active)
+            .map(|peer| {
+                PublicKey::from_slice(&peer.compressed_public_key).map_err(|_| {
+                    SigningError::InvalidMessage("invalid protocol settings recipient".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if recipients.is_empty() {
+            return Ok(());
+        }
+        let message = NodeMessage::new(
+            NodeMessageKind::ProtocolSettings,
+            None,
+            &self.state.protocol_settings(),
+        )?
+        .into_storm_message()?;
+        self.storm.send_message(message, &recipients).await?;
+
+        Ok(())
+    }
+
     async fn announce_exchange(&self, notification: &ExchangeRewards) -> Result<(), SigningError> {
         let recipients = self
             .peers()
@@ -424,11 +451,15 @@ impl HighStorm {
         let indexed = self.state.indexer().sync().await?;
         if let Some(cursor) = self.state.indexer().cursor().await? {
             self.state.set_block_height(cursor.height);
-            if !self.state.is_spending_paused() {
-                self.state
+            if !self.state.is_spending_paused()
+                && let Err(error) = self
+                    .state
                     .indexer()
                     .recover_droplet_exchanges(cursor.height, self.is_leader().await)
-                    .await?;
+                    .await
+            {
+                // Indexing succeeded; a failed Droplets recovery must not halt burning.
+                tracing::warn!(%error, "Droplets exchange recovery failed");
             }
         }
         Ok(indexed)
@@ -674,6 +705,17 @@ impl HighStorm {
             ));
         }
         let block_height = self.state.block_height();
+        let released = self
+            .state
+            .burning()
+            .release_vanished_burns(block_height)
+            .await?;
+        if released > 0 {
+            tracing::info!(
+                released,
+                "returned items whose burning transaction vanished to the burn queue"
+            );
+        }
         let reconciled = self.state.burning().reconcile_mempool(block_height).await?;
         if reconciled > 0 {
             tracing::info!(
@@ -990,6 +1032,11 @@ impl HighStormHandle {
     ) -> Result<[u8; 32], VotingExecutionError> {
         let peers = self.peers().await;
         let current_members = voting_member_keys(&peers)?;
+        let local = leader::local_public_key(&peers).ok_or_else(|| {
+            VotingExecutionError::Invalid("local network member is missing".into())
+        })?;
+        handler::authorize_voting_executor(&current_members, local)?;
+
         let vote = self
             .state
             .voting()
@@ -1019,19 +1066,6 @@ impl HighStormHandle {
             .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
         request.chain_tip = Some(chain_tip);
         let proposer = request.proposer_public_key;
-        let local = leader::local_public_key(&self.peers().await).ok_or_else(|| {
-            VotingExecutionError::Invalid("local network member is missing".into())
-        })?;
-        let local = PublicKey::from_slice(&local)
-            .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?
-            .x_only_public_key()
-            .0
-            .serialize();
-        if local != proposer {
-            return Err(VotingExecutionError::Invalid(
-                "only the node that proposed a voting request may execute it".into(),
-            ));
-        }
 
         self.state
             .voting_execution()
@@ -1192,6 +1226,10 @@ impl HighStormHandle {
                 .voting_execution()
                 .is_final(inclusion.confirmations)
             {
+                // Peers that missed the first notice can still record it before finality.
+                if let Err(error) = self.announce_voting_execution(request_hash, &request).await {
+                    tracing::warn!(%error, "failed to reannounce voting execution");
+                }
                 continue;
             }
 

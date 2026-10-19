@@ -113,6 +113,54 @@ Heartbeat send and receive events are emitted at trace level. Enable them with
 
 The checked-in identities and database password are for local development only.
 
+## Isolated integration tests
+
+The ignored tests in `tests/issuance_burning.rs` fund addresses, submit requests,
+mine blocks, and can invalidate blocks. Run them serially against a disposable
+regtest stack, never a shared development deployment. They fail closed unless
+`HIGH_STORM_TEST_ALLOW_CHAIN_WRITES=1` is set. Register the matching development
+operators before running governance tests. Keep mining enabled for scheduled
+issuance/burning; pause it and synchronize indexed tips for governance execution.
+
+Override the default shared-stack endpoints explicitly:
+
+```sh
+export HIGH_STORM_TEST_ALLOW_CHAIN_WRITES=1
+export HIGH_STORM_TEST_RPC_URL=http://127.0.0.1:28884
+export HIGH_STORM_TEST_API_ADDRESS=127.0.0.1:29100
+export HIGH_STORM_TEST_DATABASE_BASE_URL=postgres://high-storm:high-storm@127.0.0.1:25432
+
+cargo test --locked -p high-storm --test issuance_burning \
+  batches_two_users_and_burns_both_to_one_empty_op_return \
+  -- --ignored --exact --nocapture
+```
+
+The database names default to `high-storm-node-1`, `high-storm-node-2`, and
+`high-storm-node-3`. Set `HIGH_STORM_TEST_DATABASE_NODES=1,2,4` to check the active
+set after replacing member three with four. Price tests also require fresh
+observations on a signing quorum, not just an HTTP price cached by one node.
+
+Run `splits_and_merges_storm_eyes_without_changing_supply` before
+`migrates_every_storm_eye_after_a_member_replacement`. The latter additionally
+requires `HIGH_STORM_TEST_ALLOW_MEMBER_REMOVAL=1` and development node four waiting
+to join with its own database. It verifies the membership minimum, transaction
+inputs, new-root outputs, metadata propagation, and supply conservation. Follow
+it with the Tick lifecycle test against `1,2,4`. The replacement test also waits
+for every active indexer's cursors to converge; matching metadata alone does not
+establish a working migration. Recreate disposable state before repeating the
+replacement test.
+
+For an already migrated network, pause mining and run
+`indexes_past_a_finalized_member_migration` with the active database-node list to
+verify canonical convergence. Startup automatically rebuilds a lagging peer's
+projections when finalized migration metadata is ahead of its cursors, preserving
+the historical migration checks. No manual database reset is required.
+
+The populated-schema PostgreSQL upgrade test requires a separate **empty** database
+in `TEST_POSTGRES_MIGRATION_URL`. Run it with
+`cargo test --locked -p high-storm postgres_upgrades_a_populated_ledger_without_losing_locks -- --ignored`.
+Use a new empty database for each run. SQLite upgrade coverage runs by default.
+
 ## Configuration
 
 Copy `config.example.toml` to `config.toml`, then set the listener port, signer key,
@@ -238,10 +286,22 @@ migration period. New clients send
 | `GET` | `/operators/voting/{hash}` | `Authorization: Bearer <token>` |
 | `POST` | `/operators/voting` | Signed request envelope |
 | `POST` | `/operators/voting/{hash}/approve` | Signed request envelope |
+| `GET` | `/users/network` | None |
+| `GET` | `/users/account/{public_key}` | None |
 | `POST` | `/users/requests` | User Schnorr signature in JSON |
 | `GET` | `/users/requests/{request_hash}` | None; coordinator node only |
 | `GET` | `/price-feeds` | None; coordinator node only |
 | `GET` | `/price-feeds/{id}` | None; coordinator node only |
+
+`GET /users/network` returns `network`, `storm_eye_asset_id`, `tick_asset_id`,
+`oracle_verifier_asset_id` and `storm_tree_root` from the active network assets,
+without a user public key or account derivation. The root is 64-character hex
+decoded from the same active Storm Eye record as its asset ID. It returns 503
+while a required asset is inactive or Storm Eye contract data is missing or
+invalid. Trusting these values delegates deployment and root selection to this
+node; independently pinned clients must verify them against their own anchors.
+Account lookup uses the same asset metadata and additionally derives
+the supplied user's account and voucher scripts.
 
 Challenge and token requests use these shapes:
 
@@ -426,7 +486,8 @@ block interval, in both production and the bundled Docker deployment. The
 deterministic round-robin leader batches expired Ticks across users, obtains a
 Storm Tree signature, and burns their summed value into one empty `OP_RETURN`. The
 remaining reserve is returned to each Account covenant after deducting its
-share of `burn_transaction_fee_sats`. After broadcasting, the leader announces
+share of the burn fee: `burn_transaction_fee_sats`, raised for larger burns to
+Elements' default 0.1 sat/vB relay floor on a bounded transaction weight. After broadcasting, the leader announces
 the burn transaction and selected Tick outpoints to the other nodes. Nodes also
 reconcile their burn state from the mempool before each leader round so missed
 announcements do not cause duplicate burns. Unconfirmed burns return to the
