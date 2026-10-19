@@ -19,7 +19,7 @@ pub struct Auth {
 impl Auth {
     #[must_use]
     pub fn new(params: AuthParameters, storage: AuthStorage) -> Self {
-        let mut program = AuthProgram::new(&params.build_arguments()).with_storage_capacity(2);
+        let mut program = AuthProgram::new(params.build_arguments()).with_storage_capacity(2);
         storage.apply(&mut program);
 
         Self {
@@ -57,7 +57,7 @@ impl Auth {
             PartialInput::new(utxo.clone()),
             ProgramInput::new(
                 Box::new(self.program.as_ref().clone()),
-                Box::new(path.build_witness(self.storage, bloom)),
+                path.build_witness(self.storage, bloom),
             ),
             AuthSpendPath::required_signature(),
         );
@@ -70,7 +70,7 @@ impl Auth {
             PartialInput::new(utxo.clone()).with_sequence(Sequence::ENABLE_LOCKTIME_NO_RBF),
             ProgramInput::new(
                 Box::new(self.program.as_ref().clone()),
-                Box::new(build_rescue_witness(self.storage, output_index)),
+                build_rescue_witness(self.storage, output_index),
             ),
             RequiredSignature::None,
         );

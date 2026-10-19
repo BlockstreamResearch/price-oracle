@@ -19,10 +19,7 @@ use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
 use simplex::{
     provider::SimplicityNetwork,
-    simplicityhl::{
-        elements::{AssetId, Block, BlockHash, Script, Transaction, Txid, encode},
-        simplicity::hashes::Hash,
-    },
+    simplicityhl::elements::{AssetId, Block, BlockHash, Script, Transaction, Txid, encode},
 };
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use tokio::{
