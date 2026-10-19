@@ -131,6 +131,10 @@ pub(crate) struct Prices {
     /// The name of the source at each index of a feed's state. An index is
     /// where this run polls a source; only a name outlives a restart.
     source_names: Arc<Mutex<BTreeMap<usize, &'static str>>>,
+    /// Serializes the changes that write `frozen_price_sources`, so the table
+    /// and the feed states stay in step without `feeds` being held across the
+    /// write. That lock also gates polling, attestation and signing.
+    changes: Arc<Mutex<()>>,
 }
 
 impl Prices {
@@ -149,6 +153,7 @@ impl Prices {
                     .expect("the built-in registry routes every Cross pair"),
             )),
             source_names: Arc::default(),
+            changes: Arc::default(),
             store,
             frozen,
             registry,
@@ -185,6 +190,10 @@ impl Prices {
         index: usize,
         name: &'static str,
     ) -> Result<(), PriceSourceError> {
+        let _changes = self.changes.lock().await;
+        // Read before `feeds` is taken, never under it: a slow database would
+        // otherwise stall every feed's polling, attestation and signing.
+        let frozen = self.frozen.frozen_at(feed, name).await?.is_some();
         let mut feeds = self.feeds.lock().await;
         let state = direct_feed(&self.registry, &mut feeds, feed)?;
         {
@@ -204,7 +213,7 @@ impl Prices {
             }
         }
         state.register(index);
-        if self.frozen.frozen_at(feed, name).await?.is_some() {
+        if frozen {
             state.freeze(index);
         }
         Ok(())
@@ -219,24 +228,34 @@ impl Prices {
         name: &str,
         frozen: bool,
     ) -> Result<(), PriceSourceError> {
-        let mut feeds = self.feeds.lock().await;
-        let state = direct_feed(&self.registry, &mut feeds, feed)?;
-        let index = self
-            .source_names
-            .lock()
-            .await
-            .iter()
-            .find_map(|(index, registered)| (*registered == name).then_some(*index))
-            .filter(|index| state.is_registered(*index))
-            .ok_or_else(|| PriceSourceError::UnknownSource {
-                feed,
-                name: name.to_string(),
-            })?;
+        let _changes = self.changes.lock().await;
+        // One name may sit at different indices in different feeds, so the
+        // index has to match the name *and* be registered for this feed.
+        let index = {
+            let mut feeds = self.feeds.lock().await;
+            let state = direct_feed(&self.registry, &mut feeds, feed)?;
+            let names = self.source_names.lock().await;
+            names
+                .iter()
+                .find(|(index, registered)| **registered == name && state.is_registered(**index))
+                .map(|(index, _)| *index)
+                .ok_or_else(|| PriceSourceError::UnknownSource {
+                    feed,
+                    name: name.to_string(),
+                })?
+        };
+        // Persisted first, and outside the `feeds` lock, so a restart freezes
+        // exactly what is frozen while a slow write stalls no signing.
         if frozen {
             self.frozen.freeze(feed, name, self.clock.now()).await?;
-            state.freeze(index);
         } else {
             self.frozen.unfreeze(feed, name).await?;
+        }
+        let mut feeds = self.feeds.lock().await;
+        let state = direct_feed(&self.registry, &mut feeds, feed)?;
+        if frozen {
+            state.freeze(index);
+        } else {
             state.unfreeze(index);
         }
         Ok(())
@@ -1159,6 +1178,69 @@ mod tests {
         assert_eq!(prices.value(LBTC_USDT).await, None);
         let listed = prices.sources().await.unwrap();
         assert_eq!(listed[0].sources[0].frozen_at, Some(NOW));
+    }
+
+    #[tokio::test]
+    async fn freezing_one_of_two_sources_takes_it_out_of_the_price() {
+        let prices = prices().await;
+        let good = Fake::answering(Ok(SourceObservation::new(100, 8, NOW, NOW)));
+        let wrong = Fake::answering(Ok(SourceObservation::new(1_000_000, 8, NOW, NOW)));
+        prices
+            .register_source(LBTC_USD, 0, COINGECKO)
+            .await
+            .unwrap();
+        prices.register_source(LBTC_USD, 1, "kraken").await.unwrap();
+        prices.poll(LBTC_USD, 0, &good).await;
+        prices.poll(LBTC_USD, 1, &wrong).await;
+        assert_eq!(prices.value(LBTC_USD).await.unwrap().price, 500_050);
+
+        prices
+            .set_source_frozen(LBTC_USD, "kraken", true)
+            .await
+            .unwrap();
+
+        // The wrong price is gone from the median straight away, which is what
+        // an operator freezes a source to do.
+        assert_eq!(prices.value(LBTC_USD).await.unwrap().price, 100);
+
+        // Unfreezing brings the observation it kept back.
+        prices
+            .set_source_frozen(LBTC_USD, "kraken", false)
+            .await
+            .unwrap();
+        assert_eq!(prices.value(LBTC_USD).await.unwrap().price, 500_050);
+    }
+
+    #[tokio::test]
+    async fn freezing_a_source_registered_at_another_index_for_its_feed() {
+        let prices = prices().await;
+        // One source, polled at index 0 for one feed and index 1 for another,
+        // which registering allows: an index may not be renamed, but a name is
+        // not tied to one index.
+        prices
+            .register_source(LBTC_USD, 0, COINGECKO)
+            .await
+            .unwrap();
+        prices
+            .register_source(USDT_USD, 1, COINGECKO)
+            .await
+            .unwrap();
+
+        prices
+            .set_source_frozen(USDT_USD, COINGECKO, true)
+            .await
+            .unwrap();
+
+        let listed = prices.sources().await.unwrap();
+        assert_eq!(
+            source_state(&listed, USDT_USD, COINGECKO),
+            SourceState::Frozen
+        );
+        // Freezing it for one feed leaves it alone in the other.
+        assert_eq!(
+            source_state(&listed, LBTC_USD, COINGECKO),
+            SourceState::Active
+        );
     }
 
     #[tokio::test]

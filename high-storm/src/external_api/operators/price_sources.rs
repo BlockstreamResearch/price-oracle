@@ -72,7 +72,7 @@ async fn set_frozen(
     path: &str,
     frozen: bool,
 ) -> Result<Json<PriceSourcesResponse>, ApiError> {
-    state.auth.verify_write(&request, "POST", path).await?;
+    let operator = state.auth.verify_write(&request, "POST", path).await?;
 
     let PriceSourcePayload { feed_id, source } = request.payload;
     state
@@ -80,10 +80,13 @@ async fn set_frozen(
         .set_price_source_frozen(feed_id, &source, frozen)
         .await
         .map_err(map_error)?;
+    // Named, because a freeze on the coordinator halts priced issuance at
+    // that feed for the whole network.
     tracing::info!(
         feed = feed_id,
         source,
         frozen,
+        operator,
         "the operator changed a price source"
     );
     Ok(Json(response(&state).await?))

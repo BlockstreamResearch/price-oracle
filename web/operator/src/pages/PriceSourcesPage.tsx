@@ -124,7 +124,7 @@ export function PriceSourcesPage() {
             }))}
             {unpriced.map((feed) => <tr key={`${feed.id}:none`}>
               <td data-label="Feed"><strong>{feed.symbol}</strong><small>Feed {feed.id} · <span className="status-pill unavailable">unavailable</span></small></td>
-              <td className="muted-cell" data-label="Source" colSpan={6}>No source is configured for this feed on this node.</td>
+              <td data-label="Source" colSpan={6}><span className="muted-cell">No source is configured for this feed on this node.</span></td>
             </tr>)}
             {!loading && feeds.length === 0 && <tr><td className="empty-row" colSpan={7}>No direct feeds are registered.</td></tr>}
           </tbody>

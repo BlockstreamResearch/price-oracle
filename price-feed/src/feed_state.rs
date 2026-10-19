@@ -119,15 +119,24 @@ impl FeedState {
             })
     }
 
-    /// Freezing keeps the source's observations, which expire on their own.
+    /// Freezing keeps the source's observation, so unfreezing restores it, but
+    /// `valid_observations` leaves it out: an operator freezes a source to stop
+    /// it pricing the feed, which a kept observation would otherwise go on
+    /// doing until it expired.
     pub fn freeze(&mut self, source: usize) {
         let record = self.sources.entry(source).or_default();
         record.state = SourceState::Frozen;
         record.retry_at = None;
     }
 
+    /// Only a frozen source is returned to active. Unfreezing anything else
+    /// would clear a dropped source's `retry_at`, putting it back in the
+    /// cycle before `POLLING_RETRY_TIME`, and reset a failing source's count.
     pub fn unfreeze(&mut self, source: usize) {
         let record = self.sources.entry(source).or_default();
+        if record.state != SourceState::Frozen {
+            return;
+        }
         record.state = SourceState::Active;
         record.failures = 0;
         record.retry_at = None;
@@ -137,6 +146,7 @@ impl FeedState {
         let now = self.clock.now();
         self.sources
             .values()
+            .filter(|record| record.state != SourceState::Frozen)
             .filter_map(|record| record.observation)
             .filter(|observation| observation.valid_until >= now)
             .collect()
@@ -474,6 +484,59 @@ mod tests {
             state.record_poll_failure(0);
         }
         assert_eq!(state.state(0), SourceState::Active);
+    }
+
+    #[test]
+    fn a_frozen_source_does_not_price_the_feed() {
+        let mut state = feed_state(Clock::Fixed(NOW));
+        state.record_poll_success(0, observation(100, NOW));
+        state.record_poll_success(1, observation(1_000_000, NOW));
+
+        state.freeze(1);
+
+        // Priced by source 0 alone, not the median of the two.
+        assert!(state.is_available());
+        assert_eq!(state.value().unwrap().price, 100);
+
+        // The observation is kept, so unfreezing brings it back.
+        state.unfreeze(1);
+        assert_eq!(state.value().unwrap().price, 500_050);
+    }
+
+    #[test]
+    fn a_feed_whose_only_reporting_source_is_frozen_is_unavailable() {
+        let mut state = feed_state(Clock::Fixed(NOW));
+        state.register(0);
+        state.record_poll_success(1, observation(1_000_000, NOW));
+
+        state.freeze(1);
+
+        assert!(!state.is_available());
+        assert_eq!(state.value(), None);
+    }
+
+    #[test]
+    fn unfreezing_a_source_that_is_not_frozen_keeps_its_drop_back_off() {
+        let mut state = feed_state(Clock::Fixed(NOW));
+        for _ in 0..MAX_POLLING_ERROR_NUM {
+            state.record_poll_failure(0);
+        }
+        assert_eq!(state.state(0), SourceState::Dropped);
+
+        state.unfreeze(0);
+
+        // Still dropped, and still waiting out POLLING_RETRY_TIME.
+        assert_eq!(state.state(0), SourceState::Dropped);
+        assert!(!state.is_pollable(0));
+
+        // An active source keeps the failures it has run up, too.
+        let mut state = feed_state(Clock::Fixed(NOW));
+        state.record_poll_failure(0);
+        state.unfreeze(0);
+        for _ in 0..MAX_POLLING_ERROR_NUM - 1 {
+            state.record_poll_failure(0);
+        }
+        assert_eq!(state.state(0), SourceState::Dropped);
     }
 
     #[test]
