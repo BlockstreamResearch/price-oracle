@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use simplex::provider::SimplicityNetwork;
 use simplex::simplicityhl::elements::{
-    AssetId, Script, Transaction, TxOut, TxOutSecrets,
+    AssetId, Script, Transaction, TxIn, TxOut, TxOutSecrets,
     confidential::{AssetBlindingFactor, ValueBlindingFactor},
     encode, opcodes,
     script::Instruction,
@@ -15,6 +15,7 @@ use simplex::simplicityhl::elements::{
 use simplex::utils::hash_script;
 use std::str::FromStr;
 use storm::{PeerStatus, StormContext, StormHandle};
+use storm_tree::StormTree;
 use url::Url;
 
 use crate::{
@@ -244,24 +245,35 @@ pub enum AssetError {
     Random,
     #[error("asset issuance produced confidential output {0}")]
     ConfidentialOutput(u32),
+    #[error("announced network asset is invalid: {0}")]
+    InvalidAnnouncement(String),
 }
 
 #[derive(Clone)]
 pub(crate) struct Assets {
     store: NetworkAssetStore,
+    elements_rpc: ElementsRpcConfig,
 }
 
 impl Assets {
-    pub(crate) fn new(store: NetworkAssetStore) -> Self {
-        Self { store }
+    pub(crate) fn new(store: NetworkAssetStore, elements_rpc: ElementsRpcConfig) -> Self {
+        Self {
+            store,
+            elements_rpc,
+        }
     }
 
     pub(crate) async fn handle_announcement(
         &self,
         message: NodeMessage,
         _context: &StormContext,
+        storm_tree_root: Option<[u8; 32]>,
     ) -> Result<(), AssetError> {
-        let announcement: NetworkAssets = message.decode_payload()?;
+        let mut announcement: NetworkAssets = message.decode_payload()?;
+        // Tick and Verifier are verified against the Storm Eye, so it is stored first.
+        announcement
+            .assets
+            .sort_by_key(|asset| asset.kind != STORM_EYE_KIND);
 
         for asset in announcement.assets {
             if let Some(existing) = self.store.get(&asset.kind).await? {
@@ -271,6 +283,7 @@ impl Assets {
                 continue;
             }
 
+            self.verify_announced(&asset, storm_tree_root).await?;
             if !self.store.insert_active(&asset).await? {
                 let existing = self.store.get(&asset.kind).await?;
                 if existing.as_ref() != Some(&asset) {
@@ -280,6 +293,44 @@ impl Assets {
         }
 
         Ok(())
+    }
+
+    async fn verify_announced(
+        &self,
+        asset: &NetworkAsset,
+        storm_tree_root: Option<[u8; 32]>,
+    ) -> Result<(), AssetError> {
+        let storm_eye = if asset.kind == STORM_EYE_KIND {
+            None
+        } else {
+            Some(self.store.get(STORM_EYE_KIND).await?.ok_or_else(|| {
+                AssetError::InvalidAnnouncement(format!(
+                    "{} was announced before the Storm Eye",
+                    asset.kind
+                ))
+            })?)
+        };
+        let client = Client::new(
+            &self.elements_rpc.url,
+            Auth::UserPass(
+                self.elements_rpc.username.clone(),
+                self.elements_rpc.password.clone(),
+            ),
+        )?;
+        let asset = asset.clone();
+        tokio::task::spawn_blocking(move || {
+            let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
+            let network = simplicity_network(&chain.chain)?;
+            let issuance = confirmed_issuance(&client, asset.issuance_txid)?;
+            verify_announced_asset(
+                &asset,
+                &issuance,
+                storm_eye.as_ref(),
+                storm_tree_root,
+                &network,
+            )
+        })
+        .await?
     }
 
     pub(crate) async fn announce_pending(&self, storm: &StormHandle) -> Result<(), AssetError> {
@@ -502,6 +553,292 @@ pub(crate) fn storm_eye_program(asset: &NetworkAsset) -> Result<AuthProgram, Ass
     program.set_storage_at(1, rescue_block_slot(data.rescue_height));
 
     Ok(program)
+}
+
+struct ConfirmedIssuance {
+    transaction: Transaction,
+    block_height: u64,
+}
+
+#[derive(Deserialize)]
+struct IssuanceTransactionInfo {
+    hex: String,
+    #[serde(default)]
+    confirmations: u64,
+    #[serde(default)]
+    blockhash: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BlockHeight {
+    height: u64,
+}
+
+fn invalid_announcement(asset: &NetworkAsset, reason: &str) -> AssetError {
+    AssetError::InvalidAnnouncement(format!("{}: {reason}", asset.kind))
+}
+
+/// `issuance_txid` is stored in display byte order.
+fn confirmed_issuance(client: &Client, txid: [u8; 32]) -> Result<ConfirmedIssuance, AssetError> {
+    let txid = hex::encode(txid);
+    let info: IssuanceTransactionInfo =
+        client.call("getrawtransaction", &[txid.clone().into(), true.into()])?;
+    let block_hash = info
+        .blockhash
+        .filter(|_| info.confirmations > 0)
+        .ok_or_else(|| {
+            AssetError::InvalidAnnouncement(format!("issuance {txid} is not confirmed"))
+        })?;
+    let header: BlockHeight = client.call("getblockheader", &[block_hash.into(), true.into()])?;
+    let transaction: Transaction = encode::deserialize(
+        &hex::decode(info.hex).map_err(|_| AssetError::InvalidRpcResponse("issuance hex"))?,
+    )
+    .map_err(|_| AssetError::InvalidRpcResponse("issuance transaction"))?;
+    if transaction.txid().to_string() != txid {
+        return Err(AssetError::InvalidRpcResponse("issuance transaction id"));
+    }
+
+    Ok(ConfirmedIssuance {
+        transaction,
+        block_height: header.height,
+    })
+}
+
+fn verify_announced_asset(
+    asset: &NetworkAsset,
+    issuance: &ConfirmedIssuance,
+    storm_eye: Option<&NetworkAsset>,
+    storm_tree_root: Option<[u8; 32]>,
+    network: &SimplicityNetwork,
+) -> Result<(), AssetError> {
+    match (asset.kind.as_str(), storm_eye) {
+        (STORM_EYE_KIND, None) => verify_storm_eye(asset, issuance, storm_tree_root, network),
+        (TICK_ASSET_KIND | ORACLE_VERIFIER_KIND, Some(storm_eye)) => {
+            verify_reissuable_asset(asset, issuance, storm_eye, network)
+        }
+        _ => Err(invalid_announcement(asset, "unexpected asset kind")),
+    }
+}
+
+/// The single new issuance of `asset` in its issuance transaction.
+fn issuance_input<'a>(
+    asset: &NetworkAsset,
+    issuance: &'a ConfirmedIssuance,
+) -> Result<&'a TxIn, AssetError> {
+    if asset.created_at_block > issuance.block_height {
+        return Err(invalid_announcement(
+            asset,
+            "created after its issuance was confirmed",
+        ));
+    }
+    let asset_id = AssetId::from_byte_array(asset.asset_id);
+    let mut inputs = issuance
+        .transaction
+        .input
+        .iter()
+        .filter(|input| input.has_issuance() && input.issuance_ids().0 == asset_id);
+    let input = inputs
+        .next()
+        .ok_or_else(|| invalid_announcement(asset, "issuance transaction does not issue it"))?;
+    if inputs.next().is_some() || !input.asset_issuance.asset_blinding_nonce.is_null() {
+        return Err(invalid_announcement(asset, "not a single new issuance"));
+    }
+    let entropy = AssetId::generate_asset_entropy(
+        input.previous_output,
+        input.asset_issuance.asset_entropy.into_contract_hash(),
+    );
+    if asset.entropy != Some(entropy.to_byte_array()) {
+        return Err(invalid_announcement(
+            asset,
+            "entropy does not match its issuance",
+        ));
+    }
+
+    Ok(input)
+}
+
+fn verify_storm_eye(
+    asset: &NetworkAsset,
+    issuance: &ConfirmedIssuance,
+    storm_tree_root: Option<[u8; 32]>,
+    network: &SimplicityNetwork,
+) -> Result<(), AssetError> {
+    if asset.supply != STORM_EYE_SUPPLY || asset.reissuance_token_id.is_some() {
+        return Err(invalid_announcement(
+            asset,
+            "must have the fixed supply and no token",
+        ));
+    }
+    let input = issuance_input(asset, issuance)?;
+    if input.asset_issuance.amount.explicit() != Some(STORM_EYE_SUPPLY)
+        || !input.asset_issuance.inflation_keys.is_null()
+    {
+        return Err(invalid_announcement(
+            asset,
+            "issuance must be the full supply with no reissuance token",
+        ));
+    }
+    let transaction = &issuance.transaction;
+    if transaction
+        .output
+        .iter()
+        .any(|output| output.asset.is_confidential() || output.value.is_confidential())
+    {
+        return Err(invalid_announcement(
+            asset,
+            "issuance outputs must be explicit",
+        ));
+    }
+    let mut markers = Vec::new();
+    for output in &transaction.output {
+        if let Some(members) = initial_members_from_script(&output.script_pubkey)? {
+            markers.push(members);
+        }
+    }
+    let [members] = markers.as_slice() else {
+        return Err(invalid_announcement(
+            asset,
+            "issuance must contain one initial-members marker",
+        ));
+    };
+    let genesis_root = StormTree::new(members.clone())
+        .map_err(|error| invalid_announcement(asset, &error.to_string()))?
+        .root();
+
+    let current = storm_eye_contract_data(asset)?;
+    let genesis_rescue_height = u32::try_from(asset.created_at_block.saturating_add(RESCUE_BLOCKS))
+        .map_err(|_| AssetError::RescueHeight)?;
+    let renewals = current
+        .rescue_height
+        .checked_sub(genesis_rescue_height)
+        .map(u64::from);
+    if renewals.is_none_or(|blocks| blocks % RESCUE_BLOCKS != 0) {
+        return Err(invalid_announcement(
+            asset,
+            "rescue height is not a renewal of the genesis height",
+        ));
+    }
+    let genesis = NetworkAsset {
+        contract_data: Some(postcard::to_stdvec(&StormEyeContractData {
+            storm_tree_root: genesis_root,
+            rescue_height: genesis_rescue_height,
+            rescue_output_script_hash: current.rescue_output_script_hash,
+        })?),
+        ..asset.clone()
+    };
+    let genesis_script = storm_eye_program(&genesis)?.get_script_pubkey(network);
+    let asset_id = AssetId::from_byte_array(asset.asset_id);
+    let mut supply = 0u64;
+    for output in &transaction.output {
+        if output.asset.explicit() != Some(asset_id) {
+            continue;
+        }
+        if output.script_pubkey != genesis_script {
+            return Err(invalid_announcement(
+                asset,
+                "supply must go to the genesis covenant of the initial members",
+            ));
+        }
+        supply = output
+            .value
+            .explicit()
+            .and_then(|value| supply.checked_add(value))
+            .ok_or_else(|| invalid_announcement(asset, "invalid Storm Eye output value"))?;
+    }
+    if supply != STORM_EYE_SUPPLY {
+        return Err(invalid_announcement(
+            asset,
+            "the genesis covenant must hold the full supply",
+        ));
+    }
+
+    if storm_eye_program(asset)?
+        .get_script_pubkey(network)
+        .into_bytes()
+        != asset.contract_script
+    {
+        return Err(invalid_announcement(
+            asset,
+            "contract script does not match its contract data",
+        ));
+    }
+    if storm_tree_root != Some(current.storm_tree_root) {
+        return Err(invalid_announcement(
+            asset,
+            "covenant does not commit to this node's Storm Tree",
+        ));
+    }
+
+    Ok(())
+}
+
+fn verify_reissuable_asset(
+    asset: &NetworkAsset,
+    issuance: &ConfirmedIssuance,
+    storm_eye: &NetworkAsset,
+    network: &SimplicityNetwork,
+) -> Result<(), AssetError> {
+    let token_id = asset
+        .reissuance_token_id
+        .filter(|_| asset.supply == REISSUABLE_ASSET_SUPPLY)
+        .ok_or_else(|| invalid_announcement(asset, "must be issued empty with a token"))?;
+    let input = issuance_input(asset, issuance)?;
+    if input.issuance_ids().1.to_byte_array() != token_id {
+        return Err(invalid_announcement(
+            asset,
+            "token does not match its issuance",
+        ));
+    }
+    if !(input.asset_issuance.amount.is_null() || input.asset_issuance.amount.explicit() == Some(0))
+    {
+        return Err(invalid_announcement(asset, "issuance must create no units"));
+    }
+    let token_supply = input
+        .asset_issuance
+        .inflation_keys
+        .explicit()
+        .filter(|supply| *supply > 0)
+        .ok_or_else(|| invalid_announcement(asset, "token supply must be explicit"))?;
+
+    let treasury_script = TreasuryProgram::new(&TreasuryArguments {
+        storm_eye_asset_id: storm_eye.asset_id,
+    })
+    .get_script_pubkey(network);
+    if asset.contract_script != treasury_script.as_bytes() {
+        return Err(invalid_announcement(
+            asset,
+            "contract script is not the Storm Eye Treasury",
+        ));
+    }
+    let data: TickAssetContractData = postcard::from_bytes(
+        asset
+            .contract_data
+            .as_deref()
+            .ok_or_else(|| invalid_announcement(asset, "missing contract data"))?,
+    )?;
+    if data.issuance_tx != encode::serialize(&issuance.transaction) {
+        return Err(invalid_announcement(
+            asset,
+            "contract data does not hold its issuance",
+        ));
+    }
+    let token_output = issuance
+        .transaction
+        .output
+        .get(data.token_output_index as usize)
+        .filter(|output| output.script_pubkey == treasury_script)
+        .ok_or_else(|| invalid_announcement(asset, "token output is not at the Treasury"))?;
+    let secrets = token_output
+        .unblind(&Secp256k1::new(), treasury_blinding_secret())
+        .map_err(|_| invalid_announcement(asset, "token output is not Treasury-blinded"))?;
+    if secrets.asset != AssetId::from_byte_array(token_id) || secrets.value != token_supply {
+        return Err(invalid_announcement(
+            asset,
+            "the Treasury must hold the whole token supply",
+        ));
+    }
+
+    Ok(())
 }
 
 trait AssetIssuer {
@@ -1327,7 +1664,408 @@ mod tests {
 
     async fn assets() -> Assets {
         let database = Database::connect("sqlite::memory:", 1).await.unwrap();
-        Assets::new(database.network_assets())
+        Assets::new(
+            database.network_assets(),
+            ElementsRpcConfig {
+                url: "http://127.0.0.1:1".into(),
+                username: String::new(),
+                password: String::new(),
+                wallet: "funded-key".into(),
+            },
+        )
+    }
+
+    mod announcement_verification {
+        use super::*;
+        use secp256k1_zkp::Keypair;
+        use simplex::simplicityhl::elements::{
+            AssetIssuance, LockTime, OutPoint, Txid, confidential,
+        };
+
+        fn members(bytes: &[u8]) -> Vec<[u8; 32]> {
+            let secp = Secp256k1::new();
+            bytes
+                .iter()
+                .map(|byte| {
+                    let secret = SecretKey::from_slice(&[*byte; 32]).unwrap();
+                    Keypair::from_secret_key(&secp, &secret)
+                        .x_only_public_key()
+                        .0
+                        .serialize()
+                })
+                .collect()
+        }
+
+        fn with_storm_eye_state(asset: &NetworkAsset, root: [u8; 32], rescue: u32) -> NetworkAsset {
+            let mut asset = asset.clone();
+            asset.contract_data = Some(
+                postcard::to_stdvec(&StormEyeContractData {
+                    storm_tree_root: root,
+                    rescue_height: rescue,
+                    rescue_output_script_hash: [9; 32],
+                })
+                .unwrap(),
+            );
+            asset.contract_script = storm_eye_program(&asset)
+                .unwrap()
+                .get_script_pubkey(&SimplicityNetwork::default_regtest())
+                .into_bytes();
+            asset
+        }
+
+        fn issuing_input(amount: u64, inflation_keys: u64) -> TxIn {
+            let explicit = |value| {
+                if value == 0 {
+                    confidential::Value::Null
+                } else {
+                    confidential::Value::Explicit(value)
+                }
+            };
+            TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([4; 32]), 1),
+                asset_issuance: AssetIssuance {
+                    amount: explicit(amount),
+                    inflation_keys: explicit(inflation_keys),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        fn output(asset: AssetId, value: u64, script: Script) -> TxOut {
+            TxOut {
+                asset: confidential::Asset::Explicit(asset),
+                value: confidential::Value::Explicit(value),
+                nonce: confidential::Nonce::Null,
+                script_pubkey: script,
+                witness: Default::default(),
+            }
+        }
+
+        /// A genesis Storm Eye issued to three members at block 100.
+        fn storm_eye() -> (NetworkAsset, ConfirmedIssuance, [u8; 32]) {
+            let members = members(&[1, 2, 3]);
+            let root = StormTree::new(members.clone()).unwrap().root();
+            let input = issuing_input(STORM_EYE_SUPPLY, 0);
+            let (asset_id, _) = input.issuance_ids();
+            let entropy = AssetId::generate_asset_entropy(
+                input.previous_output,
+                input.asset_issuance.asset_entropy.into_contract_hash(),
+            );
+            let template = NetworkAsset {
+                kind: STORM_EYE_KIND.into(),
+                name: STORM_EYE_NAME.into(),
+                asset_id: asset_id.to_byte_array(),
+                reissuance_token_id: None,
+                entropy: Some(entropy.to_byte_array()),
+                issuance_txid: [0; 32],
+                contract_script: Vec::new(),
+                contract_data: None,
+                supply: STORM_EYE_SUPPLY,
+                created_at_block: 100,
+            };
+            let asset = with_storm_eye_state(&template, root, 100 + RESCUE_BLOCKS as u32);
+            let script = Script::from(asset.contract_script.clone());
+            let mut outputs = (0..INITIAL_STORM_EYE_UTXO_COUNT as u64)
+                .map(|index| output(asset_id, 1_666 + u64::from(index < 4), script.clone()))
+                .collect::<Vec<_>>();
+            outputs.push(TxOut {
+                script_pubkey: initial_members_script(&members).unwrap(),
+                ..output(AssetId::from_byte_array([5; 32]), 0, Script::new())
+            });
+            let issuance = ConfirmedIssuance {
+                transaction: Transaction {
+                    version: 2,
+                    lock_time: LockTime::ZERO,
+                    input: vec![input],
+                    output: outputs,
+                },
+                block_height: 101,
+            };
+            (asset, issuance, root)
+        }
+
+        fn verify_storm_eye_with(
+            asset: &NetworkAsset,
+            issuance: &ConfirmedIssuance,
+            root: Option<[u8; 32]>,
+        ) -> Result<(), AssetError> {
+            verify_announced_asset(
+                asset,
+                issuance,
+                None,
+                root,
+                &SimplicityNetwork::default_regtest(),
+            )
+        }
+
+        #[test]
+        fn accepts_genesis_renewed_and_migrated_storm_eyes() {
+            let (genesis, issuance, root) = storm_eye();
+            verify_storm_eye_with(&genesis, &issuance, Some(root)).unwrap();
+
+            let renewed = with_storm_eye_state(&genesis, root, 100 + 2 * RESCUE_BLOCKS as u32);
+            verify_storm_eye_with(&renewed, &issuance, Some(root)).unwrap();
+
+            let migrated_root = StormTree::new(members(&[1, 2, 4])).unwrap().root();
+            let migrated =
+                with_storm_eye_state(&genesis, migrated_root, 100 + RESCUE_BLOCKS as u32);
+            verify_storm_eye_with(&migrated, &issuance, Some(migrated_root)).unwrap();
+        }
+
+        #[test]
+        fn rejects_forged_storm_eye_announcements() {
+            let (genesis, issuance, root) = storm_eye();
+            let rejected = |asset: &NetworkAsset, issuance: &ConfirmedIssuance, root| {
+                assert!(verify_storm_eye_with(asset, issuance, root).is_err());
+            };
+
+            // A covenant over someone else's keys, or before this node has a tree.
+            rejected(&genesis, &issuance, Some([0; 32]));
+            rejected(&genesis, &issuance, None);
+
+            let mut hidden_token = issuance.transaction.clone();
+            hidden_token.input[0].asset_issuance.inflation_keys = confidential::Value::Explicit(1);
+            rejected(
+                &genesis,
+                &ConfirmedIssuance {
+                    transaction: hidden_token,
+                    block_height: 101,
+                },
+                Some(root),
+            );
+
+            let mut diverted = issuance.transaction.clone();
+            diverted.output[0].script_pubkey = Script::from(vec![0x51]);
+            rejected(
+                &genesis,
+                &ConfirmedIssuance {
+                    transaction: diverted,
+                    block_height: 101,
+                },
+                Some(root),
+            );
+
+            let mut other_members = issuance.transaction.clone();
+            other_members.output.last_mut().unwrap().script_pubkey =
+                initial_members_script(&members(&[4, 5, 6])).unwrap();
+            rejected(
+                &genesis,
+                &ConfirmedIssuance {
+                    transaction: other_members,
+                    block_height: 101,
+                },
+                Some(root),
+            );
+
+            let off_schedule = with_storm_eye_state(&genesis, root, 101 + RESCUE_BLOCKS as u32);
+            rejected(&off_schedule, &issuance, Some(root));
+
+            let mut wrong_script = genesis.clone();
+            wrong_script.contract_script = vec![0x51];
+            rejected(&wrong_script, &issuance, Some(root));
+
+            let mut wrong_entropy = genesis.clone();
+            wrong_entropy.entropy = Some([1; 32]);
+            rejected(&wrong_entropy, &issuance, Some(root));
+
+            rejected(
+                &genesis,
+                &ConfirmedIssuance {
+                    transaction: issuance.transaction.clone(),
+                    block_height: 99,
+                },
+                Some(root),
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires HIGH_STORM_TEST_ASSET_DATABASE_URL and HIGH_STORM_TEST_RPC_URL of a live network"]
+        async fn verifies_a_live_networks_issued_assets() {
+            let database = Database::connect(
+                &std::env::var("HIGH_STORM_TEST_ASSET_DATABASE_URL").unwrap(),
+                1,
+            )
+            .await
+            .unwrap();
+            let store = database.network_assets();
+            let client = Client::new(
+                &std::env::var("HIGH_STORM_TEST_RPC_URL").unwrap(),
+                Auth::UserPass("high-storm".into(), "high-storm".into()),
+            )
+            .unwrap();
+            let storm_eye = store.get(STORM_EYE_KIND).await.unwrap().unwrap();
+            let root = storm_eye_contract_data(&storm_eye).unwrap().storm_tree_root;
+            let mut reissuable = Vec::new();
+            for kind in [TICK_ASSET_KIND, ORACLE_VERIFIER_KIND] {
+                reissuable.push(store.get(kind).await.unwrap().unwrap());
+            }
+
+            tokio::task::spawn_blocking(move || {
+                let chain: ChainInfo = client.call("getblockchaininfo", &[]).unwrap();
+                let network = simplicity_network(&chain.chain).unwrap();
+                let issuance = confirmed_issuance(&client, storm_eye.issuance_txid).unwrap();
+                verify_announced_asset(&storm_eye, &issuance, None, Some(root), &network).unwrap();
+                for asset in reissuable {
+                    let issuance = confirmed_issuance(&client, asset.issuance_txid).unwrap();
+                    verify_announced_asset(&asset, &issuance, Some(&storm_eye), None, &network)
+                        .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        /// A Tick issued empty, its single token blinded to the Treasury.
+        fn tick(storm_eye: &NetworkAsset) -> (NetworkAsset, ConfirmedIssuance) {
+            let network = SimplicityNetwork::default_regtest();
+            let treasury_script = TreasuryProgram::new(&TreasuryArguments {
+                storm_eye_asset_id: storm_eye.asset_id,
+            })
+            .get_script_pubkey(&network);
+            let input = issuing_input(0, REISSUANCE_TOKEN_SUPPLY);
+            let (asset_id, token_id) = input.issuance_ids();
+            let entropy = AssetId::generate_asset_entropy(
+                input.previous_output,
+                input.asset_issuance.asset_entropy.into_contract_hash(),
+            );
+            let funding = AssetId::from_byte_array([5; 32]);
+            let (token_output, _, _, _) = TxOut::new_last_confidential(
+                &mut secp256k1_zkp::rand::thread_rng(),
+                &Secp256k1::new(),
+                REISSUANCE_TOKEN_SUPPLY,
+                token_id,
+                treasury_script.clone(),
+                PublicKey::from_secret_key(&Secp256k1::new(), &treasury_blinding_secret()),
+                &[
+                    TxOutSecrets::new(
+                        funding,
+                        AssetBlindingFactor::zero(),
+                        10_000,
+                        ValueBlindingFactor::zero(),
+                    ),
+                    TxOutSecrets::new(
+                        token_id,
+                        AssetBlindingFactor::zero(),
+                        REISSUANCE_TOKEN_SUPPLY,
+                        ValueBlindingFactor::zero(),
+                    ),
+                ],
+                &[],
+            )
+            .unwrap();
+            let transaction = Transaction {
+                version: 2,
+                lock_time: LockTime::ZERO,
+                input: vec![input],
+                output: vec![
+                    token_output,
+                    output(funding, 9_000, Script::from(vec![0x51])),
+                ],
+            };
+            let asset = NetworkAsset {
+                kind: TICK_ASSET_KIND.into(),
+                name: TICK_ASSET_NAME.into(),
+                asset_id: asset_id.to_byte_array(),
+                reissuance_token_id: Some(token_id.to_byte_array()),
+                entropy: Some(entropy.to_byte_array()),
+                issuance_txid: [0; 32],
+                contract_script: treasury_script.into_bytes(),
+                contract_data: Some(
+                    postcard::to_stdvec(&TickAssetContractData {
+                        issuance_tx: encode::serialize(&transaction),
+                        token_output_index: 0,
+                    })
+                    .unwrap(),
+                ),
+                supply: REISSUABLE_ASSET_SUPPLY,
+                created_at_block: 100,
+            };
+            (
+                asset,
+                ConfirmedIssuance {
+                    transaction,
+                    block_height: 101,
+                },
+            )
+        }
+
+        fn verify_tick_with(
+            asset: &NetworkAsset,
+            issuance: &ConfirmedIssuance,
+            storm_eye: &NetworkAsset,
+        ) -> Result<(), AssetError> {
+            verify_announced_asset(
+                asset,
+                issuance,
+                Some(storm_eye),
+                None,
+                &SimplicityNetwork::default_regtest(),
+            )
+        }
+
+        #[test]
+        fn accepts_only_treasury_held_reissuance_tokens() {
+            let (storm_eye, _, _) = storm_eye();
+            let (asset, issuance) = tick(&storm_eye);
+            verify_tick_with(&asset, &issuance, &storm_eye).unwrap();
+
+            // Announced before the Storm Eye it must be verified against.
+            assert!(
+                verify_announced_asset(
+                    &asset,
+                    &issuance,
+                    None,
+                    None,
+                    &SimplicityNetwork::default_regtest()
+                )
+                .is_err()
+            );
+
+            let mut other_storm_eye = storm_eye.clone();
+            other_storm_eye.asset_id = [8; 32];
+            assert!(verify_tick_with(&asset, &issuance, &other_storm_eye).is_err());
+
+            let mut kept_token = issuance.transaction.clone();
+            kept_token.output[0].script_pubkey = Script::from(vec![0x51]);
+            let mut diverted = asset.clone();
+            diverted.contract_data = Some(
+                postcard::to_stdvec(&TickAssetContractData {
+                    issuance_tx: encode::serialize(&kept_token),
+                    token_output_index: 0,
+                })
+                .unwrap(),
+            );
+            assert!(
+                verify_tick_with(
+                    &diverted,
+                    &ConfirmedIssuance {
+                        transaction: kept_token,
+                        block_height: 101,
+                    },
+                    &storm_eye,
+                )
+                .is_err()
+            );
+
+            let mut wrong_token = asset.clone();
+            wrong_token.reissuance_token_id = Some([7; 32]);
+            assert!(verify_tick_with(&wrong_token, &issuance, &storm_eye).is_err());
+
+            let mut minted = issuance.transaction.clone();
+            minted.input[0].asset_issuance.amount = confidential::Value::Explicit(1);
+            assert!(
+                verify_tick_with(
+                    &asset,
+                    &ConfirmedIssuance {
+                        transaction: minted,
+                        block_height: 101,
+                    },
+                    &storm_eye,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[tokio::test]

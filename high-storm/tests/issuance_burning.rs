@@ -928,8 +928,9 @@ async fn operator_post(node: u8, path: &str, payload: Value) -> TestResult<(u16,
             .as_nanos()
     );
     let message = format!(
-        "high-storm:operator-write:v1\nPOST\n{path}\n{timestamp}\n{nonce}\n{}",
-        hex::encode(Sha256::digest(serde_json::to_vec(&payload)?))
+        "high-storm:operator-write:v3\nSignature scheme: bip322-v1\nMethod: POST\nPath: {path}\nTimestamp (Unix seconds): {timestamp}\nNonce: {nonce}\nPayload SHA-256: {}\n\nPayload JSON:\n{}",
+        hex::encode(Sha256::digest(serde_json::to_vec(&payload)?)),
+        serde_json::to_string_pretty(&payload)?
     );
     let address = bitcoin::Address::p2tr(&secp, public_key, None, bitcoin::Network::Regtest);
     let signature = bip322::sign_simple_encoded(
@@ -976,7 +977,7 @@ async fn vote_and_confirm(
     let height: u64 = rpc.call("getblockcount", &[])?;
     let hash: String = rpc.call("getblockhash", &[height.into()])?;
     wait_for_indexed_tip(&pools, height, &hash, Duration::from_secs(60)).await?;
-    let (status, response) = operator_post(1, "/operators/voting", proposal).await?;
+    let (status, response) = operator_post(1, "/operators/voting", proposal.clone()).await?;
     assert_eq!(status, 201, "vote creation failed: {response}");
     let hash = response["message_hash"]
         .as_str()
@@ -988,7 +989,7 @@ async fn vote_and_confirm(
     for node in 1..=2 {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let (status, response) = operator_post(node, &approval_path, json!({})).await?;
+            let (status, response) = operator_post(node, &approval_path, proposal.clone()).await?;
             if status == 204 {
                 break;
             }
@@ -1026,8 +1027,12 @@ async fn vote_and_confirm(
         {
             break Txid::from_byte_array(txid);
         }
-        let (status, response) =
-            operator_post(1, &format!("/operators/voting/{hash}/execute"), json!({})).await?;
+        let (status, response) = operator_post(
+            1,
+            &format!("/operators/voting/{hash}/execute"),
+            proposal.clone(),
+        )
+        .await?;
         if status == 200 {
             let bytes = hex::decode(
                 response["execution_txid"]
@@ -1041,6 +1046,7 @@ async fn vote_and_confirm(
         }
         sleep(Duration::from_millis(500)).await;
     };
+
     let mining_address = wallet
         .call::<Vec<WalletUtxo>>("listunspent", &[1.into(), 9_999_999.into()])?
         .into_iter()

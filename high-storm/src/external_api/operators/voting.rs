@@ -13,9 +13,6 @@ use crate::{
     external_api::{ApiError, ExternalApiState},
 };
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(super) struct EmptyPayload {}
-
 #[derive(Serialize)]
 pub(super) struct CreatedVoting {
     message_hash: String,
@@ -88,12 +85,19 @@ pub(super) async fn create_voting(
 pub(super) async fn approve_voting(
     State(state): State<ExternalApiState>,
     Path(hash): Path<String>,
-    Json(request): Json<SignedRequest<EmptyPayload>>,
+    Json(request): Json<SignedRequest<VotingProposal>>,
 ) -> Result<StatusCode, ApiError> {
     let path = format!("/operators/voting/{hash}/approve");
     state.auth.verify_write(&request, "POST", &path).await?;
 
     let hash = parse_hash(&hash)?;
+    let voting = state
+        .node
+        .voting_request(hash)
+        .await?
+        .ok_or_else(|| ApiError::not_found("voting request does not exist"))?;
+    request.payload.verify_matches(&voting.request)?;
+
     match state.node.approve_voting_request(hash).await {
         Ok(()) | Err(VotingError::DuplicateApproval(_)) => {}
         Err(error) => return Err(error.into()),
@@ -105,12 +109,19 @@ pub(super) async fn approve_voting(
 pub(super) async fn execute_voting(
     State(state): State<ExternalApiState>,
     Path(hash): Path<String>,
-    Json(request): Json<SignedRequest<EmptyPayload>>,
+    Json(request): Json<SignedRequest<VotingProposal>>,
 ) -> Result<Json<ExecutedVoting>, ApiError> {
     let path = format!("/operators/voting/{hash}/execute");
     state.auth.verify_write(&request, "POST", &path).await?;
 
     let hash = parse_hash(&hash)?;
+    let voting = state
+        .node
+        .voting_request(hash)
+        .await?
+        .ok_or_else(|| ApiError::not_found("voting request does not exist"))?;
+    request.payload.verify_matches(&voting.request)?;
+
     let execution_txid = state.node.execute_voting_request(hash).await?;
 
     Ok(Json(ExecutedVoting {
@@ -140,7 +151,7 @@ fn parse_hash(encoded: &str) -> Result<[u8; 32], ApiError> {
         .map_err(|_| ApiError::bad_request("invalid voting request hash"))
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VotingProposal {
     UpdateNetworkMembers {
@@ -156,7 +167,7 @@ pub enum VotingProposal {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Utxo {
     pub txid: String,
     pub output_index: u32,
@@ -180,6 +191,17 @@ pub struct VotingApprovalResponse {
 }
 
 impl VotingProposal {
+    fn verify_matches(&self, request: &NetworkVoteRequest) -> Result<(), ApiError> {
+        let expected = Self::from_request(request).map_err(ApiError::internal)?;
+        if self != &expected {
+            return Err(ApiError::bad_request(
+                "signed proposal does not match the voting request",
+            ));
+        }
+
+        Ok(())
+    }
+
     pub fn into_request(self) -> Result<NetworkVoteRequest, String> {
         match self {
             Self::UpdateNetworkMembers {
@@ -363,8 +385,34 @@ mod tests {
         ];
 
         for proposal in proposals {
-            let request = proposal.into_request().unwrap();
+            let request = proposal.clone().into_request().unwrap();
+            assert!(proposal.verify_matches(&request).is_ok());
             VotingProposal::from_request(&request).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_signed_details_that_differ_from_the_stored_proposal() {
+        let proposal = VotingProposal::SplitStormEye {
+            utxo_to_split: utxo(1),
+            number_of_splits: 2,
+        };
+        let request = proposal.into_request().unwrap();
+
+        for altered in [
+            VotingProposal::SplitStormEye {
+                utxo_to_split: utxo(1),
+                number_of_splits: 3,
+            },
+            VotingProposal::SplitStormEye {
+                utxo_to_split: utxo(2),
+                number_of_splits: 2,
+            },
+            VotingProposal::MergeStormEyes {
+                utxos_to_merge: vec![utxo(1), utxo(2)],
+            },
+        ] {
+            assert!(altered.verify_matches(&request).is_err());
         }
     }
 

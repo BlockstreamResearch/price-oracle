@@ -367,6 +367,8 @@ pub(crate) struct VotingSyncRequest {
 pub(crate) struct VotingSyncMessage {
     pub(crate) is_response: bool,
     pub(crate) requests: Vec<VotingSyncRequest>,
+    /// Approved votes the requester has no execution for.
+    pub(crate) missing_executions: Vec<[u8; 32]>,
 }
 
 impl NodeMessageKind {

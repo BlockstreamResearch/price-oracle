@@ -327,8 +327,16 @@ impl VotingExecution {
 
         let stored = self.stored_vote(request_hash).await?;
         require_retryable(&stored)?;
-        self.validate_transaction(request_hash, request, false, false, true, current_members)
-            .await?;
+        self.validate_transaction(
+            request_hash,
+            request,
+            false,
+            false,
+            true,
+            false,
+            current_members,
+        )
+        .await?;
 
         if stored.execution_started
             && stored.execution_transaction.as_deref() != Some(request.tx.as_slice())
@@ -377,6 +385,7 @@ impl VotingExecution {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn validate_transaction(
         &self,
         request_hash: [u8; 32],
@@ -384,6 +393,7 @@ impl VotingExecution {
         allow_spent_inputs: bool,
         allow_missing_proposer: bool,
         allow_execution_replacement: bool,
+        allow_unindexed_treasury: bool,
         current_members: &BTreeSet<[u8; 32]>,
     ) -> Result<(), VotingExecutionError> {
         let stored = self.stored_vote(request_hash).await?;
@@ -420,6 +430,7 @@ impl VotingExecution {
             self.transaction_fee_sats,
             &indexed_treasury,
             allow_spent_inputs,
+            allow_unindexed_treasury,
         )
     }
 
@@ -702,8 +713,18 @@ impl VotingExecution {
             return Ok(txid);
         }
 
-        self.validate_transaction(request_hash, request, true, true, true, current_members)
-            .await?;
+        // A confirmed execution has already spent its Treasury inputs out of the index.
+        let confirmed = self.transaction_confirmation(txid)?.is_some();
+        self.validate_transaction(
+            request_hash,
+            request,
+            true,
+            true,
+            true,
+            confirmed,
+            current_members,
+        )
+        .await?;
 
         if stored.execution_started
             && stored.execution_transaction.as_deref() != Some(request.tx.as_slice())
@@ -913,6 +934,8 @@ struct ScanResult {
 struct ScannedUtxo {
     txid: String,
     vout: u32,
+    #[serde(default)]
+    asset: Option<String>,
     height: Option<u64>,
 }
 
@@ -1004,6 +1027,14 @@ fn scan_storm_eye_utxos_with_mempool(
     let mut utxos = scan
         .unspents
         .into_iter()
+        // Anyone can pay to the covenant script; only Storm Eye outputs belong to the network.
+        .filter(|unspent| {
+            unspent
+                .asset
+                .as_deref()
+                .and_then(|asset| AssetId::from_str(asset).ok())
+                == Some(expected_asset)
+        })
         .map(|unspent| {
             let txid = Txid::from_str(&unspent.txid)
                 .map_err(|_| VotingExecutionError::Invalid("invalid Storm Eye txid".into()))?;
@@ -1217,6 +1248,7 @@ fn validate_layout(
     transaction_fee_sats: u64,
     indexed_treasury: &[TreasuryUtxo],
     allow_spent_inputs: bool,
+    allow_unindexed_treasury: bool,
 ) -> Result<(), VotingExecutionError> {
     let scanned_update_utxos = if matches!(operation, ReshapeOperation::UpdateMembers { .. }) {
         match scan_storm_eye_utxos(client, storm_eye) {
@@ -1325,10 +1357,12 @@ fn validate_layout(
     let mut treasury_total = 0u64;
     for index in storm_count..pset.inputs().len() {
         let input = &pset.inputs()[index];
-        if !indexed_treasury.iter().any(|utxo| {
-            utxo.txid == input.previous_txid.to_byte_array()
-                && utxo.output_index == input.previous_output_index
-        }) {
+        if !allow_unindexed_treasury
+            && !indexed_treasury.iter().any(|utxo| {
+                utxo.txid == input.previous_txid.to_byte_array()
+                    && utxo.output_index == input.previous_output_index
+            })
+        {
             return Err(VotingExecutionError::Invalid(
                 "voting transaction uses an unindexed Treasury input".into(),
             ));
@@ -1690,6 +1724,71 @@ mod inventory_tests {
         BlockHash, LockTime, OutPoint, Transaction, TxIn, confidential,
     };
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn storm_eye_scan_ignores_foreign_and_confidential_outputs() {
+        use serde_json::json;
+
+        let storm_eye_asset = AssetId::from_byte_array([7; 32]);
+        let storm_eye = NetworkAsset {
+            kind: crate::db::network_asset::STORM_EYE_KIND.into(),
+            name: "Storm Eye".into(),
+            asset_id: [7; 32],
+            reissuance_token_id: None,
+            entropy: None,
+            issuance_txid: [1; 32],
+            contract_script: vec![0x51],
+            contract_data: None,
+            supply: 10_000,
+            created_at_block: 1,
+        };
+        let genuine = Txid::from_byte_array([2; 32]);
+        let dust = Txid::from_byte_array([3; 32]);
+        let confidential = Txid::from_byte_array([4; 32]);
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let result = match request["method"].as_str().unwrap() {
+                    "scantxoutset" => json!({ "unspents": [
+                        { "txid": genuine.to_string(), "vout": 0, "asset": storm_eye_asset.to_string() },
+                        { "txid": dust.to_string(), "vout": 0, "asset": AssetId::from_byte_array([8; 32]).to_string() },
+                        { "txid": confidential.to_string(), "vout": 0 },
+                    ] }),
+                    "gettxout" => {
+                        assert_eq!(request["params"][0], json!(genuine.to_string()));
+                        json!({
+                            "confirmations": 1,
+                            "asset": storm_eye_asset.to_string(),
+                            "value": 0.00001667,
+                            "scriptPubKey": { "hex": "51" },
+                        })
+                    }
+                    method => panic!("unexpected RPC method: {method}"),
+                };
+                async move {
+                    axum::Json(json!({ "id": request["id"], "result": result, "error": null }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = tokio::task::spawn_blocking(move || {
+            let client =
+                Client::new(&format!("http://{address}"), bitcoincore_rpc::Auth::None).unwrap();
+            for utxos in [
+                scan_storm_eye_utxos(&client, &storm_eye),
+                scan_storm_eye_utxos_ignoring_mempool(&client, &storm_eye),
+            ] {
+                let utxos = utxos.unwrap();
+                assert_eq!(utxos.len(), 1);
+                assert_eq!(utxos[0].outpoint, OutPoint::new(genuine, 0));
+            }
+        })
+        .await;
+        server.abort();
+        result.unwrap();
+    }
+
     #[test]
     fn confirmation_uses_header_height_only_for_a_canonical_hash() {
         assert_eq!(
@@ -1735,6 +1834,49 @@ mod inventory_tests {
         assert!(matches!(
             require_approved_or_executing(&executing, &[4, 5, 6]),
             Err(VotingExecutionError::AlreadyExecuting)
+        ));
+    }
+
+    #[test]
+    fn execution_requires_approval_and_cannot_repeat_after_broadcast_or_finality() {
+        let mut vote = stored_member_update([8; 32], [9; 32]);
+        vote.approved_at_block_height = None;
+
+        assert!(matches!(
+            require_retryable(&vote),
+            Err(VotingExecutionError::NotApproved)
+        ));
+        assert!(matches!(
+            require_approved_or_executing(&vote, &[1, 2, 3]),
+            Err(VotingExecutionError::NotApproved)
+        ));
+
+        vote.approved_at_block_height = Some(2);
+        assert!(require_retryable(&vote).is_ok());
+        assert!(require_approved_or_executing(&vote, &[1, 2, 3]).is_ok());
+
+        vote.execution_started = true;
+        vote.execution_transaction = Some(vec![1, 2, 3]);
+        assert!(require_approved_or_executing(&vote, &[1, 2, 3]).is_ok());
+
+        vote.execution_txid = Some([10; 32]);
+        assert!(matches!(
+            require_retryable(&vote),
+            Err(VotingExecutionError::AlreadyExecuting)
+        ));
+        assert!(matches!(
+            require_approved_or_executing(&vote, &[1, 2, 3]),
+            Err(VotingExecutionError::AlreadyExecuting)
+        ));
+
+        vote.execution_confirmed = true;
+        assert!(matches!(
+            require_retryable(&vote),
+            Err(VotingExecutionError::AlreadyExecuted)
+        ));
+        assert!(matches!(
+            require_approved_or_executing(&vote, &[1, 2, 3]),
+            Err(VotingExecutionError::AlreadyExecuted)
         ));
     }
 

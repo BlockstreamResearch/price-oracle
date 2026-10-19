@@ -66,6 +66,7 @@ pub enum SigningError {
 struct SignerContribution {
     nonces: Option<Vec<PublicNonce>>,
     partial_signatures: Option<Vec<PartialSignature>>,
+    partial_signatures_verified: bool,
 }
 
 struct SigningSession {
@@ -828,6 +829,7 @@ impl SigningState {
                     SignerContribution {
                         nonces: None,
                         partial_signatures: None,
+                        partial_signatures_verified: false,
                     },
                 )
             })
@@ -933,6 +935,7 @@ impl SigningState {
                 .values()
                 .all(|contribution| contribution.nonces.is_some())
         {
+            self.complete_session(request_hash)?;
             return Ok(None);
         }
 
@@ -979,14 +982,17 @@ impl SigningState {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some((
+        let outbound = (
             NodeMessage::new(
                 NodeMessageKind::PartialSignatures,
                 Some(request_hash),
                 &payload,
             )?,
             recipients,
-        )))
+        );
+        self.complete_session(request_hash)?;
+
+        Ok(Some(outbound))
     }
 
     fn accept_partial_signatures(
@@ -1000,7 +1006,6 @@ impl SigningState {
                 "partial-signature contributor does not match authenticated sender".into(),
             ));
         }
-        let local_node = self.local_node;
         let Some(session) = self.sessions.get_mut(&request_hash) else {
             return Ok(());
         };
@@ -1011,32 +1016,83 @@ impl SigningState {
         }
         let contribution = session
             .contributions
-            .get_mut(&sender)
+            .get(&sender)
             .ok_or_else(|| SigningError::InvalidMessage("signature from a non-signer".into()))?;
         if contribution.partial_signatures.is_some() {
             return Ok(());
         }
-        contribution.partial_signatures = Some(
-            message
-                .partial_signatures
-                .iter()
-                .map(|signature| {
-                    PartialSignature::from_byte_array(signature).map_err(|_| {
-                        SigningError::InvalidMessage("invalid partial signature".into())
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        if session.requestor != local_node
+        let partial_signatures = message
+            .partial_signatures
+            .iter()
+            .enumerate()
+            .map(|(index, signature)| {
+                PartialSignature::from_byte_array(signature)
+                    .map_err(|_| invalid_partial_signature(sender, index))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let nonces_ready = session
+            .contributions
+            .values()
+            .all(|contribution| contribution.nonces.is_some());
+        if nonces_ready {
+            let cache = key_agg_cache(&session.signers)?;
+            verify_signer_partials(session, &cache, sender, &partial_signatures)?;
+        }
+
+        let contribution = session
+            .contributions
+            .get_mut(&sender)
+            .expect("contributor was checked above");
+        contribution.partial_signatures = Some(partial_signatures);
+        contribution.partial_signatures_verified = nonces_ready;
+
+        self.complete_session(request_hash)
+    }
+
+    fn complete_session(&mut self, request_hash: [u8; 32]) -> Result<(), SigningError> {
+        let Some(session) = self.sessions.get_mut(&request_hash) else {
+            return Ok(());
+        };
+        if session.requestor != self.local_node
             || !session
                 .contributions
                 .values()
-                .all(|contribution| contribution.partial_signatures.is_some())
+                .all(|contribution| contribution.nonces.is_some())
         {
             return Ok(());
         }
 
         let cache = key_agg_cache(&session.signers)?;
+        for signer in session.signers.clone() {
+            let contribution = &session.contributions[&signer];
+            if contribution.partial_signatures_verified {
+                continue;
+            }
+            let Some(partials) = contribution.partial_signatures.as_ref() else {
+                continue;
+            };
+            if let Err(error) = verify_signer_partials(session, &cache, signer, partials) {
+                session
+                    .contributions
+                    .get_mut(&signer)
+                    .expect("signer belongs to the branch")
+                    .partial_signatures = None;
+                return Err(error);
+            }
+            session
+                .contributions
+                .get_mut(&signer)
+                .expect("signer belongs to the branch")
+                .partial_signatures_verified = true;
+        }
+        if !session
+            .contributions
+            .values()
+            .all(|contribution| contribution.partial_signatures.is_some())
+        {
+            return Ok(());
+        }
+
         let mut signatures = Vec::with_capacity(session.request.message_hashes.len());
         for (index, message_hash) in session.request.message_hashes.iter().enumerate() {
             let signing_session = musig_session(session, &cache, index, message_hash)?;
@@ -1089,6 +1145,41 @@ fn execute_message_hashes(signing_hash: [u8; 32], price_hash: Option<[u8; 32]>) 
     hashes.extend(price_hash);
 
     hashes
+}
+
+fn invalid_partial_signature(signer: NodePublicKey, index: usize) -> SigningError {
+    SigningError::InvalidMessage(format!(
+        "invalid partial signature from signer {} for message {index}",
+        hex::encode(signer)
+    ))
+}
+
+fn verify_signer_partials(
+    session: &SigningSession,
+    cache: &KeyAggCache,
+    signer: NodePublicKey,
+    partials: &[PartialSignature],
+) -> Result<(), SigningError> {
+    let public_key = XOnlyPublicKey::from_byte_array(signer)
+        .map_err(|_| SigningError::InvalidMessage("invalid signer public key".into()))?
+        .public_key(Parity::Even);
+    let nonces = session.contributions[&signer]
+        .nonces
+        .as_ref()
+        .ok_or_else(|| SigningError::InvalidMessage("missing signer nonce".into()))?;
+
+    for (index, (partial, message_hash)) in partials
+        .iter()
+        .zip(&session.request.message_hashes)
+        .enumerate()
+    {
+        let signing_session = musig_session(session, cache, index, message_hash)?;
+        if !signing_session.partial_verify(cache, partial, &nonces[index], public_key) {
+            return Err(invalid_partial_signature(signer, index));
+        }
+    }
+
+    Ok(())
 }
 
 fn musig_session(
@@ -1246,6 +1337,201 @@ mod tests {
             execute_message_hashes([7; 32], Some([8; 32])),
             vec![[7; 32], [8; 32]]
         );
+    }
+
+    fn signing_round() -> (
+        Vec<SigningState>,
+        Vec<PartialSignaturesMessage>,
+        oneshot::Receiver<SigningResult>,
+    ) {
+        let secrets = [[11; 32], [12; 32], [13; 32]];
+        let peers = secrets
+            .iter()
+            .map(|secret| {
+                let key = secp256k1_zkp::SecretKey::from_slice(secret).unwrap();
+                Peer::new(
+                    TransportPublicKey::from_secret_key(&secp256k1_zkp::Secp256k1::new(), &key)
+                        .serialize(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut states = secrets
+            .into_iter()
+            .map(|secret| SigningState::new(secret, &peers))
+            .collect::<Vec<_>>();
+        let tree = states[0].tree.as_ref().unwrap();
+        let branch = tree.branches().next().unwrap();
+        let signers = tree.nodes_for_branch(&branch).unwrap().to_vec();
+        states.retain(|state| signers.contains(&state.local_node));
+        let requestor = states[0].local_node;
+        let (completion, receiver) = oneshot::channel();
+        let mut completion = Some(completion);
+        let mut nonces = Vec::<SigningNoncesMessage>::new();
+
+        for (index, state) in states.iter_mut().enumerate() {
+            let message = state
+                .start_session(
+                    [42; 32],
+                    requestor,
+                    SigningRequest {
+                        signing_storm_tree_branch: branch,
+                        message_hashes: vec![[24; 32], [25; 32]],
+                    },
+                    if index == 0 { completion.take() } else { None },
+                )
+                .unwrap()
+                .unwrap();
+            nonces.push(message.decode_payload().unwrap());
+        }
+
+        let mut partials = Vec::new();
+        for state in &mut states {
+            for nonce in &nonces {
+                if nonce.signer == state.local_node {
+                    continue;
+                }
+                if let Some((message, _)) = state
+                    .accept_nonces(
+                        [42; 32],
+                        nonce.signer,
+                        SigningNoncesMessage {
+                            signer: nonce.signer,
+                            nonces: nonce.nonces.clone(),
+                        },
+                    )
+                    .unwrap()
+                {
+                    partials.push(message.decode_payload().unwrap());
+                }
+            }
+        }
+
+        (states, partials, receiver)
+    }
+
+    #[test]
+    fn rejects_a_bad_batch_atomically_and_accepts_a_valid_retry() {
+        let (mut states, messages, mut completion) = signing_round();
+        let state = &mut states[0];
+        let valid = messages
+            .into_iter()
+            .find(|message| message.signer != state.local_node)
+            .unwrap();
+        let mut bad = PartialSignaturesMessage {
+            signer: valid.signer,
+            partial_signatures: valid.partial_signatures.clone(),
+        };
+        bad.partial_signatures[1] = bad.partial_signatures[0];
+
+        let error = state
+            .accept_partial_signatures([42; 32], bad.signer, bad)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&hex::encode(valid.signer)));
+        assert!(error.contains("message 1"));
+        assert!(
+            state.sessions[&[42; 32]].contributions[&valid.signer]
+                .partial_signatures
+                .is_none()
+        );
+        assert!(completion.try_recv().is_err());
+
+        state
+            .accept_partial_signatures([42; 32], valid.signer, valid)
+            .unwrap();
+        assert_eq!(completion.try_recv().unwrap().signatures.len(), 2);
+        assert!(!state.sessions.contains_key(&[42; 32]));
+    }
+
+    #[test]
+    fn rejects_shares_from_another_nonce_round() {
+        let (mut states, _, mut completion) = signing_round();
+        let (_, replayed, _) = signing_round();
+        let state = &mut states[0];
+        let replayed = replayed
+            .into_iter()
+            .find(|message| message.signer != state.local_node)
+            .unwrap();
+        let signer = replayed.signer;
+
+        let error = state
+            .accept_partial_signatures([42; 32], signer, replayed)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&hex::encode(signer)));
+        assert!(error.contains("message 0"));
+        assert!(
+            state.sessions[&[42; 32]].contributions[&signer]
+                .partial_signatures
+                .is_none()
+        );
+        assert!(completion.try_recv().is_err());
+    }
+
+    #[test]
+    fn verifies_pending_shares_when_the_last_nonce_arrives() {
+        for invalid in [false, true] {
+            let (mut states, messages, mut completion) = signing_round();
+            let state = &mut states[0];
+            let valid = messages
+                .into_iter()
+                .find(|message| message.signer != state.local_node)
+                .unwrap();
+            let signer = valid.signer;
+            let nonces = state
+                .sessions
+                .get_mut(&[42; 32])
+                .unwrap()
+                .contributions
+                .get_mut(&signer)
+                .unwrap()
+                .nonces
+                .take()
+                .unwrap();
+            let mut pending = PartialSignaturesMessage {
+                signer,
+                partial_signatures: valid.partial_signatures.clone(),
+            };
+            if invalid {
+                pending.partial_signatures[1] = pending.partial_signatures[0];
+            }
+
+            state
+                .accept_partial_signatures([42; 32], signer, pending)
+                .unwrap();
+            assert!(completion.try_recv().is_err());
+
+            let result = state.accept_nonces(
+                [42; 32],
+                signer,
+                SigningNoncesMessage {
+                    signer,
+                    nonces: nonces
+                        .iter()
+                        .map(|nonce| nonce.serialize().to_vec())
+                        .collect(),
+                },
+            );
+            if invalid {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(&hex::encode(signer)));
+                assert!(error.contains("message 1"));
+                assert!(
+                    state.sessions[&[42; 32]].contributions[&signer]
+                        .partial_signatures
+                        .is_none()
+                );
+                assert!(completion.try_recv().is_err());
+                state
+                    .accept_partial_signatures([42; 32], signer, valid)
+                    .unwrap();
+            } else {
+                assert!(result.is_ok());
+            }
+
+            assert_eq!(completion.try_recv().unwrap().signatures.len(), 2);
+            assert!(!state.sessions.contains_key(&[42; 32]));
+        }
     }
 
     #[tokio::test]

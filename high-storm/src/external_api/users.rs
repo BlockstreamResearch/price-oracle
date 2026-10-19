@@ -63,6 +63,7 @@ struct OracleAccount {
 #[derive(Serialize)]
 struct OracleNetwork {
     storm_eye_asset_id: AssetId,
+    storm_tree_root: String,
     tick_asset_id: AssetId,
     oracle_verifier_asset_id: AssetId,
     network: super::operators::auth::AuthNetwork,
@@ -70,6 +71,7 @@ struct OracleNetwork {
 
 async fn network_metadata(state: &ExternalApiState) -> Result<OracleNetwork, ApiError> {
     let mut asset_ids = Vec::with_capacity(3);
+    let mut storm_tree_root = None;
     for (kind, name) in [
         (STORM_EYE_KIND, "Storm Eye"),
         (TICK_ASSET_KIND, "Tick"),
@@ -81,10 +83,18 @@ async fn network_metadata(state: &ExternalApiState) -> Result<OracleNetwork, Api
             .await
             .map_err(ApiError::unavailable)?
             .ok_or_else(|| ApiError::unavailable(format!("{name} asset is not active")))?;
+        if kind == STORM_EYE_KIND {
+            let data: crate::high_storm::StormEyeContractData =
+                crate::high_storm::storm_eye_contract_data(&asset)
+                    .map_err(ApiError::unavailable)?;
+            storm_tree_root = Some(hex::encode(data.storm_tree_root));
+        }
         asset_ids.push(AssetId::from_byte_array(asset.asset_id));
     }
     Ok(OracleNetwork {
         storm_eye_asset_id: asset_ids[0],
+        storm_tree_root: storm_tree_root
+            .ok_or_else(|| ApiError::unavailable("Storm Eye root is not available"))?,
         tick_asset_id: asset_ids[1],
         oracle_verifier_asset_id: asset_ids[2],
         network: state.auth.network(),

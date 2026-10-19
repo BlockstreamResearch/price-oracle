@@ -18,6 +18,7 @@ use simplex::{
         pset::PartiallySignedTransaction,
     },
 };
+use storm_tree::StormTree;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -35,7 +36,7 @@ use super::{
     ChainTip,
     assets::{
         initial_members_from_script, migrated_members_proposer_from_script, renewed_storm_eye,
-        treasury_blinding_secret,
+        storm_eye_contract_data, treasury_blinding_secret,
     },
     droplets::member_from_script,
     issuance::IssuedUtxoDescriptor,
@@ -707,7 +708,8 @@ fn verify_initial_members(
 ) -> Result<(), IndexerError> {
     let Some(transaction) = transactions
         .iter()
-        .find(|transaction| transaction.txid().to_byte_array() == storm_eye.issuance_txid)
+        // `issuance_txid` is stored in display byte order.
+        .find(|transaction| transaction.txid().to_string() == hex::encode(storm_eye.issuance_txid))
     else {
         return Ok(());
     };
@@ -724,6 +726,18 @@ fn verify_initial_members(
         return Err(IndexerError::Invalid(
             "Storm Eye issuance must contain one initial-members marker".into(),
         ));
+    }
+    let marker_root = StormTree::new(markers[0].clone())
+        .map_err(|error| IndexerError::Invalid(error.to_string()))?
+        .root();
+    let replayed_root = storm_eye_contract_data(storm_eye)
+        .map_err(|error| IndexerError::Invalid(error.to_string()))?
+        .storm_tree_root;
+    if replayed_root != marker_root {
+        tracing::warn!(
+            "skipped the initial-members check: this node has no history of a later member migration"
+        );
+        return Ok(());
     }
     let mut expected_members = expected_members.to_vec();
     expected_members.sort_unstable();
@@ -1304,6 +1318,60 @@ mod tests {
                 false,
             ));
         }
+    }
+
+    #[test]
+    fn verifies_initial_members_of_the_storm_eye_issuance() {
+        use crate::high_storm::assets::{StormEyeContractData, initial_members_script};
+        use simplex::simplicityhl::elements::LockTime;
+
+        let members = [1u8, 2, 3]
+            .map(|byte| {
+                secp256k1_zkp::Keypair::from_seckey_slice(&Secp256k1::new(), &[byte; 32])
+                    .unwrap()
+                    .x_only_public_key()
+                    .0
+                    .serialize()
+            })
+            .to_vec();
+        let issuance = Transaction {
+            version: 2,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![TxOut {
+                script_pubkey: initial_members_script(&members).unwrap(),
+                ..Default::default()
+            }],
+        };
+        let with_root = |root| crate::NetworkAsset {
+            kind: STORM_EYE_KIND.into(),
+            name: "Storm Eye".into(),
+            asset_id: [1; 32],
+            reissuance_token_id: None,
+            entropy: None,
+            issuance_txid: hex::decode(issuance.txid().to_string())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            contract_script: vec![0x51],
+            contract_data: Some(
+                postcard::to_stdvec(&StormEyeContractData {
+                    storm_tree_root: root,
+                    rescue_height: 1,
+                    rescue_output_script_hash: [0; 32],
+                })
+                .unwrap(),
+            ),
+            supply: 10_000,
+            created_at_block: 1,
+        };
+        let genesis = with_root(StormTree::new(members.clone()).unwrap().root());
+        let transactions = std::slice::from_ref(&issuance);
+
+        verify_initial_members(transactions, &genesis, &members).unwrap();
+        assert!(verify_initial_members(transactions, &genesis, &members[..2]).is_err());
+        // A member that joined after a migration it holds no record of.
+        verify_initial_members(transactions, &with_root([7; 32]), &members[..2]).unwrap();
     }
 
     #[test]

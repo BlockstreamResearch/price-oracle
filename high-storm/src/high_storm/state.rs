@@ -150,7 +150,7 @@ impl NetworkState {
                 protocol_config.finality_confirmations,
             ),
             prices: prices.clone(),
-            assets: Assets::new(network_assets.clone()),
+            assets: Assets::new(network_assets.clone(), elements_rpc.clone()),
             renewal: super::renewal::Renewal::new(
                 network_assets.clone(),
                 droplets.clone(),

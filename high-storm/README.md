@@ -293,10 +293,14 @@ migration period. New clients send
 | `GET` | `/price-feeds` | None; coordinator node only |
 | `GET` | `/price-feeds/{id}` | None; coordinator node only |
 
-`GET /users/network` returns `network`, `storm_eye_asset_id`, `tick_asset_id`
-and `oracle_verifier_asset_id` from the active network assets, without a user
-public key or account derivation. It returns 503 while a required asset is not
-active. Account lookup uses the same asset metadata and additionally derives
+`GET /users/network` returns `network`, `storm_eye_asset_id`, `tick_asset_id`,
+`oracle_verifier_asset_id` and `storm_tree_root` from the active network assets,
+without a user public key or account derivation. The root is 64-character hex
+decoded from the same active Storm Eye record as its asset ID. It returns 503
+while a required asset is inactive or Storm Eye contract data is missing or
+invalid. Trusting these values delegates deployment and root selection to this
+node; independently pinned clients must verify them against their own anchors.
+Account lookup uses the same asset metadata and additionally derives
 the supplied user's account and voucher scripts.
 
 Challenge and token requests use these shapes:

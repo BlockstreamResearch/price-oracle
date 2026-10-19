@@ -23,6 +23,7 @@ mod voting;
 mod voting_execution;
 
 pub use assets::AssetError;
+pub(crate) use assets::{StormEyeContractData, storm_eye_contract_data};
 pub use burning::BurningError;
 pub use droplets::DropletsError;
 pub(crate) use droplets::exchange_recipient_amount;
@@ -1031,6 +1032,11 @@ impl HighStormHandle {
     ) -> Result<[u8; 32], VotingExecutionError> {
         let peers = self.peers().await;
         let current_members = voting_member_keys(&peers)?;
+        let local = leader::local_public_key(&peers).ok_or_else(|| {
+            VotingExecutionError::Invalid("local network member is missing".into())
+        })?;
+        handler::authorize_voting_executor(&current_members, local)?;
+
         let vote = self
             .state
             .voting()
@@ -1060,19 +1066,6 @@ impl HighStormHandle {
             .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
         request.chain_tip = Some(chain_tip);
         let proposer = request.proposer_public_key;
-        let local = leader::local_public_key(&self.peers().await).ok_or_else(|| {
-            VotingExecutionError::Invalid("local network member is missing".into())
-        })?;
-        let local = PublicKey::from_slice(&local)
-            .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?
-            .x_only_public_key()
-            .0
-            .serialize();
-        if local != proposer {
-            return Err(VotingExecutionError::Invalid(
-                "only the node that proposed a voting request may execute it".into(),
-            ));
-        }
 
         self.state
             .voting_execution()
@@ -1233,6 +1226,10 @@ impl HighStormHandle {
                 .voting_execution()
                 .is_final(inclusion.confirmations)
             {
+                // Peers that missed the first notice can still record it before finality.
+                if let Err(error) = self.announce_voting_execution(request_hash, &request).await {
+                    tracing::warn!(%error, "failed to reannounce voting execution");
+                }
                 continue;
             }
 
