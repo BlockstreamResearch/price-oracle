@@ -1,6 +1,6 @@
 FROM rust:1.97.1-bookworm AS builder
 
-ARG SIMPLEX_VERSION=0.0.11
+ARG SIMPLEX_VERSION=0.1.1
 
 WORKDIR /workspace
 RUN apt-get update \
