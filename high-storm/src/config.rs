@@ -45,6 +45,23 @@ pub struct ServiceConfig {
     pub db: DbConfig,
     #[serde(default)]
     pub price_sources: PriceSourcesConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// The Prometheus endpoint is internal; keep it off public interfaces.
+#[derive(Clone, Debug, Deserialize)]
+pub struct MetricsConfig {
+    #[serde(default = "default_metrics_address")]
+    pub address: SocketAddr,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            address: default_metrics_address(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -86,6 +103,12 @@ fn default_external_api_address() -> SocketAddr {
     "127.0.0.1:9001"
         .parse()
         .expect("the default external API address is valid")
+}
+
+fn default_metrics_address() -> SocketAddr {
+    "127.0.0.1:9300"
+        .parse()
+        .expect("the default metrics address is valid")
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -252,6 +275,30 @@ max_connections = 5
             .peer_addresses
             .insert("not-a-key".into(), "node:9000".into());
         assert!(matches!(config.validate(), Err(Error::P2p(_))));
+    }
+
+    #[test]
+    fn metrics_listen_on_loopback_by_default() {
+        let config: Config = toml::from_str(&config_with_protocol_section("protocol")).unwrap();
+
+        assert_eq!(
+            config.service.metrics.address,
+            "127.0.0.1:9300".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn parses_metrics_section() {
+        let config: Config = toml::from_str(&format!(
+            "{}\n[service.metrics]\naddress = \"0.0.0.0:9400\"\n",
+            config_with_protocol_section("protocol")
+        ))
+        .unwrap();
+
+        assert_eq!(
+            config.service.metrics.address,
+            "0.0.0.0:9400".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[test]
