@@ -6,11 +6,13 @@ use high_storm::{
     db::{Database, network::NetworkStore},
     external_api::ExternalApiServer,
     ipc::IpcServer,
+    monitoring::{self, MetricsServer},
     sources,
 };
 use std::process::ExitCode;
 use tokio::{
     sync::Notify,
+    task::JoinHandle,
     time::{Duration, Instant, MissedTickBehavior},
 };
 use tracing_subscriber::EnvFilter;
@@ -122,6 +124,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         database = %config.service.db.database,
         "configuration loaded"
     );
+    // Served before discovery so that a node waiting for its peers is still scrapeable.
+    let metrics =
+        MetricsServer::bind(config.service.metrics.address, monitoring::install()?).await?;
+    tracing::info!(address = %metrics.local_addr()?, "metrics endpoint is listening");
+    let metrics_task = tokio::spawn(metrics.run());
+
     let database =
         Database::connect(&config.database_url()?, config.service.db.max_connections).await?;
     let store = database.network();
@@ -184,7 +192,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let ipc = IpcServer::bind(&config.service.ipc_path, database.node_operators()).await?;
     let price_observed = sources::spawn(&config.service.price_sources, storm.handle())?;
-    run_until_shutdown(storm, &store, ipc, external_api, &price_observed).await?;
+    run_until_shutdown(
+        storm,
+        &store,
+        ipc,
+        external_api,
+        metrics_task,
+        &price_observed,
+    )
+    .await?;
 
     Ok(())
 }
@@ -233,6 +249,7 @@ async fn run_until_shutdown(
     store: &NetworkStore,
     ipc: IpcServer,
     external_api: ExternalApiServer,
+    metrics_task: JoinHandle<std::io::Result<()>>,
     price_observed: &Notify,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reconnect = tokio::time::interval(Duration::from_secs(3));
@@ -270,6 +287,7 @@ async fn run_until_shutdown(
     tokio::pin!(ipc_task);
     let external_api_task = tokio::spawn(external_api.run());
     tokio::pin!(external_api_task);
+    tokio::pin!(metrics_task);
 
     loop {
         tokio::select! {
@@ -484,6 +502,10 @@ async fn run_until_shutdown(
                 result??;
                 return Err("external API listener stopped unexpectedly".into());
             }
+            result = &mut metrics_task => {
+                result??;
+                return Err("metrics listener stopped unexpectedly".into());
+            }
         }
     }
 
@@ -491,6 +513,8 @@ async fn run_until_shutdown(
     let _ = ipc_task.await;
     external_api_task.abort();
     let _ = external_api_task.await;
+    metrics_task.abort();
+    let _ = metrics_task.await;
 
     let peers = storm.peers().await;
     tracing::info!(
