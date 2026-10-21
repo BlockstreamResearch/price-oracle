@@ -129,6 +129,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         MetricsServer::bind(config.service.metrics.address, monitoring::install()?).await?;
     tracing::info!(address = %metrics.local_addr()?, "metrics endpoint is listening");
     let metrics_task = tokio::spawn(metrics.run());
+    monitoring::spawn_elements_probe(&config.service.elements_rpc)?;
 
     let database =
         Database::connect(&config.database_url()?, config.service.db.max_connections).await?;
@@ -351,8 +352,19 @@ async fn run_until_shutdown(
                     if let Err(error) = storm.announce_protocol_settings().await {
                         tracing::warn!(%error, "protocol settings announcement failed");
                     }
+                    match storm.storm_eye_rescue_height().await {
+                        Ok(Some(rescue_height)) => monitoring::set_storm_eye_rescue_blocks_remaining(
+                            rescue_height,
+                            storm.handle().block_height(),
+                        ),
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to read the Storm Eye rescue height");
+                        }
+                    }
                     match storm.storm_eye_utxo_count().await {
                         Ok(storm_eye_count) => {
+                            monitoring::set_storm_eye_utxos(storm_eye_count);
                             round_schedule = BlockRoundSchedule::new(storm_eye_count);
                             round_started_at = Instant::now();
                             issuance_lane = 0;

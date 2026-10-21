@@ -1,15 +1,22 @@
 //! Prometheus metrics, served on the internal `service.metrics` listener.
 
+mod chain;
+mod elements;
 mod names;
 mod refresh;
 mod server;
 
 use std::time::Duration;
 
-use metrics::{describe_gauge, describe_histogram, gauge};
+use metrics::{describe_counter, describe_gauge, describe_histogram, gauge};
 use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
 use metrics_util::MetricKindMask;
 
+pub(crate) use chain::{
+    RenewalOutcome, record_chain_reorg, record_storm_eye_renewal, set_chain_safety_halt,
+};
+pub use chain::{set_storm_eye_rescue_blocks_remaining, set_storm_eye_utxos};
+pub use elements::spawn_elements_probe;
 pub use refresh::{LoopTask, record_loop_tick, spawn_refresh};
 pub use server::MetricsServer;
 
@@ -103,7 +110,59 @@ fn describe() {
         names::DB_POOL_CONNECTIONS,
         "Database pool connections, by state."
     );
+    describe_gauge!(
+        names::ELEMENTS_RPC_UP,
+        "1 if the last probe of this node's Elements RPC succeeded."
+    );
+    describe_gauge!(
+        names::ELEMENTS_TIP_HEIGHT,
+        "Height of Elements' best block, as last seen."
+    );
+    describe_gauge!(
+        names::ELEMENTS_TIP_TIMESTAMP,
+        "Unix time of Elements' best block, as last seen."
+    );
+    describe_gauge!(
+        names::ELEMENTS_PEERS,
+        "Peers Elements is connected to, as last seen."
+    );
+    describe_gauge!(
+        names::ELEMENTS_INITIAL_BLOCK_DOWNLOAD,
+        "1 while Elements is in initial block download."
+    );
+    describe_counter!(
+        names::CHAIN_REORGS,
+        "Chain reorganizations the indexer found under its journal or cursors."
+    );
+    describe_gauge!(
+        names::CHAIN_RECOVERING,
+        "1 while the indexer rebuilds chain-derived state."
+    );
+    describe_gauge!(
+        names::CHAIN_SAFETY_HALT,
+        "1 while indexing is halted for safety; an operator must act."
+    );
+    describe_gauge!(
+        names::SPENDING_PAUSED,
+        "1 while spending is paused for a member migration."
+    );
+    describe_gauge!(
+        names::STORM_EYE_UTXOS,
+        "Storm Eye UTXOs available to sign with, counted after each new block."
+    );
+    describe_gauge!(
+        names::STORM_EYE_RESCUE_BLOCKS_REMAINING,
+        "Blocks until anyone may take the Storm Eye UTXOs; negative once passed."
+    );
+    describe_counter!(
+        names::STORM_EYE_RENEWALS,
+        "Storm Eye timelock renewals, by outcome."
+    );
     metrics_process::Collector::default().describe();
+}
+
+fn flag(value: bool) -> f64 {
+    f64::from(u8::from(value))
 }
 
 fn record_build_info() {

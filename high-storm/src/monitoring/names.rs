@@ -16,3 +16,20 @@ pub(super) const PEER_LAST_SEEN: &str = "storm_peer_last_seen_timestamp_seconds"
 pub(super) const DB_UP: &str = "high_storm_db_up";
 pub(super) const DB_PING_DURATION: &str = "high_storm_db_ping_duration_seconds";
 pub(super) const DB_POOL_CONNECTIONS: &str = "high_storm_db_pool_connections";
+
+pub(super) const ELEMENTS_RPC_UP: &str = "high_storm_elements_rpc_up";
+pub(super) const ELEMENTS_TIP_HEIGHT: &str = "high_storm_elements_tip_height";
+pub(super) const ELEMENTS_TIP_TIMESTAMP: &str = "high_storm_elements_tip_timestamp_seconds";
+pub(super) const ELEMENTS_PEERS: &str = "high_storm_elements_peers";
+pub(super) const ELEMENTS_INITIAL_BLOCK_DOWNLOAD: &str =
+    "high_storm_elements_initial_block_download";
+
+pub(super) const CHAIN_REORGS: &str = "high_storm_chain_reorgs_total";
+pub(super) const CHAIN_RECOVERING: &str = "high_storm_chain_recovering";
+pub(super) const CHAIN_SAFETY_HALT: &str = "high_storm_chain_safety_halt";
+pub(super) const SPENDING_PAUSED: &str = "high_storm_spending_paused";
+
+pub(super) const STORM_EYE_UTXOS: &str = "high_storm_storm_eye_utxos";
+pub(super) const STORM_EYE_RESCUE_BLOCKS_REMAINING: &str =
+    "high_storm_storm_eye_rescue_blocks_remaining";
+pub(super) const STORM_EYE_RENEWALS: &str = "high_storm_storm_eye_renewals_total";

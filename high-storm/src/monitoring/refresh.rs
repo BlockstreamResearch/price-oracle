@@ -1,6 +1,9 @@
 use std::{
-    collections::BTreeSet,
-    sync::atomic::{AtomicU64, Ordering},
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -9,7 +12,7 @@ use storm::{Peer, PeerStatus};
 use storm_tree::StormTree;
 use tokio::time::{Instant, MissedTickBehavior};
 
-use super::{names, record_build_info};
+use super::{flag, names, record_build_info};
 use crate::{HighStormHandle, db::Database};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -61,6 +64,25 @@ pub fn record_loop_tick(task: LoopTask) {
     LOOP_TICKS[task as usize].store(unix_now(), Ordering::Relaxed);
 }
 
+/// Gauges set where something happens rather than read by this task. Their
+/// last values are republished on every refresh, so they never go idle.
+static RETAINED: Mutex<BTreeMap<&'static str, f64>> = Mutex::new(BTreeMap::new());
+
+pub(super) fn set_retained(name: &'static str, value: f64) {
+    gauge!(name).set(value);
+    RETAINED
+        .lock()
+        .expect("retained gauges lock poisoned")
+        .insert(name, value);
+}
+
+fn record_retained() {
+    let retained = RETAINED.lock().expect("retained gauges lock poisoned");
+    for (&name, &value) in retained.iter() {
+        gauge!(name).set(value);
+    }
+}
+
 /// Republishes the node's gauges until the process exits.
 pub fn spawn_refresh(node: HighStormHandle, database: Database) {
     tokio::spawn(async move {
@@ -70,6 +92,7 @@ pub fn spawn_refresh(node: HighStormHandle, database: Database) {
             refresh.tick().await;
             record_build_info();
             record_loop_ticks();
+            record_retained();
             record_node(&NodeSnapshot::read(&node).await);
             record_database(&database).await;
         }
@@ -92,6 +115,8 @@ struct NodeSnapshot {
     is_member: bool,
     is_leader: bool,
     block_height: u64,
+    is_recovering: bool,
+    is_spending_paused: bool,
 }
 
 impl NodeSnapshot {
@@ -103,6 +128,8 @@ impl NodeSnapshot {
             is_member: node.is_local_member().await,
             is_leader: node.is_leader().await,
             block_height: node.block_height(),
+            is_recovering: node.is_recovering(),
+            is_spending_paused: node.is_spending_paused(),
         }
     }
 
@@ -136,6 +163,8 @@ fn record_node(node: &NodeSnapshot) {
     gauge!(names::SIGNING_THRESHOLD).set(StormTree::minimum_threshold(members) as f64);
     gauge!(names::CONNECTED_MEMBERS).set(signers as f64);
     gauge!(names::COORDINATOR_CONNECTED).set(flag(coordinator_connected));
+    gauge!(names::CHAIN_RECOVERING).set(flag(node.is_recovering));
+    gauge!(names::SPENDING_PAUSED).set(flag(node.is_spending_paused));
 
     for peer in node
         .peers
@@ -164,10 +193,6 @@ async fn record_database(database: &Database) {
     let pool = database.pool_connections();
     gauge!(names::DB_POOL_CONNECTIONS, "state" => "idle").set(pool.idle as f64);
     gauge!(names::DB_POOL_CONNECTIONS, "state" => "used").set(pool.used as f64);
-}
-
-fn flag(value: bool) -> f64 {
-    f64::from(u8::from(value))
 }
 
 fn unix_now() -> u64 {
@@ -220,6 +245,24 @@ mod tests {
     }
 
     #[test]
+    fn republishes_retained_gauges_from_memory() {
+        let first = recorder();
+        metrics::with_local_recorder(&first, || {
+            set_retained("high_storm_test_retained", 7.0);
+        });
+        let second = recorder();
+
+        metrics::with_local_recorder(&second, record_retained);
+
+        assert!(
+            second
+                .handle()
+                .render()
+                .contains("high_storm_test_retained 7")
+        );
+    }
+
+    #[test]
     fn counts_the_members_signing_can_use() {
         let mut seen = peer(2, PeerStatus::Active);
         seen.last_seen = Some(1_700_000_000);
@@ -236,6 +279,8 @@ mod tests {
             is_member: true,
             is_leader: false,
             block_height: 42,
+            is_recovering: true,
+            is_spending_paused: true,
         };
         let recorder = recorder();
 
@@ -251,6 +296,8 @@ mod tests {
             "high_storm_signing_threshold 3".to_string(),
             "high_storm_connected_members 2".to_string(),
             "high_storm_coordinator_connected 0".to_string(),
+            "high_storm_chain_recovering 1".to_string(),
+            "high_storm_spending_paused 1".to_string(),
             format!("storm_peer_connected{{peer=\"{}\"}} 1", label(2)),
             format!("storm_peer_connected{{peer=\"{}\"}} 0", label(3)),
             format!("storm_peer_connected{{peer=\"{}\"}} 0", label(4)),
@@ -276,6 +323,8 @@ mod tests {
             is_member: true,
             is_leader: true,
             block_height: 0,
+            is_recovering: false,
+            is_spending_paused: false,
         };
         let recorder = recorder();
 

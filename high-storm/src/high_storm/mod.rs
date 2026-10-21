@@ -6,6 +6,8 @@ use std::{
 use secp256k1_zkp::PublicKey;
 use storm::{PeerStatus, Storm, StormHandle};
 
+use crate::monitoring::{self, RenewalOutcome};
+
 mod assets;
 mod burning;
 mod droplets;
@@ -448,7 +450,20 @@ impl HighStorm {
     }
 
     pub async fn index_blocks(&self) -> Result<u64, IndexerError> {
-        let indexed = self.state.indexer().sync().await?;
+        // Any other error says nothing about a halt, which is checked only once
+        // the chain tip has been read.
+        let indexed = match self.state.indexer().sync().await {
+            Ok(indexed) => {
+                monitoring::set_chain_safety_halt(false);
+                indexed
+            }
+            Err(error) => {
+                if matches!(error, IndexerError::SafetyHalt(_)) {
+                    monitoring::set_chain_safety_halt(true);
+                }
+                return Err(error);
+            }
+        };
         if let Some(cursor) = self.state.indexer().cursor().await? {
             self.state.set_block_height(cursor.height);
             if !self.state.is_spending_paused()
@@ -467,6 +482,9 @@ impl HighStorm {
 
     pub async fn reconcile_storm_eye_renewal(&self) -> Result<bool, RenewalError> {
         let confirmed = self.state.renewal().reconcile().await?;
+        if confirmed {
+            monitoring::record_storm_eye_renewal(RenewalOutcome::Confirmed);
+        }
         if !confirmed
             && self.is_coordinator().await
             && let Some(request) = self.state.renewal().pending_request().await?
@@ -486,9 +504,24 @@ impl HighStorm {
             return Ok(None);
         }
         let block_height = self.state.block_height();
-        let Some(mut prepared) = self.state.renewal().prepare(block_height).await? else {
+        let Some(prepared) = self.state.renewal().prepare(block_height).await? else {
             return Ok(None);
         };
+        // Counted only once a renewal is due, not while production is paused.
+        let renewed = self.broadcast_renewal(prepared, block_height).await;
+        monitoring::record_storm_eye_renewal(if renewed.is_ok() {
+            RenewalOutcome::Broadcast
+        } else {
+            RenewalOutcome::Failed
+        });
+        renewed.map(Some)
+    }
+
+    async fn broadcast_renewal(
+        &self,
+        mut prepared: renewal::PreparedRenewal,
+        block_height: u64,
+    ) -> Result<[u8; 32], RenewalError> {
         let chain_tip = self
             .state
             .indexer()
@@ -523,7 +556,13 @@ impl HighStorm {
             tracing::warn!(%error, "failed to announce Storm Eye timelock renewal");
         }
 
-        Ok(Some(txid))
+        Ok(txid)
+    }
+
+    /// The height from which anyone may spend the Storm Eye UTXOs, once the
+    /// Storm Eye exists.
+    pub async fn storm_eye_rescue_height(&self) -> Result<Option<u32>, RenewalError> {
+        self.state.renewal().rescue_height().await
     }
 
     pub async fn announce_network_assets(&self) -> Result<(), AssetError> {
@@ -833,6 +872,10 @@ impl HighStormHandle {
 
     pub fn is_spending_paused(&self) -> bool {
         self.state.is_spending_paused()
+    }
+
+    pub(crate) fn is_recovering(&self) -> bool {
+        self.state.is_recovering()
     }
 
     pub async fn member_migration_request(&self) -> Option<[u8; 32]> {

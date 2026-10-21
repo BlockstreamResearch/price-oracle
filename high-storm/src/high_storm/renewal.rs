@@ -149,6 +149,14 @@ impl Renewal {
             .map(Some)
     }
 
+    /// The height from which anyone may spend the active Storm Eye UTXOs.
+    pub(crate) async fn rescue_height(&self) -> Result<Option<u32>, RenewalError> {
+        let Some(storm_eye) = self.assets.get(STORM_EYE_KIND).await? else {
+            return Ok(None);
+        };
+        Ok(Some(storm_eye_contract_data(&storm_eye)?.rescue_height))
+    }
+
     pub(crate) async fn validate_request(
         &self,
         request: &RenewStormUtxos,
