@@ -6,7 +6,7 @@ use high_storm::{
     db::{Database, network::NetworkStore},
     external_api::ExternalApiServer,
     ipc::IpcServer,
-    monitoring::{self, MetricsServer},
+    monitoring::{self, LoopTask, MetricsServer},
     sources,
 };
 use std::process::ExitCode;
@@ -144,6 +144,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             high_storm::initialize_join(&config, &store, &public_key, &address).await?
         }
     };
+    monitoring::spawn_refresh(storm.handle(), database.clone());
 
     if let Some(storm_eye) = storm
         .initialize_storm_eye(&config.service.elements_rpc)
@@ -296,6 +297,7 @@ async fn run_until_shutdown(
                 break;
             },
             _ = reconnect.tick() => {
+                monitoring::record_loop_tick(LoopTask::Reconnect);
                 if !storm.is_local_member().await {
                     tracing::info!("local signer was removed from the network; shutting down");
                     break;
@@ -311,6 +313,7 @@ async fn run_until_shutdown(
                 }
             }
             _ = index_blocks.tick() => {
+                monitoring::record_loop_tick(LoopTask::IndexBlocks);
                 let indexed = storm.index_blocks().await;
                 match &indexed {
                     Ok(0) => {}
@@ -395,12 +398,14 @@ async fn run_until_shutdown(
                 }
             }
             _ = persist_runtime.tick() => {
+                monitoring::record_loop_tick(LoopTask::PersistRuntime);
                 let peers = storm.peers().await;
                 if let Err(error) = store.update_runtime(&peers).await {
                     tracing::warn!(%error, "failed to persist current peer state");
                 }
             }
             _ = &mut issuance_round => {
+                monitoring::record_loop_tick(LoopTask::IssuanceRound);
                 let Some(schedule) = round_schedule else {
                     issuance_round.as_mut().reset(idle_round_deadline());
                     continue;
@@ -426,6 +431,7 @@ async fn run_until_shutdown(
                 }
             }
             _ = &mut burning_round => {
+                monitoring::record_loop_tick(LoopTask::BurningRound);
                 let Some(schedule) = round_schedule else {
                     burning_round.as_mut().reset(idle_round_deadline());
                     continue;
@@ -451,6 +457,7 @@ async fn run_until_shutdown(
                 }
             }
             _ = reconcile_requests.tick() => {
+                monitoring::record_loop_tick(LoopTask::ReconcileRequests);
                 match storm.remove_expired_voting_requests(storm.handle().block_height()).await {
                     Ok(0) => {}
                     Ok(request_count) => {
@@ -484,6 +491,7 @@ async fn run_until_shutdown(
             }
             // A node attests on every new observation.
             _ = price_observed.notified() => {
+                monitoring::record_loop_tick(LoopTask::PriceAttestation);
                 match storm.attest_prices().await {
                     Ok(0) => {}
                     Ok(feed_count) => {

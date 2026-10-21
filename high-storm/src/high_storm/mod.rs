@@ -906,8 +906,20 @@ impl HighStormHandle {
         self.storm.peers().await
     }
 
+    pub(crate) async fn connected_peer_keys(&self) -> BTreeSet<[u8; 33]> {
+        self.storm.connected_peer_keys().await
+    }
+
+    pub(crate) async fn is_local_member(&self) -> bool {
+        self.storm.is_local_member().await
+    }
+
     pub(crate) async fn current_leader(&self) -> Option<[u8; 33]> {
         leader::leader_for_height(&self.peers().await, self.state.block_height())
+    }
+
+    pub(crate) async fn is_leader(&self) -> bool {
+        leader::is_local_leader(&self.peers().await, self.state.block_height())
     }
 
     pub(crate) async fn next_local_leader_height(&self) -> Option<u64> {
