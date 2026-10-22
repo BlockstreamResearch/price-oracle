@@ -6,11 +6,13 @@ use high_storm::{
     db::{Database, network::NetworkStore},
     external_api::ExternalApiServer,
     ipc::IpcServer,
+    monitoring::{self, LoopTask, MetricsServer},
     sources,
 };
 use std::process::ExitCode;
 use tokio::{
     sync::Notify,
+    task::JoinHandle,
     time::{Duration, Instant, MissedTickBehavior},
 };
 use tracing_subscriber::EnvFilter;
@@ -122,6 +124,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         database = %config.service.db.database,
         "configuration loaded"
     );
+    // Served before discovery so that a node waiting for its peers is still scrapeable.
+    let metrics =
+        MetricsServer::bind(config.service.metrics.address, monitoring::install()?).await?;
+    tracing::info!(address = %metrics.local_addr()?, "metrics endpoint is listening");
+    let metrics_task = tokio::spawn(metrics.run());
+    monitoring::spawn_elements_probe(&config.service.elements_rpc)?;
+
     let database =
         Database::connect(&config.database_url()?, config.service.db.max_connections).await?;
     let store = database.network();
@@ -136,6 +145,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             high_storm::initialize_join(&config, &store, &public_key, &address).await?
         }
     };
+    monitoring::spawn_refresh(storm.handle(), database.clone());
 
     if let Some(storm_eye) = storm
         .initialize_storm_eye(&config.service.elements_rpc)
@@ -184,7 +194,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let ipc = IpcServer::bind(&config.service.ipc_path, database.node_operators()).await?;
     let price_observed = sources::spawn(&config.service.price_sources, storm.handle())?;
-    run_until_shutdown(storm, &store, ipc, external_api, &price_observed).await?;
+    run_until_shutdown(
+        storm,
+        &store,
+        ipc,
+        external_api,
+        metrics_task,
+        &price_observed,
+    )
+    .await?;
 
     Ok(())
 }
@@ -233,6 +251,7 @@ async fn run_until_shutdown(
     store: &NetworkStore,
     ipc: IpcServer,
     external_api: ExternalApiServer,
+    metrics_task: JoinHandle<std::io::Result<()>>,
     price_observed: &Notify,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reconnect = tokio::time::interval(Duration::from_secs(3));
@@ -270,6 +289,7 @@ async fn run_until_shutdown(
     tokio::pin!(ipc_task);
     let external_api_task = tokio::spawn(external_api.run());
     tokio::pin!(external_api_task);
+    tokio::pin!(metrics_task);
 
     loop {
         tokio::select! {
@@ -278,6 +298,7 @@ async fn run_until_shutdown(
                 break;
             },
             _ = reconnect.tick() => {
+                monitoring::record_loop_tick(LoopTask::Reconnect);
                 if !storm.is_local_member().await {
                     tracing::info!("local signer was removed from the network; shutting down");
                     break;
@@ -293,6 +314,7 @@ async fn run_until_shutdown(
                 }
             }
             _ = index_blocks.tick() => {
+                monitoring::record_loop_tick(LoopTask::IndexBlocks);
                 let indexed = storm.index_blocks().await;
                 match &indexed {
                     Ok(0) => {}
@@ -330,8 +352,19 @@ async fn run_until_shutdown(
                     if let Err(error) = storm.announce_protocol_settings().await {
                         tracing::warn!(%error, "protocol settings announcement failed");
                     }
+                    match storm.storm_eye_rescue_height().await {
+                        Ok(Some(rescue_height)) => monitoring::set_storm_eye_rescue_blocks_remaining(
+                            rescue_height,
+                            storm.handle().block_height(),
+                        ),
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to read the Storm Eye rescue height");
+                        }
+                    }
                     match storm.storm_eye_utxo_count().await {
                         Ok(storm_eye_count) => {
+                            monitoring::set_storm_eye_utxos(storm_eye_count);
                             round_schedule = BlockRoundSchedule::new(storm_eye_count);
                             round_started_at = Instant::now();
                             issuance_lane = 0;
@@ -377,12 +410,14 @@ async fn run_until_shutdown(
                 }
             }
             _ = persist_runtime.tick() => {
+                monitoring::record_loop_tick(LoopTask::PersistRuntime);
                 let peers = storm.peers().await;
                 if let Err(error) = store.update_runtime(&peers).await {
                     tracing::warn!(%error, "failed to persist current peer state");
                 }
             }
             _ = &mut issuance_round => {
+                monitoring::record_loop_tick(LoopTask::IssuanceRound);
                 let Some(schedule) = round_schedule else {
                     issuance_round.as_mut().reset(idle_round_deadline());
                     continue;
@@ -408,6 +443,7 @@ async fn run_until_shutdown(
                 }
             }
             _ = &mut burning_round => {
+                monitoring::record_loop_tick(LoopTask::BurningRound);
                 let Some(schedule) = round_schedule else {
                     burning_round.as_mut().reset(idle_round_deadline());
                     continue;
@@ -433,6 +469,7 @@ async fn run_until_shutdown(
                 }
             }
             _ = reconcile_requests.tick() => {
+                monitoring::record_loop_tick(LoopTask::ReconcileRequests);
                 match storm.remove_expired_voting_requests(storm.handle().block_height()).await {
                     Ok(0) => {}
                     Ok(request_count) => {
@@ -466,6 +503,7 @@ async fn run_until_shutdown(
             }
             // A node attests on every new observation.
             _ = price_observed.notified() => {
+                monitoring::record_loop_tick(LoopTask::PriceAttestation);
                 match storm.attest_prices().await {
                     Ok(0) => {}
                     Ok(feed_count) => {
@@ -484,6 +522,10 @@ async fn run_until_shutdown(
                 result??;
                 return Err("external API listener stopped unexpectedly".into());
             }
+            result = &mut metrics_task => {
+                result??;
+                return Err("metrics listener stopped unexpectedly".into());
+            }
         }
     }
 
@@ -491,6 +533,8 @@ async fn run_until_shutdown(
     let _ = ipc_task.await;
     external_api_task.abort();
     let _ = external_api_task.await;
+    metrics_task.abort();
+    let _ = metrics_task.await;
 
     let peers = storm.peers().await;
     tracing::info!(

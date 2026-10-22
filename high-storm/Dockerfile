@@ -20,6 +20,8 @@ COPY storm-tree ./storm-tree
 RUN cd contracts \
 	&& simplex install \
 	&& simplex build
+
+ARG HIGH_STORM_GIT_SHA=unknown
 RUN cargo build --locked --release --package high-storm --package storm-operator
 
 FROM debian:bookworm-slim AS runtime

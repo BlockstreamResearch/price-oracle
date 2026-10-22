@@ -35,6 +35,12 @@ pub struct Database {
     pool: AnyPool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolConnections {
+    pub idle: usize,
+    pub used: usize,
+}
+
 impl Database {
     pub async fn connect(database_url: &str, max_connections: u32) -> Result<Self, Error> {
         sqlx::any::install_default_drivers();
@@ -46,6 +52,24 @@ impl Database {
         MIGRATOR.run(&pool).await?;
         tracing::debug!("database migrations are current");
         Ok(Self { pool })
+    }
+
+    /// Round-trips a trivial query, so it also waits for a free pool connection.
+    pub async fn ping(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+    }
+
+    pub fn pool_connections(&self) -> PoolConnections {
+        let idle = self.pool.num_idle();
+        PoolConnections {
+            idle,
+            used: usize::try_from(self.pool.size())
+                .unwrap_or(usize::MAX)
+                .saturating_sub(idle),
+        }
     }
 
     pub fn network(&self) -> NetworkStore {

@@ -228,6 +228,9 @@ deploy_node() {
 port = 9000
 external_api_address = "0.0.0.0:9100"
 
+[service.metrics]
+address = "0.0.0.0:9300"
+
 [service.signer]
 private_key = "${private_key}"
 
@@ -269,6 +272,7 @@ EOF
     container_name="${project_name}-extra-node-${node}"
     peer_port="$((8999 + node))"
     api_port="$((9099 + node))"
+    metrics_port="$((9299 + node))"
     address_suffix="$((100 + node))"
     if [[ -f "${script_dir}/.env" ]]; then
         env_file_args=(--env-file "${script_dir}/.env")
@@ -284,6 +288,7 @@ EOF
         --ip "${STORM_NETWORK_PREFIX}.${address_suffix}" \
         --publish "${peer_port}:9000" \
         --publish "${api_port}:9100" \
+        --publish "127.0.0.1:${metrics_port}:9300" \
         --volume "${config_path}:/etc/high-storm/config.toml:ro" \
         "${env_file_args[@]}" \
         --env "OPERATOR_PUBLIC_KEY=${public_key}" \
@@ -293,7 +298,7 @@ EOF
         -c "(while [ ! -S /tmp/high-storm.sock ]; do sleep 1; done; until storm-operator operator add \"\${OPERATOR_PUBLIC_KEY}\"; do sleep 1; done) & high-storm run --config /etc/high-storm/config.toml || exec high-storm initialize join --config /etc/high-storm/config.toml --discovery-public-key ${coordinator_public_key} --discovery-address ${STORM_NETWORK_PREFIX}.11:9000" \
         >/dev/null
 
-    echo "Deployed node-${node} at ${STORM_NETWORK_PREFIX}.${address_suffix}:9000 (host ports ${peer_port} and ${api_port})."
+    echo "Deployed node-${node} at ${STORM_NETWORK_PREFIX}.${address_suffix}:9000 (host ports ${peer_port}, ${api_port}, and ${metrics_port})."
     echo "Public key: ${public_key}"
 }
 
