@@ -33,3 +33,12 @@ pub(super) const STORM_EYE_UTXOS: &str = "high_storm_storm_eye_utxos";
 pub(super) const STORM_EYE_RESCUE_BLOCKS_REMAINING: &str =
     "high_storm_storm_eye_rescue_blocks_remaining";
 pub(super) const STORM_EYE_RENEWALS: &str = "high_storm_storm_eye_renewals_total";
+
+pub(super) const PRICE_FEED_AVAILABLE: &str = "high_storm_price_feed_available";
+pub(super) const PRICE_FEED_RECEIVED: &str = "high_storm_price_feed_received_timestamp_seconds";
+pub(super) const PRICE_FEED_VALID_UNTIL: &str =
+    "high_storm_price_feed_valid_until_timestamp_seconds";
+pub(super) const PRICE_FEED_ACTIVE_SOURCES: &str = "high_storm_price_feed_active_sources";
+pub(super) const PRICE_SOURCE_STATE: &str = "high_storm_price_source_state";
+pub(super) const PRICE_SOURCE_LAST_OBSERVED: &str =
+    "high_storm_price_source_last_observed_timestamp_seconds";

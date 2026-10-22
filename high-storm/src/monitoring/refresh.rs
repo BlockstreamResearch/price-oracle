@@ -94,6 +94,7 @@ pub fn spawn_refresh(node: HighStormHandle, database: Database) {
             record_loop_ticks();
             record_retained();
             record_node(&NodeSnapshot::read(&node).await);
+            super::prices::record_prices(&node).await;
             record_database(&database).await;
         }
     });

@@ -3,6 +3,7 @@
 mod chain;
 mod elements;
 mod names;
+mod prices;
 mod refresh;
 mod server;
 
@@ -17,6 +18,7 @@ pub(crate) use chain::{
 };
 pub use chain::{set_storm_eye_rescue_blocks_remaining, set_storm_eye_utxos};
 pub use elements::spawn_elements_probe;
+pub use prices::register_price_source;
 pub use refresh::{LoopTask, record_loop_tick, spawn_refresh};
 pub use server::MetricsServer;
 
@@ -157,6 +159,30 @@ fn describe() {
     describe_counter!(
         names::STORM_EYE_RENEWALS,
         "Storm Eye timelock renewals, by outcome."
+    );
+    describe_gauge!(
+        names::PRICE_FEED_AVAILABLE,
+        "1 while the feed has a valid price; only feeds some source can price are reported."
+    );
+    describe_gauge!(
+        names::PRICE_FEED_RECEIVED,
+        "Unix time the feed's current price was received."
+    );
+    describe_gauge!(
+        names::PRICE_FEED_VALID_UNTIL,
+        "Unix time until which the feed's current price is valid."
+    );
+    describe_gauge!(
+        names::PRICE_FEED_ACTIVE_SOURCES,
+        "Sources of a Direct feed that are neither dropped nor frozen."
+    );
+    describe_gauge!(
+        names::PRICE_SOURCE_STATE,
+        "1 for the state a feed's source is in: active, dropped or frozen."
+    );
+    describe_gauge!(
+        names::PRICE_SOURCE_LAST_OBSERVED,
+        "Unix time the source itself stamped its latest kept observation."
     );
     metrics_process::Collector::default().describe();
 }

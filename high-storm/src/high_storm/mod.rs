@@ -38,6 +38,7 @@ pub use message::{
     UpdateNetworkMembers,
 };
 pub use prices::{ExchangeRateInfo, FeedRate, PollOutcome, PriceError};
+pub(crate) use prices::{PriceHealth, SourceHealth};
 pub use renewal::RenewalError;
 pub use signing::{SigningError, SigningResult};
 use state::NetworkState;
@@ -918,6 +919,14 @@ impl HighStormHandle {
         feed: price_feed::FeedId,
     ) -> Result<Vec<PriceAttestation>, PriceError> {
         self.state.prices().attestations_for(feed).await
+    }
+
+    pub(crate) async fn price_health(
+        &self,
+        sources: &[(price_feed::FeedId, usize)],
+        feeds: &[price_feed::FeedId],
+    ) -> PriceHealth {
+        self.state.prices().health(sources, feeds).await
     }
 
     /// Every feed this node prices, in id order.
