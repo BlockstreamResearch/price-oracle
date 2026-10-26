@@ -49,19 +49,11 @@ pub struct ServiceConfig {
     pub metrics: MetricsConfig,
 }
 
-/// The Prometheus endpoint is internal; keep it off public interfaces.
-#[derive(Clone, Debug, Deserialize)]
+/// Without an address no metrics are recorded or served. The endpoint is
+/// internal; keep it off public interfaces.
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct MetricsConfig {
-    #[serde(default = "default_metrics_address")]
-    pub address: SocketAddr,
-}
-
-impl Default for MetricsConfig {
-    fn default() -> Self {
-        Self {
-            address: default_metrics_address(),
-        }
-    }
+    pub address: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -103,12 +95,6 @@ fn default_external_api_address() -> SocketAddr {
     "127.0.0.1:9001"
         .parse()
         .expect("the default external API address is valid")
-}
-
-fn default_metrics_address() -> SocketAddr {
-    "127.0.0.1:9300"
-        .parse()
-        .expect("the default metrics address is valid")
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -278,13 +264,16 @@ max_connections = 5
     }
 
     #[test]
-    fn metrics_listen_on_loopback_by_default() {
-        let config: Config = toml::from_str(&config_with_protocol_section("protocol")).unwrap();
+    fn serves_no_metrics_without_an_address() {
+        let omitted: Config = toml::from_str(&config_with_protocol_section("protocol")).unwrap();
+        let empty: Config = toml::from_str(&format!(
+            "{}\n[service.metrics]\n",
+            config_with_protocol_section("protocol")
+        ))
+        .unwrap();
 
-        assert_eq!(
-            config.service.metrics.address,
-            "127.0.0.1:9300".parse::<SocketAddr>().unwrap()
-        );
+        assert!(omitted.service.metrics.address.is_none());
+        assert!(empty.service.metrics.address.is_none());
     }
 
     #[test]
@@ -297,7 +286,7 @@ max_connections = 5
 
         assert_eq!(
             config.service.metrics.address,
-            "0.0.0.0:9400".parse::<SocketAddr>().unwrap()
+            Some("0.0.0.0:9400".parse::<SocketAddr>().unwrap())
         );
     }
 

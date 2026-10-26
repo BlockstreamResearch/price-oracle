@@ -4,10 +4,7 @@ use std::{
 };
 
 use high_storm::{
-    config::{
-        Config, DbConfig, ElementsRpcConfig, MetricsConfig, ProtocolConfig, ServiceConfig,
-        SignerConfig,
-    },
+    config::{Config, DbConfig, ElementsRpcConfig, ProtocolConfig, ServiceConfig, SignerConfig},
     db::{Database, network::NetworkStore, network_asset::NetworkAssetStore},
 };
 use secp256k1_zkp::{Secp256k1, SecretKey};
@@ -71,9 +68,7 @@ impl TestNode {
                     max_connections: 1,
                 },
                 price_sources: Default::default(),
-                metrics: MetricsConfig {
-                    address: "127.0.0.1:0".parse().unwrap(),
-                },
+                metrics: Default::default(),
             },
         };
 

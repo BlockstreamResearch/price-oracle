@@ -125,11 +125,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "configuration loaded"
     );
     // Served before discovery so that a node waiting for its peers is still scrapeable.
-    let metrics =
-        MetricsServer::bind(config.service.metrics.address, monitoring::install()?).await?;
-    tracing::info!(address = %metrics.local_addr()?, "metrics endpoint is listening");
-    let metrics_task = tokio::spawn(metrics.run());
-    monitoring::spawn_elements_probe(&config.service.elements_rpc)?;
+    let metrics_task = match config.service.metrics.address {
+        Some(address) => {
+            let metrics = MetricsServer::bind(address, monitoring::install()?).await?;
+            tracing::info!(address = %metrics.local_addr()?, "metrics endpoint is listening");
+            monitoring::spawn_elements_probe(&config.service.elements_rpc)?;
+            tokio::spawn(metrics.run())
+        }
+        None => {
+            tracing::info!("service.metrics.address is not set; serving no metrics");
+            // Never finishes, so the main loop needs no separate case for it.
+            tokio::spawn(std::future::pending())
+        }
+    };
 
     let database =
         Database::connect(&config.database_url()?, config.service.db.max_connections).await?;
