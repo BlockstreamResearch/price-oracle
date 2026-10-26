@@ -16,7 +16,7 @@ use metrics_util::MetricKindMask;
 pub(crate) use chain::{
     RenewalOutcome, record_chain_reorg, record_storm_eye_renewal, set_chain_safety_halt,
 };
-pub use chain::{set_storm_eye_rescue_blocks_remaining, set_storm_eye_utxos};
+pub use chain::{set_storm_eye_utxos, spawn_storm_eye_probe};
 pub use elements::spawn_elements_probe;
 pub use prices::register_price_source;
 pub use refresh::{LoopTask, record_loop_tick, spawn_refresh};

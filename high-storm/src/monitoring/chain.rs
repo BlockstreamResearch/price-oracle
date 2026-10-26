@@ -1,6 +1,12 @@
-use metrics::counter;
+use std::time::Duration;
 
-use super::{flag, names, refresh::set_retained};
+use metrics::counter;
+use tokio::time::MissedTickBehavior;
+
+use super::{elements, flag, names, refresh::set_retained};
+use crate::HighStormHandle;
+
+const STORM_EYE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RenewalOutcome {
@@ -35,11 +41,35 @@ pub fn set_storm_eye_utxos(count: usize) {
     set_retained(names::STORM_EYE_UTXOS, count as f64);
 }
 
+/// Counts down to the rescue height against Elements' own tip, so the countdown
+/// keeps moving when this node's indexing stalls while blocks keep coming.
+/// Runs until the process exits.
+pub fn spawn_storm_eye_probe(node: HighStormHandle) {
+    tokio::spawn(async move {
+        let mut probe = tokio::time::interval(STORM_EYE_PROBE_INTERVAL);
+        probe.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            probe.tick().await;
+            let rescue_height = match node.storm_eye_rescue_height().await {
+                Ok(rescue_height) => rescue_height,
+                Err(error) => {
+                    tracing::debug!(%error, "could not read the Storm Eye rescue height");
+                    continue;
+                }
+            };
+            if let (Some(rescue_height), Some(tip_height)) = (rescue_height, elements::tip_height())
+            {
+                set_storm_eye_rescue_blocks_remaining(rescue_height, tip_height);
+            }
+        }
+    });
+}
+
 /// Negative once the rescue height has passed.
-pub fn set_storm_eye_rescue_blocks_remaining(rescue_height: u32, block_height: u64) {
+fn set_storm_eye_rescue_blocks_remaining(rescue_height: u32, tip_height: u64) {
     set_retained(
         names::STORM_EYE_RESCUE_BLOCKS_REMAINING,
-        f64::from(rescue_height) - block_height as f64,
+        f64::from(rescue_height) - tip_height as f64,
     );
 }
 

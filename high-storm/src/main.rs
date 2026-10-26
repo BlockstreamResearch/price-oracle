@@ -153,7 +153,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             high_storm::initialize_join(&config, &store, &public_key, &address).await?
         }
     };
-    monitoring::spawn_refresh(storm.handle(), database.clone());
+    if config.service.metrics.address.is_some() {
+        monitoring::spawn_refresh(storm.handle(), database.clone());
+        monitoring::spawn_storm_eye_probe(storm.handle());
+    }
 
     if let Some(storm_eye) = storm
         .initialize_storm_eye(&config.service.elements_rpc)
@@ -359,16 +362,6 @@ async fn run_until_shutdown(
                 if indexed.as_ref().is_ok_and(|block_count| *block_count > 0) {
                     if let Err(error) = storm.announce_protocol_settings().await {
                         tracing::warn!(%error, "protocol settings announcement failed");
-                    }
-                    match storm.storm_eye_rescue_height().await {
-                        Ok(Some(rescue_height)) => monitoring::set_storm_eye_rescue_blocks_remaining(
-                            rescue_height,
-                            storm.handle().block_height(),
-                        ),
-                        Ok(None) => {}
-                        Err(error) => {
-                            tracing::warn!(%error, "failed to read the Storm Eye rescue height");
-                        }
                     }
                     match storm.storm_eye_utxo_count().await {
                         Ok(storm_eye_count) => {

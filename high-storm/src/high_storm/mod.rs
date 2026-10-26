@@ -505,11 +505,13 @@ impl HighStorm {
             return Ok(None);
         }
         let block_height = self.state.block_height();
-        let Some(prepared) = self.state.renewal().prepare(block_height).await? else {
+        let Some(storm_eye) = self.state.renewal().due_storm_eye(block_height).await? else {
             return Ok(None);
         };
-        // Counted only once a renewal is due, not while production is paused.
-        let renewed = self.broadcast_renewal(prepared, block_height).await;
+        // Every failure from here on counts, preparation included: a due renewal
+        // that keeps failing, for example for want of Treasury funds, needs an
+        // operator before the rescue height arrives.
+        let renewed = self.renew_due_storm_eye(storm_eye, block_height).await;
         monitoring::record_storm_eye_renewal(if renewed.is_ok() {
             RenewalOutcome::Broadcast
         } else {
@@ -518,11 +520,16 @@ impl HighStorm {
         renewed.map(Some)
     }
 
-    async fn broadcast_renewal(
+    async fn renew_due_storm_eye(
         &self,
-        mut prepared: renewal::PreparedRenewal,
+        storm_eye: NetworkAsset,
         block_height: u64,
     ) -> Result<[u8; 32], RenewalError> {
+        let mut prepared = self
+            .state
+            .renewal()
+            .prepare(block_height, storm_eye)
+            .await?;
         let chain_tip = self
             .state
             .indexer()
@@ -558,12 +565,6 @@ impl HighStorm {
         }
 
         Ok(txid)
-    }
-
-    /// The height from which anyone may spend the Storm Eye UTXOs, once the
-    /// Storm Eye exists.
-    pub async fn storm_eye_rescue_height(&self) -> Result<Option<u32>, RenewalError> {
-        self.state.renewal().rescue_height().await
     }
 
     pub async fn announce_network_assets(&self) -> Result<(), AssetError> {
@@ -877,6 +878,12 @@ impl HighStormHandle {
 
     pub(crate) fn is_recovering(&self) -> bool {
         self.state.is_recovering()
+    }
+
+    /// The height from which anyone may spend the Storm Eye UTXOs, once the
+    /// Storm Eye exists.
+    pub(crate) async fn storm_eye_rescue_height(&self) -> Result<Option<u32>, RenewalError> {
+        self.state.renewal().rescue_height().await
     }
 
     pub async fn member_migration_request(&self) -> Option<[u8; 32]> {

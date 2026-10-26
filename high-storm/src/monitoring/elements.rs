@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use metrics::gauge;
@@ -27,6 +33,14 @@ struct ElementsStatus {
     initial_block_download: bool,
 }
 
+/// The last tip height Elements reported; 0 until it first answers.
+static TIP_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Elements' tip as last seen, which does not wait for this node to index it.
+pub(super) fn tip_height() -> Option<u64> {
+    Some(TIP_HEIGHT.load(Ordering::Relaxed)).filter(|height| *height > 0)
+}
+
 /// Probes the node's Elements daemon until the process exits.
 pub fn spawn_elements_probe(config: &ElementsRpcConfig) -> Result<(), bitcoincore_rpc::Error> {
     let client = Arc::new(Client::new(
@@ -45,6 +59,9 @@ pub fn spawn_elements_probe(config: &ElementsRpcConfig) -> Result<(), bitcoincor
                 .ok()
                 .and_then(Result::ok);
             last_known = status.or(last_known);
+            if let Some(status) = status {
+                TIP_HEIGHT.store(status.tip_height, Ordering::Relaxed);
+            }
             record_status(status.is_some(), last_known.as_ref());
         }
     });
@@ -121,6 +138,15 @@ mod tests {
         ] {
             assert!(rendered.contains(line), "missing {line:?} in:\n{rendered}");
         }
+    }
+
+    #[test]
+    fn shares_the_tip_only_once_elements_has_answered() {
+        TIP_HEIGHT.store(0, Ordering::Relaxed);
+        assert_eq!(tip_height(), None);
+
+        TIP_HEIGHT.store(140, Ordering::Relaxed);
+        assert_eq!(tip_height(), Some(140));
     }
 
     #[test]
