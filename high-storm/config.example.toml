@@ -10,9 +10,10 @@ ipc_path = "/tmp/high-storm.sock"
 # Bind address for the operator and user HTTP API. Keep loopback-only unless remote access is required.
 external_api_address = "127.0.0.1:9001"
 
+# Leave this section out to record and serve no metrics.
 [service.metrics]
-# Bind address for the unauthenticated Prometheus endpoint at /metrics. Defaults to
-# 127.0.0.1:9300 when omitted. Keep it loopback-only or on a private monitoring network.
+# Bind address for the unauthenticated Prometheus endpoint at /metrics.
+# Keep it loopback-only or on a private monitoring network.
 address = "127.0.0.1:9300"
 
 # Optional endpoint overrides keyed by members' compressed public keys.

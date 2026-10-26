@@ -173,9 +173,9 @@ the one-time Storm Eye issuance and defaults to `funded-key`. The `service.db.ur
 value is the database host and optional port, for example `localhost:5432`. Set
 `service.ipc_path` to a unique Unix socket path for each high-storm process running
 on the same host. The external API binds to `service.external_api_address`, which
-defaults to `127.0.0.1:9001`. Prometheus metrics are served at `/metrics` on
-`service.metrics.address`, which defaults to `127.0.0.1:9300`; give each process on a
-host its own port. The endpoint is unauthenticated, so expose it only to a private
+defaults to `127.0.0.1:9001`. Prometheus metrics are served at `/metrics` only when
+`service.metrics.address` is set, for example to `127.0.0.1:9300`; give each process on
+a host its own port. The endpoint is unauthenticated, so expose it only to a private
 monitoring network. Elements must run with `txindex=1` so HighStorm can
 reconcile confirmed request transactions after they leave the mempool. Protocol-wide
 fee budgets, burn reserves, and Tick lifetime are grouped under `service.protocol`.
