@@ -398,6 +398,26 @@ impl NodeMessageKind {
             Self::ExecuteUserRequests | Self::NetworkAssets | Self::RenewStormUtxos
         )
     }
+
+    /// A metric label.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecuteUserRequests => "execute_user_requests",
+            Self::ExchangeRewards => "exchange_rewards",
+            Self::SigningNonces => "signing_nonces",
+            Self::PartialSignatures => "partial_signatures",
+            Self::BurnExpiredUtxos => "burn_expired_utxos",
+            Self::ExpiredUtxosBurned => "expired_utxos_burned",
+            Self::NetworkVoteRequest => "network_vote_request",
+            Self::ApproveVotingRequest => "approve_voting_request",
+            Self::AskAboutVotings => "ask_about_votings",
+            Self::ExecuteVotingRequest => "execute_voting_request",
+            Self::AttestPrice => "attest_price",
+            Self::NetworkAssets => "network_assets",
+            Self::RenewStormUtxos => "renew_storm_utxos",
+            Self::ProtocolSettings => "protocol_settings",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

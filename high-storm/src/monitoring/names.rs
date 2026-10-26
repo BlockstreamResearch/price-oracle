@@ -42,3 +42,7 @@ pub(super) const PRICE_FEED_ACTIVE_SOURCES: &str = "high_storm_price_feed_active
 pub(super) const PRICE_SOURCE_STATE: &str = "high_storm_price_source_state";
 pub(super) const PRICE_SOURCE_LAST_OBSERVED: &str =
     "high_storm_price_source_last_observed_timestamp_seconds";
+
+pub(super) const NODE_MESSAGES_REJECTED: &str = "high_storm_node_messages_rejected_total";
+pub(super) const UNAUTHORIZED_MESSAGES: &str = "high_storm_unauthorized_messages_total";
+pub(super) const SIGNING_REFUSED: &str = "high_storm_signing_refused_total";

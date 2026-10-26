@@ -53,6 +53,9 @@ pub enum SigningError {
     InvalidMessage(String),
     #[error("unauthorized node message: {0}")]
     UnauthorizedMessage(String),
+    /// Expected when peers are a block apart, unlike `UnauthorizedMessage`.
+    #[error("node message does not match this node's chain: {0}")]
+    ChainAnchorMismatch(String),
     #[error("Storm Tree operation failed: {0}")]
     StormTree(#[from] storm_tree::StormTreeError),
     #[error("Storm transport failed: {0}")]
@@ -61,6 +64,22 @@ pub enum SigningError {
     Encoding(#[from] postcard::Error),
     #[error("Storm message encoding failed: {0}")]
     StormMessage(#[from] storm::MessageError),
+}
+
+impl SigningError {
+    pub(crate) fn metric_reason(&self) -> &'static str {
+        match self {
+            Self::TooFewMembers => "too_few_members",
+            Self::NoAvailableBranch => "no_available_branch",
+            Self::SigningFailed => "signing_failed",
+            Self::InvalidMessage(_) => "invalid_message",
+            Self::UnauthorizedMessage(_) => "unauthorized",
+            Self::ChainAnchorMismatch(_) => "chain_anchor_mismatch",
+            Self::StormTree(_) => "storm_tree",
+            Self::Storm(_) => "storm",
+            Self::Encoding(_) | Self::StormMessage(_) => "encoding",
+        }
+    }
 }
 
 struct SignerContribution {

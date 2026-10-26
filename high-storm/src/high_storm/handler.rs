@@ -1,5 +1,7 @@
 use storm::{CustomMsg, StormContext};
 
+use crate::monitoring;
+
 use super::{
     assets::AssetError,
     burning::BurningError,
@@ -45,21 +47,141 @@ pub(crate) enum HandlerError {
     Encoding(#[from] postcard::Error),
 }
 
+impl HandlerError {
+    fn metric_reason(&self) -> &'static str {
+        match self {
+            Self::Recovering => "recovering",
+            Self::MigrationFinalizing => "migration_finalizing",
+            Self::Signing(error) => error.metric_reason(),
+            Self::Voting(_) => "voting",
+            Self::VotingExecution(_) => "voting_execution",
+            Self::Asset(_) => "asset",
+            Self::UserRequest(_) => "user_request",
+            Self::Burning(_) => "burning",
+            Self::Droplets(_) => "droplets",
+            Self::Indexer(_) => "indexer",
+            Self::Price(_) => "price",
+            Self::Renewal(_) => "renewal",
+            Self::Encoding(_) => "decode",
+        }
+    }
+
+    /// A sender acting outside its role, as opposed to a peer a block apart.
+    fn is_unauthorized(&self) -> bool {
+        matches!(self, Self::Signing(SigningError::UnauthorizedMessage(_)))
+    }
+
+    /// Why this node would not sign what the coordinator or leader proposed:
+    /// `price_*` when its own price disagrees, `invalid` when the proposal is
+    /// wrong, and `other` for a local failure that is not the proposer's doing.
+    fn refusal_reason(&self, kind: NodeMessageKind) -> Option<&'static str> {
+        use super::{
+            renewal::RenewalError, user_requests::UserRequestError,
+            voting_execution::VotingExecutionError,
+        };
+
+        if !matches!(
+            kind,
+            NodeMessageKind::ExecuteUserRequests
+                | NodeMessageKind::BurnExpiredUtxos
+                | NodeMessageKind::ExchangeRewards
+                | NodeMessageKind::ExecuteVotingRequest
+                | NodeMessageKind::RenewStormUtxos
+        ) {
+            return None;
+        }
+        let invalid = match self {
+            Self::UserRequest(UserRequestError::InstructedPrice(error)) => {
+                return Some(price_refusal(error));
+            }
+            Self::UserRequest(error) => matches!(
+                error,
+                UserRequestError::Invalid(_)
+                    | UserRequestError::Transaction(_)
+                    | UserRequestError::Pset(_)
+            ),
+            Self::Burning(error) => matches!(
+                error,
+                BurningError::ReserveShortfall
+                    | BurningError::Invalid(_)
+                    | BurningError::Transaction(_)
+                    | BurningError::Pset(_)
+            ),
+            Self::Droplets(error) => matches!(
+                error,
+                DropletsError::Invalid(_) | DropletsError::Transaction(_) | DropletsError::Pset(_)
+            ),
+            Self::VotingExecution(error) => matches!(
+                error,
+                VotingExecutionError::UnknownRequest(_)
+                    | VotingExecutionError::NotApproved
+                    | VotingExecutionError::Invalid(_)
+                    | VotingExecutionError::Transaction(_)
+                    | VotingExecutionError::Pset(_)
+            ),
+            Self::Renewal(error) => matches!(
+                error,
+                RenewalError::Invalid(_) | RenewalError::Transaction(_) | RenewalError::Pset(_)
+            ),
+            _ => return None,
+        };
+        Some(if invalid { "invalid" } else { "other" })
+    }
+}
+
+fn price_refusal(error: &price_feed::ValidationError) -> &'static str {
+    use price_feed::ValidationError;
+
+    match error {
+        ValidationError::UnknownFeed => "price_unknown_feed",
+        ValidationError::NoLocalPrice => "price_no_local_price",
+        ValidationError::Stale => "price_stale",
+        ValidationError::ImplausibleTimestamp => "price_implausible_timestamp",
+        ValidationError::StretchedValidity => "price_stretched_validity",
+        ValidationError::WrongDecimals => "price_wrong_decimals",
+        ValidationError::DeviationExceeded => "price_deviation_exceeded",
+    }
+}
+
+/// Handles a peer's message, counting each rejection by peer, kind and reason.
 pub(crate) async fn handle(
     state: NetworkState,
     custom: CustomMsg,
     context: StormContext,
 ) -> Result<(), HandlerError> {
-    let Some(message) = NodeMessage::from_custom(&custom)? else {
-        return Ok(());
+    let peer = context.message_context.peer_public_key;
+    let message = match NodeMessage::from_custom(&custom) {
+        Ok(Some(message)) => message,
+        Ok(None) => return Ok(()),
+        Err(error) => return Err(rejected(peer, None, error.into())),
     };
     let Some(kind) = message.decoded_kind() else {
-        return Err(SigningError::InvalidMessage(format!(
-            "unknown NodeMessage kind {}",
-            message.kind
-        ))
-        .into());
+        let error =
+            SigningError::InvalidMessage(format!("unknown NodeMessage kind {}", message.kind));
+        return Err(rejected(peer, None, error.into()));
     };
+    dispatch(state, message, kind, context)
+        .await
+        .map_err(|error| rejected(peer, Some(kind), error))
+}
+
+fn rejected(peer: [u8; 33], kind: Option<NodeMessageKind>, error: HandlerError) -> HandlerError {
+    monitoring::record_rejected_message(&monitoring::RejectedMessage {
+        peer,
+        kind: kind.map_or("unknown", NodeMessageKind::as_str),
+        reason: error.metric_reason(),
+        unauthorized: error.is_unauthorized(),
+        refusal: kind.and_then(|kind| error.refusal_reason(kind)),
+    });
+    error
+}
+
+async fn dispatch(
+    state: NetworkState,
+    message: NodeMessage,
+    kind: NodeMessageKind,
+    context: StormContext,
+) -> Result<(), HandlerError> {
     if state.is_recovering()
         && matches!(
             kind,
@@ -358,7 +480,7 @@ async fn require_current_leader(
     chain_tip: ChainTip,
 ) -> Result<[u8; 33], HandlerError> {
     if chain_tip.height != block_height {
-        return Err(SigningError::UnauthorizedMessage(
+        return Err(SigningError::ChainAnchorMismatch(
             "leader message block height does not match its chain anchor".into(),
         )
         .into());
@@ -373,7 +495,7 @@ async fn require_current_leader(
 
 fn required_chain_tip(chain_tip: Option<ChainTip>) -> Result<ChainTip, SigningError> {
     chain_tip.ok_or_else(|| {
-        SigningError::UnauthorizedMessage("signing request has no canonical chain anchor".into())
+        SigningError::ChainAnchorMismatch("signing request has no canonical chain anchor".into())
     })
 }
 
@@ -401,10 +523,10 @@ fn require_canonical_anchor(state: &NetworkState, chain_tip: ChainTip) -> Result
 
 fn canonical_anchor(chain_tip: ChainTip, local_hash: Option<[u8; 32]>) -> Result<(), SigningError> {
     match local_hash {
-        None => Err(SigningError::UnauthorizedMessage(
+        None => Err(SigningError::ChainAnchorMismatch(
             "finalized execution anchors a block this node has not seen".into(),
         )),
-        Some(hash) if hash != chain_tip.hash => Err(SigningError::UnauthorizedMessage(
+        Some(hash) if hash != chain_tip.hash => Err(SigningError::ChainAnchorMismatch(
             "finalized execution anchors a block outside the canonical chain".into(),
         )),
         Some(_) => Ok(()),
@@ -413,7 +535,7 @@ fn canonical_anchor(chain_tip: ChainTip, local_hash: Option<[u8; 32]>) -> Result
 
 fn require_current_tip(block_height: u64, tip: u64) -> Result<(), SigningError> {
     if block_height != tip {
-        return Err(SigningError::UnauthorizedMessage(
+        return Err(SigningError::ChainAnchorMismatch(
             "message does not target the current block".into(),
         ));
     }
@@ -423,7 +545,7 @@ fn require_current_tip(block_height: u64, tip: u64) -> Result<(), SigningError> 
 
 fn require_current_hash(expected: [u8; 32], actual: [u8; 32]) -> Result<(), SigningError> {
     if expected != actual {
-        return Err(SigningError::UnauthorizedMessage(
+        return Err(SigningError::ChainAnchorMismatch(
             "signing request does not target the current block hash".into(),
         ));
     }
@@ -556,7 +678,7 @@ mod tests {
         require_current_tip(42, 42).unwrap();
 
         let error = require_current_tip(43, 42).unwrap_err();
-        assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
+        assert!(matches!(error, SigningError::ChainAnchorMismatch(_)));
     }
 
     #[test]
@@ -570,12 +692,12 @@ mod tests {
 
         let fork = canonical_anchor(anchor, Some([5; 32])).unwrap_err();
         assert!(
-            matches!(fork, SigningError::UnauthorizedMessage(reason) if reason.contains("outside"))
+            matches!(fork, SigningError::ChainAnchorMismatch(reason) if reason.contains("outside"))
         );
 
         let unseen = canonical_anchor(anchor, None).unwrap_err();
         assert!(
-            matches!(unseen, SigningError::UnauthorizedMessage(reason) if reason.contains("not seen"))
+            matches!(unseen, SigningError::ChainAnchorMismatch(reason) if reason.contains("not seen"))
         );
     }
 
@@ -583,7 +705,7 @@ mod tests {
     fn signing_messages_require_a_chain_anchor() {
         let error = required_chain_tip(None).unwrap_err();
 
-        assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
+        assert!(matches!(error, SigningError::ChainAnchorMismatch(_)));
     }
 
     #[test]
@@ -591,6 +713,51 @@ mod tests {
         require_current_hash([4; 32], [4; 32]).unwrap();
 
         let error = require_current_hash([4; 32], [5; 32]).unwrap_err();
-        assert!(matches!(error, SigningError::UnauthorizedMessage(_)));
+        assert!(matches!(error, SigningError::ChainAnchorMismatch(_)));
+    }
+
+    #[test]
+    fn only_sender_authorization_counts_as_unauthorized() {
+        let unauthorized = HandlerError::from(
+            authorize_sender(NodeMessageKind::RenewStormUtxos, COORDINATOR, MEMBER).unwrap_err(),
+        );
+        let behind = HandlerError::from(require_current_tip(43, 42).unwrap_err());
+
+        assert!(unauthorized.is_unauthorized());
+        assert_eq!(unauthorized.metric_reason(), "unauthorized");
+        assert!(!behind.is_unauthorized());
+        assert_eq!(behind.metric_reason(), "chain_anchor_mismatch");
+    }
+
+    #[test]
+    fn labels_why_a_signing_request_was_refused() {
+        use super::super::{
+            burning::BurningError, user_requests::UserRequestError,
+            voting_execution::VotingExecutionError,
+        };
+
+        let off_price = HandlerError::UserRequest(UserRequestError::InstructedPrice(
+            price_feed::ValidationError::DeviationExceeded,
+        ));
+        let bad_burn = HandlerError::Burning(BurningError::ReserveShortfall);
+        let local = HandlerError::VotingExecution(VotingExecutionError::MemberMigrationNotReady);
+
+        assert_eq!(
+            off_price.refusal_reason(NodeMessageKind::ExecuteUserRequests),
+            Some("price_deviation_exceeded")
+        );
+        assert_eq!(
+            bad_burn.refusal_reason(NodeMessageKind::BurnExpiredUtxos),
+            Some("invalid")
+        );
+        assert_eq!(
+            local.refusal_reason(NodeMessageKind::ExecuteVotingRequest),
+            Some("other")
+        );
+        // A notice about a broadcast burn is not a request to sign.
+        assert_eq!(
+            bad_burn.refusal_reason(NodeMessageKind::ExpiredUtxosBurned),
+            None
+        );
     }
 }

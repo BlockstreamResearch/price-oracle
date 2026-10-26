@@ -2,6 +2,7 @@
 
 mod chain;
 mod elements;
+mod messages;
 mod names;
 mod prices;
 mod refresh;
@@ -18,6 +19,7 @@ pub(crate) use chain::{
 };
 pub use chain::{set_storm_eye_utxos, spawn_storm_eye_probe};
 pub use elements::spawn_elements_probe;
+pub(crate) use messages::{RejectedMessage, record_rejected_message};
 pub use prices::register_price_source;
 pub use refresh::{LoopTask, record_loop_tick, spawn_refresh};
 pub use server::MetricsServer;
@@ -183,6 +185,18 @@ fn describe() {
     describe_gauge!(
         names::PRICE_SOURCE_LAST_OBSERVED,
         "Unix time the source itself stamped its latest kept observation."
+    );
+    describe_counter!(
+        names::NODE_MESSAGES_REJECTED,
+        "Node messages from a peer that this node rejected, by kind and reason."
+    );
+    describe_counter!(
+        names::UNAUTHORIZED_MESSAGES,
+        "Messages from a peer acting outside its role, such as a non-coordinator starting user-request signing."
+    );
+    describe_counter!(
+        names::SIGNING_REFUSED,
+        "Signing requests this node refused: price_* when its own price disagrees, invalid when the proposal is wrong, other for a local failure."
     );
     metrics_process::Collector::default().describe();
 }
