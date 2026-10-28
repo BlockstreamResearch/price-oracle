@@ -45,6 +45,15 @@ pub struct ServiceConfig {
     pub db: DbConfig,
     #[serde(default)]
     pub price_sources: PriceSourcesConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// Without an address no metrics are recorded or served. The endpoint is
+/// internal; keep it off public interfaces.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct MetricsConfig {
+    pub address: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -252,6 +261,33 @@ max_connections = 5
             .peer_addresses
             .insert("not-a-key".into(), "node:9000".into());
         assert!(matches!(config.validate(), Err(Error::P2p(_))));
+    }
+
+    #[test]
+    fn serves_no_metrics_without_an_address() {
+        let omitted: Config = toml::from_str(&config_with_protocol_section("protocol")).unwrap();
+        let empty: Config = toml::from_str(&format!(
+            "{}\n[service.metrics]\n",
+            config_with_protocol_section("protocol")
+        ))
+        .unwrap();
+
+        assert!(omitted.service.metrics.address.is_none());
+        assert!(empty.service.metrics.address.is_none());
+    }
+
+    #[test]
+    fn parses_metrics_section() {
+        let config: Config = toml::from_str(&format!(
+            "{}\n[service.metrics]\naddress = \"0.0.0.0:9400\"\n",
+            config_with_protocol_section("protocol")
+        ))
+        .unwrap();
+
+        assert_eq!(
+            config.service.metrics.address,
+            Some("0.0.0.0:9400".parse::<SocketAddr>().unwrap())
+        );
     }
 
     #[test]

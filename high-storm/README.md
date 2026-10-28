@@ -48,7 +48,8 @@ also enables the CoinGecko source for extra nodes deployed with `deploy-node`.
 
 `deploy-node NODE` accepts node numbers from 4 through 99. It creates a persistent
 development signer configuration and PostgreSQL database, then starts the node on
-host ports `8999 + NODE` and `9099 + NODE`. The node waits to be admitted by an
+host ports `8999 + NODE` and `9099 + NODE`, with metrics on loopback port
+`9299 + NODE`. The node waits to be admitted by an
 approved membership vote and completes discovery once the active network stages
 its public key. Generated signer configurations live in the ignored
 `high-storm/.devenv-nodes` directory. Re-running the command preserves the node's
@@ -56,7 +57,8 @@ identity and database. `down` removes extra-node containers but preserves their
 configuration and database; `create` resets both.
 
 The Storm listeners are exposed on host ports `9000`, `9001`, and `9002`; their
-external APIs are exposed on `9100`, `9101`, and `9102`.
+external APIs are exposed on `9100`, `9101`, and `9102`. Their Prometheus metrics
+are served on `http://127.0.0.1:9300/metrics`, `9301`, and `9302`.
 Each node has its own operator platform at `http://127.0.0.1:9200`,
 `http://127.0.0.1:9201`, and `http://127.0.0.1:9202`, respectively. For local
 development, log in with the matching deterministic secret from
@@ -171,7 +173,10 @@ the one-time Storm Eye issuance and defaults to `funded-key`. The `service.db.ur
 value is the database host and optional port, for example `localhost:5432`. Set
 `service.ipc_path` to a unique Unix socket path for each high-storm process running
 on the same host. The external API binds to `service.external_api_address`, which
-defaults to `127.0.0.1:9001`. Elements must run with `txindex=1` so HighStorm can
+defaults to `127.0.0.1:9001`. Prometheus metrics are served at `/metrics` only when
+`service.metrics.address` is set, for example to `127.0.0.1:9300`; give each process on
+a host its own port. The endpoint is unauthenticated, so expose it only to a private
+monitoring network. Elements must run with `txindex=1` so HighStorm can
 reconcile confirmed request transactions after they leave the mempool. Protocol-wide
 fee budgets, burn reserves, and Tick lifetime are grouped under `service.protocol`.
 The legacy `service.user_requests` section remains accepted for existing deployments.

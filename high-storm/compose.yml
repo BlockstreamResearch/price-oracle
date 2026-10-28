@@ -288,6 +288,7 @@ services:
     ports:
       - "9000:9000"
       - "9100:9100"
+      - "127.0.0.1:9300:9300"
     networks:
       storm:
         ipv4_address: ${STORM_NETWORK_PREFIX:-172.28.0}.11
@@ -325,6 +326,7 @@ services:
     ports:
       - "9001:9000"
       - "9101:9100"
+      - "127.0.0.1:9301:9300"
     networks:
       storm:
         ipv4_address: ${STORM_NETWORK_PREFIX:-172.28.0}.12
@@ -362,6 +364,7 @@ services:
     ports:
       - "9002:9000"
       - "9102:9100"
+      - "127.0.0.1:9302:9300"
     networks:
       storm:
         ipv4_address: ${STORM_NETWORK_PREFIX:-172.28.0}.13
