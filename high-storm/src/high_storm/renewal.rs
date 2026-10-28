@@ -127,10 +127,11 @@ impl Renewal {
         }
     }
 
-    pub(crate) async fn prepare(
+    /// The Storm Eye to renew, once a renewal is due and none is pending.
+    pub(crate) async fn due_storm_eye(
         &self,
         block_height: u64,
-    ) -> Result<Option<PreparedRenewal>, RenewalError> {
+    ) -> Result<Option<NetworkAsset>, RenewalError> {
         if self.assets.pending_storm_eye_renewal().await?.is_some() {
             return Ok(None);
         }
@@ -140,13 +141,24 @@ impl Renewal {
             .await?
             .ok_or(RenewalError::MissingAsset(STORM_EYE_KIND))?;
         let data = storm_eye_contract_data(&storm_eye)?;
-        if !renewal_due(block_height, data.rescue_height) {
-            return Ok(None);
-        }
+        Ok(renewal_due(block_height, data.rescue_height).then_some(storm_eye))
+    }
 
+    pub(crate) async fn prepare(
+        &self,
+        block_height: u64,
+        storm_eye: NetworkAsset,
+    ) -> Result<PreparedRenewal, RenewalError> {
         self.prepare_transaction(block_height, storm_eye, true)
             .await
-            .map(Some)
+    }
+
+    /// The height from which anyone may spend the active Storm Eye UTXOs.
+    pub(crate) async fn rescue_height(&self) -> Result<Option<u32>, RenewalError> {
+        let Some(storm_eye) = self.assets.get(STORM_EYE_KIND).await? else {
+            return Ok(None);
+        };
+        Ok(Some(storm_eye_contract_data(&storm_eye)?.rescue_height))
     }
 
     pub(crate) async fn validate_request(

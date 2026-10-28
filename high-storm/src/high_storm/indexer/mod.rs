@@ -203,6 +203,9 @@ impl Indexer {
             droplets_cursor.as_ref().map(|cursor| cursor.height),
             self.droplets.ledger_halt().await?.is_some(),
         );
+        if journal_mismatch || cursor_mismatch {
+            crate::monitoring::record_chain_reorg();
+        }
         let mut recovered_locks = Vec::new();
         let recovering = persisted_recovery.recovering
             || missing_journal

@@ -1648,6 +1648,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-process",
+ "metrics-util",
  "postcard",
  "price-feed",
  "reqwest",
