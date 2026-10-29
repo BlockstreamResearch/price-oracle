@@ -46,3 +46,13 @@ pub(super) const PRICE_SOURCE_LAST_OBSERVED: &str =
 pub(super) const NODE_MESSAGES_REJECTED: &str = "high_storm_node_messages_rejected_total";
 pub(super) const UNAUTHORIZED_MESSAGES: &str = "high_storm_unauthorized_messages_total";
 pub(super) const SIGNING_REFUSED: &str = "high_storm_signing_refused_total";
+
+pub(super) const SIGNING_ATTEMPTS: &str = "high_storm_signing_attempts_total";
+pub(super) const SIGNING_DURATION: &str = "high_storm_signing_duration_seconds";
+pub(super) const SIGNING_BRANCH_FAILURES: &str = "high_storm_signing_branch_failures_total";
+pub(super) const SIGNING_MISSING_CONTRIBUTIONS: &str =
+    "high_storm_signing_missing_contributions_total";
+pub(super) const SIGNING_INVALID_PARTIAL_SIGNATURES: &str =
+    "high_storm_signing_invalid_partial_signatures_total";
+pub(super) const SIGNING_AGGREGATE_INVALID: &str = "high_storm_signing_aggregate_invalid_total";
+pub(super) const SIGNING_SESSIONS_ACTIVE: &str = "high_storm_signing_sessions_active";

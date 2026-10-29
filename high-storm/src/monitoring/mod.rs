@@ -7,6 +7,7 @@ mod names;
 mod prices;
 mod refresh;
 mod server;
+mod signing;
 
 use std::time::Duration;
 
@@ -23,6 +24,11 @@ pub(crate) use messages::{RejectedMessage, record_rejected_message};
 pub use prices::register_price_source;
 pub use refresh::{LoopTask, record_loop_tick, spawn_refresh};
 pub use server::MetricsServer;
+pub(crate) use signing::{
+    record_aggregate_invalid, record_invalid_partial_signatures,
+    record_missing_signing_contribution, record_signing_attempt, record_signing_branch_failure,
+    set_signing_sessions_active,
+};
 
 /// Covers fast database probes up to the 60s signing session timeout.
 const DURATION_BUCKETS: &[f64] = &[
@@ -193,6 +199,34 @@ fn describe() {
     describe_counter!(
         names::UNAUTHORIZED_MESSAGES,
         "Messages from a peer acting outside its role, such as a non-coordinator starting user-request signing."
+    );
+    describe_counter!(
+        names::SIGNING_ATTEMPTS,
+        "Signings this node requested, by message kind and outcome: ok or the reason it failed."
+    );
+    describe_histogram!(
+        names::SIGNING_DURATION,
+        "Time a signing this node requested took to succeed."
+    );
+    describe_counter!(
+        names::SIGNING_BRANCH_FAILURES,
+        "Storm Tree branches that failed within a signing, by reason: timeout or error."
+    );
+    describe_counter!(
+        names::SIGNING_MISSING_CONTRIBUTIONS,
+        "Signers that never sent their nonces or partial signatures for a signing this node requested."
+    );
+    describe_counter!(
+        names::SIGNING_INVALID_PARTIAL_SIGNATURES,
+        "Partial signatures from a signer that failed to parse or verify."
+    );
+    describe_counter!(
+        names::SIGNING_AGGREGATE_INVALID,
+        "Aggregated signatures that failed verification although every partial signature verified."
+    );
+    describe_gauge!(
+        names::SIGNING_SESSIONS_ACTIVE,
+        "Signing sessions this node holds, its own and its peers'."
     );
     describe_counter!(
         names::SIGNING_REFUSED,

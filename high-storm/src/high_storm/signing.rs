@@ -25,6 +25,7 @@ use super::message::{
     ExternalRequests, NodeMessage, NodeMessageKind, PartialSignaturesMessage, RenewStormUtxos,
     SigningNoncesMessage,
 };
+use crate::monitoring;
 
 pub(super) const SIGNING_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 type OutboundNodeMessage = (NodeMessage, Vec<[u8; 33]>);
@@ -99,6 +100,8 @@ struct SigningSession {
 }
 
 struct SigningRequest {
+    /// The message that started the signing, for metric labels.
+    kind: NodeMessageKind,
     signing_storm_tree_branch: StormTreeBranch,
     message_hashes: Vec<[u8; 32]>,
 }
@@ -187,26 +190,31 @@ impl Signing {
             ));
         }
 
-        self.sign_per_branch(&storm.handle(), SIGNING_SESSION_TIMEOUT, move |branch| {
-            let (tx, signing_hash) = round(branch)?;
-            if tx.is_empty() {
-                return Err(SigningError::InvalidMessage(
-                    "issuance transaction cannot be empty".into(),
-                ));
-            }
-            let message = NodeMessage::new(
-                NodeMessageKind::ExecuteUserRequests,
-                None,
-                &ExecuteUserRequests {
-                    tx,
-                    signing_hash,
-                    signing_storm_tree_branch: branch,
-                    external_requests: external_requests.clone(),
-                    chain_tip: Some(chain_tip),
-                },
-            )?;
-            Ok((message, execute_message_hashes(signing_hash, price_hash)))
-        })
+        self.sign_per_branch(
+            &storm.handle(),
+            NodeMessageKind::ExecuteUserRequests,
+            SIGNING_SESSION_TIMEOUT,
+            move |branch| {
+                let (tx, signing_hash) = round(branch)?;
+                if tx.is_empty() {
+                    return Err(SigningError::InvalidMessage(
+                        "issuance transaction cannot be empty".into(),
+                    ));
+                }
+                let message = NodeMessage::new(
+                    NodeMessageKind::ExecuteUserRequests,
+                    None,
+                    &ExecuteUserRequests {
+                        tx,
+                        signing_hash,
+                        signing_storm_tree_branch: branch,
+                        external_requests: external_requests.clone(),
+                        chain_tip: Some(chain_tip),
+                    },
+                )?;
+                Ok((message, execute_message_hashes(signing_hash, price_hash)))
+            },
+        )
         .await
     }
 
@@ -226,6 +234,7 @@ impl Signing {
 
         self.sign_with_message(
             &storm.handle(),
+            NodeMessageKind::BurnExpiredUtxos,
             vec![signing_hash],
             SIGNING_SESSION_TIMEOUT,
             move |branch| {
@@ -261,6 +270,7 @@ impl Signing {
 
         self.sign_with_message(
             &storm.handle(),
+            NodeMessageKind::ExchangeRewards,
             vec![signing_hash],
             SIGNING_SESSION_TIMEOUT,
             move |branch| {
@@ -292,6 +302,7 @@ impl Signing {
     ) -> Result<SigningResult, SigningError> {
         self.sign_with_message(
             storm,
+            NodeMessageKind::ExecuteVotingRequest,
             signing_hashes.clone(),
             SIGNING_SESSION_TIMEOUT,
             move |branch| {
@@ -320,6 +331,7 @@ impl Signing {
         let template = request.clone();
         self.sign_with_message(
             storm,
+            NodeMessageKind::RenewStormUtxos,
             request.signing_hashes.clone(),
             SIGNING_SESSION_TIMEOUT,
             move |branch| {
@@ -334,6 +346,7 @@ impl Signing {
     async fn sign_with_message<F>(
         &self,
         storm: &StormHandle,
+        kind: NodeMessageKind,
         message_hashes: Vec<[u8; 32]>,
         attempt_timeout: Duration,
         make_message: F,
@@ -341,7 +354,7 @@ impl Signing {
     where
         F: Fn(StormTreeBranch) -> Result<NodeMessage, postcard::Error>,
     {
-        self.sign_per_branch(storm, attempt_timeout, move |branch| {
+        self.sign_per_branch(storm, kind, attempt_timeout, move |branch| {
             Ok((make_message(branch)?, message_hashes.clone()))
         })
         .await
@@ -351,12 +364,14 @@ impl Signing {
     async fn sign_per_branch<F>(
         &self,
         storm: &StormHandle,
+        kind: NodeMessageKind,
         attempt_timeout: Duration,
         make_attempt: F,
     ) -> Result<SigningResult, SigningError>
     where
         F: Fn(StormTreeBranch) -> Result<(NodeMessage, Vec<[u8; 32]>), SigningError>,
     {
+        let started = Instant::now();
         let mut attempted = BTreeSet::new();
         let mut request_hashes = BTreeSet::new();
         let mut pending = JoinSet::new();
@@ -400,6 +415,7 @@ impl Signing {
                             continue;
                         };
                         let request = SigningRequest {
+                            kind,
                             signing_storm_tree_branch: branch,
                             message_hashes,
                         };
@@ -421,6 +437,7 @@ impl Signing {
                     let signing = self.clone();
                     let storm = storm.clone();
                     pending.spawn(async move {
+                        let mut timed_out = false;
                         let result = async {
                             let recipients = signing.remote_transport_keys(&signers).await?;
                             send_from_storm(&storm, initial, &recipients).await?;
@@ -432,19 +449,24 @@ impl Signing {
                             }
                             match timeout(attempt_timeout, receiver).await {
                                 Ok(Ok(result)) => Ok(result),
-                                Ok(Err(_)) | Err(_) => Err(SigningError::SigningFailed),
+                                Ok(Err(_)) => Err(SigningError::SigningFailed),
+                                Err(_) => {
+                                    timed_out = true;
+                                    Err(SigningError::SigningFailed)
+                                }
                             }
                         }
                         .await;
                         if result.is_err() {
-                            signing.remove_attempt(request_hash).await;
+                            signing.remove_attempt(request_hash, timed_out).await;
                         }
-                        (branch, result)
+                        (branch, result, timed_out)
                     });
                 }
                 match pending.join_next().await {
-                    Some(Ok((_, Ok(result)))) => return Ok(result),
-                    Some(Ok((branch, Err(error)))) => {
+                    Some(Ok((_, Ok(result), _))) => return Ok(result),
+                    Some(Ok((branch, Err(error), timed_out))) => {
+                        monitoring::record_signing_branch_failure(kind.as_str(), timed_out);
                         tracing::debug!(branch = %hex::encode(branch), %error, "Storm Tree signing branch failed");
                     }
                     Some(Err(error)) => {
@@ -465,14 +487,31 @@ impl Signing {
         .await;
         pending.abort_all();
         let mut state = self.state.lock().await;
+        // Branches abandoned once another succeeded; nobody withheld anything.
         for request_hash in request_hashes {
             state.sessions.remove(&request_hash);
         }
+        state.record_active_sessions();
+        monitoring::record_signing_attempt(
+            kind.as_str(),
+            result
+                .as_ref()
+                .map_or_else(SigningError::metric_reason, |_| "ok"),
+            started.elapsed(),
+        );
         result
     }
 
-    async fn remove_attempt(&self, request_hash: [u8; 32]) {
-        self.state.lock().await.sessions.remove(&request_hash);
+    /// A timed-out attempt's signers had the whole window to contribute, so
+    /// those that did not are counted.
+    async fn remove_attempt(&self, request_hash: [u8; 32], timed_out: bool) {
+        let mut state = self.state.lock().await;
+        if let Some(session) = state.sessions.remove(&request_hash)
+            && timed_out
+        {
+            state.count_missing_contributions(&session);
+        }
+        state.record_active_sessions();
     }
 
     async fn remote_transport_keys(
@@ -525,6 +564,7 @@ impl Signing {
                 request_hash,
                 sender,
                 SigningRequest {
+                    kind: NodeMessageKind::ExecuteUserRequests,
                     signing_storm_tree_branch: request.signing_storm_tree_branch,
                     message_hashes: execute_message_hashes(request.signing_hash, price_hash),
                 },
@@ -571,6 +611,7 @@ impl Signing {
                 request_hash,
                 sender,
                 SigningRequest {
+                    kind: NodeMessageKind::BurnExpiredUtxos,
                     signing_storm_tree_branch: request.signing_storm_tree_branch,
                     message_hashes: vec![request.signing_hash],
                 },
@@ -617,6 +658,7 @@ impl Signing {
                 request_hash,
                 sender,
                 SigningRequest {
+                    kind: NodeMessageKind::ExchangeRewards,
                     signing_storm_tree_branch: request.signing_storm_tree_branch,
                     message_hashes: vec![request.signing_hash],
                 },
@@ -657,6 +699,7 @@ impl Signing {
                 request_hash,
                 sender,
                 SigningRequest {
+                    kind: NodeMessageKind::ExecuteVotingRequest,
                     signing_storm_tree_branch: request.signing_storm_tree_branch,
                     message_hashes: request.signing_hashes,
                 },
@@ -697,6 +740,7 @@ impl Signing {
                 request_hash,
                 sender,
                 SigningRequest {
+                    kind: NodeMessageKind::RenewStormUtxos,
                     signing_storm_tree_branch: request.signing_storm_tree_branch,
                     message_hashes: request.signing_hashes,
                 },
@@ -905,6 +949,7 @@ impl SigningState {
                 created_at: Instant::now(),
             },
         );
+        self.record_active_sessions();
         Ok(nonce_message)
     }
 
@@ -1025,6 +1070,7 @@ impl SigningState {
                 "partial-signature contributor does not match authenticated sender".into(),
             ));
         }
+        let peer = peer_label(&self.member_transport_keys, sender);
         let Some(session) = self.sessions.get_mut(&request_hash) else {
             return Ok(());
         };
@@ -1040,6 +1086,7 @@ impl SigningState {
         if contribution.partial_signatures.is_some() {
             return Ok(());
         }
+        let kind = session.request.kind.as_str();
         let partial_signatures = message
             .partial_signatures
             .iter()
@@ -1048,14 +1095,16 @@ impl SigningState {
                 PartialSignature::from_byte_array(signature)
                     .map_err(|_| invalid_partial_signature(sender, index))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .inspect_err(|_| monitoring::record_invalid_partial_signatures(peer.clone(), kind))?;
         let nonces_ready = session
             .contributions
             .values()
             .all(|contribution| contribution.nonces.is_some());
         if nonces_ready {
             let cache = key_agg_cache(&session.signers)?;
-            verify_signer_partials(session, &cache, sender, &partial_signatures)?;
+            verify_signer_partials(session, &cache, sender, &partial_signatures)
+                .inspect_err(|_| monitoring::record_invalid_partial_signatures(peer, kind))?;
         }
 
         let contribution = session
@@ -1091,6 +1140,10 @@ impl SigningState {
                 continue;
             };
             if let Err(error) = verify_signer_partials(session, &cache, signer, partials) {
+                monitoring::record_invalid_partial_signatures(
+                    peer_label(&self.member_transport_keys, signer),
+                    session.request.kind.as_str(),
+                );
                 session
                     .contributions
                     .get_mut(&signer)
@@ -1129,6 +1182,7 @@ impl SigningState {
                 .partial_sig_agg(&partials)
                 .verify(&cache.agg_pk(), message_hash)
                 .map_err(|_| {
+                    monitoring::record_aggregate_invalid(session.request.kind.as_str());
                     SigningError::InvalidMessage("aggregate signature failed verification".into())
                 })?;
             signatures.push(signature.to_byte_array());
@@ -1141,12 +1195,59 @@ impl SigningState {
             });
         }
         self.sessions.remove(&request_hash);
+        self.record_active_sessions();
         Ok(())
     }
 
     fn remove_expired_sessions(&mut self) {
-        self.sessions
-            .retain(|_, session| session.created_at.elapsed() < SIGNING_SESSION_TIMEOUT);
+        let expired = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.created_at.elapsed() >= SIGNING_SESSION_TIMEOUT)
+            .map(|(request_hash, _)| *request_hash)
+            .collect::<Vec<_>>();
+        for request_hash in expired {
+            if let Some(session) = self.sessions.remove(&request_hash) {
+                self.count_missing_contributions(&session);
+            }
+        }
+        self.record_active_sessions();
+    }
+
+    /// Counts the signers that held up a signing this node requested and gave
+    /// up on. Until every signer sends its nonces nobody can sign, so a missing
+    /// partial signature is only counted once all nonces arrived.
+    fn count_missing_contributions(&self, session: &SigningSession) {
+        if session.requestor != self.local_node {
+            return;
+        }
+        let missing = |stage: fn(&SignerContribution) -> bool| {
+            session
+                .signers
+                .iter()
+                .filter(|signer| **signer != self.local_node)
+                .filter(|signer| session.contributions.get(*signer).is_none_or(stage))
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let (stage, signers) = match missing(|contribution| contribution.nonces.is_none()) {
+            nonces if !nonces.is_empty() => ("nonce", nonces),
+            _ => (
+                "partial",
+                missing(|contribution| contribution.partial_signatures.is_none()),
+            ),
+        };
+        for signer in signers {
+            monitoring::record_missing_signing_contribution(
+                peer_label(&self.member_transport_keys, signer),
+                session.request.kind.as_str(),
+                stage,
+            );
+        }
+    }
+
+    fn record_active_sessions(&self) {
+        monitoring::set_signing_sessions_active(self.sessions.len());
     }
 
     fn transport_key(&self, node: &NodePublicKey) -> Result<[u8; 33], SigningError> {
@@ -1164,6 +1265,17 @@ fn execute_message_hashes(signing_hash: [u8; 32], price_hash: Option<[u8; 32]>) 
     hashes.extend(price_hash);
 
     hashes
+}
+
+/// The signer's transport key, the `peer` label every other metric uses, or its
+/// signing key if it is no longer a member.
+fn peer_label(
+    member_transport_keys: &BTreeMap<NodePublicKey, [u8; 33]>,
+    signer: NodePublicKey,
+) -> String {
+    member_transport_keys
+        .get(&signer)
+        .map_or_else(|| hex::encode(signer), hex::encode)
 }
 
 fn invalid_partial_signature(signer: NodePublicKey, index: usize) -> SigningError {
@@ -1358,6 +1470,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn blames_only_the_signers_that_held_up_a_requested_signing() {
+        let secrets = [[11; 32], [12; 32], [13; 32]];
+        let peers = secrets
+            .iter()
+            .map(|secret| {
+                let key = secp256k1_zkp::SecretKey::from_slice(secret).unwrap();
+                Peer::new(
+                    TransportPublicKey::from_secret_key(&secp256k1_zkp::Secp256k1::new(), &key)
+                        .serialize(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut state = SigningState::new(secrets[0], &peers);
+        let local = state.local_node;
+        let (branch, other) = {
+            let tree = state.tree.as_ref().unwrap();
+            let branch = tree
+                .branches()
+                .find(|branch| tree.nodes_for_branch(branch).unwrap().contains(&local))
+                .unwrap();
+            let other = *tree
+                .nodes_for_branch(&branch)
+                .unwrap()
+                .iter()
+                .find(|signer| **signer != local)
+                .unwrap();
+            (branch, other)
+        };
+        let request = || SigningRequest {
+            kind: NodeMessageKind::BurnExpiredUtxos,
+            signing_storm_tree_branch: branch,
+            message_hashes: vec![[24; 32]],
+        };
+        for (request_hash, requestor) in [([1; 32], local), ([2; 32], local), ([3; 32], other)] {
+            state
+                .start_session(request_hash, requestor, request(), None)
+                .unwrap();
+        }
+        let no_nonce = state.sessions.remove(&[1; 32]).unwrap();
+        let mut no_partial = state.sessions.remove(&[2; 32]).unwrap();
+        no_partial.contributions.get_mut(&other).unwrap().nonces = Some(Vec::new());
+        let someone_elses = state.sessions.remove(&[3; 32]).unwrap();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+
+        metrics::with_local_recorder(&recorder, || {
+            state.count_missing_contributions(&no_nonce);
+            state.count_missing_contributions(&no_partial);
+            state.count_missing_contributions(&someone_elses);
+        });
+
+        let rendered = recorder.handle().render();
+        let peer = hex::encode(state.member_transport_keys[&other]);
+        for stage in ["nonce", "partial"] {
+            let line = format!(
+                r#"high_storm_signing_missing_contributions_total{{peer="{peer}",kind="burn_expired_utxos",stage="{stage}"}} 1"#
+            );
+            assert!(rendered.contains(&line), "missing {line:?} in:\n{rendered}");
+        }
+        assert!(
+            !rendered.contains(&hex::encode(state.member_transport_keys[&local])),
+            "this node never blames itself"
+        );
+    }
+
     fn signing_round() -> (
         Vec<SigningState>,
         Vec<PartialSignaturesMessage>,
@@ -1393,6 +1570,7 @@ mod tests {
                     [42; 32],
                     requestor,
                     SigningRequest {
+                        kind: NodeMessageKind::BurnExpiredUtxos,
                         signing_storm_tree_branch: branch,
                         message_hashes: vec![[24; 32], [25; 32]],
                     },
@@ -1663,26 +1841,31 @@ mod tests {
         }
         let result = timeout(
             Duration::from_secs(5),
-            signings[0].sign_per_branch(&nodes[0].handle(), SIGNING_SESSION_TIMEOUT, |branch| {
-                Ok((
-                    NodeMessage::new(
-                        NodeMessageKind::ExecuteUserRequests,
-                        None,
-                        &ExecuteUserRequests {
-                            tx: vec![1],
-                            signing_hash: [24; 32],
-                            signing_storm_tree_branch: branch,
-                            external_requests: vec![ExternalRequests {
-                                request_hash: [25; 32],
-                                network_user_requests: vec![1],
-                                additional_payload: None,
-                            }],
-                            chain_tip: None,
-                        },
-                    )?,
-                    vec![[24; 32]],
-                ))
-            }),
+            signings[0].sign_per_branch(
+                &nodes[0].handle(),
+                NodeMessageKind::BurnExpiredUtxos,
+                SIGNING_SESSION_TIMEOUT,
+                |branch| {
+                    Ok((
+                        NodeMessage::new(
+                            NodeMessageKind::ExecuteUserRequests,
+                            None,
+                            &ExecuteUserRequests {
+                                tx: vec![1],
+                                signing_hash: [24; 32],
+                                signing_storm_tree_branch: branch,
+                                external_requests: vec![ExternalRequests {
+                                    request_hash: [25; 32],
+                                    network_user_requests: vec![1],
+                                    additional_payload: None,
+                                }],
+                                chain_tip: None,
+                            },
+                        )?,
+                        vec![[24; 32]],
+                    ))
+                },
+            ),
         )
         .await;
         let unresponsive_index = public_keys
@@ -1704,26 +1887,31 @@ mod tests {
         .expect("disconnected peer remained available");
         let offline_result = timeout(
             Duration::from_secs(5),
-            signings[0].sign_per_branch(&nodes[0].handle(), SIGNING_SESSION_TIMEOUT, |branch| {
-                Ok((
-                    NodeMessage::new(
-                        NodeMessageKind::ExecuteUserRequests,
-                        None,
-                        &ExecuteUserRequests {
-                            tx: vec![1],
-                            signing_hash: [26; 32],
-                            signing_storm_tree_branch: branch,
-                            external_requests: vec![ExternalRequests {
-                                request_hash: [27; 32],
-                                network_user_requests: vec![1],
-                                additional_payload: None,
-                            }],
-                            chain_tip: None,
-                        },
-                    )?,
-                    vec![[26; 32]],
-                ))
-            }),
+            signings[0].sign_per_branch(
+                &nodes[0].handle(),
+                NodeMessageKind::BurnExpiredUtxos,
+                SIGNING_SESSION_TIMEOUT,
+                |branch| {
+                    Ok((
+                        NodeMessage::new(
+                            NodeMessageKind::ExecuteUserRequests,
+                            None,
+                            &ExecuteUserRequests {
+                                tx: vec![1],
+                                signing_hash: [26; 32],
+                                signing_storm_tree_branch: branch,
+                                external_requests: vec![ExternalRequests {
+                                    request_hash: [27; 32],
+                                    network_user_requests: vec![1],
+                                    additional_payload: None,
+                                }],
+                                chain_tip: None,
+                            },
+                        )?,
+                        vec![[26; 32]],
+                    ))
+                },
+            ),
         )
         .await;
         for node in &mut nodes {
