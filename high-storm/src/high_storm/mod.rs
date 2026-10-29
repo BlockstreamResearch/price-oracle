@@ -325,14 +325,19 @@ impl HighStorm {
             return Ok(None);
         }
 
-        match self
+        let exchanged = self
             .exchange_droplets(
                 request.transaction.clone(),
                 request.signing_hash,
                 self.state.block_height(),
             )
-            .await
-        {
+            .await;
+        monitoring::record_droplets_exchange(match &exchanged {
+            Ok(_) => "broadcast",
+            Err(error) if error.is_retryable() => "retry",
+            Err(_) => "failed",
+        });
+        match exchanged {
             Ok(txid) => {
                 self.state
                     .droplets()
@@ -923,6 +928,10 @@ impl HighStormHandle {
         self.storm.member_migration_ready().await
     }
 
+    pub(crate) async fn open_voting_kinds(&self) -> Result<Vec<&'static str>, VotingError> {
+        self.state.voting().unconfirmed_kinds().await
+    }
+
     /// Only a Direct feed has sources. Named with a Cross pair, this and the
     /// two below do nothing, since it is priced from the feeds it joins.
     pub async fn record_price_observation(
@@ -1119,6 +1128,11 @@ impl HighStormHandle {
         Ok(tokio::spawn(async move {
             let _attempt = attempt;
             let result = handle.execute_voting_request_inner(request_hash).await;
+            monitoring::record_voting_execution(match &result {
+                Ok(_) => "broadcast",
+                Err(VotingExecutionError::MemberMigrationNotReady) => "migration_not_ready",
+                Err(_) => "failed",
+            });
             if let Err(error) = &result {
                 tracing::warn!(request_hash = %hex::encode(request_hash), %error, "voting execution attempt failed");
             }
@@ -1364,6 +1378,7 @@ impl HighStormHandle {
                     .confirm(request_hash, txid)
                     .await?;
             }
+            monitoring::record_voting_execution("confirmed");
             confirmed += 1;
         }
 

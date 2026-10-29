@@ -66,3 +66,11 @@ pub(super) const USER_REQUEST_OLDEST_PENDING_AGE: &str =
     "high_storm_user_request_oldest_pending_age_blocks";
 pub(super) const USER_REQUESTS_FAILED: &str = "high_storm_user_requests_failed_total";
 pub(super) const ISSUANCE_ROUNDS: &str = "high_storm_issuance_rounds_total";
+
+pub(super) const VOTING_REQUESTS_CREATED: &str = "high_storm_voting_requests_created_total";
+pub(super) const VOTING_APPROVALS: &str = "high_storm_voting_approvals_total";
+pub(super) const VOTING_REQUESTS_OPEN: &str = "high_storm_voting_requests_open";
+pub(super) const VOTING_EXECUTIONS: &str = "high_storm_voting_executions_total";
+pub(super) const MEMBER_MIGRATION_IN_PROGRESS: &str = "high_storm_member_migration_in_progress";
+pub(super) const MEMBER_MIGRATION_READY: &str = "high_storm_member_migration_ready";
+pub(super) const DROPLETS_EXCHANGES: &str = "high_storm_droplets_exchanges_total";

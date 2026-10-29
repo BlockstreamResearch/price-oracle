@@ -159,6 +159,15 @@ impl NetworkVoteKind {
             _ => return None,
         })
     }
+
+    /// The `kind` label of governance metrics.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::UpdateNetworkMembers => "update_network_members",
+            Self::MergeStormEyes => "merge_storm_eyes",
+            Self::SplitStormEye => "split_storm_eye",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

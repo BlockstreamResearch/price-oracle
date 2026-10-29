@@ -31,8 +31,8 @@ pub(crate) fn record_user_request_failed(reason: &'static str) {
     counter!(names::USER_REQUESTS_FAILED, "reason" => reason).increment(1);
 }
 
-/// Reports monitored UTXOs and user requests from the database until the
-/// process exits.
+/// Reports monitored UTXOs, user requests and open votes from the database
+/// until the process exits.
 pub fn spawn_db_gauges(node: HighStormHandle, database: Database, tick_lifetime_blocks: u64) {
     tokio::spawn(async move {
         let mut refresh = tokio::time::interval(DB_GAUGES_INTERVAL);
@@ -75,6 +75,7 @@ pub fn spawn_db_gauges(node: HighStormHandle, database: Database, tick_lifetime_
                     tracing::debug!(%error, "could not read the oldest open user request")
                 }
             }
+            super::governance::record_open_votings(&node).await;
         }
     });
 }

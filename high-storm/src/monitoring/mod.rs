@@ -2,6 +2,7 @@
 
 mod chain;
 mod elements;
+mod governance;
 mod messages;
 mod names;
 mod prices;
@@ -21,6 +22,10 @@ pub(crate) use chain::{
 };
 pub use chain::{set_storm_eye_utxos, spawn_storm_eye_probe};
 pub use elements::spawn_elements_probe;
+pub(crate) use governance::{
+    record_droplets_exchange, record_voting_approval, record_voting_execution,
+    record_voting_request_created,
+};
 pub(crate) use messages::{RejectedMessage, record_rejected_message};
 pub use prices::register_price_source;
 pub use refresh::{LoopTask, record_loop_tick, spawn_refresh};
@@ -268,6 +273,34 @@ fn describe() {
     describe_counter!(
         names::SIGNING_REFUSED,
         "Signing requests this node refused: price_* when its own price disagrees, invalid when the proposal is wrong, other for a local failure."
+    );
+    describe_counter!(
+        names::VOTING_REQUESTS_CREATED,
+        "Governance votes this node stored for the first time, by kind and proposer."
+    );
+    describe_counter!(
+        names::VOTING_APPROVALS,
+        "Approvals of governance votes this node stored for the first time, by vote kind."
+    );
+    describe_gauge!(
+        names::VOTING_REQUESTS_OPEN,
+        "Governance votes not yet executed and confirmed, by kind."
+    );
+    describe_counter!(
+        names::VOTING_EXECUTIONS,
+        "Vote executions this node ran or confirmed, by outcome."
+    );
+    describe_gauge!(
+        names::MEMBER_MIGRATION_IN_PROGRESS,
+        "1 while an approved member update is being executed."
+    );
+    describe_gauge!(
+        names::MEMBER_MIGRATION_READY,
+        "1 once every member of the new network is connected, so the member update can be executed."
+    );
+    describe_counter!(
+        names::DROPLETS_EXCHANGES,
+        "Queued Droplets exchanges this node ran as leader, by outcome."
     );
     metrics_process::Collector::default().describe();
 }
