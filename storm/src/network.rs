@@ -153,7 +153,7 @@ impl Storm {
             Self::perform_responder_handshake(&mut stream, &initializer_secret_key),
         )
         .await
-        .map_err(|_| Error::ConnectionTimeout("performing the responder handshake"))
+        .map_err(|_| telemetry::timed_out("handshake", "performing the responder handshake"))
         .and_then(|handshake| handshake)
         .inspect_err(|error| telemetry::record_handshake_rejected(Direction::Inbound, error))?;
 
@@ -163,7 +163,10 @@ impl Storm {
         let receiver = Self::claim_connection(&state, remote_public_key, Some(advertised_address))
             .await
             .inspect_err(|error| telemetry::record_handshake_rejected(Direction::Inbound, error))?;
-        telemetry::record_connection(remote_public_key, Direction::Inbound);
+        telemetry::record_connection(
+            telemetry::peer_label(&*state.read().await, &remote_public_key),
+            Direction::Inbound,
+        );
 
         let handle = StormHandle {
             inner: Arc::clone(&state),
@@ -175,7 +178,10 @@ impl Storm {
             Self::run_connection(stream, transport, remote_public_key, &state, receiver).await;
 
         Self::release_connection(&state, remote_public_key).await;
-        telemetry::record_disconnection(remote_public_key, &result);
+        telemetry::record_disconnection(
+            telemetry::peer_label(&*state.read().await, &remote_public_key),
+            &result,
+        );
 
         result
     }
@@ -308,15 +314,27 @@ impl Storm {
                         timeout(constants::CONNECTION_IDLE_TIMEOUT, read_frame(&mut reader))
                             .await
                             .map_err(|_| {
-                                Error::ConnectionTimeout("waiting for a peer message")
+                                telemetry::timed_out("idle", "waiting for a peer message")
                             })??;
-                    let plaintext_length = reader_transport
+                    let decrypted = reader_transport
                         .lock()
                         .await
-                        .read_message(&ciphertext, &mut buffer)?;
+                        .read_message(&ciphertext, &mut buffer);
+                    let plaintext_length = match decrypted {
+                        Ok(length) => length,
+                        Err(error) => {
+                            return Err(reject(state, peer_public_key, error.into()).await);
+                        }
+                    };
                     let plaintext = &buffer[..plaintext_length];
 
-                    for message in decoder.push(plaintext)? {
+                    let messages = match decoder.push(plaintext) {
+                        Ok(messages) => messages,
+                        Err(error) => {
+                            return Err(reject(state, peer_public_key, error.into()).await);
+                        }
+                    };
+                    for message in messages {
                         Self::handle_message(state, peer_public_key, message).await?;
                     }
                 }
@@ -351,7 +369,7 @@ impl Storm {
                             write_frame(&mut writer, &buffer[..ciphertext_length]),
                         )
                         .await
-                        .map_err(|_| Error::ConnectionTimeout("writing to a peer"))??;
+                        .map_err(|_| telemetry::timed_out("write", "writing to a peer"))??;
                     }
                     if is_heartbeat {
                         tracing::trace!(
@@ -379,7 +397,7 @@ impl Storm {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let context = {
+        let admitted = async {
             let mut state = state.write().await;
             let peer_index = state
                 .peers
@@ -405,8 +423,13 @@ impl Storm {
                 state.migration_peers[index].last_seen = Some(received_at);
             }
 
-            MessageContext { peer_public_key }
+            Ok(MessageContext { peer_public_key })
         };
+        let context = match admitted.await {
+            Ok(context) => context,
+            Err(error) => return Err(reject(state, peer_public_key, error).await),
+        };
+        telemetry::set_peer_protocol_version(peer_public_key, message.header.protocol_version);
 
         let staged_only = {
             let state = state.read().await;
@@ -422,7 +445,7 @@ impl Storm {
                 != message_handlers::StormMessagePayloadType::AskPeersSocketInfo as u32
             && message.header.payload_id != message_handlers::StormMessagePayloadType::Error as u32
         {
-            return Err(Error::UnauthorizedConnection);
+            return Err(reject(state, peer_public_key, Error::UnauthorizedConnection).await);
         }
 
         let handle = StormHandle {
@@ -433,6 +456,7 @@ impl Storm {
         match message_handlers::storm_message(&handle, context, message).await {
             Ok(()) => Ok(()),
             Err((code, error)) => {
+                telemetry::record_message_rejected(hex::encode(peer_public_key), code.as_str());
                 log::error!(
                     "Failed to handle message from peer {}: {error}",
                     hex::encode(peer_public_key)
@@ -581,4 +605,13 @@ where
     stream.write_all(message).await?;
 
     Ok(())
+}
+
+/// Counts a message dropped from `peer_public_key` and returns why.
+async fn reject(state: &Arc<RwLock<StormState>>, peer_public_key: [u8; 33], error: Error) -> Error {
+    telemetry::record_message_rejected(
+        telemetry::peer_label(&*state.read().await, &peer_public_key),
+        error.metric_reason(),
+    );
+    error
 }
