@@ -339,6 +339,64 @@ async fn authenticated_peer_is_active_once_and_inactive_after_disconnect() {
 }
 
 #[tokio::test]
+async fn counts_connections_rejections_and_disconnections() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let secp = Secp256k1::new();
+    let mut random = rand::thread_rng();
+    let server_secret_key = SecretKey::new(&mut random);
+    let server_public_key = server_secret_key.public_key(&secp).serialize();
+    let peer_secret_key = SecretKey::new(&mut random);
+    let peer_public_key = peer_secret_key.public_key(&secp).serialize();
+    let state = Arc::new(RwLock::new(StormState::new(
+        server_secret_key,
+        vec![Peer::new(peer_public_key)],
+    )));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let (first_client, mut first_server) = connect(
+        address,
+        &listener,
+        &peer_secret_key,
+        &server_public_key,
+        Arc::clone(&state),
+    )
+    .await;
+    wait_for_status(&state, PeerStatus::Active, &mut first_server).await;
+    let (_second_client, second_server) = connect(
+        address,
+        &listener,
+        &peer_secret_key,
+        &server_public_key,
+        Arc::clone(&state),
+    )
+    .await;
+    timeout(Duration::from_secs(1), second_server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    drop(first_client);
+    timeout(Duration::from_secs(1), first_server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+
+    let rendered = recorder.handle().render();
+    let peer = hex::encode(peer_public_key);
+    for line in [
+        format!("storm_peer_connections_total{{peer=\"{peer}\",direction=\"inbound\"}} 1"),
+        r#"storm_handshakes_rejected_total{direction="inbound",reason="already_connected"} 1"#
+            .into(),
+        format!("storm_peer_disconnections_total{{peer=\"{peer}\",reason=\"closed_by_peer\"}} 1"),
+    ] {
+        assert!(rendered.contains(&line), "missing {line:?} in:\n{rendered}");
+    }
+}
+
+#[tokio::test]
 async fn replayed_noise_message_one_cannot_claim_peer_slot_or_change_address() {
     let secp = Secp256k1::new();
     let server_secret = SecretKey::from_slice(&[41; 32]).unwrap();

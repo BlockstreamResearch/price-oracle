@@ -16,7 +16,9 @@ use tokio::{
 
 use crate::{
     Error, MessageContext, Peer, PeerStatus, Storm, StormHandle, StormMessage, constants, crypto,
-    message, message_handlers, state::StormState,
+    message, message_handlers,
+    state::StormState,
+    telemetry::{self, Direction},
 };
 
 pub(crate) const HANDSHAKE_KEY_CONFIRMATION: &[u8] = b"Storm/key-confirmation/v1";
@@ -118,6 +120,7 @@ impl Storm {
 
                     tokio::spawn(async move {
                         let _permit = permit;
+                        let _connection = telemetry::InboundConnection::open();
                         if let Err(e) = Self::handle_connection(stream, peer_address, state).await {
                             log::log!(
                                 e.connection_log_level(),
@@ -150,13 +153,17 @@ impl Storm {
             Self::perform_responder_handshake(&mut stream, &initializer_secret_key),
         )
         .await
-        .map_err(|_| Error::ConnectionTimeout("performing the responder handshake"))??;
+        .map_err(|_| Error::ConnectionTimeout("performing the responder handshake"))
+        .and_then(|handshake| handshake)
+        .inspect_err(|error| telemetry::record_handshake_rejected(Direction::Inbound, error))?;
 
         let advertised_address = advertised_port
             .map(|port| SocketAddr::new(peer_address.ip(), port))
             .unwrap_or(peer_address);
-        let receiver =
-            Self::claim_connection(&state, remote_public_key, Some(advertised_address)).await?;
+        let receiver = Self::claim_connection(&state, remote_public_key, Some(advertised_address))
+            .await
+            .inspect_err(|error| telemetry::record_handshake_rejected(Direction::Inbound, error))?;
+        telemetry::record_connection(remote_public_key, Direction::Inbound);
 
         let handle = StormHandle {
             inner: Arc::clone(&state),
@@ -168,6 +175,7 @@ impl Storm {
             Self::run_connection(stream, transport, remote_public_key, &state, receiver).await;
 
         Self::release_connection(&state, remote_public_key).await;
+        telemetry::record_disconnection(remote_public_key, &result);
 
         result
     }

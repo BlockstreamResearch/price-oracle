@@ -303,6 +303,7 @@ fn describe() {
         "Queued Droplets exchanges this node ran as leader, by outcome."
     );
     metrics_process::Collector::default().describe();
+    storm::telemetry::describe();
 }
 
 fn flag(value: bool) -> f64 {

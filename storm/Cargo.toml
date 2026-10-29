@@ -12,6 +12,7 @@ clap = { workspace = true, features = ["derive"] }
 crossterm.workspace = true
 hex.workspace = true
 log.workspace = true
+metrics.workspace = true
 postcard = { workspace = true, features = ["use-std"] }
 ratatui = { workspace = true, features = ["crossterm_0_28"] }
 secp256k1-zkp = { workspace = true, features = ["rand-std"] }
@@ -22,3 +23,6 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
 toml.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+metrics-exporter-prometheus.workspace = true

@@ -4006,6 +4006,8 @@ dependencies = [
  "crossterm 0.28.1",
  "hex",
  "log",
+ "metrics",
+ "metrics-exporter-prometheus",
  "postcard",
  "ratatui",
  "secp256k1-zkp",
