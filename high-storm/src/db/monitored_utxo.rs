@@ -71,13 +71,15 @@ impl MonitoredUtxoStore {
         transaction.commit().await
     }
 
+    /// Returns how many burns reverted to `expired` because their transaction
+    /// was not confirmed within `BURNING_BLOCKS`.
     pub(crate) async fn apply_block_in(
         transaction: &mut Transaction<'_, Any>,
         block: &IndexedBlock,
         issued: &[MonitoredUtxo],
         spent: &[([u8; 32], u32, [u8; 32])],
         active_blocks: u64,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<u64, sqlx::Error> {
         for utxo in issued {
             sqlx::query(
                 "INSERT INTO monitored_utxos \
@@ -119,15 +121,39 @@ impl MonitoredUtxoStore {
         .bind(encode_u64(active_blocks)?)
         .execute(&mut **transaction)
         .await?;
-        sqlx::query(
+        let reverted = sqlx::query(
             "UPDATE monitored_utxos SET status = 'expired', status_block_height = $1, \
              burn_txid = NULL WHERE status = 'burning' AND status_block_height + $2 <= $1",
         )
         .bind(encode_u64(block.height)?)
         .bind(encode_u64(BURNING_BLOCKS)?)
         .execute(&mut **transaction)
-        .await?;
-        Ok(())
+        .await?
+        .rows_affected();
+        Ok(reverted)
+    }
+
+    pub async fn count_by_status(&self) -> Result<Vec<(String, u64)>, sqlx::Error> {
+        sqlx::query("SELECT status, COUNT(*) AS count FROM monitored_utxos GROUP BY status")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| Ok((row.try_get("status")?, decode_u64(row.try_get("count")?)?)))
+            .collect()
+    }
+
+    /// The issue height of the oldest Tick or Verifier that expired and is still
+    /// not burned.
+    pub async fn oldest_unburned_block_height(&self) -> Result<Option<u64>, sqlx::Error> {
+        sqlx::query(
+            "SELECT MIN(block_height) AS height FROM monitored_utxos \
+             WHERE status IN ('expired', 'burning')",
+        )
+        .fetch_one(&self.pool)
+        .await?
+        .try_get::<Option<i64>, _>("height")?
+        .map(decode_u64)
+        .transpose()
     }
 
     pub(crate) async fn record_cursor(
@@ -442,6 +468,59 @@ mod tests {
         );
         store.pool.close().await;
         assert!(store.burning_reservations(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reports_statuses_the_oldest_unburned_utxo_and_reverted_burns() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.monitored_utxos();
+        let block = |height: u64| IndexedBlock {
+            height,
+            hash: [height as u8; 32],
+        };
+        let mut second = monitored(10);
+        second.output_index = 4;
+        store
+            .apply_block("burning-v1", &block(10), &[monitored(10), second], &[], 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.count_by_status().await.unwrap(),
+            vec![("active".to_string(), 2)]
+        );
+        assert_eq!(store.oldest_unburned_block_height().await.unwrap(), None);
+
+        store
+            .apply_block("burning-v1", &block(70), &[], &[], 60)
+            .await
+            .unwrap();
+        store
+            .mark_burning(&[([1; 32], 2)], [8; 32], 70)
+            .await
+            .unwrap();
+        let mut statuses = store.count_by_status().await.unwrap();
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            vec![("burning".to_string(), 1), ("expired".to_string(), 1)]
+        );
+        assert_eq!(
+            store.oldest_unburned_block_height().await.unwrap(),
+            Some(10)
+        );
+
+        // Unconfirmed after five blocks, the burn goes back to the queue.
+        let mut transaction = store.pool.begin().await.unwrap();
+        let reverted =
+            MonitoredUtxoStore::apply_block_in(&mut transaction, &block(75), &[], &[], 60)
+                .await
+                .unwrap();
+        transaction.commit().await.unwrap();
+        assert_eq!(reverted, 1);
+        assert_eq!(
+            store.count_by_status().await.unwrap(),
+            vec![("expired".to_string(), 2)]
+        );
     }
 
     #[tokio::test]

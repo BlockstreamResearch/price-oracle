@@ -6,6 +6,7 @@ mod messages;
 mod names;
 mod prices;
 mod refresh;
+mod rounds;
 mod server;
 mod signing;
 
@@ -23,6 +24,10 @@ pub use elements::spawn_elements_probe;
 pub(crate) use messages::{RejectedMessage, record_rejected_message};
 pub use prices::register_price_source;
 pub use refresh::{LoopTask, record_loop_tick, spawn_refresh};
+pub use rounds::spawn_db_gauges;
+pub(crate) use rounds::{
+    record_burn_round, record_burns_reverted, record_issuance_round, record_user_request_failed,
+};
 pub use server::MetricsServer;
 pub(crate) use signing::{
     record_aggregate_invalid, record_invalid_partial_signatures,
@@ -227,6 +232,38 @@ fn describe() {
     describe_gauge!(
         names::SIGNING_SESSIONS_ACTIVE,
         "Signing sessions this node holds, its own and its peers'."
+    );
+    describe_gauge!(
+        names::MONITORED_UTXOS,
+        "Issued Ticks and Verifiers this node tracks, by state."
+    );
+    describe_gauge!(
+        names::EXPIRED_UTXO_OLDEST_AGE,
+        "Blocks since the oldest unburned Tick or Verifier expired; 0 when none is waiting."
+    );
+    describe_counter!(
+        names::BURN_ROUNDS,
+        "Burn rounds this node led that had something to burn, by outcome."
+    );
+    describe_counter!(
+        names::BURNING_REVERTED,
+        "Burns returned to the queue because their transaction was not confirmed in time."
+    );
+    describe_gauge!(
+        names::USER_REQUESTS,
+        "User requests in this node's database, by status."
+    );
+    describe_gauge!(
+        names::USER_REQUEST_OLDEST_PENDING_AGE,
+        "Blocks since the oldest user request not yet in a block was submitted; 0 when none."
+    );
+    describe_counter!(
+        names::USER_REQUESTS_FAILED,
+        "User requests marked failed, by reason."
+    );
+    describe_counter!(
+        names::ISSUANCE_ROUNDS,
+        "Issuance rounds this node coordinated that had requests to issue, by outcome."
     );
     describe_counter!(
         names::SIGNING_REFUSED,

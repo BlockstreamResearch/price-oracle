@@ -370,8 +370,9 @@ impl Indexer {
                     "replayed member migration does not match active state".into(),
                 ));
             }
+            let mut reverted_burns = 0;
             if let (Some(issued), Some(spent)) = (&issued, &spent) {
-                MonitoredUtxoStore::apply_block_in(
+                reverted_burns = MonitoredUtxoStore::apply_block_in(
                     &mut transaction,
                     &indexed_block,
                     issued,
@@ -420,6 +421,10 @@ impl Indexer {
             }
             ChainStore::record_block(&mut transaction, &canonical_block).await?;
             transaction.commit().await?;
+            // Replaying history while recovering would count past reverts again.
+            if reverted_burns > 0 && !recovering {
+                crate::monitoring::record_burns_reverted(reverted_burns);
+            }
 
             if let Some((txid, renewed)) = renewal {
                 tracing::info!(%txid, height, "indexed Storm Eye timelock renewal");

@@ -156,6 +156,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if config.service.metrics.address.is_some() {
         monitoring::spawn_refresh(storm.handle(), database.clone());
         monitoring::spawn_storm_eye_probe(storm.handle());
+        monitoring::spawn_db_gauges(
+            storm.handle(),
+            database.clone(),
+            config.service.protocol.tick_lifetime_blocks,
+        );
     }
 
     if let Some(storm_eye) = storm

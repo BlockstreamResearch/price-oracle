@@ -56,3 +56,13 @@ pub(super) const SIGNING_INVALID_PARTIAL_SIGNATURES: &str =
     "high_storm_signing_invalid_partial_signatures_total";
 pub(super) const SIGNING_AGGREGATE_INVALID: &str = "high_storm_signing_aggregate_invalid_total";
 pub(super) const SIGNING_SESSIONS_ACTIVE: &str = "high_storm_signing_sessions_active";
+
+pub(super) const MONITORED_UTXOS: &str = "high_storm_monitored_utxos";
+pub(super) const EXPIRED_UTXO_OLDEST_AGE: &str = "high_storm_expired_utxo_oldest_age_blocks";
+pub(super) const BURN_ROUNDS: &str = "high_storm_burn_rounds_total";
+pub(super) const BURNING_REVERTED: &str = "high_storm_burning_reverted_total";
+pub(super) const USER_REQUESTS: &str = "high_storm_user_requests";
+pub(super) const USER_REQUEST_OLDEST_PENDING_AGE: &str =
+    "high_storm_user_request_oldest_pending_age_blocks";
+pub(super) const USER_REQUESTS_FAILED: &str = "high_storm_user_requests_failed_total";
+pub(super) const ISSUANCE_ROUNDS: &str = "high_storm_issuance_rounds_total";

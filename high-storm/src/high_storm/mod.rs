@@ -673,7 +673,21 @@ impl HighStorm {
         if !self.is_coordinator().await {
             return Ok(0);
         }
+        // Counted once this node coordinates the round, preparation included.
+        let issued = self
+            .coordinate_issuance_round(storm_eye_lane, max_transaction_weight)
+            .await;
+        if let Some(outcome) = round_outcome(&issued) {
+            monitoring::record_issuance_round(outcome);
+        }
+        issued
+    }
 
+    async fn coordinate_issuance_round(
+        &self,
+        storm_eye_lane: usize,
+        max_transaction_weight: usize,
+    ) -> Result<usize, user_requests::UserRequestError> {
         let mut prepared = match self
             .state
             .user_requests()
@@ -769,7 +783,22 @@ impl HighStorm {
         if !leader::is_local_leader(&peers, block_height) {
             return Ok(0);
         }
+        // Counted once this node leads the round, preparation included.
+        let burned = self
+            .lead_burn_round(block_height, storm_eye_lane, max_transaction_weight)
+            .await;
+        if let Some(outcome) = round_outcome(&burned) {
+            monitoring::record_burn_round(outcome);
+        }
+        burned
+    }
 
+    async fn lead_burn_round(
+        &self,
+        block_height: u64,
+        storm_eye_lane: usize,
+        max_transaction_weight: usize,
+    ) -> Result<usize, BurningError> {
         let mut prepared = match self
             .state
             .burning()
@@ -1405,6 +1434,15 @@ impl HighStormHandle {
 
     pub async fn network_asset(&self, kind: &str) -> Result<Option<NetworkAsset>, AssetError> {
         self.state.assets().get(kind).await
+    }
+}
+
+/// A round that had nothing to do is not counted.
+fn round_outcome<E>(result: &Result<usize, E>) -> Option<&'static str> {
+    match result {
+        Ok(0) => None,
+        Ok(_) => Some("broadcast"),
+        Err(_) => Some("failed"),
     }
 }
 
