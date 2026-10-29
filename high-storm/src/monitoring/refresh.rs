@@ -93,6 +93,7 @@ pub fn spawn_refresh(node: HighStormHandle, database: Database) {
             record_build_info();
             record_loop_ticks();
             record_retained();
+            storm::telemetry::record_gauges();
             record_node(&NodeSnapshot::read(&node).await);
             super::prices::record_prices(&node).await;
             record_database(&database).await;

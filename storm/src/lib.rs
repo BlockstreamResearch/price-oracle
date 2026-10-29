@@ -32,6 +32,7 @@ mod network;
 mod peer;
 mod state;
 mod storm;
+pub mod telemetry;
 
 pub use error::Error;
 pub use message::{MAX_MESSAGE_SIZE, MessageError, StormMessage, StormMessageHeader};
