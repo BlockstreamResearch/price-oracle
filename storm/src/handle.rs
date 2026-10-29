@@ -228,6 +228,12 @@ impl StormHandle {
 
         for (peer_public_key, connection) in connections {
             if let Err(error) = connection.try_send(framed_message.clone()) {
+                if matches!(error, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                    telemetry::record_outbound_queue_full(telemetry::peer_label(
+                        &*self.inner.read().await,
+                        &peer_public_key,
+                    ));
+                }
                 first_error.get_or_insert(match error {
                     tokio::sync::mpsc::error::TrySendError::Full(_) => {
                         Error::PeerQueueFull(hex::encode(peer_public_key))
@@ -369,7 +375,7 @@ impl StormHandle {
         };
         let mut stream = timeout(constants::CONNECT_TIMEOUT, connect)
             .await
-            .map_err(|_| Error::ConnectionTimeout("connecting to a peer"))??;
+            .map_err(|_| telemetry::timed_out("connect", "connecting to a peer"))??;
         let transport = timeout(
             constants::HANDSHAKE_TIMEOUT,
             Storm::perform_initiator_handshake(
@@ -380,7 +386,7 @@ impl StormHandle {
             ),
         )
         .await
-        .map_err(|_| Error::ConnectionTimeout("performing the initiator handshake"))
+        .map_err(|_| telemetry::timed_out("handshake", "performing the initiator handshake"))
         .and_then(|handshake| handshake)
         .inspect_err(|error| telemetry::record_handshake_rejected(Direction::Outbound, error))?;
         let receiver = Storm::claim_connection(&self.inner, peer_public_key, None)
@@ -388,7 +394,8 @@ impl StormHandle {
             .inspect_err(|error| {
                 telemetry::record_handshake_rejected(Direction::Outbound, error)
             })?;
-        telemetry::record_connection(peer_public_key, Direction::Outbound);
+        let label = telemetry::peer_label(&*self.inner.read().await, &peer_public_key);
+        telemetry::record_connection(label.clone(), Direction::Outbound);
         self.finish_client_discovery_if_connected().await;
         let state = Arc::clone(&self.inner);
 
@@ -396,7 +403,7 @@ impl StormHandle {
             let result =
                 Storm::run_connection(stream, transport, peer_public_key, &state, receiver).await;
             Storm::release_connection(&state, peer_public_key).await;
-            telemetry::record_disconnection(peer_public_key, &result);
+            telemetry::record_disconnection(label, &result);
 
             if let Err(error) = result {
                 log::log!(
