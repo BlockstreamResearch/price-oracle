@@ -1,0 +1,727 @@
+# Alert rules for high-storm nodes, one group per section of the failure
+# catalog. `severity` is `page` (P0: the network or funds are at risk), `warn`
+# (P1: degraded, or signs of an attack) or `info` (P2: for diagnosis), and
+# `catalog` names the catalog item each rule covers.
+groups:
+  - name: high-storm-node
+    rules:
+      - alert: HighStormDown
+        expr: up{job="high-storm"} == 0
+        for: 1m
+        labels: { severity: page, catalog: "1.1" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#11
+          summary: "{{ $labels.instance }} cannot be scraped"
+          description: The high-storm process is down, crashed or unreachable.
+
+      - alert: HighStormRestartLoop
+        expr: changes(process_start_time_seconds{job="high-storm"}[15m]) > 2
+        labels: { severity: warn, catalog: "1.2" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#12
+          summary: "{{ $labels.instance }} restarted {{ $value }} times in 15 minutes"
+
+      # The loop runs one arm at a time, so a long round delays every other
+      # arm; only the freshest periodic arm going stale means it is stuck.
+      - alert: HighStormMainLoopStuck
+        expr: >
+          time() - max by (instance) (
+            high_storm_loop_last_tick_timestamp_seconds{task=~"reconnect|index_blocks|persist_runtime|reconcile_requests"}
+          ) > 60
+        for: 1m
+        labels: { severity: page, catalog: "1.3" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#13
+          summary: "{{ $labels.instance }} main loop has not ticked for {{ $value | humanizeDuration }}"
+
+      - alert: HighStormNotMember
+        expr: high_storm_is_member == 0
+        for: 1m
+        labels: { severity: warn, catalog: "1.4" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#14
+          summary: "{{ $labels.instance }} is no longer in the member table"
+
+      # A full pool also fails the probe; that is HighStormDatabasePoolExhausted.
+      - alert: HighStormDatabaseDown
+        expr: >
+          high_storm_db_up == 0
+            unless on (instance)
+          (high_storm_db_pool_connections{state="used"} >= ignoring (state) high_storm_db_pool_max_connections)
+        for: 1m
+        labels: { severity: page, catalog: "1.6" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#16
+          summary: "{{ $labels.instance }} cannot reach its database"
+          description: A trivial query did not complete within 2s, or no pool connection was free.
+
+      - alert: HighStormDatabasePoolExhausted
+        expr: high_storm_db_pool_connections{state="used"} >= ignoring (state) high_storm_db_pool_max_connections
+        for: 5m
+        labels: { severity: warn, catalog: "1.6" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#16
+          summary: "{{ $labels.instance }} has used every database connection for 5 minutes"
+
+      - alert: HighStormDatabaseSlow
+        expr: >
+          histogram_quantile(0.95,
+            sum by (instance, le) (rate(high_storm_db_ping_duration_seconds_bucket[5m]))
+          ) > 0.5
+        for: 5m
+        labels: { severity: warn, catalog: "1.6" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#16
+          summary: "{{ $labels.instance }} database p95 ping is {{ $value | humanizeDuration }}"
+
+      - alert: HighStormFileDescriptorsLow
+        expr: process_open_fds{job="high-storm"} / process_max_fds{job="high-storm"} > 0.8
+        for: 5m
+        labels: { severity: warn, catalog: "1.7" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#17
+          summary: "{{ $labels.instance }} uses {{ $value | humanizePercentage }} of its file descriptors"
+
+      # From node_exporter, which the README asks operators to run.
+      - alert: NodeDiskFilling
+        expr: node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes < 0.1
+        for: 10m
+        labels: { severity: warn, catalog: "1.7" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#17
+          summary: "{{ $labels.mountpoint }} on {{ $labels.instance }} has {{ $value | humanizePercentage }} free"
+
+  - name: high-storm-quorum
+    rules:
+      - alert: StormPeerDisconnected
+        expr: storm_peer_connected == 0
+        for: 2m
+        labels: { severity: warn, catalog: "2.1" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#21
+          summary: "{{ $labels.instance }} has no usable connection to peer {{ $labels.peer }}"
+
+      - alert: HighStormQuorumLost
+        expr: high_storm_connected_members < high_storm_signing_threshold
+        for: 1m
+        labels: { severity: page, catalog: "2.2" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#22
+          summary: "{{ $labels.instance }} can reach fewer members than signing needs"
+          description: Nothing can be signed, so no issuance, burns or Storm Eye renewal.
+
+      - alert: HighStormNoRedundancy
+        expr: high_storm_connected_members == high_storm_signing_threshold
+        for: 10m
+        labels: { severity: warn, catalog: "2.3" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#23
+          summary: "{{ $labels.instance }} is exactly at the signing threshold"
+
+      # The coordinator always reports itself as reachable, so only the other
+      # nodes count; a coordinator that is down reports nothing.
+      - alert: HighStormCoordinatorUnreachable
+        expr: >
+          max(
+            high_storm_coordinator_connected unless on (instance) (high_storm_is_coordinator == 1)
+          ) == 0
+        for: 2m
+        labels: { severity: page, catalog: "2.4" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#24
+          summary: No node can reach the coordinator, so the user API is down network-wide
+
+      - alert: StormPeerFlapping
+        expr: sum by (instance, peer) (increase(storm_peer_connections_total[10m])) > 5
+        labels: { severity: warn, catalog: "2.5" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#25
+          summary: "{{ $labels.instance }} reconnected to {{ $labels.peer }} {{ $value }} times in 10 minutes"
+
+      - alert: StormPeerBackpressure
+        expr: sum by (instance, peer) (increase(storm_outbound_queue_full_total[10m])) >= 5
+        labels: { severity: warn, catalog: "2.6" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#26
+          summary: "{{ $labels.peer }} is not draining the messages {{ $labels.instance }} queues for it"
+
+      - alert: StormConnectionTimeouts
+        expr: sum by (instance, stage) (increase(storm_connection_timeouts_total[10m])) >= 5
+        labels: { severity: warn, catalog: "2.6" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#26
+          summary: "{{ $labels.instance }} keeps timing out at the {{ $labels.stage }} stage"
+
+      - alert: StormProtocolVersionMismatch
+        expr: count(count_values("version", storm_peer_protocol_version)) > 1
+        for: 10m
+        labels: { severity: warn, catalog: "2.7" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#27
+          summary: Peers run different Storm protocol versions
+
+      - alert: StormDnsResolutionFailing
+        expr: sum by (instance, peer) (increase(storm_dns_resolution_failures_total[10m])) >= 3
+        labels: { severity: warn, catalog: "2.8" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#28
+          summary: "{{ $labels.instance }} cannot resolve the address of {{ $labels.peer }}"
+
+  - name: high-storm-members
+    rules:
+      # Honest nodes have repeated a message once in a reconnection race (seen
+      # once in three days of restarts); a replaying peer repeats many.
+      - alert: StormPeerReplaysMessages
+        expr: sum by (instance, peer) (increase(storm_messages_rejected_total{reason="replay"}[30m])) >= 2
+        labels: { severity: warn, catalog: "3.1" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#31
+          summary: "{{ $labels.peer }} replayed messages to {{ $labels.instance }}"
+
+      - alert: StormPeerFloods
+        expr: sum by (instance, peer) (increase(storm_messages_rejected_total{reason="rate_limit"}[5m])) > 0
+        labels: { severity: warn, catalog: "3.2" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#32
+          summary: "{{ $labels.peer }} exceeded the message rate limit on {{ $labels.instance }}"
+
+      - alert: StormPeerMalformedMessages
+        expr: >
+          sum by (instance, peer, reason) (
+            increase(storm_messages_rejected_total{reason=~"decode|too_large|noise|invalid_payload|unsupported_version"}[10m])
+          ) >= 3
+        labels: { severity: warn, catalog: "3.3" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#33
+          summary: "{{ $labels.peer }} keeps sending {{ $labels.reason }} messages to {{ $labels.instance }}"
+
+      # A chain-anchor mismatch is a peer a block apart, and the other two are
+      # this node's own state, so none of them says anything about the peer.
+      - alert: HighStormNodeMessagesRejected
+        expr: >
+          sum by (instance, peer, kind, reason) (
+            increase(high_storm_node_messages_rejected_total{reason!~"chain_anchor_mismatch|recovering|migration_finalizing"}[10m])
+          ) >= 5
+        labels: { severity: warn, catalog: "3.3" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#33
+          summary: "{{ $labels.instance }} keeps rejecting {{ $labels.kind }} from {{ $labels.peer }}: {{ $labels.reason }}"
+
+      - alert: HighStormUnauthorizedMessage
+        expr: sum by (instance, peer, kind) (increase(high_storm_unauthorized_messages_total[5m])) > 0
+        labels: { severity: page, catalog: "3.4" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#34
+          summary: "{{ $labels.peer }} sent {{ $labels.kind }} outside its role"
+          description: A non-coordinator started user-request signing, or a non-leader a burn or exchange.
+
+      - alert: HighStormSigningRefused
+        expr: sum by (instance, peer) (increase(high_storm_signing_refused_total{reason!="other"}[15m])) > 3
+        labels: { severity: warn, catalog: "3.5, 5.8" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#35
+          summary: "{{ $labels.instance }} refused {{ $value }} proposals from {{ $labels.peer }} in 15 minutes"
+
+      - alert: HighStormBadPartialSignature
+        expr: sum by (instance, peer, kind) (increase(high_storm_signing_invalid_partial_signatures_total[5m])) > 0
+        labels: { severity: page, catalog: "3.6" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#36
+          summary: "{{ $labels.peer }} sent a partial signature that does not verify"
+
+      - alert: HighStormAggregateSignatureInvalid
+        expr: sum by (instance, kind) (increase(high_storm_signing_aggregate_invalid_total[5m])) > 0
+        labels: { severity: page, catalog: "3.6" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#36
+          summary: "{{ $labels.instance }} aggregated a {{ $labels.kind }} signature that does not verify"
+
+      - alert: HighStormSignerWithholding
+        expr: sum by (instance, peer) (increase(high_storm_signing_missing_contributions_total[30m])) > 3
+        labels: { severity: warn, catalog: "3.7" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#37
+          summary: "{{ $labels.peer }} held up {{ $value }} signings by {{ $labels.instance }} in 30 minutes"
+
+      - alert: HighStormInvalidPriceAttestation
+        expr: sum by (instance, peer, reason) (increase(high_storm_price_attestations_rejected_total[5m])) > 0
+        labels: { severity: warn, catalog: "3.8" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#38
+          summary: "{{ $labels.peer }} sent price attestations refused as {{ $labels.reason }}"
+
+      - alert: HighStormPeerPriceDeviation
+        expr: high_storm_price_peer_deviation_bps > 100
+        for: 5m
+        labels: { severity: warn, catalog: "3.9" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#39
+          summary: "{{ $labels.peer }} prices {{ $labels.feed }} {{ $value }} bps away from {{ $labels.instance }}"
+
+      - alert: HighStormMemberUpdateVote
+        expr: sum by (instance, proposer) (increase(high_storm_voting_requests_created_total{kind="update_network_members"}[5m])) > 0
+        labels: { severity: page, catalog: "3.10" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#310
+          summary: "{{ $labels.proposer }} proposed adding or removing members"
+          description: An operator must review the vote before approving it.
+
+      - alert: HighStormStormEyeVote
+        expr: sum by (instance, kind, proposer) (increase(high_storm_voting_requests_created_total{kind!="update_network_members"}[5m])) > 0
+        labels: { severity: warn, catalog: "3.10" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#310
+          summary: "{{ $labels.proposer }} proposed {{ $labels.kind }}"
+
+      # Outbound `already_connected` is two nodes dialling each other at once.
+      - alert: StormHandshakesRejected
+        expr: >
+          sum by (instance, reason) (
+            rate(storm_handshakes_rejected_total{direction="inbound",reason!="already_connected"}[10m])
+          ) * 60 > 1
+        for: 10m
+        labels: { severity: warn, catalog: "3.11" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#311
+          summary: "{{ $labels.instance }} rejects {{ $value }} inbound handshakes a minute: {{ $labels.reason }}"
+
+      - alert: HighStormTooManySigningSessions
+        expr: high_storm_signing_sessions_active > 50
+        for: 5m
+        labels: { severity: warn, catalog: "3.12" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#312
+          summary: "{{ $labels.instance }} holds {{ $value }} signing sessions"
+
+  - name: high-storm-abuse
+    rules:
+      - alert: HighStormApiConnectionFlood
+        expr: sum by (instance) (rate(high_storm_api_connections_rejected_total[5m])) > 10
+        for: 5m
+        labels: { severity: warn, catalog: "4.1" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#41
+          summary: "{{ $labels.instance }} turns away {{ $value }} API connections a second"
+
+      - alert: HighStormApiRequestFlood
+        expr: sum by (instance) (rate(high_storm_api_requests_rejected_total{reason="busy"}[5m])) > 1
+        for: 5m
+        labels: { severity: warn, catalog: "4.2" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#42
+          summary: "{{ $labels.instance }} sheds {{ $value }} API requests a second as busy"
+
+      - alert: HighStormApiErrors
+        expr: >
+          sum by (instance) (rate(high_storm_api_requests_total{status=~"5.."}[10m]))
+            / sum by (instance) (rate(high_storm_api_requests_total[10m])) > 0.05
+        for: 10m
+        labels: { severity: warn, catalog: "4.3" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#43
+          summary: "{{ $labels.instance }} answers {{ $value | humanizePercentage }} of API requests with 5xx"
+
+      - alert: HighStormApiSlow
+        expr: >
+          histogram_quantile(0.95,
+            sum by (instance, route, le) (rate(high_storm_api_request_duration_seconds_bucket[10m]))
+          ) > 5
+        for: 10m
+        labels: { severity: warn, catalog: "4.3" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#43
+          summary: "{{ $labels.route }} on {{ $labels.instance }} has a p95 of {{ $value | humanizeDuration }}"
+
+      - alert: HighStormOperatorAuthFailures
+        expr: sum by (instance) (increase(high_storm_operator_auth_failures_total[5m])) > 10
+        labels: { severity: warn, catalog: "4.4" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#44
+          summary: "{{ $value }} failed operator logins on {{ $labels.instance }} in 5 minutes"
+
+      - alert: HighStormUserRequestSpam
+        expr: sum by (instance) (rate(high_storm_user_requests_rejected_total[5m])) > 1
+        for: 10m
+        labels: { severity: info, catalog: "4.5" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#45
+          summary: "{{ $labels.instance }} rejects {{ $value }} user requests a second"
+
+      # The listener never rejects: it stops accepting at 128.
+      - alert: StormInboundConnectionLimit
+        expr: storm_inbound_connections_active >= 128
+        for: 5m
+        labels: { severity: warn, catalog: "4.6" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#46
+          summary: "{{ $labels.instance }} has no free inbound P2P slot"
+
+      - alert: HighStormIpcRejected
+        expr: sum by (instance, reason) (increase(high_storm_ipc_rejected_total[5m])) > 0
+        labels: { severity: warn, catalog: "4.7" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#47
+          summary: "{{ $labels.instance }} refused a local IPC connection: {{ $labels.reason }}"
+
+      - alert: HighStormOperatorsChanged
+        expr: sum by (instance, action) (increase(high_storm_operator_changes_total[5m])) > 0
+        labels: { severity: warn, catalog: "4.8" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#48
+          summary: "An operator was {{ $labels.action }}ed on {{ $labels.instance }}"
+
+  - name: high-storm-prices
+    rules:
+      - alert: HighStormPriceSourceFailing
+        expr: >
+          sum by (instance, source) (rate(high_storm_price_polls_total{outcome="failed"}[10m]))
+            / sum by (instance, source) (rate(high_storm_price_polls_total{outcome!="skipped"}[10m])) > 0.5
+        for: 10m
+        labels: { severity: warn, catalog: "5.1" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#51
+          summary: "{{ $labels.source }} fails {{ $value | humanizePercentage }} of polls on {{ $labels.instance }}"
+
+      - alert: HighStormPriceSourceDropped
+        expr: high_storm_price_source_state{state="dropped"} == 1
+        for: 5m
+        labels: { severity: warn, catalog: "5.2" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#52
+          summary: "{{ $labels.source }} is dropped for {{ $labels.feed }} on {{ $labels.instance }}"
+
+      - alert: HighStormFeedUnavailable
+        expr: high_storm_price_feed_available == 0
+        for: 2m
+        labels: { severity: page, catalog: "5.3" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#53
+          summary: "{{ $labels.instance }} has no valid {{ $labels.feed }} price"
+
+      - alert: HighStormPriceSourceStuck
+        expr: time() - high_storm_price_source_last_observed_timestamp_seconds > 300
+        for: 1m
+        labels: { severity: warn, catalog: "5.4" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#54
+          summary: "{{ $labels.source }} has published nothing new for {{ $labels.feed }} in {{ $value | humanizeDuration }}"
+
+      - alert: HighStormNoActivePriceSource
+        expr: high_storm_price_feed_active_sources < 1
+        for: 2m
+        labels: { severity: page, catalog: "5.5" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#55
+          summary: "{{ $labels.feed }} has no active source on {{ $labels.instance }}"
+
+      - alert: HighStormSinglePriceSource
+        expr: high_storm_price_feed_active_sources < 2
+        for: 1h
+        labels: { severity: info, catalog: "5.5" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#55
+          summary: "{{ $labels.feed }} depends on one source on {{ $labels.instance }}"
+
+      - alert: HighStormPriceJump
+        expr: high_storm_price_change_bps > 1000
+        labels: { severity: info, catalog: "5.6" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#56
+          summary: "{{ $labels.source }} moved {{ $labels.feed }} {{ $value }} bps between two observations"
+
+      # A peer attests only when its price moves, so a quiet market is told
+      # apart by this node's own price being fresh.
+      - alert: HighStormPeerStoppedAttesting
+        expr: >
+          time() - high_storm_price_peer_attestation_timestamp_seconds > 300
+            and on (instance, feed)
+          time() - high_storm_price_feed_received_timestamp_seconds < 300
+        for: 5m
+        labels: { severity: warn, catalog: "5.7" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#57
+          summary: "{{ $labels.peer }} has not attested {{ $labels.feed }} for {{ $value | humanizeDuration }}"
+
+  - name: high-storm-clock
+    rules:
+      # Several peers at once points at this node's clock, not theirs.
+      - alert: HighStormClockDrift
+        expr: >
+          count by (instance) (
+            sum by (instance, peer) (increase(storm_messages_rejected_total{reason="timestamp_window"}[10m])) > 0
+              or
+            sum by (instance, peer) (increase(high_storm_price_attestations_rejected_total{reason="implausible_timestamp"}[10m])) > 0
+          ) >= 2
+        labels: { severity: warn, catalog: "6.1" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#61
+          summary: "{{ $labels.instance }} rejects timestamps from {{ $value }} peers"
+
+      - alert: HighStormPriceSourceClockSkew
+        expr: sum by (instance, source) (increase(high_storm_price_poll_failures_total{reason="clock_skew"}[10m])) > 0
+        labels: { severity: warn, catalog: "6.1" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#61
+          summary: "{{ $labels.source }} observations are stamped ahead of {{ $labels.instance }}'s clock"
+
+      # From node_exporter, which the README asks operators to run.
+      - alert: NodeClockOffset
+        expr: abs(node_timex_offset_seconds) > 1
+        for: 5m
+        labels: { severity: warn, catalog: "6.2" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#62
+          summary: "{{ $labels.instance }} clock is {{ $value | humanizeDuration }} off"
+
+      - alert: NodeClockNotSynchronized
+        expr: node_timex_sync_status == 0
+        for: 10m
+        labels: { severity: warn, catalog: "6.2" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#62
+          summary: "{{ $labels.instance }} clock is not synchronized by NTP"
+
+  - name: high-storm-chain
+    rules:
+      - alert: HighStormElementsRpcDown
+        expr: high_storm_elements_rpc_up == 0
+        for: 1m
+        labels: { severity: page, catalog: "7.1" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#71
+          summary: "{{ $labels.instance }} cannot reach its Elements RPC"
+
+      # Only `transport` errors: some calls expect Elements to answer with one.
+      - alert: HighStormElementsRpcErrors
+        expr: sum by (instance, method) (increase(high_storm_elements_rpc_errors_total{reason="transport"}[5m])) >= 3
+        labels: { severity: warn, catalog: "7.1" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#71
+          summary: "{{ $labels.method }} calls from {{ $labels.instance }} keep failing to reach Elements"
+
+      - alert: HighStormElementsStale
+        expr: time() - high_storm_elements_tip_timestamp_seconds > 300
+        for: 2m
+        labels: { severity: page, catalog: "7.2" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#72
+          summary: "Elements behind {{ $labels.instance }} has had no new block for {{ $value | humanizeDuration }}"
+
+      - alert: HighStormElementsNoPeers
+        expr: high_storm_elements_peers == 0
+        for: 5m
+        labels: { severity: page, catalog: "7.2" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#72
+          summary: "Elements behind {{ $labels.instance }} has no peers"
+
+      - alert: HighStormElementsInitialBlockDownload
+        expr: high_storm_elements_initial_block_download == 1
+        for: 10m
+        labels: { severity: warn, catalog: "7.2" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#72
+          summary: "Elements behind {{ $labels.instance }} is still in initial block download"
+
+      - alert: HighStormIndexerLag
+        expr: high_storm_elements_tip_height - high_storm_block_height > 3
+        for: 5m
+        labels: { severity: warn, catalog: "7.3" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#73
+          summary: "{{ $labels.instance }} indexing is {{ $value }} blocks behind Elements"
+
+      - alert: HighStormChainReorg
+        expr: increase(high_storm_chain_reorgs_total[10m]) > 0
+        labels: { severity: warn, catalog: "7.4" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#74
+          summary: "{{ $labels.instance }} found a chain reorganization"
+
+      - alert: HighStormChainRecoveringTooLong
+        expr: high_storm_chain_recovering == 1
+        for: 10m
+        labels: { severity: page, catalog: "7.4" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#74
+          summary: "{{ $labels.instance }} has been rebuilding chain state for over 10 minutes"
+
+      - alert: HighStormSafetyHalt
+        expr: high_storm_chain_safety_halt == 1
+        labels: { severity: page, catalog: "7.5" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#75
+          summary: "{{ $labels.instance }} halted indexing for safety"
+          description: An operator must act before the node indexes again.
+
+      - alert: HighStormSpendingPausedTooLong
+        expr: high_storm_spending_paused == 1
+        for: 30m
+        labels: { severity: warn, catalog: "7.6" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#76
+          summary: "{{ $labels.instance }} has paused spending for a member migration for over 30 minutes"
+
+      - alert: HighStormBroadcastFailing
+        expr: sum by (instance, kind, outcome) (increase(high_storm_tx_broadcast_total{outcome=~"rejected|failed"}[30m])) > 0
+        labels: { severity: warn, catalog: "7.7" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#77
+          summary: "A {{ $labels.kind }} broadcast from {{ $labels.instance }} ended {{ $labels.outcome }}"
+          description: An input that is missing or spent (also a confirmed transaction resent) is `inputs_spent` and does not alert.
+
+  - name: high-storm-funds
+    rules:
+      - alert: HighStormNoStormEyeUtxos
+        expr: high_storm_storm_eye_utxos == 0
+        for: 1m
+        labels: { severity: page, catalog: "8.1" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#81
+          summary: "{{ $labels.instance }} has no Storm Eye UTXO to sign with"
+
+      - alert: HighStormStormEyeUtxosLow
+        expr: high_storm_storm_eye_utxos < 6
+        for: 30m
+        labels: { severity: warn, catalog: "8.1" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#81
+          summary: "{{ $labels.instance }} has {{ $value }} of 6 Storm Eye UTXOs"
+
+      - alert: HighStormStormEyeRescueSoon
+        expr: high_storm_storm_eye_rescue_blocks_remaining < 43200
+        labels: { severity: warn, catalog: "8.2" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#82
+          summary: "The Storm Eye timelock expires in {{ $value }} blocks"
+
+      - alert: HighStormStormEyeRescueImminent
+        expr: high_storm_storm_eye_rescue_blocks_remaining < 10080
+        labels: { severity: page, catalog: "8.2" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#82
+          summary: "The Storm Eye timelock expires in {{ $value }} blocks"
+          description: At the rescue height anyone can take the Storm Eye UTXOs and the network is dead.
+
+      - alert: HighStormStormEyeRenewalFailed
+        expr: increase(high_storm_storm_eye_renewals_total{outcome="failed"}[1h]) > 0
+        labels: { severity: warn, catalog: "8.2" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#82
+          summary: "{{ $labels.instance }} failed to renew the Storm Eye timelock"
+
+      - alert: HighStormExpiredUtxosNotBurned
+        expr: high_storm_expired_utxo_oldest_age_blocks > 20
+        labels: { severity: page, catalog: "8.3" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#83
+          summary: "An expired Tick or Verifier has waited {{ $value }} blocks to be burned"
+          description: Stale prices stay spendable until they are burned.
+
+      - alert: HighStormBurnsReverted
+        expr: increase(high_storm_burning_reverted_total[1h]) > 0
+        labels: { severity: warn, catalog: "8.4" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#84
+          summary: "A burn returned to the queue on {{ $labels.instance }}, unconfirmed after 5 blocks"
+
+      - alert: HighStormUserRequestsStuck
+        expr: high_storm_user_request_oldest_pending_age_blocks > 5
+        for: 5m
+        labels: { severity: warn, catalog: "8.5" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#85
+          summary: "A user request has waited {{ $value }} blocks on {{ $labels.instance }}"
+
+      - alert: HighStormUserRequestsFailing
+        expr: sum by (instance, reason) (increase(high_storm_user_requests_failed_total[10m])) > 0
+        labels: { severity: warn, catalog: "8.5" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#85
+          summary: "User requests failed on {{ $labels.instance }}: {{ $labels.reason }}"
+
+      - alert: HighStormSigningFailing
+        expr: >
+          sum by (instance, kind) (rate(high_storm_signing_attempts_total{outcome!="ok"}[15m]))
+            / sum by (instance, kind) (rate(high_storm_signing_attempts_total[15m])) > 0.2
+        for: 15m
+        labels: { severity: warn, catalog: "8.6" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#86
+          summary: "{{ $value | humanizePercentage }} of {{ $labels.kind }} signings fail on {{ $labels.instance }}"
+
+      - alert: HighStormVotingExecutionFailed
+        expr: sum by (instance) (increase(high_storm_voting_executions_total{outcome="failed"}[30m])) > 0
+        labels: { severity: warn, catalog: "8.8" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#88
+          summary: "A vote execution failed on {{ $labels.instance }}"
+
+      - alert: HighStormDropletsExchangeFailed
+        expr: sum by (instance) (increase(high_storm_droplets_exchanges_total{outcome="failed"}[1h])) > 0
+        labels: { severity: info, catalog: "8.7" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#87
+          summary: "A queued Droplets exchange failed on {{ $labels.instance }}"
+
+      - alert: HighStormMemberMigrationStuck
+        expr: high_storm_member_migration_in_progress == 1 and high_storm_member_migration_ready == 0
+        for: 5m
+        labels: { severity: warn, catalog: "8.8" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#88
+          summary: "{{ $labels.instance }} has waited 5 minutes for the new network's members to connect"
+
+  # Without these, a dead metrics task or Prometheus losing every target would
+  # silence the alerts above instead of firing them.
+  - name: high-storm-monitoring
+    rules:
+      # Always firing, so Alertmanager can page when it stops arriving.
+      - alert: Watchdog
+        expr: vector(1)
+        labels: { severity: none, catalog: "monitoring" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#monitoring
+          summary: The alerting pipeline is working
+
+      - alert: HighStormNoTargets
+        expr: absent(up{job="high-storm"})
+        for: 5m
+        labels: { severity: page, catalog: "1.1" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#11
+          summary: Prometheus scrapes no high-storm node
+          description: Every node needs `service.metrics.address` set and a scrape target.
+
+      # The refresh task publishes the gauges most P0 alerts read.
+      - alert: HighStormMonitoringTaskMissing
+        expr: up{job="high-storm"} == 1 unless on (instance) high_storm_monitoring_task_last_run_timestamp_seconds{task="refresh"}
+        for: 2m
+        labels: { severity: page, catalog: "monitoring" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#monitoring
+          summary: "{{ $labels.instance }} is scraped but its refresh task reports nothing"
+
+      # Four passes of the slowest task, which runs every 30s.
+      - alert: HighStormMonitoringTaskStale
+        expr: time() - high_storm_monitoring_task_last_run_timestamp_seconds > 120
+        for: 1m
+        labels: { severity: page, catalog: "monitoring" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#monitoring
+          summary: "The {{ $labels.task }} task on {{ $labels.instance }} last ran {{ $value | humanizeDuration }} ago"
+
+      - alert: HighStormMonitoringTaskErrors
+        expr: sum by (instance, task) (increase(high_storm_monitoring_task_errors_total[15m])) >= 5
+        labels: { severity: warn, catalog: "monitoring" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#monitoring
+          summary: "The {{ $labels.task }} task on {{ $labels.instance }} failed {{ $value }} reads in 15 minutes"
+          description: The gauges those reads feed keep their last values.
+
+      - alert: HighStormMetricsConnectionsRefused
+        expr: sum by (instance) (increase(high_storm_metrics_connections_rejected_total[10m])) >= 10
+        labels: { severity: warn, catalog: "monitoring" }
+        annotations:
+          runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#monitoring
+          summary: "{{ $labels.instance }} turned away {{ $value }} connections to its metrics endpoint"

@@ -58,7 +58,10 @@ configuration and database; `create` resets both.
 
 The Storm listeners are exposed on host ports `9000`, `9001`, and `9002`; their
 external APIs are exposed on `9100`, `9101`, and `9102`. Their Prometheus metrics
-are served on `http://127.0.0.1:9300/metrics`, `9301`, and `9302`.
+are served on `http://127.0.0.1:9300/metrics`, `9301`, and `9302`. Prometheus
+scrapes the three nodes and evaluates the alert rules in `prometheus/alerts.yml`;
+see its targets and alerts at `http://127.0.0.1:9090`. Nodes added with
+`deploy-node` are not scraped.
 Each node has its own operator platform at `http://127.0.0.1:9200`,
 `http://127.0.0.1:9201`, and `http://127.0.0.1:9202`, respectively. For local
 development, log in with the matching deterministic secret from
@@ -179,7 +182,16 @@ a host its own port. Expose it only to a private monitoring network, and set
 `service.metrics.bearer_token` to require `Authorization: Bearer <token>`: the
 metrics show which members are reachable and who coordinates. The listener holds
 at most 8 connections and closes each after 60 seconds, so a scraper cannot tie up
-the file descriptors the node shares with its P2P port and API. Elements must run with `txindex=1` so HighStorm can
+the file descriptors the node shares with its P2P port and API. `prometheus/alerts.yml` holds alert rules for these metrics,
+labelled `severity: page`, `warn` or `info`, each linking to its entry in
+`prometheus/RUNBOOK.md`; `promtool test rules prometheus/alerts.test.yml` checks
+the less obvious ones. The `Watchdog` rule always fires, so a paging service can
+alert when it stops arriving. Two failure modes are
+not reported by high-storm itself, so run
+[node_exporter](https://github.com/prometheus/node_exporter) beside each node:
+free disk space for the database and Elements (`node_filesystem_avail_bytes`), and
+clock synchronization (`node_timex_offset_seconds`, `node_timex_sync_status`), which
+the clock alerts in `alerts.yml` read. Price checks tolerate only 5 seconds of skew. Elements must run with `txindex=1` so HighStorm can
 reconcile confirmed request transactions after they leave the mempool. Protocol-wide
 fee budgets, burn reserves, and Tick lifetime are grouped under `service.protocol`.
 The legacy `service.user_requests` section remains accepted for existing deployments.

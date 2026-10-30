@@ -54,3 +54,25 @@ jobs:
         timeout-minutes: 20
         run: >
           cargo test --workspace --exclude contracts --all-targets --all-features --locked
+
+  prometheus:
+    name: Prometheus rules
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check scrape config and alert rules
+        working-directory: high-storm/prometheus
+        run: >
+          docker run --rm --entrypoint promtool
+          -v "$PWD:/etc/prometheus:ro" -w /etc/prometheus
+          prom/prometheus:v3.5.0 check config prometheus.yml
+
+      - name: Test alert rules
+        working-directory: high-storm/prometheus
+        run: >
+          docker run --rm --entrypoint promtool
+          -v "$PWD:/etc/prometheus:ro" -w /etc/prometheus
+          prom/prometheus:v3.5.0 test rules alerts.test.yml
