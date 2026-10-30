@@ -39,6 +39,7 @@ pub struct Database {
 pub struct PoolConnections {
     pub idle: usize,
     pub used: usize,
+    pub max: u32,
 }
 
 impl Database {
@@ -69,6 +70,7 @@ impl Database {
             used: usize::try_from(self.pool.size())
                 .unwrap_or(usize::MAX)
                 .saturating_sub(idle),
+            max: self.pool.options().get_max_connections(),
         }
     }
 

@@ -752,12 +752,13 @@ impl Burning {
             .pop_if_empty()
             .push("wallet")
             .push(&self.elements_rpc.wallet);
-        Ok(Client::new(
+        Ok(crate::monitoring::elements_client(
             url.as_str(),
             Auth::UserPass(
                 self.elements_rpc.username.clone(),
                 self.elements_rpc.password.clone(),
             ),
+            "burn",
         )?)
     }
 }

@@ -43,9 +43,10 @@ pub(super) fn tip_height() -> Option<u64> {
 
 /// Probes the node's Elements daemon until the process exits.
 pub fn spawn_elements_probe(config: &ElementsRpcConfig) -> Result<(), bitcoincore_rpc::Error> {
-    let client = Arc::new(Client::new(
+    let client = Arc::new(super::rpc::elements_client(
         &config.url,
         Auth::UserPass(config.username.clone(), config.password.clone()),
+        "probe",
     )?);
     tokio::spawn(async move {
         let mut probe = tokio::time::interval(PROBE_INTERVAL);
