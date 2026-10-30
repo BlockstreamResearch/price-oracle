@@ -1,5 +1,6 @@
 //! Prometheus metrics, served on the internal `service.metrics` listener.
 
+mod api;
 mod chain;
 mod elements;
 mod governance;
@@ -17,6 +18,11 @@ use metrics::{describe_counter, describe_gauge, describe_histogram, gauge};
 use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
 use metrics_util::MetricKindMask;
 
+pub(crate) use api::{
+    ApiConnection, record_api_connection_rejected, record_api_request, record_api_request_rejected,
+    record_ipc_rejected, record_operator_auth_failure, record_operator_change,
+    record_user_request_rejected,
+};
 pub(crate) use chain::{
     RenewalOutcome, record_chain_reorg, record_storm_eye_renewal, set_chain_safety_halt,
 };
@@ -233,6 +239,46 @@ fn describe() {
     describe_gauge!(
         names::PRICE_PEER_DEVIATION,
         "How far a peer's still-valid price is from this node's own, in basis points of its own; NaN while either is missing."
+    );
+    describe_gauge!(
+        names::API_CONNECTIONS_ACTIVE,
+        "External API connections open; the listener holds 256, and 16 per client IP."
+    );
+    describe_counter!(
+        names::API_CONNECTIONS_REJECTED,
+        "External API connections closed on accept, by limit: global or per_client."
+    );
+    describe_counter!(
+        names::API_REQUESTS_REJECTED,
+        "External API requests refused by a request limit, by reason."
+    );
+    describe_counter!(
+        names::API_REQUESTS,
+        "External API requests answered, by route template, method and status."
+    );
+    describe_histogram!(
+        names::API_REQUEST_DURATION,
+        "Time taken to answer an external API request, by route template."
+    );
+    describe_counter!(
+        names::OPERATOR_AUTH_FAILURES,
+        "Failed operator authentications, by reason."
+    );
+    describe_counter!(
+        names::USER_REQUESTS_REJECTED,
+        "User requests the API refused to register, by reason."
+    );
+    describe_counter!(
+        names::IPC_REJECTED,
+        "Operator IPC connections refused, by reason: no_credentials or uid."
+    );
+    describe_counter!(
+        names::OPERATOR_CHANGES,
+        "Operators added or removed over IPC, by action."
+    );
+    describe_gauge!(
+        names::OPERATORS,
+        "Operators allowed to use the operator API."
     );
     describe_counter!(
         names::NODE_MESSAGES_REJECTED,

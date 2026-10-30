@@ -82,6 +82,25 @@ pub enum AuthError {
     Store(#[from] crate::db::node_operator::Error),
 }
 
+impl AuthError {
+    /// Why an operator failed to authenticate; `None` for a failure of this
+    /// node's own.
+    pub(crate) fn failure_reason(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::InvalidPublicKey => "invalid_public_key",
+            Self::Unauthorized => "unknown_operator",
+            Self::InvalidChallenge => "invalid_challenge",
+            Self::InvalidToken => "invalid_token",
+            Self::InvalidSignature => "invalid_signature",
+            Self::InvalidSignatureScheme => "invalid_signature_scheme",
+            Self::InvalidTimestamp => "invalid_timestamp",
+            Self::InvalidNonce => "invalid_nonce",
+            Self::ReplayedNonce => "replayed_nonce",
+            Self::Clock | Self::Random | Self::Store(_) => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Challenge {
     pub message: String,
@@ -539,7 +558,10 @@ pub(super) async fn authenticate_bearer(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
+        .ok_or_else(|| {
+            crate::monitoring::record_operator_auth_failure("missing_token");
+            ApiError::unauthorized("missing bearer token")
+        })?;
     auth.authenticate_token(token).await?;
     Ok(())
 }

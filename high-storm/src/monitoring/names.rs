@@ -51,6 +51,17 @@ pub(super) const PRICE_PEER_ATTESTATION: &str =
     "high_storm_price_peer_attestation_timestamp_seconds";
 pub(super) const PRICE_PEER_DEVIATION: &str = "high_storm_price_peer_deviation_bps";
 
+pub(super) const API_CONNECTIONS_ACTIVE: &str = "high_storm_api_connections_active";
+pub(super) const API_CONNECTIONS_REJECTED: &str = "high_storm_api_connections_rejected_total";
+pub(super) const API_REQUESTS_REJECTED: &str = "high_storm_api_requests_rejected_total";
+pub(super) const API_REQUESTS: &str = "high_storm_api_requests_total";
+pub(super) const API_REQUEST_DURATION: &str = "high_storm_api_request_duration_seconds";
+pub(super) const OPERATOR_AUTH_FAILURES: &str = "high_storm_operator_auth_failures_total";
+pub(super) const USER_REQUESTS_REJECTED: &str = "high_storm_user_requests_rejected_total";
+pub(super) const IPC_REJECTED: &str = "high_storm_ipc_rejected_total";
+pub(super) const OPERATOR_CHANGES: &str = "high_storm_operator_changes_total";
+pub(super) const OPERATORS: &str = "high_storm_operators";
+
 pub(super) const NODE_MESSAGES_REJECTED: &str = "high_storm_node_messages_rejected_total";
 pub(super) const UNAUTHORIZED_MESSAGES: &str = "high_storm_unauthorized_messages_total";
 pub(super) const SIGNING_REFUSED: &str = "high_storm_signing_refused_total";

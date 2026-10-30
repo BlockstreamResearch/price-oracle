@@ -10,7 +10,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 
-use crate::db::node_operator::NodeOperatorStore;
+use crate::{db::node_operator::NodeOperatorStore, monitoring};
 
 const MAX_FRAME_SIZE: usize = 64 * 1024;
 
@@ -74,11 +74,13 @@ impl IpcServer {
                 Ok(credentials) => credentials.uid(),
                 Err(error) => {
                     tracing::warn!(%error, "rejected operator IPC connection without credentials");
+                    monitoring::record_ipc_rejected("no_credentials");
                     continue;
                 }
             };
             if !is_authorized_peer(self.owner_uid, peer_uid) {
                 tracing::warn!(peer_uid, "rejected unauthorized operator IPC connection");
+                monitoring::record_ipc_rejected("uid");
                 continue;
             }
             let operators = self.operators.clone();
@@ -161,13 +163,19 @@ async fn execute_command(
     };
     if add {
         match operators.add(public_key).await {
-            Ok(true) => NodeOperatorResponse::Added,
+            Ok(true) => {
+                monitoring::record_operator_change("add");
+                NodeOperatorResponse::Added
+            }
             Ok(false) => NodeOperatorResponse::AlreadyExists,
             Err(error) => NodeOperatorResponse::Error(error.to_string()),
         }
     } else {
         match operators.remove(public_key).await {
-            Ok(true) => NodeOperatorResponse::Removed,
+            Ok(true) => {
+                monitoring::record_operator_change("remove");
+                NodeOperatorResponse::Removed
+            }
             Ok(false) => NodeOperatorResponse::NotFound,
             Err(error) => NodeOperatorResponse::Error(error.to_string()),
         }
@@ -206,12 +214,50 @@ async fn read_frame<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T, E
 
 #[cfg(test)]
 mod tests {
-    use super::is_authorized_peer;
+    use super::*;
 
     #[test]
     fn authorizes_only_the_socket_owner_and_root() {
         assert!(is_authorized_peer(1000, 1000));
         assert!(is_authorized_peer(1000, 0));
         assert!(!is_authorized_peer(1000, 1001));
+    }
+
+    #[tokio::test]
+    async fn counts_only_the_operator_changes_that_happened() {
+        let operators = crate::db::Database::connect("sqlite::memory:", 1)
+            .await
+            .unwrap()
+            .node_operators();
+        let key = "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337";
+        let command = |add: bool| {
+            let public_key = key.to_owned();
+            if add {
+                NodeOperatorCommand::Add { public_key }
+            } else {
+                NodeOperatorCommand::Remove { public_key }
+            }
+        };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+
+        {
+            let _local = metrics::set_default_local_recorder(&recorder);
+            for add in [true, true] {
+                execute_command(&operators, command(add)).await;
+            }
+            assert_eq!(operators.count().await.unwrap(), 1);
+            for add in [false, false] {
+                execute_command(&operators, command(add)).await;
+            }
+        }
+
+        assert_eq!(operators.count().await.unwrap(), 0);
+        let rendered = recorder.handle().render();
+        for line in [
+            r#"high_storm_operator_changes_total{action="add"} 1"#,
+            r#"high_storm_operator_changes_total{action="remove"} 1"#,
+        ] {
+            assert!(rendered.contains(line), "missing {line:?} in:\n{rendered}");
+        }
     }
 }
