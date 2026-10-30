@@ -29,8 +29,8 @@ pub(crate) use governance::{
 pub(crate) use messages::{RejectedMessage, record_rejected_message};
 pub use prices::register_price_source;
 pub(crate) use prices::{
-    record_price_change, record_price_poll, record_price_poll_duration, record_price_poll_error,
-    record_price_poll_rejection,
+    record_price_attestation_rejected, record_price_change, record_price_poll,
+    record_price_poll_duration, record_price_poll_error, record_price_poll_rejection,
 };
 pub use refresh::{LoopTask, record_loop_tick, spawn_refresh};
 pub use rounds::spawn_db_gauges;
@@ -221,6 +221,18 @@ fn describe() {
     describe_gauge!(
         names::PRICE_CHANGE,
         "Change between a source's last two observations of a feed, in basis points."
+    );
+    describe_counter!(
+        names::PRICE_ATTESTATIONS_REJECTED,
+        "Price attestation messages from a peer that this node refused, by reason."
+    );
+    describe_gauge!(
+        names::PRICE_PEER_ATTESTATION,
+        "Unix time a peer's latest stored price for the feed was received by that peer."
+    );
+    describe_gauge!(
+        names::PRICE_PEER_DEVIATION,
+        "How far a peer's still-valid price is from this node's own, in basis points of its own; NaN while either is missing."
     );
     describe_counter!(
         names::NODE_MESSAGES_REJECTED,

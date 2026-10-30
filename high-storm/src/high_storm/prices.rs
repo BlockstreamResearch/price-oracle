@@ -50,6 +50,27 @@ pub enum PriceError {
     NotAMember(String),
 }
 
+impl PriceError {
+    /// Why a peer's attestations were refused; `None` for a failure of this
+    /// node's own, which says nothing about the peer.
+    pub(crate) fn rejection_reason(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::InvalidSignature(_) => "invalid_signature",
+            Self::InvalidPublicKey => "invalid_public_key",
+            Self::UnregisteredFeed(_) => "unregistered_feed",
+            Self::RepeatedFeed(_) => "repeated_feed",
+            Self::ImplausibleTimestamp(_) => "implausible_timestamp",
+            Self::StretchedValidity(_) => "stretched_validity",
+            Self::WrongDecimals(_) => "wrong_decimals",
+            Self::NotAMember(_) => "not_a_member",
+            Self::Encoding(_) => "decode",
+            Self::Database(_) | Self::Message(_) | Self::Transport(_) | Self::InvalidPeerKey(_) => {
+                return None;
+            }
+        })
+    }
+}
+
 /// What a client reads for one feed: this node's own attestation, and the
 /// ones it holds from the other members.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -306,16 +327,27 @@ impl Prices {
         message: NodeMessage,
         context: &StormContext,
     ) -> Result<(), PriceError> {
-        let announcement: AttestPriceMsg = message.decode_payload()?;
-        let peers = context.storm_handle.peers().await;
-        let members =
-            member_keys(&peers).map_err(|error| PriceError::InvalidPeerKey(error.to_string()))?;
-        check(
-            &announcement.attestations,
-            &members,
-            &self.registry,
-            self.clock.now(),
-        )?;
+        let checked = async {
+            let announcement: AttestPriceMsg = message.decode_payload()?;
+            let peers = context.storm_handle.peers().await;
+            let members = member_keys(&peers)
+                .map_err(|error| PriceError::InvalidPeerKey(error.to_string()))?;
+            check(
+                &announcement.attestations,
+                &members,
+                &self.registry,
+                self.clock.now(),
+            )?;
+            Ok::<_, PriceError>(announcement)
+        };
+        let announcement = checked.await.inspect_err(|error| {
+            if let Some(reason) = error.rejection_reason() {
+                monitoring::record_price_attestation_rejected(
+                    context.message_context.peer_public_key,
+                    reason,
+                );
+            }
+        })?;
 
         for attestation in &announcement.attestations {
             self.store.store_latest(attestation).await?;
@@ -661,6 +693,31 @@ mod tests {
 
         assert!(checked(whole_window).is_ok());
         assert!(checked(part_of_one).is_ok());
+    }
+
+    #[test]
+    fn blames_a_peer_only_for_what_it_sent() {
+        let ahead = PriceFeedData {
+            received_at: NOW + MAX_CLOCK_SKEW + 1,
+            ..feed()
+        };
+        let outsider = check(
+            &[attest(&keypair(9), feed())],
+            &members([1, 2]),
+            &FeedRegistry::default(),
+            NOW,
+        )
+        .unwrap_err();
+
+        assert_eq!(outsider.rejection_reason(), Some("not_a_member"));
+        assert_eq!(
+            checked(ahead).unwrap_err().rejection_reason(),
+            Some("implausible_timestamp")
+        );
+        assert_eq!(
+            PriceError::InvalidPeerKey("local peer table".into()).rejection_reason(),
+            None
+        );
     }
 
     #[test]

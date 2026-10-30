@@ -203,7 +203,7 @@ async fn record_database(database: &Database) {
     gauge!(names::DB_POOL_CONNECTIONS, "state" => "used").set(pool.used as f64);
 }
 
-fn unix_now() -> u64 {
+pub(super) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

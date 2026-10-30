@@ -73,8 +73,12 @@ impl CoinGecko {
             .send()
             .await
             .map_err(|_| ConnectionError::RequestFailure)?;
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(ConnectionError::RateLimited);
+        match response.status() {
+            reqwest::StatusCode::TOO_MANY_REQUESTS => return Err(ConnectionError::RateLimited),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                return Err(ConnectionError::Unauthorized);
+            }
+            _ => {}
         }
         let response = response
             .error_for_status()
