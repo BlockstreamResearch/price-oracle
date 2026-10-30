@@ -127,15 +127,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Served before discovery so that a node waiting for its peers is still scrapeable.
     let metrics_task = match config.service.metrics.address {
         Some(address) => {
-            let metrics = MetricsServer::bind(address, monitoring::install()?).await?;
+            let metrics = MetricsServer::bind(
+                address,
+                monitoring::install()?,
+                config.service.metrics.bearer_token.clone(),
+            )
+            .await?;
             tracing::info!(address = %metrics.local_addr()?, "metrics endpoint is listening");
             monitoring::spawn_elements_probe(&config.service.elements_rpc)?;
-            tokio::spawn(metrics.run())
+            // Monitoring never stops the signer; failed scrapes report it instead.
+            tokio::spawn(async move {
+                if let Err(error) = metrics.run().await {
+                    tracing::error!(%error, "metrics listener stopped; the node keeps running");
+                }
+            })
         }
         None => {
-            tracing::info!("service.metrics.address is not set; serving no metrics");
-            // Never finishes, so the main loop needs no separate case for it.
-            tokio::spawn(std::future::pending())
+            tracing::warn!("service.metrics.address is not set; serving no metrics");
+            tokio::spawn(async {})
         }
     };
 
@@ -267,7 +276,7 @@ async fn run_until_shutdown(
     store: &NetworkStore,
     ipc: IpcServer,
     external_api: ExternalApiServer,
-    metrics_task: JoinHandle<std::io::Result<()>>,
+    metrics_task: JoinHandle<()>,
     price_observed: &Notify,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reconnect = tokio::time::interval(Duration::from_secs(3));
@@ -305,7 +314,6 @@ async fn run_until_shutdown(
     tokio::pin!(ipc_task);
     let external_api_task = tokio::spawn(external_api.run());
     tokio::pin!(external_api_task);
-    tokio::pin!(metrics_task);
 
     loop {
         tokio::select! {
@@ -527,10 +535,6 @@ async fn run_until_shutdown(
             result = &mut external_api_task => {
                 result??;
                 return Err("external API listener stopped unexpectedly".into());
-            }
-            result = &mut metrics_task => {
-                result??;
-                return Err("metrics listener stopped unexpectedly".into());
             }
         }
     }

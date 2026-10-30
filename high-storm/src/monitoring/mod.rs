@@ -84,6 +84,10 @@ fn describe() {
         names::BUILD_INFO,
         "Always 1; the labels identify the running high-storm build."
     );
+    describe_counter!(
+        names::METRICS_CONNECTIONS_REJECTED,
+        "Connections to this metrics endpoint closed on accept because every slot was taken."
+    );
     describe_gauge!(
         names::LOOP_LAST_TICK,
         "Unix time at which each main loop task last started."
