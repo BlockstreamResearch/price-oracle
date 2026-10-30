@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use tokio::time::MissedTickBehavior;
 
 use super::{elements, names, refresh::set_retained};
@@ -23,6 +23,10 @@ pub(crate) fn record_issuance_round(outcome: &'static str) {
     counter!(names::ISSUANCE_ROUNDS, "outcome" => outcome).increment(1);
 }
 
+pub(crate) fn record_issuance_tx_weight(weight: usize) {
+    histogram!(names::ISSUANCE_TX_WEIGHT).record(weight as f64);
+}
+
 pub(crate) fn record_burns_reverted(count: u64) {
     counter!(names::BURNING_REVERTED).increment(count);
 }
@@ -32,7 +36,8 @@ pub(crate) fn record_user_request_failed(reason: &'static str) {
 }
 
 /// Reports monitored UTXOs, user requests, open votes, peer price
-/// attestations and operators from the database until the process exits.
+/// attestations, operators and balances from the database until the process
+/// exits.
 pub fn spawn_db_gauges(node: HighStormHandle, database: Database, tick_lifetime_blocks: u64) {
     tokio::spawn(async move {
         let mut refresh = tokio::time::interval(DB_GAUGES_INTERVAL);
@@ -80,6 +85,20 @@ pub fn spawn_db_gauges(node: HighStormHandle, database: Database, tick_lifetime_
             match database.node_operators().count().await {
                 Ok(count) => super::api::set_operators(count),
                 Err(error) => tracing::debug!(%error, "could not count operators"),
+            }
+            match database.droplets().treasury_utxos().await {
+                Ok(utxos) => set_retained(
+                    names::TREASURY_BALANCE,
+                    utxos.iter().map(|utxo| utxo.amount).sum::<u64>() as f64,
+                ),
+                Err(error) => tracing::debug!(%error, "could not read the Treasury UTXOs"),
+            }
+            match node.droplet_state().await {
+                Ok((balance, _)) => set_retained(
+                    names::DROPLETS_BALANCE,
+                    balance.map_or(0, |balance| balance.amount) as f64,
+                ),
+                Err(error) => tracing::debug!(%error, "could not read this node's Droplets"),
             }
         }
     });
@@ -133,6 +152,7 @@ mod tests {
                 &[("expired".into(), 3)],
             );
             record_burns_reverted(2);
+            record_issuance_tx_weight(42_000);
             record_burn_round("failed");
             record_user_request_failed("unpriced_feed");
         });
@@ -143,6 +163,8 @@ mod tests {
             r#"high_storm_monitored_utxos{state="active"} 0"#,
             r#"high_storm_monitored_utxos{state="unburnable"} 0"#,
             "high_storm_burning_reverted_total 2",
+            r#"high_storm_issuance_tx_weight_bucket{le="50000"} 1"#,
+            r#"high_storm_issuance_tx_weight_bucket{le="25000"} 0"#,
             r#"high_storm_burn_rounds_total{outcome="failed"} 1"#,
             r#"high_storm_user_requests_failed_total{reason="unpriced_feed"} 1"#,
         ] {

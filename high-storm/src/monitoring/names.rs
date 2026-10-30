@@ -91,6 +91,9 @@ pub(super) const USER_REQUEST_OLDEST_PENDING_AGE: &str =
     "high_storm_user_request_oldest_pending_age_blocks";
 pub(super) const USER_REQUESTS_FAILED: &str = "high_storm_user_requests_failed_total";
 pub(super) const ISSUANCE_ROUNDS: &str = "high_storm_issuance_rounds_total";
+pub(super) const ISSUANCE_TX_WEIGHT: &str = "high_storm_issuance_tx_weight";
+pub(super) const TREASURY_BALANCE: &str = "high_storm_treasury_balance_sats";
+pub(super) const DROPLETS_BALANCE: &str = "high_storm_droplets_balance_sats";
 
 pub(super) const VOTING_REQUESTS_CREATED: &str = "high_storm_voting_requests_created_total";
 pub(super) const VOTING_APPROVALS: &str = "high_storm_voting_approvals_total";
