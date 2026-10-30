@@ -17,12 +17,16 @@ pub(super) const PEER_LAST_SEEN: &str = "storm_peer_last_seen_timestamp_seconds"
 
 pub(super) const DB_UP: &str = "high_storm_db_up";
 pub(super) const DB_PING_DURATION: &str = "high_storm_db_ping_duration_seconds";
+pub(super) const DB_POOL_MAX_CONNECTIONS: &str = "high_storm_db_pool_max_connections";
 pub(super) const DB_POOL_CONNECTIONS: &str = "high_storm_db_pool_connections";
 
 pub(super) const ELEMENTS_RPC_UP: &str = "high_storm_elements_rpc_up";
 pub(super) const ELEMENTS_TIP_HEIGHT: &str = "high_storm_elements_tip_height";
 pub(super) const ELEMENTS_TIP_TIMESTAMP: &str = "high_storm_elements_tip_timestamp_seconds";
 pub(super) const ELEMENTS_PEERS: &str = "high_storm_elements_peers";
+pub(super) const ELEMENTS_RPC_ERRORS: &str = "high_storm_elements_rpc_errors_total";
+pub(super) const ELEMENTS_RPC_DURATION: &str = "high_storm_elements_rpc_duration_seconds";
+pub(super) const TX_BROADCASTS: &str = "high_storm_tx_broadcast_total";
 pub(super) const ELEMENTS_INITIAL_BLOCK_DOWNLOAD: &str =
     "high_storm_elements_initial_block_download";
 

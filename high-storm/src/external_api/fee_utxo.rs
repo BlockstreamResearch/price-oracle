@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Auth, RpcApi};
 use contracts::artifacts::account::{AccountProgram, derived_account::AccountArguments};
 use serde::Deserialize;
 use serde_json::{Number, Value};
@@ -188,7 +188,7 @@ fn validate_with_rpc(
     storm_eye_asset_id: [u8; 32],
     minimum_value: u64,
 ) -> Result<(), FeeUtxoValidationError> {
-    let client = Client::new(rpc_url, auth)?;
+    let client = crate::monitoring::elements_client(rpc_url, auth, "fee_utxo_check")?;
     let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
     let network = match chain.chain.as_str() {
         "liquidv1" => SimplicityNetwork::Liquid,

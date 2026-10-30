@@ -202,6 +202,7 @@ async fn record_database(database: &Database) {
     let pool = database.pool_connections();
     gauge!(names::DB_POOL_CONNECTIONS, "state" => "idle").set(pool.idle as f64);
     gauge!(names::DB_POOL_CONNECTIONS, "state" => "used").set(pool.used as f64);
+    gauge!(names::DB_POOL_MAX_CONNECTIONS).set(f64::from(pool.max));
 }
 
 pub(super) fn unix_now() -> u64 {
@@ -378,5 +379,6 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(connections("idle") + connections("used"), 1.0);
+        assert!(rendered.contains("high_storm_db_pool_max_connections 1"));
     }
 }

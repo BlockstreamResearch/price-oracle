@@ -9,6 +9,7 @@ mod names;
 mod prices;
 mod refresh;
 mod rounds;
+mod rpc;
 mod server;
 mod signing;
 
@@ -43,6 +44,7 @@ pub use rounds::spawn_db_gauges;
 pub(crate) use rounds::{
     record_burn_round, record_burns_reverted, record_issuance_round, record_user_request_failed,
 };
+pub(crate) use rpc::elements_client;
 pub use server::MetricsServer;
 pub(crate) use signing::{
     record_aggregate_invalid, record_invalid_partial_signatures,
@@ -145,6 +147,10 @@ fn describe() {
         "Database pool connections, by state."
     );
     describe_gauge!(
+        names::DB_POOL_MAX_CONNECTIONS,
+        "Connections the database pool may open; the probe fails when all are used."
+    );
+    describe_gauge!(
         names::ELEMENTS_RPC_UP,
         "1 if the last probe of this node's Elements RPC succeeded."
     );
@@ -163,6 +169,18 @@ fn describe() {
     describe_gauge!(
         names::ELEMENTS_INITIAL_BLOCK_DOWNLOAD,
         "1 while Elements is in initial block download."
+    );
+    describe_counter!(
+        names::ELEMENTS_RPC_ERRORS,
+        "Failed Elements RPC calls, by method and reason: transport when Elements did not answer, rpc when it answered with an error."
+    );
+    describe_histogram!(
+        names::ELEMENTS_RPC_DURATION,
+        "Time an Elements RPC call took, by method."
+    );
+    describe_counter!(
+        names::TX_BROADCASTS,
+        "Transactions sent to Elements, by kind and outcome: accepted, inputs_spent (also a confirmed one resent), rejected or failed."
     );
     describe_counter!(
         names::CHAIN_REORGS,
