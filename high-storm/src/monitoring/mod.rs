@@ -42,7 +42,8 @@ pub(crate) use prices::{
 pub use refresh::{LoopTask, record_loop_tick, spawn_refresh};
 pub use rounds::spawn_db_gauges;
 pub(crate) use rounds::{
-    record_burn_round, record_burns_reverted, record_issuance_round, record_user_request_failed,
+    record_burn_round, record_burns_reverted, record_issuance_round, record_issuance_tx_weight,
+    record_user_request_failed,
 };
 pub(crate) use rpc::elements_client;
 pub use server::MetricsServer;
@@ -55,6 +56,11 @@ pub(crate) use signing::{
 /// Covers fast database probes up to the 60s signing session timeout.
 const DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
+/// Up to Elements' standard limit of 400,000 weight units.
+const WEIGHT_BUCKETS: &[f64] = &[
+    10_000.0, 25_000.0, 50_000.0, 100_000.0, 200_000.0, 300_000.0, 400_000.0,
 ];
 
 /// Drops a gauge nothing has set for this long, such as one for a peer that
@@ -77,6 +83,10 @@ fn builder() -> Result<PrometheusBuilder, BuildError> {
         .set_buckets_for_metric(
             Matcher::Suffix("_duration_seconds".into()),
             DURATION_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full(names::ISSUANCE_TX_WEIGHT.into()),
+            WEIGHT_BUCKETS,
         )?
         .idle_timeout(MetricKindMask::GAUGE, Some(GAUGE_IDLE_TIMEOUT)))
 }
@@ -365,6 +375,18 @@ fn describe() {
     describe_counter!(
         names::USER_REQUESTS_FAILED,
         "User requests marked failed, by reason."
+    );
+    describe_histogram!(
+        names::ISSUANCE_TX_WEIGHT,
+        "Weight of each issuance transaction this node broadcast, in weight units."
+    );
+    describe_gauge!(
+        names::TREASURY_BALANCE,
+        "Sats held in Treasury UTXOs, as this node indexed them."
+    );
+    describe_gauge!(
+        names::DROPLETS_BALANCE,
+        "Droplets credited to this node, in sats."
     );
     describe_counter!(
         names::ISSUANCE_ROUNDS,

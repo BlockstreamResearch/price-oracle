@@ -890,6 +890,7 @@ impl UserRequestProcessor {
                 "broadcast transaction id mismatch".into(),
             ));
         }
+        crate::monitoring::record_issuance_tx_weight(final_tx.weight());
 
         fn verify_tx_amt_proofs(
             transaction: &simplex::simplicityhl::elements::Transaction,
