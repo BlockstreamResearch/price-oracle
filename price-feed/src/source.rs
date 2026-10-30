@@ -41,6 +41,10 @@ pub enum ConnectionError {
     #[error("the source refused the request as too many")]
     // HTTP 429
     RateLimited,
+
+    #[error("the source refused the credentials it was sent")]
+    // HTTP 401 or 403: a missing, invalid or expired API key
+    Unauthorized,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
