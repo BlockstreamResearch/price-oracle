@@ -30,7 +30,10 @@ pub fn spawn(
         let (node, source) = (node.clone(), source.clone());
         let poll = move || {
             let (node, source) = (node.clone(), source.clone());
-            async move { node.poll_price_source(feed, COINGECKO, &*source).await }
+            async move {
+                node.poll_price_source(feed, COINGECKO, COINGECKO_NAME, &*source)
+                    .await
+            }
         };
         tokio::spawn(run(poll, observed.clone()));
     }

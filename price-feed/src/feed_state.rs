@@ -60,10 +60,12 @@ impl FeedState {
 
     /// What `StaleObservation` compares the source's next observation against.
     pub fn last_observed_at(&self, source: usize) -> Option<u64> {
-        self.sources
-            .get(&source)?
-            .observation
+        self.last_observation(source)
             .map(|observation| observation.observed_at)
+    }
+
+    pub fn last_observation(&self, source: usize) -> Option<SourceObservation> {
+        self.sources.get(&source)?.observation
     }
 
     /// Whether this cycle polls the source: active ones always, dropped ones

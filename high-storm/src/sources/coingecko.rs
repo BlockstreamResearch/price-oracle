@@ -72,7 +72,12 @@ impl CoinGecko {
         let response = request
             .send()
             .await
-            .and_then(reqwest::Response::error_for_status)
+            .map_err(|_| ConnectionError::RequestFailure)?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(ConnectionError::RateLimited);
+        }
+        let response = response
+            .error_for_status()
             .map_err(|_| ConnectionError::RequestFailure)?;
         response
             .json()

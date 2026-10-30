@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use price_feed::{
     Clock, FeedAvailability, FeedId, FeedRegistry, FeedStates, PriceFeedData, PriceSource,
@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::crypto::tagged_hash;
 use crate::db::price_attestation::PriceAttestationStore;
+use crate::monitoring;
 
 use super::{
     AttestPriceMsg, NodeMessage, NodeMessageKind, PriceAttestation,
@@ -77,6 +78,17 @@ pub enum PollOutcome {
     Unchanged,
     /// Unreachable, unreadable or rejected, counting towards a drop.
     Failed,
+}
+
+impl PollOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Observed => "observed",
+            Self::Unchanged => "unchanged",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// A polled source as this node holds it now.
@@ -170,11 +182,24 @@ impl Prices {
     }
 
     /// Polls `source`, the one at `index` in the feed's state, if that state
-    /// allows it, and records what it answered.
+    /// allows it, and records what it answered. `name` labels its metrics.
     pub(crate) async fn poll<S: PriceSource>(
         &self,
         feed: FeedId,
         index: usize,
+        name: &'static str,
+        source: &S,
+    ) -> PollOutcome {
+        let outcome = self.poll_source(feed, index, name, source).await;
+        monitoring::record_price_poll(feed, name, outcome);
+        outcome
+    }
+
+    async fn poll_source<S: PriceSource>(
+        &self,
+        feed: FeedId,
+        index: usize,
+        name: &'static str,
         source: &S,
     ) -> PollOutcome {
         let pollable = self
@@ -187,7 +212,9 @@ impl Prices {
             return PollOutcome::Skipped;
         }
         // Not locked while the source answers, so a slow one never holds the feeds.
+        let started = Instant::now();
         let answer = source.poll(feed).await;
+        monitoring::record_price_poll_duration(name, started.elapsed());
 
         let mut feeds = self.feeds.lock().await;
         let Some(state) = feeds.get_mut(feed) else {
@@ -196,18 +223,23 @@ impl Prices {
         match answer {
             Ok(observation) => match S::validate(&observation, state.last_observed_at(index)) {
                 Ok(()) => {
+                    if let Some(previous) = state.last_observation(index) {
+                        monitoring::record_price_change(feed, name, &previous, &observation);
+                    }
                     state.record_poll_success(index, observation);
                     PollOutcome::Observed
                 }
                 Err(RejectionReason::StaleObservation) => PollOutcome::Unchanged,
                 Err(reason) => {
                     tracing::debug!(feed, source = index, %reason, "rejected a price observation");
+                    monitoring::record_price_poll_rejection(name, reason);
                     state.record_poll_failure(index);
                     PollOutcome::Failed
                 }
             },
             Err(error) => {
                 tracing::debug!(feed, source = index, %error, "failed to poll a price source");
+                monitoring::record_price_poll_error(name, error);
                 state.record_poll_failure(index);
                 PollOutcome::Failed
             }
@@ -813,7 +845,7 @@ mod tests {
         let prices = prices().await;
         let source = Fake::answering(Ok(SourceObservation::new(100, 8, NOW, NOW)));
         assert_eq!(
-            prices.poll(LBTC_USD, 0, &source).await,
+            prices.poll(LBTC_USD, 0, "test", &source).await,
             PollOutcome::Observed
         );
 
@@ -941,25 +973,58 @@ mod tests {
 
         for _ in 0..MAX_POLLING_ERROR_NUM {
             assert_eq!(
-                prices.poll(LBTC_USD, 0, &unreachable).await,
+                prices.poll(LBTC_USD, 0, "test", &unreachable).await,
                 PollOutcome::Failed
             );
             assert_eq!(
-                prices.poll(LBTC_USD, 1, &rejected).await,
+                prices.poll(LBTC_USD, 1, "test", &rejected).await,
                 PollOutcome::Failed
             );
         }
 
         // Both are dropped, so neither is polled until `POLLING_RETRY_TIME`.
         assert_eq!(
-            prices.poll(LBTC_USD, 0, &unreachable).await,
+            prices.poll(LBTC_USD, 0, "test", &unreachable).await,
             PollOutcome::Skipped
         );
         assert_eq!(
-            prices.poll(LBTC_USD, 1, &rejected).await,
+            prices.poll(LBTC_USD, 1, "test", &rejected).await,
             PollOutcome::Skipped
         );
         assert_eq!(unreachable.polls(), MAX_POLLING_ERROR_NUM as usize);
+    }
+
+    #[tokio::test]
+    async fn counts_each_poll_and_the_change_between_observations() {
+        let prices = prices().await;
+        let first = Fake::answering(Ok(SourceObservation::new(100_000, 8, NOW - 10, NOW)));
+        let moved = Fake::answering(Ok(SourceObservation::new(112_000, 8, NOW - 5, NOW)));
+        let limited = Fake::answering(Err(ConnectionError::RateLimited));
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+
+        {
+            let _local = metrics::set_default_local_recorder(&recorder);
+            for (index, source, outcome) in [
+                (0, &first, PollOutcome::Observed),
+                (0, &moved, PollOutcome::Observed),
+                (0, &moved, PollOutcome::Unchanged),
+                (1, &limited, PollOutcome::Failed),
+            ] {
+                assert_eq!(prices.poll(LBTC_USD, index, "test", source).await, outcome);
+            }
+        }
+
+        let rendered = recorder.handle().render();
+        for line in [
+            r#"high_storm_price_polls_total{feed="LBTC/USD",source="test",outcome="observed"} 2"#,
+            r#"high_storm_price_polls_total{feed="LBTC/USD",source="test",outcome="unchanged"} 1"#,
+            r#"high_storm_price_polls_total{feed="LBTC/USD",source="test",outcome="failed"} 1"#,
+            r#"high_storm_price_poll_failures_total{source="test",reason="rate_limited"} 1"#,
+            r#"high_storm_price_poll_duration_seconds_count{source="test"} 4"#,
+            r#"high_storm_price_change_bps{feed="LBTC/USD",source="test"} 1200"#,
+        ] {
+            assert!(rendered.contains(line), "missing {line:?} in:\n{rendered}");
+        }
     }
 
     #[tokio::test]
@@ -968,12 +1033,12 @@ mod tests {
         let stuck = Fake::answering(Ok(SourceObservation::new(100, 8, NOW, NOW)));
 
         assert_eq!(
-            prices.poll(LBTC_USD, 0, &stuck).await,
+            prices.poll(LBTC_USD, 0, "test", &stuck).await,
             PollOutcome::Observed
         );
         for _ in 0..=MAX_POLLING_ERROR_NUM {
             assert_eq!(
-                prices.poll(LBTC_USD, 0, &stuck).await,
+                prices.poll(LBTC_USD, 0, "test", &stuck).await,
                 PollOutcome::Unchanged
             );
         }
