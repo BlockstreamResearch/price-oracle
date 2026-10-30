@@ -37,6 +37,10 @@ pub enum ConnectionError {
     #[error("the source answer is unparseable or missing fields")]
     // answered, but unparseable or missing fields
     MalformedResponse,
+
+    #[error("the source refused the request as too many")]
+    // HTTP 429
+    RateLimited,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]

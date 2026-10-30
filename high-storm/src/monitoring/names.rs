@@ -42,6 +42,10 @@ pub(super) const PRICE_FEED_ACTIVE_SOURCES: &str = "high_storm_price_feed_active
 pub(super) const PRICE_SOURCE_STATE: &str = "high_storm_price_source_state";
 pub(super) const PRICE_SOURCE_LAST_OBSERVED: &str =
     "high_storm_price_source_last_observed_timestamp_seconds";
+pub(super) const PRICE_POLLS: &str = "high_storm_price_polls_total";
+pub(super) const PRICE_POLL_FAILURES: &str = "high_storm_price_poll_failures_total";
+pub(super) const PRICE_POLL_DURATION: &str = "high_storm_price_poll_duration_seconds";
+pub(super) const PRICE_CHANGE: &str = "high_storm_price_change_bps";
 
 pub(super) const NODE_MESSAGES_REJECTED: &str = "high_storm_node_messages_rejected_total";
 pub(super) const UNAUTHORIZED_MESSAGES: &str = "high_storm_unauthorized_messages_total";

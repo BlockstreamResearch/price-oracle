@@ -28,6 +28,10 @@ pub(crate) use governance::{
 };
 pub(crate) use messages::{RejectedMessage, record_rejected_message};
 pub use prices::register_price_source;
+pub(crate) use prices::{
+    record_price_change, record_price_poll, record_price_poll_duration, record_price_poll_error,
+    record_price_poll_rejection,
+};
 pub use refresh::{LoopTask, record_loop_tick, spawn_refresh};
 pub use rounds::spawn_db_gauges;
 pub(crate) use rounds::{
@@ -201,6 +205,22 @@ fn describe() {
     describe_gauge!(
         names::PRICE_SOURCE_LAST_OBSERVED,
         "Unix time the source itself stamped its latest kept observation."
+    );
+    describe_counter!(
+        names::PRICE_POLLS,
+        "Polls of a feed's source, by outcome: observed, unchanged, failed or skipped."
+    );
+    describe_counter!(
+        names::PRICE_POLL_FAILURES,
+        "Failed polls of a source, by reason."
+    );
+    describe_histogram!(
+        names::PRICE_POLL_DURATION,
+        "Time a source took to answer a poll, failed polls included."
+    );
+    describe_gauge!(
+        names::PRICE_CHANGE,
+        "Change between a source's last two observations of a feed, in basis points."
     );
     describe_counter!(
         names::NODE_MESSAGES_REJECTED,
