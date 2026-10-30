@@ -54,6 +54,10 @@ pub struct ServiceConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct MetricsConfig {
     pub address: Option<SocketAddr>,
+    /// When set, `/metrics` answers only requests that carry it as a bearer
+    /// token, since the metrics show which members are reachable and who
+    /// coordinates.
+    pub bearer_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -279,7 +283,7 @@ max_connections = 5
     #[test]
     fn parses_metrics_section() {
         let config: Config = toml::from_str(&format!(
-            "{}\n[service.metrics]\naddress = \"0.0.0.0:9400\"\n",
+            "{}\n[service.metrics]\naddress = \"0.0.0.0:9400\"\nbearer_token = \"secret\"\n",
             config_with_protocol_section("protocol")
         ))
         .unwrap();
@@ -287,6 +291,10 @@ max_connections = 5
         assert_eq!(
             config.service.metrics.address,
             Some("0.0.0.0:9400".parse::<SocketAddr>().unwrap())
+        );
+        assert_eq!(
+            config.service.metrics.bearer_token.as_deref(),
+            Some("secret")
         );
     }
 

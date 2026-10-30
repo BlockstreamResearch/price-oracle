@@ -1,3 +1,5 @@
+pub(super) const METRICS_CONNECTIONS_REJECTED: &str =
+    "high_storm_metrics_connections_rejected_total";
 pub(super) const BUILD_INFO: &str = "high_storm_build_info";
 
 pub(super) const LOOP_LAST_TICK: &str = "high_storm_loop_last_tick_timestamp_seconds";
