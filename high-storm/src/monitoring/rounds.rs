@@ -3,7 +3,12 @@ use std::time::Duration;
 use metrics::{counter, gauge, histogram};
 use tokio::time::MissedTickBehavior;
 
-use super::{elements, names, refresh::set_retained};
+use super::{
+    elements,
+    health::{MonitoringTask, record_task_error, record_task_run},
+    names,
+    refresh::set_retained,
+};
 use crate::{HighStormHandle, db::Database};
 
 /// These gauges need `GROUP BY` queries, too heavy for the 5s refresh.
@@ -52,14 +57,20 @@ pub fn spawn_db_gauges(node: HighStormHandle, database: Database, tick_lifetime_
                 Ok(counts) => {
                     record_counts(names::MONITORED_UTXOS, "state", &UTXO_STATUSES, &counts)
                 }
-                Err(error) => tracing::debug!(%error, "could not count monitored UTXOs"),
+                Err(error) => {
+                    record_task_error(MonitoringTask::DbGauges);
+                    tracing::debug!(%error, "could not count monitored UTXOs");
+                }
             }
             match utxos.oldest_unburned_block_height().await {
                 Ok(oldest) => set_retained(
                     names::EXPIRED_UTXO_OLDEST_AGE,
                     expired_age_blocks(oldest, tick_lifetime_blocks, tip) as f64,
                 ),
-                Err(error) => tracing::debug!(%error, "could not read the oldest unburned UTXO"),
+                Err(error) => {
+                    record_task_error(MonitoringTask::DbGauges);
+                    tracing::debug!(%error, "could not read the oldest unburned UTXO");
+                }
             }
             let requests = database.user_requests();
             match requests.count_by_status().await {
@@ -69,7 +80,10 @@ pub fn spawn_db_gauges(node: HighStormHandle, database: Database, tick_lifetime_
                     &USER_REQUEST_STATUSES,
                     &counts,
                 ),
-                Err(error) => tracing::debug!(%error, "could not count user requests"),
+                Err(error) => {
+                    record_task_error(MonitoringTask::DbGauges);
+                    tracing::debug!(%error, "could not count user requests");
+                }
             }
             match requests.oldest_open_block_height().await {
                 Ok(oldest) => set_retained(
@@ -77,29 +91,40 @@ pub fn spawn_db_gauges(node: HighStormHandle, database: Database, tick_lifetime_
                     oldest.map_or(0, |height| tip.saturating_sub(height)) as f64,
                 ),
                 Err(error) => {
-                    tracing::debug!(%error, "could not read the oldest open user request")
+                    record_task_error(MonitoringTask::DbGauges);
+                    tracing::debug!(%error, "could not read the oldest open user request");
                 }
             }
             super::governance::record_open_votings(&node).await;
             super::prices::record_peer_attestations(&node).await;
             match database.node_operators().count().await {
                 Ok(count) => super::api::set_operators(count),
-                Err(error) => tracing::debug!(%error, "could not count operators"),
+                Err(error) => {
+                    record_task_error(MonitoringTask::DbGauges);
+                    tracing::debug!(%error, "could not count operators");
+                }
             }
             match database.droplets().treasury_utxos().await {
                 Ok(utxos) => set_retained(
                     names::TREASURY_BALANCE,
                     utxos.iter().map(|utxo| utxo.amount).sum::<u64>() as f64,
                 ),
-                Err(error) => tracing::debug!(%error, "could not read the Treasury UTXOs"),
+                Err(error) => {
+                    record_task_error(MonitoringTask::DbGauges);
+                    tracing::debug!(%error, "could not read the Treasury UTXOs");
+                }
             }
             match node.droplet_state().await {
                 Ok((balance, _)) => set_retained(
                     names::DROPLETS_BALANCE,
                     balance.map_or(0, |balance| balance.amount) as f64,
                 ),
-                Err(error) => tracing::debug!(%error, "could not read this node's Droplets"),
+                Err(error) => {
+                    record_task_error(MonitoringTask::DbGauges);
+                    tracing::debug!(%error, "could not read this node's Droplets");
+                }
             }
+            record_task_run(MonitoringTask::DbGauges);
         }
     });
 }
