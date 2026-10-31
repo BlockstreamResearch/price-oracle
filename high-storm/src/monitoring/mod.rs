@@ -4,6 +4,7 @@ mod api;
 mod chain;
 mod elements;
 mod governance;
+mod health;
 mod messages;
 mod names;
 mod prices;
@@ -95,6 +96,14 @@ fn describe() {
     describe_gauge!(
         names::BUILD_INFO,
         "Always 1; the labels identify the running high-storm build."
+    );
+    describe_gauge!(
+        names::MONITORING_TASK_LAST_RUN,
+        "Unix time each background metrics task last finished a pass; stale or missing means its gauges are too."
+    );
+    describe_counter!(
+        names::MONITORING_TASK_ERRORS,
+        "Reads a background metrics task failed, leaving the gauges they feed at their last values."
     );
     describe_counter!(
         names::METRICS_CONNECTIONS_REJECTED,

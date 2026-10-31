@@ -64,6 +64,7 @@ pub fn spawn_elements_probe(config: &ElementsRpcConfig) -> Result<(), bitcoincor
                 TIP_HEIGHT.store(status.tip_height, Ordering::Relaxed);
             }
             record_status(status.is_some(), last_known.as_ref());
+            super::health::record_task_run(super::health::MonitoringTask::ElementsProbe);
         }
     });
     Ok(())

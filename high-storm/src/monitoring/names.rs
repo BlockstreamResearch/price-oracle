@@ -1,3 +1,6 @@
+pub(super) const MONITORING_TASK_LAST_RUN: &str =
+    "high_storm_monitoring_task_last_run_timestamp_seconds";
+pub(super) const MONITORING_TASK_ERRORS: &str = "high_storm_monitoring_task_errors_total";
 pub(super) const METRICS_CONNECTIONS_REJECTED: &str =
     "high_storm_metrics_connections_rejected_total";
 pub(super) const BUILD_INFO: &str = "high_storm_build_info";

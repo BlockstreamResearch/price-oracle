@@ -12,7 +12,11 @@ use storm::{Peer, PeerStatus};
 use storm_tree::StormTree;
 use tokio::time::{Instant, MissedTickBehavior};
 
-use super::{flag, names, record_build_info};
+use super::{
+    flag,
+    health::{MonitoringTask, record_task_run},
+    names, record_build_info,
+};
 use crate::{HighStormHandle, db::Database};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -98,6 +102,7 @@ pub fn spawn_refresh(node: HighStormHandle, database: Database) {
             record_node(&NodeSnapshot::read(&node).await);
             super::prices::record_prices(&node).await;
             record_database(&database).await;
+            record_task_run(MonitoringTask::Refresh);
         }
     });
 }
