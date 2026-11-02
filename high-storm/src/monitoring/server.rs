@@ -242,6 +242,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serves_process_metrics() {
+        let recorder = builder().unwrap().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+
+        let response = router(handle, None)
+            .oneshot(request("/metrics"))
+            .await
+            .unwrap();
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("process_resident_memory_bytes")
+        );
+    }
+
+    #[tokio::test]
     async fn serves_nothing_else() {
         let handle = builder().unwrap().build_recorder().handle();
 
