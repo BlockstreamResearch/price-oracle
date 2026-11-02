@@ -12,6 +12,18 @@ use crate::{
     telemetry::{self, Direction},
 };
 
+/// Resolved apart from connecting, so a DNS failure can be told apart.
+pub(crate) async fn connect_tcp(
+    peer_public_key: [u8; 33],
+    socket_address: String,
+) -> std::io::Result<TcpStream> {
+    let addresses = lookup_host(socket_address)
+        .await
+        .inspect_err(|_| telemetry::record_dns_failure(peer_public_key))?
+        .collect::<Vec<_>>();
+    TcpStream::connect(addresses.as_slice()).await
+}
+
 impl StormHandle {
     /// Overrides an identity's endpoint in current and future peer tables.
     ///
@@ -365,17 +377,12 @@ impl StormHandle {
         initializer_secret_key: &[u8],
         listener_port: Option<u16>,
     ) -> Result<(), Error> {
-        // Resolved apart from connecting, so a DNS failure can be told apart.
-        let connect = async {
-            let addresses = lookup_host(socket_address)
-                .await
-                .inspect_err(|_| telemetry::record_dns_failure(peer_public_key))?
-                .collect::<Vec<_>>();
-            TcpStream::connect(addresses.as_slice()).await
-        };
-        let mut stream = timeout(constants::CONNECT_TIMEOUT, connect)
-            .await
-            .map_err(|_| telemetry::timed_out("connect", "connecting to a peer"))??;
+        let mut stream = timeout(
+            constants::CONNECT_TIMEOUT,
+            connect_tcp(peer_public_key, socket_address),
+        )
+        .await
+        .map_err(|_| telemetry::timed_out("connect", "connecting to a peer"))??;
         let transport = timeout(
             constants::HANDSHAKE_TIMEOUT,
             Storm::perform_initiator_handshake(

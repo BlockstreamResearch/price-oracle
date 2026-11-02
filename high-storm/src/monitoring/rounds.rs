@@ -9,7 +9,13 @@ use super::{
     names,
     refresh::set_retained,
 };
-use crate::{HighStormHandle, db::Database};
+use crate::{
+    HighStormHandle,
+    db::{
+        Database,
+        droplet::{DropletBalance, TreasuryUtxo},
+    },
+};
 
 /// These gauges need `GROUP BY` queries, too heavy for the 5s refresh.
 const DB_GAUGES_INTERVAL: Duration = Duration::from_secs(30);
@@ -63,10 +69,7 @@ pub fn spawn_db_gauges(node: HighStormHandle, database: Database, tick_lifetime_
                 }
             }
             match utxos.oldest_unburned_block_height().await {
-                Ok(oldest) => set_retained(
-                    names::EXPIRED_UTXO_OLDEST_AGE,
-                    expired_age_blocks(oldest, tick_lifetime_blocks, tip) as f64,
-                ),
+                Ok(oldest) => record_expired_utxo_age(oldest, tick_lifetime_blocks, tip),
                 Err(error) => {
                     record_task_error(MonitoringTask::DbGauges);
                     tracing::debug!(%error, "could not read the oldest unburned UTXO");
@@ -86,10 +89,7 @@ pub fn spawn_db_gauges(node: HighStormHandle, database: Database, tick_lifetime_
                 }
             }
             match requests.oldest_open_block_height().await {
-                Ok(oldest) => set_retained(
-                    names::USER_REQUEST_OLDEST_PENDING_AGE,
-                    oldest.map_or(0, |height| tip.saturating_sub(height)) as f64,
-                ),
+                Ok(oldest) => record_oldest_open_request_age(oldest, tip),
                 Err(error) => {
                     record_task_error(MonitoringTask::DbGauges);
                     tracing::debug!(%error, "could not read the oldest open user request");
@@ -105,20 +105,14 @@ pub fn spawn_db_gauges(node: HighStormHandle, database: Database, tick_lifetime_
                 }
             }
             match database.droplets().treasury_utxos().await {
-                Ok(utxos) => set_retained(
-                    names::TREASURY_BALANCE,
-                    utxos.iter().map(|utxo| utxo.amount).sum::<u64>() as f64,
-                ),
+                Ok(utxos) => record_treasury_balance(&utxos),
                 Err(error) => {
                     record_task_error(MonitoringTask::DbGauges);
                     tracing::debug!(%error, "could not read the Treasury UTXOs");
                 }
             }
             match node.droplet_state().await {
-                Ok((balance, _)) => set_retained(
-                    names::DROPLETS_BALANCE,
-                    balance.map_or(0, |balance| balance.amount) as f64,
-                ),
+                Ok((balance, _)) => record_droplets_balance(balance.as_ref()),
                 Err(error) => {
                     record_task_error(MonitoringTask::DbGauges);
                     tracing::debug!(%error, "could not read this node's Droplets");
@@ -127,6 +121,36 @@ pub fn spawn_db_gauges(node: HighStormHandle, database: Database, tick_lifetime_
             record_task_run(MonitoringTask::DbGauges);
         }
     });
+}
+
+fn record_expired_utxo_age(oldest_issued: Option<u64>, tick_lifetime_blocks: u64, tip: u64) {
+    set_retained(
+        names::EXPIRED_UTXO_OLDEST_AGE,
+        expired_age_blocks(oldest_issued, tick_lifetime_blocks, tip) as f64,
+    );
+}
+
+/// 0 when no request is waiting.
+fn record_oldest_open_request_age(oldest_submitted: Option<u64>, tip: u64) {
+    set_retained(
+        names::USER_REQUEST_OLDEST_PENDING_AGE,
+        oldest_submitted.map_or(0, |height| tip.saturating_sub(height)) as f64,
+    );
+}
+
+fn record_treasury_balance(utxos: &[TreasuryUtxo]) {
+    set_retained(
+        names::TREASURY_BALANCE,
+        utxos.iter().map(|utxo| utxo.amount).sum::<u64>() as f64,
+    );
+}
+
+/// 0 when nothing was credited to this node.
+fn record_droplets_balance(balance: Option<&DropletBalance>) {
+    set_retained(
+        names::DROPLETS_BALANCE,
+        balance.map_or(0, |balance| balance.amount) as f64,
+    );
 }
 
 /// Every known status is reported, a missing one as 0, so a count that drops
@@ -177,6 +201,22 @@ mod tests {
                 &[("expired".into(), 3)],
             );
             record_burns_reverted(2);
+            record_issuance_round("broadcast");
+            record_expired_utxo_age(Some(100), 60, 185);
+            record_oldest_open_request_age(Some(90), 100);
+            record_treasury_balance(&[
+                TreasuryUtxo {
+                    txid: [1; 32],
+                    output_index: 0,
+                    amount: 1_500,
+                },
+                TreasuryUtxo {
+                    txid: [2; 32],
+                    output_index: 1,
+                    amount: 500,
+                },
+            ]);
+            record_droplets_balance(None);
             record_issuance_tx_weight(42_000);
             record_burn_round("failed");
             record_user_request_failed("unpriced_feed");
@@ -191,6 +231,11 @@ mod tests {
             r#"high_storm_issuance_tx_weight_bucket{le="50000"} 1"#,
             r#"high_storm_issuance_tx_weight_bucket{le="25000"} 0"#,
             r#"high_storm_burn_rounds_total{outcome="failed"} 1"#,
+            r#"high_storm_issuance_rounds_total{outcome="broadcast"} 1"#,
+            "high_storm_expired_utxo_oldest_age_blocks 25",
+            "high_storm_user_request_oldest_pending_age_blocks 10",
+            "high_storm_treasury_balance_sats 2000",
+            "high_storm_droplets_balance_sats 0",
             r#"high_storm_user_requests_failed_total{reason="unpriced_feed"} 1"#,
         ] {
             assert!(rendered.contains(line), "missing {line:?} in:\n{rendered}");

@@ -695,6 +695,46 @@ mod tests {
         assert!(checked(part_of_one).is_ok());
     }
 
+    #[tokio::test]
+    async fn counts_refused_attestations_against_the_peer_that_sent_them() {
+        let prices = prices().await;
+        let sender = keypair(2).public_key().serialize();
+        let storm = storm::Storm::from_peers(
+            secp256k1_zkp::SecretKey::from_slice(&[OWN_KEY; 32]).unwrap(),
+            vec![storm::Peer::new(sender)],
+        );
+        // Signed by a key that is not a member.
+        let message = NodeMessage::new(
+            NodeMessageKind::AttestPrice,
+            None,
+            &AttestPriceMsg {
+                attestations: vec![attest(&keypair(9), feed())],
+            },
+        )
+        .unwrap();
+        let context = StormContext {
+            storm_handle: storm.handle(),
+            storm_message: message.clone().into_storm_message().unwrap(),
+            message_context: storm::MessageContext {
+                peer_public_key: sender,
+            },
+        };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+
+        {
+            let _local = metrics::set_default_local_recorder(&recorder);
+            assert!(matches!(
+                prices.handle_attestation(message, &context).await,
+                Err(PriceError::NotAMember(_))
+            ));
+        }
+
+        assert!(recorder.handle().render().contains(&format!(
+            "high_storm_price_attestations_rejected_total{{peer=\"{}\",reason=\"not_a_member\"}} 1",
+            hex::encode(sender)
+        )));
+    }
+
     #[test]
     fn blames_a_peer_only_for_what_it_sent() {
         let ahead = PriceFeedData {
