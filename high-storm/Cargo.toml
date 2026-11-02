@@ -16,6 +16,7 @@ log.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 metrics-process.workspace = true
+metrics-util.workspace = true
 postcard = { workspace = true, features = ["use-std"] }
 reqwest.workspace = true
 rustls.workspace = true

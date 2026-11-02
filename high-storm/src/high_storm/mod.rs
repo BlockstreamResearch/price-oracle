@@ -6,6 +6,8 @@ use std::{
 use secp256k1_zkp::PublicKey;
 use storm::{PeerStatus, Storm, StormHandle};
 
+use crate::monitoring::{self, RenewalOutcome};
+
 mod assets;
 mod burning;
 mod droplets;
@@ -36,6 +38,7 @@ pub use message::{
     UpdateNetworkMembers,
 };
 pub use prices::{ExchangeRateInfo, FeedRate, PollOutcome, PriceError};
+pub(crate) use prices::{PriceHealth, SourceHealth};
 pub use renewal::RenewalError;
 pub use signing::{SigningError, SigningResult};
 use state::NetworkState;
@@ -448,7 +451,20 @@ impl HighStorm {
     }
 
     pub async fn index_blocks(&self) -> Result<u64, IndexerError> {
-        let indexed = self.state.indexer().sync().await?;
+        // Any other error says nothing about a halt, which is checked only once
+        // the chain tip has been read.
+        let indexed = match self.state.indexer().sync().await {
+            Ok(indexed) => {
+                monitoring::set_chain_safety_halt(false);
+                indexed
+            }
+            Err(error) => {
+                if matches!(error, IndexerError::SafetyHalt(_)) {
+                    monitoring::set_chain_safety_halt(true);
+                }
+                return Err(error);
+            }
+        };
         if let Some(cursor) = self.state.indexer().cursor().await? {
             self.state.set_block_height(cursor.height);
             if !self.state.is_spending_paused()
@@ -467,6 +483,9 @@ impl HighStorm {
 
     pub async fn reconcile_storm_eye_renewal(&self) -> Result<bool, RenewalError> {
         let confirmed = self.state.renewal().reconcile().await?;
+        if confirmed {
+            monitoring::record_storm_eye_renewal(RenewalOutcome::Confirmed);
+        }
         if !confirmed
             && self.is_coordinator().await
             && let Some(request) = self.state.renewal().pending_request().await?
@@ -486,9 +505,31 @@ impl HighStorm {
             return Ok(None);
         }
         let block_height = self.state.block_height();
-        let Some(mut prepared) = self.state.renewal().prepare(block_height).await? else {
+        let Some(storm_eye) = self.state.renewal().due_storm_eye(block_height).await? else {
             return Ok(None);
         };
+        // Every failure from here on counts, preparation included: a due renewal
+        // that keeps failing, for example for want of Treasury funds, needs an
+        // operator before the rescue height arrives.
+        let renewed = self.renew_due_storm_eye(storm_eye, block_height).await;
+        monitoring::record_storm_eye_renewal(if renewed.is_ok() {
+            RenewalOutcome::Broadcast
+        } else {
+            RenewalOutcome::Failed
+        });
+        renewed.map(Some)
+    }
+
+    async fn renew_due_storm_eye(
+        &self,
+        storm_eye: NetworkAsset,
+        block_height: u64,
+    ) -> Result<[u8; 32], RenewalError> {
+        let mut prepared = self
+            .state
+            .renewal()
+            .prepare(block_height, storm_eye)
+            .await?;
         let chain_tip = self
             .state
             .indexer()
@@ -523,7 +564,7 @@ impl HighStorm {
             tracing::warn!(%error, "failed to announce Storm Eye timelock renewal");
         }
 
-        Ok(Some(txid))
+        Ok(txid)
     }
 
     pub async fn announce_network_assets(&self) -> Result<(), AssetError> {
@@ -835,6 +876,16 @@ impl HighStormHandle {
         self.state.is_spending_paused()
     }
 
+    pub(crate) fn is_recovering(&self) -> bool {
+        self.state.is_recovering()
+    }
+
+    /// The height from which anyone may spend the Storm Eye UTXOs, once the
+    /// Storm Eye exists.
+    pub(crate) async fn storm_eye_rescue_height(&self) -> Result<Option<u32>, RenewalError> {
+        self.state.renewal().rescue_height().await
+    }
+
     pub async fn member_migration_request(&self) -> Option<[u8; 32]> {
         self.state.member_migration_request().await
     }
@@ -877,6 +928,14 @@ impl HighStormHandle {
         self.state.prices().attestations_for(feed).await
     }
 
+    pub(crate) async fn price_health(
+        &self,
+        sources: &[(price_feed::FeedId, usize)],
+        feeds: &[price_feed::FeedId],
+    ) -> PriceHealth {
+        self.state.prices().health(sources, feeds).await
+    }
+
     /// Every feed this node prices, in id order.
     pub fn price_feeds(&self) -> Vec<price_feed::FeedDefinition> {
         self.state.prices().registry().feeds().copied().collect()
@@ -906,8 +965,20 @@ impl HighStormHandle {
         self.storm.peers().await
     }
 
+    pub(crate) async fn connected_peer_keys(&self) -> BTreeSet<[u8; 33]> {
+        self.storm.connected_peer_keys().await
+    }
+
+    pub(crate) async fn is_local_member(&self) -> bool {
+        self.storm.is_local_member().await
+    }
+
     pub(crate) async fn current_leader(&self) -> Option<[u8; 33]> {
         leader::leader_for_height(&self.peers().await, self.state.block_height())
+    }
+
+    pub(crate) async fn is_leader(&self) -> bool {
+        leader::is_local_leader(&self.peers().await, self.state.block_height())
     }
 
     pub(crate) async fn next_local_leader_height(&self) -> Option<u64> {

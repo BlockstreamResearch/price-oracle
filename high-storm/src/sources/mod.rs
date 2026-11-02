@@ -11,6 +11,7 @@ use coingecko::CoinGecko;
 
 /// The source's index in every feed's state.
 const COINGECKO: usize = 0;
+const COINGECKO_NAME: &str = "coingecko";
 
 /// Polls every configured source, each feed on its own task. The returned
 /// `Notify` fires on every new observation, which is when the node attests.
@@ -25,6 +26,7 @@ pub fn spawn(
     };
     let source = Arc::new(CoinGecko::new(coingecko)?);
     for feed in source.feeds() {
+        crate::monitoring::register_price_source(feed, COINGECKO, COINGECKO_NAME);
         let (node, source) = (node.clone(), source.clone());
         let poll = move || {
             let (node, source) = (node.clone(), source.clone());

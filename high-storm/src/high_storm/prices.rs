@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use price_feed::{
     Clock, FeedAvailability, FeedId, FeedRegistry, FeedStates, PriceFeedData, PriceSource,
-    RejectionReason, SourceObservation, ValidationError, instruction,
+    RejectionReason, SourceObservation, SourceState, ValidationError, instruction,
 };
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, schnorr};
 use secp256k1_zkp::PublicKey as TransportPublicKey;
@@ -79,6 +79,23 @@ pub enum PollOutcome {
     Failed,
 }
 
+/// A polled source as this node holds it now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SourceHealth {
+    pub(crate) feed: FeedId,
+    pub(crate) source: usize,
+    pub(crate) state: SourceState,
+    /// Cleared when the source is dropped.
+    pub(crate) observed_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PriceHealth {
+    pub(crate) sources: Vec<SourceHealth>,
+    /// Each feed asked about, with its value or `None` while it is unavailable.
+    pub(crate) values: Vec<(FeedId, Option<PriceFeedData>)>,
+}
+
 #[derive(Clone)]
 pub(crate) struct Prices {
     store: PriceAttestationStore,
@@ -121,6 +138,34 @@ impl Prices {
         let mut feeds = self.feeds.lock().await;
         if let Some(state) = feeds.get_mut(feed) {
             state.record_poll_failure(source);
+        }
+    }
+
+    /// Read under one lock and from memory only, so monitoring can call it often.
+    /// A `(feed, source)` naming a Cross pair is skipped, since it has no sources.
+    pub(crate) async fn health(
+        &self,
+        sources: &[(FeedId, usize)],
+        feeds: &[FeedId],
+    ) -> PriceHealth {
+        let states = self.feeds.lock().await;
+        PriceHealth {
+            sources: sources
+                .iter()
+                .filter_map(|&(feed, source)| {
+                    let state = states.get(feed)?;
+                    Some(SourceHealth {
+                        feed,
+                        source,
+                        state: state.state(source),
+                        observed_at: state.last_observed_at(source),
+                    })
+                })
+                .collect(),
+            values: feeds
+                .iter()
+                .map(|&feed| (feed, states.value(feed)))
+                .collect(),
         }
     }
 
@@ -759,6 +804,47 @@ mod tests {
             valid_until: NOW - 1,
             ..feed
         }
+    }
+
+    #[tokio::test]
+    async fn reports_the_health_of_polled_sources_and_feeds() {
+        const USDT_USD: FeedId = 1;
+        const LBTC_USDT: FeedId = 4;
+        let prices = prices().await;
+        let source = Fake::answering(Ok(SourceObservation::new(100, 8, NOW, NOW)));
+        assert_eq!(
+            prices.poll(LBTC_USD, 0, &source).await,
+            PollOutcome::Observed
+        );
+
+        let health = prices
+            .health(
+                &[(LBTC_USD, 0), (USDT_USD, 0), (LBTC_USDT, 0)],
+                &[LBTC_USD, LBTC_USDT],
+            )
+            .await;
+
+        assert_eq!(
+            health.sources,
+            vec![
+                SourceHealth {
+                    feed: LBTC_USD,
+                    source: 0,
+                    state: SourceState::Active,
+                    observed_at: Some(NOW),
+                },
+                // Not polled yet, so active with nothing observed.
+                SourceHealth {
+                    feed: USDT_USD,
+                    source: 0,
+                    state: SourceState::Active,
+                    observed_at: None,
+                },
+            ]
+        );
+        assert!(health.values[0].1.is_some());
+        // The Cross pair also needs USDT/USD, which has no price yet.
+        assert_eq!(health.values[1], (LBTC_USDT, None));
     }
 
     #[tokio::test]
