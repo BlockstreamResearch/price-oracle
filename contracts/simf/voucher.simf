@@ -10,9 +10,12 @@ type ScriptAuthWit = (u32, u32);
 type SignAuthWit = (Signature, u32);
 /// 4. storm_eye_input_index
 type NetworkAuthWit = u32;
+/// 5. voucher_utxo_output_index
+type PermissionlessBurnWit = u32;
 
 type AuthKindLeft = Either<AssetAuthWit, ScriptAuthWit>;
-type AuthKindRight = Either<SignAuthWit, NetworkAuthWit>;
+type BurnKind = Either<NetworkAuthWit, PermissionlessBurnWit>;
+type AuthKindRight = Either<SignAuthWit, BurnKind>;
 
 /// SHA-256 of `voucher_input_index` as 4 big-endian bytes
 fn get_burn_tag_hash(voucher_input_index: u32) -> u256 {
@@ -62,6 +65,20 @@ fn network_auth_spend(storm_eye_input_index: u32) {
     assert_eq_256(get_input_asset(storm_eye_input_index), param::STORM_EYE_ASSET_ID);
 }
 
+/// BIP68 measures relative time in 512-second units: ceil(70 minutes / 512) = 9.
+fn permissionless_burn(voucher_utxo_output_index: u32) {
+    let version: u32 = jet::version();
+    assert!(jet::le_32(2, version));
+    assert!(jet::le_32(version, 0x7fffffff));
+
+    // Check this input, not a transaction-wide lock supplied by another input.
+    let sequence: u32 = jet::current_sequence();
+    assert_eq_32(jet::and_32(sequence, 0x80400000), 0x00400000);
+    assert!(jet::le_32(9, jet::and_32(sequence, 0x0000ffff)));
+
+    assert_voucher_utxo_burned(voucher_utxo_output_index);
+}
+
 fn main() {
     match witness::PATH {
         Left(index_auth: AuthKindLeft) => match index_auth {
@@ -79,8 +96,13 @@ fn main() {
                 let (signature, output_index): SignAuthWit = wit;
                 user_spend_via_sign_auth(signature, output_index);
             },
-            Right(input_index: NetworkAuthWit) => {
-                network_auth_spend(input_index);
+            Right(burn: BurnKind) => match burn {
+                Left(input_index: NetworkAuthWit) => {
+                    network_auth_spend(input_index);
+                },
+                Right(output_index: PermissionlessBurnWit) => {
+                    permissionless_burn(output_index);
+                },
             },
         },
     }

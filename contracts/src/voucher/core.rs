@@ -1,10 +1,10 @@
 use simplex::simplicityhl::elements::schnorr::XOnlyPublicKey;
-use simplex::simplicityhl::elements::{AssetId, Script};
+use simplex::simplicityhl::elements::{AssetId, Script, Sequence};
 use simplex::transaction::utxo::UTXO;
 use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, ProgramInput};
 
 use crate::artifacts::voucher::VoucherProgram;
-use crate::voucher::{VoucherParameters, VoucherSpendPath};
+use crate::voucher::{PERMISSIONLESS_BURN_DELAY_INTERVALS, VoucherParameters, VoucherSpendPath};
 
 /// The Voucher covenant: a burn-after-use, network-issued proof token.
 pub struct Voucher {
@@ -53,9 +53,16 @@ impl Voucher {
         path: VoucherSpendPath,
     ) {
         let required_signature = path.required_signature();
+        let input = PartialInput::new(voucher_utxo.clone());
+        let input = match path {
+            VoucherSpendPath::PermissionlessBurn { .. } => input.with_sequence(
+                Sequence::from_512_second_intervals(PERMISSIONLESS_BURN_DELAY_INTERVALS),
+            ),
+            _ => input,
+        };
 
         ft.add_program_input(
-            PartialInput::new(voucher_utxo.clone()),
+            input,
             ProgramInput::new(
                 Box::new(self.program.as_ref().clone()),
                 path.build_witness(),
@@ -64,13 +71,13 @@ impl Voucher {
         );
     }
 
-    /// The script a user-path spend of the voucher at `voucher_input_index` must burn into.
+    /// The script requester and permissionless burns must pay into.
     #[must_use]
     pub fn get_burn_script(voucher_input_index: u32) -> Script {
         Script::new_op_return(&voucher_input_index.to_be_bytes())
     }
 
-    /// Adds the burn output for a user-path spend of `voucher_utxo` at `voucher_input_index`.
+    /// Adds the full-amount, input-tagged burn for requester and permissionless paths.
     pub fn attach_voucher_output(
         &self,
         ft: &mut FinalTransaction,

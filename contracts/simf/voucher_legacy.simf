@@ -1,0 +1,79 @@
+// Frozen pre-permissionless covenant for spending already-issued vouchers.
+use std::lib::asserts::{assert_eq_32, assert_eq_256};
+
+use crate::lib::tx::{get_input_asset, get_input_script_hash, assert_output_preserves_utxo};
+
+type AssetAuthWit = (u32, u32);
+type ScriptAuthWit = (u32, u32);
+type SignAuthWit = (Signature, u32);
+type NetworkAuthWit = u32;
+
+type AuthKindLeft = Either<AssetAuthWit, ScriptAuthWit>;
+type AuthKindRight = Either<SignAuthWit, NetworkAuthWit>;
+
+fn get_burn_tag_hash(voucher_input_index: u32) -> u256 {
+    let hash_ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let hash_ctx: Ctx8 = jet::sha_256_ctx_8_add_4(hash_ctx, voucher_input_index);
+
+    jet::sha_256_ctx_8_finalize(hash_ctx)
+}
+
+fn assert_voucher_utxo_burned(voucher_utxo_output_index: u32) {
+    assert_output_preserves_utxo(voucher_utxo_output_index);
+
+    let tag: Either<(u2, u256), Either<u1, u4>> = unwrap(
+        unwrap(jet::output_null_datum(voucher_utxo_output_index, 0))
+    );
+    let (_, tag_hash): (u2, u256) = unwrap_left::<Either<u1, u4>>(tag);
+
+    assert_eq_256(tag_hash, get_burn_tag_hash(jet::current_index()));
+}
+
+fn user_spend_via_asset_auth(asset_auth_utxo_input_index: u32, voucher_utxo_output_index: u32) {
+    assert_eq_32(param::AUTH_METHOD, 0);
+    assert_eq_256(get_input_asset(asset_auth_utxo_input_index), param::AUTH_ASSET_ID);
+
+    assert_voucher_utxo_burned(voucher_utxo_output_index);
+}
+
+fn user_spend_via_script_auth(script_auth_utxo_input_index: u32, voucher_utxo_output_index: u32) {
+    assert_eq_32(param::AUTH_METHOD, 1);
+    assert_eq_256(get_input_script_hash(script_auth_utxo_input_index), param::AUTH_SCRIPT_HASH);
+
+    assert_voucher_utxo_burned(voucher_utxo_output_index);
+}
+
+fn user_spend_via_sign_auth(auth_signature: Signature, voucher_utxo_output_index: u32) {
+    assert_eq_32(param::AUTH_METHOD, 2);
+    jet::bip_0340_verify((param::AUTH_PUBKEY, jet::sig_all_hash()), auth_signature);
+
+    assert_voucher_utxo_burned(voucher_utxo_output_index);
+}
+
+fn network_auth_spend(storm_eye_input_index: u32) {
+    assert_eq_256(get_input_asset(storm_eye_input_index), param::STORM_EYE_ASSET_ID);
+}
+
+fn main() {
+    match witness::PATH {
+        Left(index_auth: AuthKindLeft) => match index_auth {
+            Left(wit: AssetAuthWit) => {
+                let (input_index, output_index): AssetAuthWit = wit;
+                user_spend_via_asset_auth(input_index, output_index);
+            },
+            Right(wit: ScriptAuthWit) => {
+                let (input_index, output_index): ScriptAuthWit = wit;
+                user_spend_via_script_auth(input_index, output_index);
+            },
+        },
+        Right(sign_or_network: AuthKindRight) => match sign_or_network {
+            Left(wit: SignAuthWit) => {
+                let (signature, output_index): SignAuthWit = wit;
+                user_spend_via_sign_auth(signature, output_index);
+            },
+            Right(input_index: NetworkAuthWit) => {
+                network_auth_spend(input_index);
+            },
+        },
+    }
+}

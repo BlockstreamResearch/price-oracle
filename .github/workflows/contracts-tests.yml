@@ -72,10 +72,16 @@ jobs:
           # code (crates/cli/src/commands/test.rs). That printed line is the only
           # reliable signal, so read it back out of the log. A missing line means
           # the child was killed by a signal ("Process terminated.") and also fails.
-          simplex test --test-threads 1 2>&1 | tee simplex.log
+          for mode in simplex rust; do
+            args=(--test-threads 1)
+            if [ "$mode" = rust ]; then
+              args+=(--no-simplex)
+            fi
+            simplex test "${args[@]}" 2>&1 | tee "simplex-$mode.log"
 
-          status=$(grep -Eo 'Exit Status: [0-9]+' simplex.log | tail -1 | grep -Eo '[0-9]+$')
-          if [ -z "${status}" ] || [ "${status}" -ne 0 ]; then
-            echo "::error::simplex test failed (status=${status:-none})"
-            exit 1
-          fi
+            status=$(grep -Eo 'Exit Status: [0-9]+' "simplex-$mode.log" | tail -1 | grep -Eo '[0-9]+$')
+            if [ -z "${status}" ] || [ "${status}" -ne 0 ]; then
+              echo "::error::simplex $mode tests failed (status=${status:-none})"
+              exit 1
+            fi
+          done

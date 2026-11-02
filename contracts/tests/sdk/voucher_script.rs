@@ -58,18 +58,20 @@ fn matches_browser_account_vectors() {
             format!("{:x}", account.get_script_pubkey(&network)),
             "51209e5d728f0d11006d520364701a84ddb9afa2498c72fae3d138b373603771e2d7"
         );
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
         for (method, expected_leaf, expected_script) in [
             (
                 VoucherAuthMethod::Signature {
                     auth_pubkey: x_only([0x1f; 32]).serialize(),
                 },
-                "cb926f0b19654c6513e4bd89f8a354a8ab313c6b190c5541ae3da22e14edd8a8",
-                "5120265faf88d7ee1325f627a1720ecb0d939e135ceab9b928c235cc6f911229e563",
+                "d4d648685d1728e5e73b8e6dda55d5d25251e7750e09644f7adb5027dab5b3ba",
+                "5120e41c2cceff59748998f4c6d0540b870ba2c726e9e350b7f7d95b88ed3408a3c8",
             ),
             (
                 VoucherAuthMethod::Script { auth_script_hash },
-                "b51543ae57064fae1439ed2c355ea46a92e6141716491c439ae31b813c42a71e",
-                "5120d594a98b24b870a07995f993898ef58731d3ee48813f70f26f00e996688e6ab1",
+                "b65e44c00e48ca8956a138a4553f3ed376ea253e5b3881e7db3d42157dd8a462",
+                "5120a8e28c5f060c0d9d45d50cf7e4bc79077cb17abede7438af92791a2eb10632f3",
             ),
         ] {
             let voucher = Voucher::new(VoucherParameters {
@@ -77,16 +79,39 @@ fn matches_browser_account_vectors() {
                 auth_method: method,
                 network,
             });
-            assert_eq!(
+            actual.push((
                 TapNodeHash::from_byte_array(voucher.get_tapleaf_hash()).to_string(),
-                expected_leaf
-            );
-            assert_eq!(
                 format!("{:x}", voucher.get_script_pubkey()),
-                expected_script
-            );
+            ));
+            expected.push((expected_leaf.to_owned(), expected_script.to_owned()));
         }
+        assert_eq!(actual, expected);
     }
+}
+
+#[test]
+fn legacy_voucher_keeps_its_pre_upgrade_script() {
+    use contracts::artifacts::voucher_legacy::VoucherLegacyProgram;
+    use contracts::voucher::{VoucherAuthMethod, VoucherParameters};
+    use simplex::provider::SimplicityNetwork;
+    use simplex::simplicityhl::elements::AssetId;
+
+    let params = VoucherParameters {
+        storm_eye_asset_id: AssetId::from_byte_array([1; 32]),
+        auth_method: VoucherAuthMethod::Signature {
+            auth_pubkey: x_only([0x1f; 32]).serialize(),
+        },
+        network: SimplicityNetwork::default_regtest(),
+    };
+    let legacy = VoucherLegacyProgram::new(params.build_arguments());
+    assert_eq!(
+        TapNodeHash::from_byte_array(legacy.get_tapleaf_hash()).to_string(),
+        "cb926f0b19654c6513e4bd89f8a354a8ab313c6b190c5541ae3da22e14edd8a8"
+    );
+    assert_eq!(
+        format!("{:x}", legacy.get_script_pubkey(&params.network)),
+        "5120265faf88d7ee1325f627a1720ecb0d939e135ceab9b928c235cc6f911229e563"
+    );
 }
 
 #[test]

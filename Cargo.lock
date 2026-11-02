@@ -786,7 +786,9 @@ name = "contracts"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bitcoincore-rpc",
  "price-feed",
+ "smplx-regtest",
  "smplx-std",
  "storm-tree",
  "thiserror",
