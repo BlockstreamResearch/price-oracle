@@ -43,6 +43,10 @@ jobs:
         uses: BlockstreamResearch/simplicityhl-toolchain@v0.0.2
         with:
           components: simplex@${{ env.SIMPLEX_VERSION }}
+      
+      - name: Check contracts formatting
+        working-directory: contracts
+        run: simplex fmt --check
 
       - name: Generate contract artifacts
         shell: bash
