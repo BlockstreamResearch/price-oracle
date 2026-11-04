@@ -41,7 +41,7 @@ const ACCOUNT_VERIFICATION = {
   accountTapleafHash:
     "78f352902bd0a539848dad38389f9d5ead152d49bb494b220765bb0ff7ad8c35",
   tickTapleafHash:
-    "cb926f0b19654c6513e4bd89f8a354a8ab313c6b190c5541ae3da22e14edd8a8",
+    "d4d648685d1728e5e73b8e6dda55d5d25251e7750e09644f7adb5027dab5b3ba",
 };
 const ACCOUNT = {
   address: "ert1pnewh9rcdzyqx65srv3cp4pxahxh6yjvvwtaw85fckdekqdm3utts0yqwxr",
@@ -50,7 +50,7 @@ const ACCOUNT = {
   storm_eye_asset_id: "01".repeat(32),
   tick_asset_id: "02".repeat(32),
   tick_script_pubkey:
-    "5120265faf88d7ee1325f627a1720ecb0d939e135ceab9b928c235cc6f911229e563",
+    "5120e41c2cceff59748998f4c6d0540b870ba2c726e9e350b7f7d95b88ed3408a3c8",
   oracle_verifier_asset_id: "04".repeat(32),
   network: "elementsregtest",
 };
@@ -361,12 +361,12 @@ describe("Price Oracle SDK", () => {
       ...ACCOUNT_VERIFICATION,
       authScriptPubKey,
       tickTapleafHash:
-        "b51543ae57064fae1439ed2c355ea46a92e6141716491c439ae31b813c42a71e",
+        "b65e44c00e48ca8956a138a4553f3ed376ea253e5b3881e7db3d42157dd8a462",
     };
     const expected = {
       ...ACCOUNT,
       tick_script_pubkey:
-        "5120d594a98b24b870a07995f993898ef58731d3ee48813f70f26f00e996688e6ab1",
+        "5120a8e28c5f060c0d9d45d50cf7e4bc79077cb17abede7438af92791a2eb10632f3",
     };
     const client = new PriceOracleClient(
       "https://coordinator.test",

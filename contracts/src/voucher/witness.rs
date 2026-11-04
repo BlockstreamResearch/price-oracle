@@ -4,6 +4,9 @@ use simplex::transaction::RequiredSignature;
 
 use crate::artifacts::voucher::derived_voucher::VoucherWitness;
 
+/// Minimum BIP68 time-based delay: nine 512-second intervals (76m48s).
+pub const PERMISSIONLESS_BURN_DELAY_INTERVALS: u16 = 9;
+
 #[derive(Debug, Clone, Copy)]
 pub enum VoucherSpendPath {
     /// An input carrying `AUTH_ASSET_ID` authorizes the burn.
@@ -20,6 +23,8 @@ pub enum VoucherSpendPath {
     SignatureAuth { voucher_output_index: u32 },
     /// The Storm Eye asset at this input authorizes the burn.
     NetworkAuth { storm_eye_input_index: u32 },
+    /// Anyone may burn the full voucher amount after the relative time delay.
+    PermissionlessBurn { voucher_output_index: u32 },
 }
 
 impl VoucherSpendPath {
@@ -49,7 +54,10 @@ impl VoucherSpendPath {
             } => Either::Right(Either::Left((DUMMY_SIGNATURE, voucher_output_index))),
             Self::NetworkAuth {
                 storm_eye_input_index,
-            } => Either::Right(Either::Right(storm_eye_input_index)),
+            } => Either::Right(Either::Right(Either::Left(storm_eye_input_index))),
+            Self::PermissionlessBurn {
+                voucher_output_index,
+            } => Either::Right(Either::Right(Either::Right(voucher_output_index))),
         };
 
         VoucherWitness { path }

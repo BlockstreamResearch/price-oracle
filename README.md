@@ -18,11 +18,13 @@ covenant.
   signing key. A contract that spends one can check any message signed by that
   key. Price feeds are the first data type; the signature scheme itself works for
   any data.
-- **Freshness.** Ticks and Verifiers expire after 60 blocks and the network burns
-  them, so old attestations stop being usable on-chain.
+- **Freshness.** The network schedules Tick and Verifier burns after 60 blocks
+  by default. Burned attestations cannot be reused on-chain.
 - **Spending rules for vouchers.** Each voucher is locked to its requester by a
-  public key, a script or an asset. Only the requester, or the network when
-  burning it, can spend it.
+  public key, a script or an asset. Requesters can burn their vouchers immediately;
+  network-authorized spends remain untimelocked. Anyone can burn a newly issued
+  voucher after nine BIP68 time intervals (76m48s of confirmation-based median
+  time), with the covenant enforcing full destruction.
 
 ## How it works
 
@@ -32,8 +34,8 @@ covenant.
   peer-to-peer layer. Any two-thirds of members can sign jointly with MuSig2.
   Every such subset is committed to in a Merkle tree, the *Storm Tree*.
 - **Authorization.** A single on-chain asset, the *Storm Eye*, gates every
-  network action. Treasury, Account and Voucher covenants accept a spend only
-  when a Storm Eye input is present.
+  network action. Network-authorized Treasury, Account and Voucher spends require
+  a Storm Eye input.
 - **Roles.** A coordinator batches user requests into issuance rounds. A leader,
   rotating every block, burns expired vouchers.
 - **Governance.** Membership changes and Storm Eye maintenance go through

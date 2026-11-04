@@ -7,8 +7,9 @@ use bitcoincore_rpc::{Auth, Client, RpcApi};
 use contracts::artifacts::{
     account::{AccountProgram, derived_account::AccountArguments},
     auth::derived_auth::AuthWitness,
-    voucher::{VoucherProgram, derived_voucher::VoucherWitness},
+    voucher_legacy::derived_voucher_legacy::VoucherLegacyWitness,
 };
+use contracts::voucher::VoucherSpendPath;
 use secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
 use serde::Deserialize;
 use simplex::{
@@ -38,7 +39,7 @@ use crate::{
 use super::{
     SigningResult,
     assets::{StormEyeContractData, storm_eye_program},
-    issuance::voucher_program,
+    issuance::{legacy_voucher_program, voucher_program},
     message::{BurnExpiredUtxos, ExpiredUtxosBurned, StormEyeUtxo},
     signing::SigningError,
     user_requests::{
@@ -56,7 +57,7 @@ const MAX_STANDARD_TX_WEIGHT: usize = 400_000;
 const BURN_FEE_RATE_SAT_PER_KVB: u64 = 100;
 /// Upper bounds on finalized burn weight, above `measures_burn_transaction_weight`.
 const BURN_BASE_WEIGHT: u64 = 3_900;
-const BURN_ITEM_WEIGHT: u64 = 450;
+const BURN_ITEM_WEIGHT: u64 = 500;
 const BURN_RESERVE_WEIGHT: u64 = 750;
 
 #[derive(Debug, thiserror::Error)]
@@ -871,15 +872,9 @@ fn build_burn_transaction(
             {
                 return Err(BurningError::Invalid("indexed issued UTXO changed".into()));
             }
-            let program = issued_program(storm_eye.asset_id, tick)?;
             final_transaction.add_program_input(
                 PartialInput::new(tick_utxo.clone()),
-                ProgramInput::new(
-                    Box::new(program.as_ref().clone()),
-                    VoucherWitness {
-                        path: Either::Right(Either::Right(0)),
-                    },
-                ),
+                issued_network_input(storm_eye.asset_id, tick, network)?,
                 RequiredSignature::None,
             );
             spent_utxos.push(tick_utxo.txout.clone());
@@ -981,7 +976,7 @@ fn validate_group_items(
         {
             return Err(BurningError::Invalid("indexed issued UTXO changed".into()));
         }
-        issued_program(storm_eye_asset_id, tick)?;
+        issued_program(storm_eye_asset_id, tick, voucher_program)?;
     }
     Ok(())
 }
@@ -1063,10 +1058,41 @@ fn burn_outputs<'a>(
 }
 
 /// Covenant of an issued UTXO, with a Verifier's internal key.
-fn issued_program(
+fn issued_network_input(
     storm_eye_asset_id: [u8; 32],
     utxo: &MonitoredUtxo,
-) -> Result<VoucherProgram, BurningError> {
+    network: &SimplicityNetwork,
+) -> Result<ProgramInput, BurningError> {
+    let program = issued_program(storm_eye_asset_id, utxo, voucher_program)?;
+    if program.get_script_pubkey(network).as_bytes() == utxo.script_pubkey {
+        return Ok(ProgramInput::new(
+            Box::new(program.as_ref().clone()),
+            VoucherSpendPath::NetworkAuth {
+                storm_eye_input_index: 0,
+            }
+            .build_witness(),
+        ));
+    }
+
+    let legacy = issued_program(storm_eye_asset_id, utxo, legacy_voucher_program)?;
+    if legacy.get_script_pubkey(network).as_bytes() != utxo.script_pubkey {
+        return Err(BurningError::Invalid(
+            "issued UTXO does not match a supported voucher covenant".into(),
+        ));
+    }
+    Ok(ProgramInput::new(
+        Box::new(legacy.as_ref().clone()),
+        VoucherLegacyWitness {
+            path: Either::Right(Either::Right(0)),
+        },
+    ))
+}
+
+fn issued_program<P>(
+    storm_eye_asset_id: [u8; 32],
+    utxo: &MonitoredUtxo,
+    create: impl FnOnce([u8; 32], u8, [u8; 32], Option<[u8; 32]>) -> Result<P, String>,
+) -> Result<P, BurningError> {
     let auth_kind = match utxo.auth_method.as_str() {
         "asset-id-auth" => 0,
         "scriptPubKey-auth" => 1,
@@ -1083,7 +1109,7 @@ fn issued_program(
         })?),
         _ => None,
     };
-    voucher_program(
+    create(
         storm_eye_asset_id,
         auth_kind,
         decode_32(&utxo.auth_data)?,
@@ -1189,10 +1215,8 @@ fn validate_layout(
             &tick.script_pubkey,
             "issued UTXO",
         )?;
-        if input.value.explicit() != Some(tick.amount)
-            || issued_program(storm_eye.asset_id, tick)?.get_script_pubkey(network)
-                != input.script_pubkey
-        {
+        issued_network_input(storm_eye.asset_id, tick, network)?;
+        if input.value.explicit() != Some(tick.amount) {
             return Err(BurningError::Invalid(
                 "issued UTXO input does not match indexed state".into(),
             ));
@@ -1858,7 +1882,7 @@ mod tests {
                 monitored.auth_data = descriptor.auth_data.to_vec();
 
                 assert_eq!(
-                    issued_program([7; 32], &monitored)
+                    issued_program([7; 32], &monitored, voucher_program)
                         .unwrap()
                         .get_script_pubkey(&network),
                     descriptor
@@ -1958,7 +1982,7 @@ mod tests {
                 } else {
                     tick(reserve, index, reserve, reserve)
                 };
-                let script = issued_program(Self::STORM_EYE_ID, &item)
+                let script = issued_program(Self::STORM_EYE_ID, &item, voucher_program)
                     .unwrap()
                     .get_script_pubkey(&self.network);
                 item.script_pubkey = script.as_bytes().to_vec();
@@ -2011,11 +2035,11 @@ mod tests {
     #[test]
     fn sizes_the_burn_fee_to_the_relay_floor_above_the_minimum() {
         assert_eq!(burn_fee(500, 1, 1).unwrap(), 500);
-        assert_eq!(burn_fee(500, 34, 1).unwrap(), 500);
-        assert_eq!(burn_fee(500, 35, 1).unwrap(), 510);
-        // 3,900 + 450 * 50 + 750 = 27,150 WU -> 6,788 vB -> 679 sats at 0.1 sat/vB.
-        assert_eq!(burn_fee(500, 50, 1).unwrap(), 679);
-        assert_eq!(burn_fee(500, 100, 100).unwrap(), 3_098);
+        assert_eq!(burn_fee(500, 30, 1).unwrap(), 500);
+        assert_eq!(burn_fee(500, 31, 1).unwrap(), 504);
+        // 3,900 + 500 * 50 + 750 = 29,650 WU -> 7,413 vB -> 742 sats at 0.1 sat/vB.
+        assert_eq!(burn_fee(500, 50, 1).unwrap(), 742);
+        assert_eq!(burn_fee(500, 100, 100).unwrap(), 3_223);
         assert_eq!(burn_fee(5_000, 100, 100).unwrap(), 5_000);
     }
 
@@ -2026,10 +2050,10 @@ mod tests {
         let built = fixture.build(&groups, 500).unwrap();
         let (pset, _) = built.final_transaction.extract_pst();
         let fee_output = pset.outputs().last().unwrap();
-        assert_eq!(fee_output.amount, Some(679));
+        assert_eq!(fee_output.amount, Some(742));
         assert_eq!(
             pset.outputs()[pset.outputs().len() - 2].amount,
-            Some(100_000 - 679)
+            Some(100_000 - 742)
         );
 
         let request = BurnExpiredUtxos {
@@ -2051,7 +2075,8 @@ mod tests {
             )
         };
         validate(500).unwrap();
-        assert!(validate(700).is_err());
+        validate(742).unwrap();
+        assert!(validate(743).is_err());
     }
 
     #[test]
@@ -2213,7 +2238,7 @@ mod tests {
         let mut monitored = verifier(1, 2, 3, 4);
         monitored.internal_key = None;
 
-        assert!(issued_program([7; 32], &monitored).is_err());
+        assert!(issued_program([7; 32], &monitored, voucher_program).is_err());
     }
 
     #[test]
@@ -2250,5 +2275,60 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn burns_legacy_and_current_vouchers_together_without_a_timelock() {
+        let fixture = BurnFixture::new();
+        let mut groups = [
+            fixture.group(1, 2, false, 1_000),
+            fixture.group(2, 2, true, 1_000),
+        ];
+        for (group, _, _, utxos) in &mut groups {
+            let legacy = issued_program(
+                BurnFixture::STORM_EYE_ID,
+                &group.ticks[0],
+                legacy_voucher_program,
+            )
+            .unwrap();
+            let script = legacy.get_script_pubkey(&fixture.network);
+            group.ticks[0].script_pubkey = script.as_bytes().to_vec();
+            utxos[0].txout.script_pubkey = script;
+            validate_group_items(BurnFixture::STORM_EYE_ID, &fixture.assets, group, utxos).unwrap();
+        }
+        let built = fixture.build(&groups, 500).unwrap();
+        let (pset, _) = built.final_transaction.extract_pst();
+        for index in 1..=4 {
+            let input = built.final_transaction.inputs()[index]
+                .program_input
+                .as_ref()
+                .unwrap();
+            input
+                .program
+                .execute(&pset, &input.witness, index, &fixture.network)
+                .unwrap();
+            assert!(pset.inputs()[index].sequence.unwrap().is_final());
+        }
+        let request = BurnExpiredUtxos {
+            tx: encode::serialize(&pset),
+            signing_hash: signing_hash(&pset, &fixture.storm_eye, &fixture.network).unwrap(),
+            signing_storm_tree_branch: built.signing_branch,
+            block_height: 61,
+            chain_tip: None,
+        };
+        let ticks = groups
+            .iter()
+            .flat_map(|group| group.0.ticks.clone())
+            .collect::<Vec<_>>();
+        validate_layout(
+            &pset,
+            &request,
+            &ticks,
+            &fixture.storm_eye,
+            &fixture.assets,
+            &fixture.network,
+            500,
+        )
+        .unwrap();
     }
 }

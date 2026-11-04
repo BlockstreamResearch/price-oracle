@@ -249,8 +249,9 @@ The voucher contract has the following spending paths:
 2. User spending via the Script authorization method  
 3. User spending via the Signature authorization method  
 4. Network authorized spending
+5. Permissionless burning after the relative time delay
 
-The user spending paths burn the voucher into an OP\_RETURN tagged with the voucher's own input index: its first entry must be the pushed data *jet::current\_index()* as 4 big-endian bytes. Input indexes are unique, so two vouchers cannot be burned into the same output.
+The user and permissionless spending paths burn the voucher into an OP\_RETURN tagged with the voucher's own input index: its first entry must be the pushed data *jet::current\_index()* as 4 big-endian bytes. Input indexes are unique, so two vouchers cannot be burned into the same output.
 
 ### 3.4.1. User spending via the Asset authorization method
 
@@ -316,6 +317,57 @@ This spending path includes only the following covenant check:
 1. assert(jet::input\_asset(*storm\_eye\_input\_index*) \== param::STORM\_EYE\_ASSET\_ID)  
 
 Before signing, every network node validates that all selected voucher amounts are summed exactly into one empty OP\_RETURN output with the voucher asset. This permits many voucher inputs to share one aggregate burn output without relying on an invalid per-input inequality.
+
+There is no covenant timelock on this path. Network scheduling remains controlled
+by `tick_lifetime_blocks` (60 blocks by default).
+
+### 3.4.5. Permissionless burning
+
+Anyone can burn either a Tick or a Verifier without requester authorization or a
+Storm Eye input once the voucher's own input satisfies BIP68 relative time:
+
+1. Transaction version is between 2 and `0x7fffffff`.
+2. The current input's sequence disable flag (bit 31) is clear.
+3. Its time-based flag (bit 22) is set.
+4. Its low 16 bits are at least 9.
+5. The selected output has the same explicit asset and the full explicit input
+   amount, and is an OP\_RETURN with the input-index tag described above.
+
+Nine 512-second intervals are **4,608 seconds (76m48s)**, the first representable
+BIP68 delay not shorter than 70 minutes. Elements consensus measures this from
+the median time past of the block before the voucher's confirmation, not request
+creation or wall-clock time. An unrelated input's sequence cannot satisfy the
+voucher's delay. This path does not change any requester or network path.
+
+The witness `PATH` is
+`Either<Either<AssetAuthWit, ScriptAuthWit>, Either<SignAuthWit, Either<u32, u32>>>`:
+network spends use `Right(Right(Left(storm_eye_input_index)))`; permissionless
+burns use `Right(Right(Right(voucher_utxo_output_index)))`. Requester witness
+paths are unchanged.
+
+Rust callers can construct a single-voucher burn with:
+
+```rust
+let mut tx = FinalTransaction::new();
+voucher.attach_spend(
+    &mut tx,
+    &voucher_utxo,
+    VoucherSpendPath::PermissionlessBurn { voucher_output_index: 0 },
+);
+voucher.attach_voucher_output(&mut tx, &voucher_utxo, 0);
+let receipt = fee_payer.broadcast(&tx)?;
+```
+
+`attach_spend` sets that input's relative sequence automatically. The caller must
+fund L-BTC fees separately; the network burn reserve still requires Storm Eye
+authorization.
+
+**Upgrade:** the new covenant changes voucher tapleaf hashes and scripts.
+Deploy compatible software on all network nodes together, between signing rounds,
+and update consumers' pinned voucher tapleaf hashes for new issuances. Already
+issued outputs are immutable and do **not** gain permissionless burning. The
+indexer and network burner retain the frozen legacy covenant to recognize and
+burn those outputs using their original network witness.
 
 ## 3.5. Tick creation transaction
 
