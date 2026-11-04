@@ -1,8 +1,10 @@
-use std::lib::asserts::{assert_eq_64, assert_eq_256};
+use std::lib::asserts::assert_eq_256;
+use std::lib::utxo::getters::asset_id_with_amount::get_explicit_input_asset_id_with_amount;
+use std::lib::utxo::asserts::asset_id_with_amount::assert_explicit_input_asset_id_with_amount;
+use std::lib::utxo::getters::script_hash::get_input_script_hash;
 
 use crate::lib::sha256_paddings::padding_96_tail;
 use crate::lib::taproot::get_p2tr_script_hash;
-use crate::lib::tx::{get_explicit_input_amount, get_input_script_hash};
 
 /// `feed_id`, `price`, `decimals`, `received_at`, `valid_until`.
 pub type PriceFeedData = (u32, u64, u32, u64, u64);
@@ -37,7 +39,7 @@ pub fn get_voucher_script_hash(internal_key: Pubkey, tapleaf_hash: u256) -> u256
 
 /// Checks the input is a Tick and returns the time it carries.
 pub fn verify_tick(tick_input_index: u32, tick_asset_id: u256) -> u64 {
-    let (asset, amount): (u256, u64) = get_explicit_input_amount(tick_input_index);
+    let (asset, amount): (u256, u64) = get_explicit_input_asset_id_with_amount(tick_input_index);
     assert_eq_256(asset, tick_asset_id);
 
     amount
@@ -50,9 +52,7 @@ pub fn verify_verifier_utxo(
     tapleaf_hash: u256,
     signer: Pubkey
 ) {
-    let (asset, amount): (u256, u64) = get_explicit_input_amount(verifier_input_index);
-    assert_eq_256(asset, verifier_asset_id);
-    assert_eq_64(amount, 1);
+    assert_explicit_input_asset_id_with_amount(verifier_input_index, verifier_asset_id, 1);
 
     assert_eq_256(
         get_input_script_hash(verifier_input_index),
