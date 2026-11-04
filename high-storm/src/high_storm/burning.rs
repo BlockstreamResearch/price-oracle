@@ -7,7 +7,6 @@ use bitcoincore_rpc::{Auth, Client, RpcApi};
 use contracts::artifacts::{
     account::{AccountProgram, derived_account::AccountArguments},
     auth::derived_auth::AuthWitness,
-    voucher_legacy::derived_voucher_legacy::VoucherLegacyWitness,
 };
 use contracts::voucher::VoucherSpendPath;
 use secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
@@ -39,7 +38,7 @@ use crate::{
 use super::{
     SigningResult,
     assets::{StormEyeContractData, storm_eye_program},
-    issuance::{legacy_voucher_program, voucher_program},
+    issuance::voucher_program,
     message::{BurnExpiredUtxos, ExpiredUtxosBurned, StormEyeUtxo},
     signing::SigningError,
     user_requests::{
@@ -1064,27 +1063,17 @@ fn issued_network_input(
     network: &SimplicityNetwork,
 ) -> Result<ProgramInput, BurningError> {
     let program = issued_program(storm_eye_asset_id, utxo, voucher_program)?;
-    if program.get_script_pubkey(network).as_bytes() == utxo.script_pubkey {
-        return Ok(ProgramInput::new(
-            Box::new(program.as_ref().clone()),
-            VoucherSpendPath::NetworkAuth {
-                storm_eye_input_index: 0,
-            }
-            .build_witness(),
-        ));
-    }
-
-    let legacy = issued_program(storm_eye_asset_id, utxo, legacy_voucher_program)?;
-    if legacy.get_script_pubkey(network).as_bytes() != utxo.script_pubkey {
+    if program.get_script_pubkey(network).as_bytes() != utxo.script_pubkey {
         return Err(BurningError::Invalid(
-            "issued UTXO does not match a supported voucher covenant".into(),
+            "issued UTXO does not match the voucher covenant".into(),
         ));
     }
     Ok(ProgramInput::new(
-        Box::new(legacy.as_ref().clone()),
-        VoucherLegacyWitness {
-            path: Either::Right(Either::Right(0)),
-        },
+        Box::new(program.as_ref().clone()),
+        VoucherSpendPath::NetworkAuth {
+            storm_eye_input_index: 0,
+        }
+        .build_witness(),
     ))
 }
 
@@ -2275,60 +2264,5 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn burns_legacy_and_current_vouchers_together_without_a_timelock() {
-        let fixture = BurnFixture::new();
-        let mut groups = [
-            fixture.group(1, 2, false, 1_000),
-            fixture.group(2, 2, true, 1_000),
-        ];
-        for (group, _, _, utxos) in &mut groups {
-            let legacy = issued_program(
-                BurnFixture::STORM_EYE_ID,
-                &group.ticks[0],
-                legacy_voucher_program,
-            )
-            .unwrap();
-            let script = legacy.get_script_pubkey(&fixture.network);
-            group.ticks[0].script_pubkey = script.as_bytes().to_vec();
-            utxos[0].txout.script_pubkey = script;
-            validate_group_items(BurnFixture::STORM_EYE_ID, &fixture.assets, group, utxos).unwrap();
-        }
-        let built = fixture.build(&groups, 500).unwrap();
-        let (pset, _) = built.final_transaction.extract_pst();
-        for index in 1..=4 {
-            let input = built.final_transaction.inputs()[index]
-                .program_input
-                .as_ref()
-                .unwrap();
-            input
-                .program
-                .execute(&pset, &input.witness, index, &fixture.network)
-                .unwrap();
-            assert!(pset.inputs()[index].sequence.unwrap().is_final());
-        }
-        let request = BurnExpiredUtxos {
-            tx: encode::serialize(&pset),
-            signing_hash: signing_hash(&pset, &fixture.storm_eye, &fixture.network).unwrap(),
-            signing_storm_tree_branch: built.signing_branch,
-            block_height: 61,
-            chain_tip: None,
-        };
-        let ticks = groups
-            .iter()
-            .flat_map(|group| group.0.ticks.clone())
-            .collect::<Vec<_>>();
-        validate_layout(
-            &pset,
-            &request,
-            &ticks,
-            &fixture.storm_eye,
-            &fixture.assets,
-            &fixture.network,
-            500,
-        )
-        .unwrap();
     }
 }

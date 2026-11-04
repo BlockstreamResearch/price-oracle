@@ -1,5 +1,4 @@
 use contracts::artifacts::voucher::{VoucherProgram, derived_voucher::VoucherArguments};
-use contracts::artifacts::voucher_legacy::VoucherLegacyProgram;
 use simplex::{
     provider::SimplicityNetwork,
     simplicityhl::elements::{Script, opcodes, schnorr::XOnlyPublicKey, script::Instruction},
@@ -195,13 +194,6 @@ impl IssuedUtxoDescriptor {
     ) -> bool {
         self.voucher_program(storm_eye_asset_id)
             .is_ok_and(|program| program.get_script_pubkey(network) == *script)
-            || legacy_voucher_program(
-                storm_eye_asset_id,
-                self.auth_kind,
-                self.auth_data,
-                self.signer,
-            )
-            .is_ok_and(|program| program.get_script_pubkey(network) == *script)
     }
 }
 
@@ -214,24 +206,6 @@ pub(crate) fn voucher_program(
 ) -> Result<VoucherProgram, String> {
     let arguments = voucher_arguments(storm_eye_asset_id, auth_kind, auth_data)?;
     let program = VoucherProgram::new(&arguments);
-    let Some(signer) = signer else {
-        return Ok(program);
-    };
-    let signer =
-        XOnlyPublicKey::from_slice(&signer).map_err(|_| "invalid Oracle Verifier signer key")?;
-
-    Ok(program.with_taproot_pubkey(signer))
-}
-
-/// Reconstructs immutable vouchers issued before the public burn path existed.
-pub(crate) fn legacy_voucher_program(
-    storm_eye_asset_id: [u8; 32],
-    auth_kind: u8,
-    auth_data: [u8; 32],
-    signer: Option<[u8; 32]>,
-) -> Result<VoucherLegacyProgram, String> {
-    let arguments = voucher_arguments(storm_eye_asset_id, auth_kind, auth_data)?;
-    let program = VoucherLegacyProgram::new(&arguments);
     let Some(signer) = signer else {
         return Ok(program);
     };
@@ -397,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_both_legacy_and_permissionless_voucher_scripts() {
+    fn recognizes_voucher_scripts() {
         let network = SimplicityNetwork::default_regtest();
         for auth_kind in [0, 1, 2] {
             for signer in [None, Some(SIGNER)] {
@@ -406,17 +380,12 @@ mod tests {
                     signer,
                     ..descriptor(2, None)
                 };
-                let current = descriptor.voucher_program([8; 32]).unwrap();
-                let legacy =
-                    legacy_voucher_program([8; 32], auth_kind, descriptor.auth_data, signer)
-                        .unwrap();
-                let current_script = current.get_script_pubkey(&network);
-                let legacy_script = legacy.get_script_pubkey(&network);
-                assert_ne!(current_script, legacy_script);
-                for script in [current_script, legacy_script] {
-                    assert!(descriptor.matches_script([8; 32], &network, &script));
-                    assert!(!descriptor.matches_script([9; 32], &network, &script));
-                }
+                let script = descriptor
+                    .voucher_program([8; 32])
+                    .unwrap()
+                    .get_script_pubkey(&network);
+                assert!(descriptor.matches_script([8; 32], &network, &script));
+                assert!(!descriptor.matches_script([9; 32], &network, &script));
                 assert!(!descriptor.matches_script([8; 32], &network, &Script::from(vec![0x51]),));
             }
         }
