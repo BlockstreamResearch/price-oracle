@@ -1,6 +1,6 @@
 use std::lib::asserts::{assert_eq_32, assert_eq_256};
 
-use std::lib::utxo::getters::asset_id::get_explicit_input_asset_id;
+use std::lib::utxo::asserts::asset_id::assert_explicit_input_asset_id;
 use std::lib::utxo::getters::script_hash::get_input_script_hash;
 
 use crate::lib::tx::assert_output_preserves_utxo;
@@ -42,7 +42,7 @@ fn assert_voucher_utxo_burned(voucher_utxo_output_index: u32) {
 /// 1. User spending via the Asset authorization method.
 fn user_spend_via_asset_auth(asset_auth_utxo_input_index: u32, voucher_utxo_output_index: u32) {
     assert_eq_32(param::AUTH_METHOD, 0);
-    assert_eq_256(get_explicit_input_asset_id(asset_auth_utxo_input_index), param::AUTH_ASSET_ID);
+    assert_explicit_input_asset_id(asset_auth_utxo_input_index, param::AUTH_ASSET_ID);
 
     assert_voucher_utxo_burned(voucher_utxo_output_index);
 }
@@ -65,7 +65,7 @@ fn user_spend_via_sign_auth(auth_signature: Signature, voucher_utxo_output_index
 
 /// 4. Network authorized spending.
 fn network_auth_spend(storm_eye_input_index: u32) {
-    assert_eq_256(get_explicit_input_asset_id(storm_eye_input_index), param::STORM_EYE_ASSET_ID);
+    assert_explicit_input_asset_id(storm_eye_input_index, param::STORM_EYE_ASSET_ID);
 }
 
 /// BIP68 measures relative time in 512-second units: ceil(70 minutes / 512) = 9.

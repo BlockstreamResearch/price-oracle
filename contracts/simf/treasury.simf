@@ -1,8 +1,7 @@
-use std::lib::asserts::assert_eq_256;
+use std::lib::utxo::asserts::asset_id::assert_explicit_input_asset_id;
 
 fn treasury(storm_eye_input_index: u32) {
-    let input_asset: u256 = unwrap_right::<Point>(unwrap(jet::input_asset(storm_eye_input_index)));
-    assert_eq_256(input_asset, param::STORM_EYE_ASSET_ID);
+    assert_explicit_input_asset_id(storm_eye_input_index, param::STORM_EYE_ASSET_ID);
 }
 
 fn main() {

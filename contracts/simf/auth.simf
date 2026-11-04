@@ -1,7 +1,7 @@
-use std::lib::asserts::{assert_eq_1, assert_eq_32, assert_eq_64, assert_eq_256};
+use std::lib::asserts::{assert_eq_32, assert_eq_64, assert_eq_256};
 use std::lib::u8::math::gt_8;
 use std::lib::u8::convert::u8_to_u32;
-use std::lib::u32::math::{add_32, gt_32};
+use std::lib::u32::math::add_32;
 use std::lib::u64::math::add_64;
 use std::lib::utxo::getters::asset_id::get_explicit_current_asset_id;
 use std::lib::utxo::getters::asset_id_with_amount::{
@@ -9,6 +9,7 @@ use std::lib::utxo::getters::asset_id_with_amount::{
     get_explicit_output_asset_id_with_amount,
     get_explicit_input_asset_id_with_amount
 };
+use std::lib::utxo::asserts::asset_id_with_amount::assert_explicit_output_asset_id_with_amount;
 use std::lib::utxo::getters::script_hash::{get_output_script_hash, get_input_script_hash};
 
 use crate::lib::tx::assert_output_preserves_utxo;
@@ -179,9 +180,7 @@ fn auth_merge_multiple_storm_eyes_into_single_utxo(storage: Storage, utxos_to_me
         for_while::<step_collect_input_total_amount>(0, ctx)
     );
 
-    let (output_asset, output_amount): (u256, u64) = get_explicit_output_asset_id_with_amount(0);
-    assert_eq_64(output_amount, total_inputs_amount);
-    assert_eq_256(output_asset, current_asset);
+    assert_explicit_output_asset_id_with_amount(0, current_asset, total_inputs_amount);
 }
 
 /// 6. Inclusion in a transaction upon reaching the rescue block number,
