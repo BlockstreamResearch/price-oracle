@@ -74,22 +74,12 @@ impl HandlerError {
     /// Why this node would not sign what the coordinator or leader proposed:
     /// `price_*` when its own price disagrees, `invalid` when the proposal is
     /// wrong, and `other` for a local failure that is not the proposer's doing.
-    fn refusal_reason(&self, kind: NodeMessageKind) -> Option<&'static str> {
+    fn refusal_reason(&self) -> Option<&'static str> {
         use super::{
             renewal::RenewalError, user_requests::UserRequestError,
             voting_execution::VotingExecutionError,
         };
 
-        if !matches!(
-            kind,
-            NodeMessageKind::ExecuteUserRequests
-                | NodeMessageKind::BurnExpiredUtxos
-                | NodeMessageKind::ExchangeRewards
-                | NodeMessageKind::ExecuteVotingRequest
-                | NodeMessageKind::RenewStormUtxos
-        ) {
-            return None;
-        }
         let invalid = match self {
             Self::UserRequest(UserRequestError::InstructedPrice(error)) => {
                 return Some(price_refusal(error));
@@ -153,34 +143,47 @@ pub(crate) async fn handle(
     let message = match NodeMessage::from_custom(&custom) {
         Ok(Some(message)) => message,
         Ok(None) => return Ok(()),
-        Err(error) => return Err(rejected(peer, None, error.into())),
+        Err(error) => return Err(rejected(peer, None, false, error.into())),
     };
     let Some(kind) = message.decoded_kind() else {
         let error =
             SigningError::InvalidMessage(format!("unknown NodeMessage kind {}", message.kind));
-        return Err(rejected(peer, None, error.into()));
+        return Err(rejected(peer, None, false, error.into()));
     };
-    dispatch(state, message, kind, context)
+    let mut requests_signature = false;
+    dispatch(state, message, kind, context, &mut requests_signature)
         .await
-        .map_err(|error| rejected(peer, Some(kind), error))
+        .map_err(|error| rejected(peer, Some(kind), requests_signature, error))
 }
 
-fn rejected(peer: [u8; 33], kind: Option<NodeMessageKind>, error: HandlerError) -> HandlerError {
+fn rejected(
+    peer: [u8; 33],
+    kind: Option<NodeMessageKind>,
+    requests_signature: bool,
+    error: HandlerError,
+) -> HandlerError {
     monitoring::record_rejected_message(&monitoring::RejectedMessage {
         peer,
         kind: kind.map_or("unknown", NodeMessageKind::as_str),
         reason: error.metric_reason(),
         unauthorized: error.is_unauthorized(),
-        refusal: kind.and_then(|kind| error.refusal_reason(kind)),
+        refusal: if requests_signature {
+            error.refusal_reason()
+        } else {
+            None
+        },
     });
     error
 }
 
+/// Sets `requests_signature` once the payload shows the message asks this
+/// node to sign: the same kinds also carry notices of a broadcast transaction.
 async fn dispatch(
     state: NetworkState,
     message: NodeMessage,
     kind: NodeMessageKind,
     context: StormContext,
+    requests_signature: &mut bool,
 ) -> Result<(), HandlerError> {
     if state.is_recovering()
         && matches!(
@@ -221,6 +224,7 @@ async fn dispatch(
     match kind {
         NodeMessageKind::ExecuteUserRequests => {
             let request: crate::ExecuteUserRequests = message.decode_payload()?;
+            *requests_signature = true;
             require_chain_tip(&state, required_chain_tip(request.chain_tip)?).await?;
             let instructed = state.user_requests().validate_execute(&request).await?;
             state
@@ -235,6 +239,7 @@ async fn dispatch(
         }
         NodeMessageKind::BurnExpiredUtxos => {
             let request: BurnExpiredUtxos = message.decode_payload()?;
+            *requests_signature = true;
             let expected_leader = require_current_leader(
                 &state,
                 &context,
@@ -251,6 +256,7 @@ async fn dispatch(
         }
         NodeMessageKind::ExchangeRewards => {
             let request: crate::ExchangeRewards = message.decode_payload()?;
+            *requests_signature = request.final_tx.is_none();
             let expected_leader = require_current_leader(
                 &state,
                 &context,
@@ -332,12 +338,13 @@ async fn dispatch(
             Ok(())
         }
         NodeMessageKind::ExecuteVotingRequest => {
+            let request: ExecuteVotingRequest = message.decode_payload()?;
+            *requests_signature = request.final_tx.is_none();
             let request_hash = message.linked_to.ok_or_else(|| {
                 super::voting_execution::VotingExecutionError::Invalid(
                     "voting execution does not link to a voting request".into(),
                 )
             })?;
-            let request: ExecuteVotingRequest = message.decode_payload()?;
             let chain_tip = required_chain_tip(request.chain_tip)?;
             if request.final_tx.is_none() {
                 require_chain_tip(&state, chain_tip).await?;
@@ -427,6 +434,7 @@ async fn dispatch(
         }
         NodeMessageKind::RenewStormUtxos => {
             let request: RenewStormUtxos = message.decode_payload()?;
+            *requests_signature = request.final_tx.is_none();
             require_chain_tip(&state, required_chain_tip(request.chain_tip)?).await?;
             if request.final_tx.is_some() {
                 state.renewal().observe_broadcast(&request).await?;
@@ -742,22 +750,70 @@ mod tests {
         let bad_burn = HandlerError::Burning(BurningError::ReserveShortfall);
         let local = HandlerError::VotingExecution(VotingExecutionError::MemberMigrationNotReady);
 
-        assert_eq!(
-            off_price.refusal_reason(NodeMessageKind::ExecuteUserRequests),
-            Some("price_deviation_exceeded")
-        );
-        assert_eq!(
-            bad_burn.refusal_reason(NodeMessageKind::BurnExpiredUtxos),
-            Some("invalid")
-        );
-        assert_eq!(
-            local.refusal_reason(NodeMessageKind::ExecuteVotingRequest),
-            Some("other")
-        );
-        // A notice about a broadcast burn is not a request to sign.
-        assert_eq!(
-            bad_burn.refusal_reason(NodeMessageKind::ExpiredUtxosBurned),
-            None
-        );
+        assert_eq!(off_price.refusal_reason(), Some("price_deviation_exceeded"));
+        assert_eq!(bad_burn.refusal_reason(), Some("invalid"));
+        assert_eq!(local.refusal_reason(), Some("other"));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_notice_of_a_broadcast_is_no_refusal_to_sign() {
+        use secp256k1_zkp::{Secp256k1, SecretKey};
+        use storm::{MessageContext, Peer, Storm};
+
+        let database = crate::db::Database::connect("sqlite::memory:", 1)
+            .await
+            .unwrap();
+        let secp = Secp256k1::new();
+        let secrets =
+            [[21; 32], [22; 32], [23; 32]].map(|secret| SecretKey::from_slice(&secret).unwrap());
+        let keys = secrets.map(|secret| secret.public_key(&secp).serialize());
+        let storm = Storm::from_peers(secrets[0], keys.into_iter().map(Peer::new).collect());
+        let state =
+            NetworkState::for_tests(&storm, secrets[0].secret_bytes(), keys[0], &database).await;
+        state.indexer().mark_synced();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+
+        {
+            let _local = metrics::set_default_local_recorder(&recorder);
+            // Neither links to the vote it executes; only the first asks to sign.
+            for final_tx in [None, Some(vec![1])] {
+                let message = NodeMessage::new(
+                    NodeMessageKind::ExecuteVotingRequest,
+                    None,
+                    &ExecuteVotingRequest {
+                        tx: Vec::new(),
+                        final_tx,
+                        signing_hashes: Vec::new(),
+                        signing_storm_tree_branch: [0; 32],
+                        proposer_public_key: [0; 32],
+                        chain_tip: None,
+                    },
+                )
+                .unwrap();
+                let storm_message = message.into_storm_message().unwrap();
+                let custom = postcard::from_bytes(&storm_message.payload).unwrap();
+                let context = StormContext {
+                    storm_handle: storm.handle(),
+                    storm_message,
+                    message_context: MessageContext {
+                        peer_public_key: keys[1],
+                    },
+                };
+                handle(state.clone(), custom, context).await.unwrap_err();
+            }
+        }
+
+        let rendered = recorder.handle().render();
+        let peer = hex::encode(keys[1]);
+        for line in [
+            format!(
+                r#"high_storm_node_messages_rejected_total{{peer="{peer}",kind="execute_voting_request",reason="voting_execution"}} 2"#
+            ),
+            format!(
+                r#"high_storm_signing_refused_total{{peer="{peer}",kind="execute_voting_request",reason="invalid"}} 1"#
+            ),
+        ] {
+            assert!(rendered.contains(&line), "missing {line:?} in:\n{rendered}");
+        }
     }
 }

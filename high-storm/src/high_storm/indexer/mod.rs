@@ -474,6 +474,12 @@ impl Indexer {
         self.recovering.load(Ordering::Acquire)
     }
 
+    /// Stands in for the first sync, which needs an Elements node.
+    #[cfg(test)]
+    pub(crate) fn mark_synced(&self) {
+        self.recovering.store(false, Ordering::Release);
+    }
+
     pub(crate) async fn cursor(&self) -> Result<Option<IndexedBlock>, IndexerError> {
         Ok(self.store.cursor(ISSUED_UTXO_RULE_SET).await?)
     }
