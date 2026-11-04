@@ -37,6 +37,19 @@ pub(super) enum StormErrorCode {
     InternalError,
 }
 
+impl StormErrorCode {
+    /// The `reason` label of a message a handler refused.
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidPayload => "invalid_payload",
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::Busy => "busy",
+            Self::Unauthorized => "unauthorized",
+            Self::InternalError => "internal_error",
+        }
+    }
+}
+
 impl StormMessage {
     /// Serializes this message with postcard.
     pub fn to_bytes(&self) -> Result<Vec<u8>, MessageError> {

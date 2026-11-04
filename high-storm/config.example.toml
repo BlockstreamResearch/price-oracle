@@ -12,9 +12,12 @@ external_api_address = "127.0.0.1:9001"
 
 # Leave this section out to record and serve no metrics.
 [service.metrics]
-# Bind address for the unauthenticated Prometheus endpoint at /metrics.
+# Bind address for the Prometheus endpoint at /metrics.
 # Keep it loopback-only or on a private monitoring network.
 address = "127.0.0.1:9300"
+# Optional: require `Authorization: Bearer <token>` on every scrape. The metrics
+# show which members are reachable and who coordinates.
+# bearer_token = "a-long-random-string"
 
 # Optional endpoint overrides keyed by members' compressed public keys.
 # Configure the required overrides on each node; this does not add network members.

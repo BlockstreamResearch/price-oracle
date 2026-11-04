@@ -27,6 +27,7 @@ use crate::db::{
     network_asset::{ORACLE_VERIFIER_KIND, STORM_EYE_KIND, TICK_ASSET_KIND},
     user_request::{FeeUtxo, InsertPendingResult},
 };
+use crate::monitoring;
 
 const USER_REQUEST_TAG: &str = "OracleNetworkV1/NetworkUserRequests";
 pub(super) const HUMID_USER_SIGNATURE_SCHEME: &str = "bitcoin-signed-message-ecdsa-v1";
@@ -262,9 +263,15 @@ async fn create_request(
     State(state): State<ExternalApiState>,
     Json(request): Json<NetworkUserRequests>,
 ) -> Result<(StatusCode, Json<CreatedRequest>), ApiError> {
-    require_coordinator(&state).await?;
-    let (fee_utxos, _) = validate_request(&request)?;
-    let owner = parse_hex_array::<32>(&request.header.public_key, "user public key")?;
+    require_coordinator(&state)
+        .await
+        .inspect_err(|_| monitoring::record_user_request_rejected("not_coordinator"))?;
+    let (fee_utxos, _) = validate_payload(&request)
+        .inspect_err(|_| monitoring::record_user_request_rejected("payload"))?;
+    verify_signature(&request)
+        .inspect_err(|_| monitoring::record_user_request_rejected("signature"))?;
+    let owner = parse_hex_array::<32>(&request.header.public_key, "user public key")
+        .inspect_err(|_| monitoring::record_user_request_rejected("payload"))?;
     state
         .fee_utxos
         .validate(&fee_utxos, owner, request.requests.len())
@@ -277,9 +284,11 @@ async fn create_request(
             | super::fee_utxo::FeeUtxoValidationError::InsufficientValue { .. }
             | super::fee_utxo::FeeUtxoValidationError::InvalidValue(_)
             | super::fee_utxo::FeeUtxoValidationError::InvalidPublicKey => {
+                monitoring::record_user_request_rejected("fee_utxo");
                 ApiError::bad_request(error)
             }
             super::fee_utxo::FeeUtxoValidationError::ReservedForBurning(_) => {
+                monitoring::record_user_request_rejected("fee_utxo");
                 ApiError::conflict(error)
             }
             _ => ApiError::unavailable(error),
@@ -299,9 +308,11 @@ async fn create_request(
     {
         InsertPendingResult::Inserted => {}
         InsertPendingResult::RequestExists => {
+            monitoring::record_user_request_rejected("conflict");
             return Err(ApiError::conflict("user request already exists"));
         }
         InsertPendingResult::FeeUtxoReserved(fee_utxo) => {
+            monitoring::record_user_request_rejected("conflict");
             return Err(ApiError::conflict(format!(
                 "fee UTXO '{}:{}' is reserved by another user request",
                 hex::encode(fee_utxo.txid),
@@ -344,6 +355,15 @@ async fn get_request(
 fn validate_request(
     request: &NetworkUserRequests,
 ) -> Result<(Vec<FeeUtxo>, Option<FeedId>), ApiError> {
+    let validated = validate_payload(request)?;
+    verify_signature(request)?;
+    Ok(validated)
+}
+
+/// Everything but the signature.
+fn validate_payload(
+    request: &NetworkUserRequests,
+) -> Result<(Vec<FeeUtxo>, Option<FeedId>), ApiError> {
     if request.requests.is_empty() {
         return Err(ApiError::bad_request(
             "at least one user request is required",
@@ -367,7 +387,6 @@ fn validate_request(
             instructed = Some(feed);
         }
     }
-    verify_signature(request)?;
 
     Ok((fee_utxos, instructed))
 }

@@ -14,13 +14,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
     Json, Router,
     body::{Body, HttpBody, to_bytes},
-    extract::{ConnectInfo, Request, State, connect_info::Connected},
+    extract::{ConnectInfo, MatchedPath, Request, State, connect_info::Connected},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -41,6 +41,7 @@ use tower_http::{
 use crate::{
     HighStormHandle, VotingError,
     db::{Database, node_operator::NodeOperatorStore, user_request::UserRequestStore},
+    monitoring,
 };
 use fee_utxo::{FeeUtxoValidationError, FeeUtxoValidator};
 use operators::{AuthError, AuthService, auth::AuthNetwork};
@@ -126,9 +127,11 @@ impl axum::serve::Listener for LimitedListener {
         loop {
             let (stream, address) = axum::serve::Listener::accept(&mut self.listener).await;
             let Ok(connection_permit) = self.connections.clone().try_acquire_owned() else {
+                monitoring::record_api_connection_rejected("global");
                 continue;
             };
             let Ok(client_permit) = self.clients.try_acquire(address.ip()) else {
+                monitoring::record_api_connection_rejected("per_client");
                 continue;
             };
             return (
@@ -136,6 +139,7 @@ impl axum::serve::Listener for LimitedListener {
                     stream,
                     _connection_permit: connection_permit,
                     _client_permit: client_permit,
+                    _open: monitoring::ApiConnection::open(),
                 },
                 address,
             );
@@ -151,6 +155,7 @@ struct LimitedConnection {
     stream: TcpStream,
     _connection_permit: OwnedSemaphorePermit,
     _client_permit: OwnedSemaphorePermit,
+    _open: monitoring::ApiConnection,
 }
 
 impl AsyncRead for LimitedConnection {
@@ -280,6 +285,20 @@ pub(crate) fn router(
             .allow_methods(Any)
             .allow_headers(Any),
     )
+    .layer(middleware::from_fn(record_request))
+}
+
+/// Outermost, so it sees every answer, the request limits' refusals included.
+async fn record_request(request: Request, next: Next) -> Response {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| "unmatched".to_owned(), |path| path.as_str().to_owned());
+    let method = request.method().clone();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    monitoring::record_api_request(route, &method, response.status(), started.elapsed());
+    response
 }
 
 fn with_request_limits(router: Router) -> Router {
@@ -310,6 +329,7 @@ async fn limit_concurrency(
             match limits.clients.try_acquire(address.ip()) {
                 Ok(permit) => Some(permit),
                 Err(_) => {
+                    monitoring::record_api_request_rejected("client_inflight");
                     return (
                         StatusCode::TOO_MANY_REQUESTS,
                         Json(ErrorBody {
@@ -328,6 +348,7 @@ async fn limit_concurrency(
         match limits.body_reads.try_acquire() {
             Ok(permit) => Some(permit),
             Err(_) => {
+                monitoring::record_api_request_rejected("body_read_limit");
                 return ApiError::unavailable("external API body-read limit reached")
                     .into_response();
             }
@@ -349,11 +370,12 @@ async fn limit_concurrency(
                     }
                     source = error.source();
                 }
-                let status = if too_large {
-                    StatusCode::PAYLOAD_TOO_LARGE
+                let (status, reason) = if too_large {
+                    (StatusCode::PAYLOAD_TOO_LARGE, "too_large")
                 } else {
-                    StatusCode::BAD_REQUEST
+                    (StatusCode::BAD_REQUEST, "body_invalid")
                 };
+                monitoring::record_api_request_rejected(reason);
                 return (
                     status,
                     Json(ErrorBody {
@@ -362,7 +384,10 @@ async fn limit_concurrency(
                 )
                     .into_response();
             }
-            Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+            Err(_) => {
+                monitoring::record_api_request_rejected("body_timeout");
+                return StatusCode::REQUEST_TIMEOUT.into_response();
+            }
         };
     drop(body_permit);
     let request = Request::from_parts(parts, Body::from(bytes));
@@ -375,6 +400,7 @@ async fn limit_concurrency(
         if rejected.is_power_of_two() {
             tracing::warn!(rejected, "external API concurrency limit reached");
         }
+        monitoring::record_api_request_rejected("busy");
         return ApiError::unavailable("external API is busy; retry later").into_response();
     };
     next.run(request).await
@@ -480,6 +506,9 @@ impl ApiError {
 
 impl From<AuthError> for ApiError {
     fn from(error: AuthError) -> Self {
+        if let Some(reason) = error.failure_reason() {
+            monitoring::record_operator_auth_failure(reason);
+        }
         let status = match error {
             AuthError::InvalidPublicKey
             | AuthError::InvalidSignatureScheme

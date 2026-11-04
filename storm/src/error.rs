@@ -78,21 +78,40 @@ impl Error {
     pub(crate) fn connection_log_level(&self) -> log::Level {
         match self {
             Self::PeerAlreadyConnected => log::Level::Debug,
-            Self::Io(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::UnexpectedEof
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::NotConnected
-                ) =>
-            {
-                log::Level::Debug
-            }
+            Self::Io(error) if closed_by_peer(error) => log::Level::Debug,
             _ => log::Level::Warn,
         }
     }
+
+    /// The `reason` label of connection metrics.
+    pub(crate) fn metric_reason(&self) -> &'static str {
+        match self {
+            Self::Io(error) if closed_by_peer(error) => "closed_by_peer",
+            Self::Io(_) => "io",
+            Self::Noise(_) | Self::AbsentRemotePublicKey => "noise",
+            Self::ConnectionTimeout(_) => "timeout",
+            Self::MessageTooLarge | Self::Message(MessageError::TooLarge { .. }) => "too_large",
+            Self::Message(MessageError::Postcard(_)) => "decode",
+            Self::MessageTimestampOutsideWindow => "timestamp_window",
+            Self::ReplayedMessage => "replay",
+            Self::MessageRateLimit => "rate_limit",
+            Self::UnauthorizedConnection => "unauthorized",
+            Self::PeerAlreadyConnected => "already_connected",
+            Self::ProvisionalConnectionLimit => "provisional_limit",
+            _ => "other",
+        }
+    }
+}
+
+fn closed_by_peer(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
+    )
 }
 
 #[cfg(test)]
@@ -130,6 +149,27 @@ mod tests {
                 .connection_log_level(),
             log::Level::Warn
         );
+    }
+
+    #[test]
+    fn labels_rejected_handshakes_by_cause() {
+        for (error, reason) in [
+            (Error::UnauthorizedConnection, "unauthorized"),
+            (Error::AbsentRemotePublicKey, "noise"),
+            (Error::PeerAlreadyConnected, "already_connected"),
+            (Error::ProvisionalConnectionLimit, "provisional_limit"),
+            (Error::ConnectionTimeout("handshaking"), "timeout"),
+            (
+                Error::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+                "closed_by_peer",
+            ),
+            (
+                Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                "io",
+            ),
+        ] {
+            assert_eq!(error.metric_reason(), reason, "{error}");
+        }
     }
 
     #[test]
