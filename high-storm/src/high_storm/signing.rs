@@ -95,9 +95,17 @@ struct SigningSession {
     signers: Vec<NodePublicKey>,
     contributions: BTreeMap<NodePublicKey, SignerContribution>,
     secret_nonces: Option<Vec<SecretNonce>>,
-    completion: Option<oneshot::Sender<SigningResult>>,
+    completion: Option<Completion>,
     created_at: Instant,
 }
+
+/// Wakes the attempt waiting on a session this node requested.
+type Completion = oneshot::Sender<Result<SigningResult, SessionExpired>>;
+
+/// The cleanup expired a session before its attempt's own deadline elapsed,
+/// which is a timeout all the same.
+#[derive(Debug)]
+struct SessionExpired;
 
 struct SigningRequest {
     /// The message that started the signing, for metric labels.
@@ -448,12 +456,12 @@ impl Signing {
                                 send_from_storm(&storm, nonce_message, &recipients).await?;
                             }
                             match timeout(attempt_timeout, receiver).await {
-                                Ok(Ok(result)) => Ok(result),
-                                Ok(Err(_)) => Err(SigningError::SigningFailed),
-                                Err(_) => {
+                                Ok(Ok(Ok(result))) => Ok(result),
+                                Ok(Ok(Err(SessionExpired))) | Err(_) => {
                                     timed_out = true;
                                     Err(SigningError::SigningFailed)
                                 }
+                                Ok(Err(_)) => Err(SigningError::SigningFailed),
                             }
                         }
                         .await;
@@ -873,7 +881,7 @@ impl SigningState {
         request_hash: [u8; 32],
         requestor: NodePublicKey,
         request: SigningRequest,
-        completion: Option<oneshot::Sender<SigningResult>>,
+        completion: Option<Completion>,
     ) -> Result<Option<NodeMessage>, SigningError> {
         if self.sessions.contains_key(&request_hash) {
             return Ok(None);
@@ -1188,11 +1196,11 @@ impl SigningState {
             signatures.push(signature.to_byte_array());
         }
         if let Some(completion) = session.completion.take() {
-            let _ = completion.send(SigningResult {
+            let _ = completion.send(Ok(SigningResult {
                 request_hash,
                 signing_storm_tree_branch: session.request.signing_storm_tree_branch,
                 signatures,
-            });
+            }));
         }
         self.sessions.remove(&request_hash);
         self.record_active_sessions();
@@ -1207,8 +1215,11 @@ impl SigningState {
             .map(|(request_hash, _)| *request_hash)
             .collect::<Vec<_>>();
         for request_hash in expired {
-            if let Some(session) = self.sessions.remove(&request_hash) {
+            if let Some(mut session) = self.sessions.remove(&request_hash) {
                 self.count_missing_contributions(&session);
+                if let Some(completion) = session.completion.take() {
+                    let _ = completion.send(Err(SessionExpired));
+                }
             }
         }
         self.record_active_sessions();
@@ -1538,7 +1549,7 @@ mod tests {
     fn signing_round() -> (
         Vec<SigningState>,
         Vec<PartialSignaturesMessage>,
-        oneshot::Receiver<SigningResult>,
+        oneshot::Receiver<Result<SigningResult, SessionExpired>>,
     ) {
         let secrets = [[11; 32], [12; 32], [13; 32]];
         let peers = secrets
@@ -1636,7 +1647,20 @@ mod tests {
         state
             .accept_partial_signatures([42; 32], valid.signer, valid)
             .unwrap();
-        assert_eq!(completion.try_recv().unwrap().signatures.len(), 2);
+        assert_eq!(completion.try_recv().unwrap().unwrap().signatures.len(), 2);
+        assert!(!state.sessions.contains_key(&[42; 32]));
+    }
+
+    #[test]
+    fn tells_the_waiting_attempt_its_session_expired() {
+        let (mut states, _, mut completion) = signing_round();
+        let state = &mut states[0];
+        state.sessions.get_mut(&[42; 32]).unwrap().created_at =
+            Instant::now() - SIGNING_SESSION_TIMEOUT;
+
+        state.remove_expired_sessions();
+
+        assert!(matches!(completion.try_recv(), Ok(Err(SessionExpired))));
         assert!(!state.sessions.contains_key(&[42; 32]));
     }
 
@@ -1726,7 +1750,7 @@ mod tests {
                 assert!(result.is_ok());
             }
 
-            assert_eq!(completion.try_recv().unwrap().signatures.len(), 2);
+            assert_eq!(completion.try_recv().unwrap().unwrap().signatures.len(), 2);
             assert!(!state.sessions.contains_key(&[42; 32]));
         }
     }
