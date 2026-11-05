@@ -1,4 +1,4 @@
-use std::lib::u64::convert::u64_to_u256;
+use std::lib::u32::convert::u32_to_u256;
 
 use crate::lib::taproot::get_p2tr_script_hash;
 
@@ -17,9 +17,7 @@ fn get_merkle_root_slot_leaf(merkle_root: u256) -> u256 {
 /// Slot 1. The rescue block number is widened to 32 bytes, so the Rust side must pass
 /// 28 zero bytes followed by the height in big-endian order.
 fn get_rescue_block_slot_leaf(rescue_block_number: Height) -> u256 {
-    let rescue_block_number: u64 = jet::left_pad_low_32_64(rescue_block_number);
-
-    get_slot_leaf(u64_to_u256(rescue_block_number))
+    get_slot_leaf(u32_to_u256(rescue_block_number))
 }
 
 /// Rebuilds the covenant's script hash from a candidate storage state.

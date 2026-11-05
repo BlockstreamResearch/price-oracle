@@ -39,18 +39,18 @@ const ACCOUNT_VERIFICATION = {
   tickAssetId: "02".repeat(32),
   verifierAssetId: "04".repeat(32),
   accountTapleafHash:
-    "78f352902bd0a539848dad38389f9d5ead152d49bb494b220765bb0ff7ad8c35",
+    "d1754012c445c3df09b0d1bec1d6fb3addd9678ccc11e3a2833b5bb6b73a7119",
   tickTapleafHash:
-    "d4d648685d1728e5e73b8e6dda55d5d25251e7750e09644f7adb5027dab5b3ba",
+    "c94377a3c786b6aefba98ca7e7c2e6ca6a9a4d6ddbdbf20a17fbc32f846be9a4",
 };
 const ACCOUNT = {
-  address: "ert1pnewh9rcdzyqx65srv3cp4pxahxh6yjvvwtaw85fckdekqdm3utts0yqwxr",
+  address: "ert1pkmmvkxqa77evn3fvqjuat2dqrf6xnwtnfau9yycpwjh6acsd9ezsmggutc",
   script_pubkey:
-    "51209e5d728f0d11006d520364701a84ddb9afa2498c72fae3d138b373603771e2d7",
+    "5120b6f6cb181df7b2c9c52c04b9d5a9a01a7469b9734f7852130174afaee20d2e45",
   storm_eye_asset_id: "01".repeat(32),
   tick_asset_id: "02".repeat(32),
   tick_script_pubkey:
-    "5120e41c2cceff59748998f4c6d0540b870ba2c726e9e350b7f7d95b88ed3408a3c8",
+    "5120c34ad1035500f2c8e74a71f36e22ff83cb0094b6fe950b86a709b534b4b226e5",
   oracle_verifier_asset_id: "04".repeat(32),
   network: "elementsregtest",
 };
@@ -339,11 +339,11 @@ describe("Price Oracle SDK", () => {
     for (const [network, address] of [
       [
         "liquidv1",
-        "ex1pnewh9rcdzyqx65srv3cp4pxahxh6yjvvwtaw85fckdekqdm3uttscflvq5",
+        "ex1pkmmvkxqa77evn3fvqjuat2dqrf6xnwtnfau9yycpwjh6acsd9ezsv9h7d0",
       ],
       [
         "liquidtestnet",
-        "tex1pnewh9rcdzyqx65srv3cp4pxahxh6yjvvwtaw85fckdekqdm3uttsesdt3m",
+        "tex1pkmmvkxqa77evn3fvqjuat2dqrf6xnwtnfau9yycpwjh6acsd9ezsdu9euq",
       ],
       ["elementsregtest", ACCOUNT.address],
     ] as const) {
@@ -361,12 +361,12 @@ describe("Price Oracle SDK", () => {
       ...ACCOUNT_VERIFICATION,
       authScriptPubKey,
       tickTapleafHash:
-        "b65e44c00e48ca8956a138a4553f3ed376ea253e5b3881e7db3d42157dd8a462",
+        "88367e67f5f27e1aa2e906627cc1b57777489d93c7f48554065602d275c1391a",
     };
     const expected = {
       ...ACCOUNT,
       tick_script_pubkey:
-        "5120a8e28c5f060c0d9d45d50cf7e4bc79077cb17abede7438af92791a2eb10632f3",
+        "5120f84a9ece5e4fab1c3c166a27e6695bd715058afe75074ff6c879de19495a81b7",
     };
     const client = new PriceOracleClient(
       "https://coordinator.test",
