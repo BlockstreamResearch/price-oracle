@@ -42,3 +42,35 @@ pub(super) const PRICE_FEED_ACTIVE_SOURCES: &str = "high_storm_price_feed_active
 pub(super) const PRICE_SOURCE_STATE: &str = "high_storm_price_source_state";
 pub(super) const PRICE_SOURCE_LAST_OBSERVED: &str =
     "high_storm_price_source_last_observed_timestamp_seconds";
+
+pub(super) const NODE_MESSAGES_REJECTED: &str = "high_storm_node_messages_rejected_total";
+pub(super) const UNAUTHORIZED_MESSAGES: &str = "high_storm_unauthorized_messages_total";
+pub(super) const SIGNING_REFUSED: &str = "high_storm_signing_refused_total";
+
+pub(super) const SIGNING_ATTEMPTS: &str = "high_storm_signing_attempts_total";
+pub(super) const SIGNING_DURATION: &str = "high_storm_signing_duration_seconds";
+pub(super) const SIGNING_BRANCH_FAILURES: &str = "high_storm_signing_branch_failures_total";
+pub(super) const SIGNING_MISSING_CONTRIBUTIONS: &str =
+    "high_storm_signing_missing_contributions_total";
+pub(super) const SIGNING_INVALID_PARTIAL_SIGNATURES: &str =
+    "high_storm_signing_invalid_partial_signatures_total";
+pub(super) const SIGNING_AGGREGATE_INVALID: &str = "high_storm_signing_aggregate_invalid_total";
+pub(super) const SIGNING_SESSIONS_ACTIVE: &str = "high_storm_signing_sessions_active";
+
+pub(super) const MONITORED_UTXOS: &str = "high_storm_monitored_utxos";
+pub(super) const EXPIRED_UTXO_OLDEST_AGE: &str = "high_storm_expired_utxo_oldest_age_blocks";
+pub(super) const BURN_ROUNDS: &str = "high_storm_burn_rounds_total";
+pub(super) const BURNING_REVERTED: &str = "high_storm_burning_reverted_total";
+pub(super) const USER_REQUESTS: &str = "high_storm_user_requests";
+pub(super) const USER_REQUEST_OLDEST_PENDING_AGE: &str =
+    "high_storm_user_request_oldest_pending_age_blocks";
+pub(super) const USER_REQUESTS_FAILED: &str = "high_storm_user_requests_failed_total";
+pub(super) const ISSUANCE_ROUNDS: &str = "high_storm_issuance_rounds_total";
+
+pub(super) const VOTING_REQUESTS_CREATED: &str = "high_storm_voting_requests_created_total";
+pub(super) const VOTING_APPROVALS: &str = "high_storm_voting_approvals_total";
+pub(super) const VOTING_REQUESTS_OPEN: &str = "high_storm_voting_requests_open";
+pub(super) const VOTING_EXECUTIONS: &str = "high_storm_voting_executions_total";
+pub(super) const MEMBER_MIGRATION_IN_PROGRESS: &str = "high_storm_member_migration_in_progress";
+pub(super) const MEMBER_MIGRATION_READY: &str = "high_storm_member_migration_ready";
+pub(super) const DROPLETS_EXCHANGES: &str = "high_storm_droplets_exchanges_total";

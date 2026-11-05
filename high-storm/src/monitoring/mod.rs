@@ -2,10 +2,14 @@
 
 mod chain;
 mod elements;
+mod governance;
+mod messages;
 mod names;
 mod prices;
 mod refresh;
+mod rounds;
 mod server;
+mod signing;
 
 use std::time::Duration;
 
@@ -18,9 +22,23 @@ pub(crate) use chain::{
 };
 pub use chain::{set_storm_eye_utxos, spawn_storm_eye_probe};
 pub use elements::spawn_elements_probe;
+pub(crate) use governance::{
+    record_droplets_exchange, record_voting_approval, record_voting_execution,
+    record_voting_request_created,
+};
+pub(crate) use messages::{RejectedMessage, record_rejected_message};
 pub use prices::register_price_source;
 pub use refresh::{LoopTask, record_loop_tick, spawn_refresh};
+pub use rounds::spawn_db_gauges;
+pub(crate) use rounds::{
+    record_burn_round, record_burns_reverted, record_issuance_round, record_user_request_failed,
+};
 pub use server::MetricsServer;
+pub(crate) use signing::{
+    record_aggregate_invalid, record_invalid_partial_signatures,
+    record_missing_signing_contribution, record_signing_attempt, record_signing_branch_failure,
+    set_signing_sessions_active,
+};
 
 /// Covers fast database probes up to the 60s signing session timeout.
 const DURATION_BUCKETS: &[f64] = &[
@@ -183,6 +201,106 @@ fn describe() {
     describe_gauge!(
         names::PRICE_SOURCE_LAST_OBSERVED,
         "Unix time the source itself stamped its latest kept observation."
+    );
+    describe_counter!(
+        names::NODE_MESSAGES_REJECTED,
+        "Node messages from a peer that this node rejected, by kind and reason."
+    );
+    describe_counter!(
+        names::UNAUTHORIZED_MESSAGES,
+        "Messages from a peer acting outside its role, such as a non-coordinator starting user-request signing."
+    );
+    describe_counter!(
+        names::SIGNING_ATTEMPTS,
+        "Signings this node requested, by message kind and outcome: ok or the reason it failed."
+    );
+    describe_histogram!(
+        names::SIGNING_DURATION,
+        "Time a signing this node requested took to succeed."
+    );
+    describe_counter!(
+        names::SIGNING_BRANCH_FAILURES,
+        "Storm Tree branches that failed within a signing, by reason: timeout or error."
+    );
+    describe_counter!(
+        names::SIGNING_MISSING_CONTRIBUTIONS,
+        "Signers that never sent their nonces or partial signatures for a signing this node requested."
+    );
+    describe_counter!(
+        names::SIGNING_INVALID_PARTIAL_SIGNATURES,
+        "Partial signatures from a signer that failed to parse or verify."
+    );
+    describe_counter!(
+        names::SIGNING_AGGREGATE_INVALID,
+        "Aggregated signatures that failed verification although every partial signature verified."
+    );
+    describe_gauge!(
+        names::SIGNING_SESSIONS_ACTIVE,
+        "Signing sessions this node holds, its own and its peers'."
+    );
+    describe_gauge!(
+        names::MONITORED_UTXOS,
+        "Issued Ticks and Verifiers this node tracks, by state."
+    );
+    describe_gauge!(
+        names::EXPIRED_UTXO_OLDEST_AGE,
+        "Blocks since the oldest unburned Tick or Verifier expired; 0 when none is waiting."
+    );
+    describe_counter!(
+        names::BURN_ROUNDS,
+        "Burn rounds this node led that had something to burn, by outcome."
+    );
+    describe_counter!(
+        names::BURNING_REVERTED,
+        "Burns returned to the queue because their transaction was not confirmed in time."
+    );
+    describe_gauge!(
+        names::USER_REQUESTS,
+        "User requests in this node's database, by status."
+    );
+    describe_gauge!(
+        names::USER_REQUEST_OLDEST_PENDING_AGE,
+        "Blocks since the oldest user request not yet in a block was submitted; 0 when none."
+    );
+    describe_counter!(
+        names::USER_REQUESTS_FAILED,
+        "User requests marked failed, by reason."
+    );
+    describe_counter!(
+        names::ISSUANCE_ROUNDS,
+        "Issuance rounds this node coordinated that had requests to issue, by outcome."
+    );
+    describe_counter!(
+        names::SIGNING_REFUSED,
+        "Signing requests this node refused: price_* when its own price disagrees, invalid when the proposal is wrong, other for a local failure."
+    );
+    describe_counter!(
+        names::VOTING_REQUESTS_CREATED,
+        "Governance votes this node stored for the first time, by kind and proposer."
+    );
+    describe_counter!(
+        names::VOTING_APPROVALS,
+        "Approvals of governance votes this node stored for the first time, by vote kind."
+    );
+    describe_gauge!(
+        names::VOTING_REQUESTS_OPEN,
+        "Governance votes not yet executed and confirmed, by kind."
+    );
+    describe_counter!(
+        names::VOTING_EXECUTIONS,
+        "Vote executions this node ran or confirmed, by outcome."
+    );
+    describe_gauge!(
+        names::MEMBER_MIGRATION_IN_PROGRESS,
+        "1 while an approved member update is being executed."
+    );
+    describe_gauge!(
+        names::MEMBER_MIGRATION_READY,
+        "1 once every member of the new network is connected, so the member update can be executed."
+    );
+    describe_counter!(
+        names::DROPLETS_EXCHANGES,
+        "Queued Droplets exchanges this node ran as leader, by outcome."
     );
     metrics_process::Collector::default().describe();
 }

@@ -118,6 +118,8 @@ struct NodeSnapshot {
     block_height: u64,
     is_recovering: bool,
     is_spending_paused: bool,
+    migration_in_progress: bool,
+    migration_ready: bool,
 }
 
 impl NodeSnapshot {
@@ -131,6 +133,8 @@ impl NodeSnapshot {
             block_height: node.block_height(),
             is_recovering: node.is_recovering(),
             is_spending_paused: node.is_spending_paused(),
+            migration_in_progress: node.member_migration_request().await.is_some(),
+            migration_ready: node.member_migration_ready().await,
         }
     }
 
@@ -166,6 +170,8 @@ fn record_node(node: &NodeSnapshot) {
     gauge!(names::COORDINATOR_CONNECTED).set(flag(coordinator_connected));
     gauge!(names::CHAIN_RECOVERING).set(flag(node.is_recovering));
     gauge!(names::SPENDING_PAUSED).set(flag(node.is_spending_paused));
+    gauge!(names::MEMBER_MIGRATION_IN_PROGRESS).set(flag(node.migration_in_progress));
+    gauge!(names::MEMBER_MIGRATION_READY).set(flag(node.migration_ready));
 
     for peer in node
         .peers
@@ -282,6 +288,8 @@ mod tests {
             block_height: 42,
             is_recovering: true,
             is_spending_paused: true,
+            migration_in_progress: true,
+            migration_ready: false,
         };
         let recorder = recorder();
 
@@ -299,6 +307,8 @@ mod tests {
             "high_storm_coordinator_connected 0".to_string(),
             "high_storm_chain_recovering 1".to_string(),
             "high_storm_spending_paused 1".to_string(),
+            "high_storm_member_migration_in_progress 1".to_string(),
+            "high_storm_member_migration_ready 0".to_string(),
             format!("storm_peer_connected{{peer=\"{}\"}} 1", label(2)),
             format!("storm_peer_connected{{peer=\"{}\"}} 0", label(3)),
             format!("storm_peer_connected{{peer=\"{}\"}} 0", label(4)),
@@ -326,6 +336,8 @@ mod tests {
             block_height: 0,
             is_recovering: false,
             is_spending_paused: false,
+            migration_in_progress: false,
+            migration_ready: false,
         };
         let recorder = recorder();
 

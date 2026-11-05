@@ -354,17 +354,55 @@ impl NetworkState {
 }
 
 #[cfg(test)]
+impl NetworkState {
+    /// A state on `database`, with an Elements node nobody listens on.
+    pub(crate) async fn for_tests(
+        storm: &Storm,
+        secret_key: [u8; 32],
+        coordinator_public_key: [u8; 33],
+        database: &crate::db::Database,
+    ) -> Self {
+        Self::new(
+            storm,
+            secret_key,
+            coordinator_public_key,
+            HighStormDependencies::new(
+                database.network(),
+                database.voting(),
+                database.network_assets(),
+                database.monitored_utxos(),
+                database.droplets(),
+                database.user_requests(),
+                database.price_attestations(),
+                crate::config::ElementsRpcConfig {
+                    url: "http://127.0.0.1:18884".to_string(),
+                    username: "unused".to_string(),
+                    password: "unused".to_string(),
+                    wallet: "unused".to_string(),
+                },
+                crate::config::ProtocolConfig {
+                    operational_fee_sats: 1_000,
+                    tick_burn_reserve_sats: 1_000,
+                    issuance_transaction_fee_sats: 1_000,
+                    burn_transaction_fee_sats: 500,
+                    exchange_transaction_fee_sats: 500,
+                    tick_lifetime_blocks: 60,
+                    finality_confirmations: 2,
+                },
+            ),
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use secp256k1_zkp::{Secp256k1, SecretKey};
     use storm::{Peer, Storm};
 
-    use crate::{
-        config::{ElementsRpcConfig, ProtocolConfig},
-        db::Database,
-        high_storm::HighStormDependencies,
-    };
+    use crate::db::Database;
 
     use super::{NetworkState, VotingExecutionAttempts};
 
@@ -448,36 +486,9 @@ mod tests {
                 Peer::new(second_public),
             ],
         );
-        let state = NetworkState::new(
-            &storm,
-            local_secret.secret_bytes(),
-            local_public,
-            HighStormDependencies::new(
-                database.network(),
-                database.voting(),
-                database.network_assets(),
-                database.monitored_utxos(),
-                database.droplets(),
-                database.user_requests(),
-                database.price_attestations(),
-                ElementsRpcConfig {
-                    url: "http://127.0.0.1:18884".to_string(),
-                    username: "unused".to_string(),
-                    password: "unused".to_string(),
-                    wallet: "unused".to_string(),
-                },
-                ProtocolConfig {
-                    operational_fee_sats: 1_000,
-                    tick_burn_reserve_sats: 1_000,
-                    issuance_transaction_fee_sats: 1_000,
-                    burn_transaction_fee_sats: 500,
-                    exchange_transaction_fee_sats: 500,
-                    tick_lifetime_blocks: 60,
-                    finality_confirmations: 2,
-                },
-            ),
-        )
-        .await;
+        let state =
+            NetworkState::for_tests(&storm, local_secret.secret_bytes(), local_public, &database)
+                .await;
         let first_target: BTreeSet<[u8; 32]> = [local_public, first_public]
             .into_iter()
             .map(|key| key[1..].try_into().unwrap())

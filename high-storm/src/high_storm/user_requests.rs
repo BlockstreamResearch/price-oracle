@@ -318,9 +318,13 @@ impl UserRequestProcessor {
                     let reason = format!(
                         "request transaction weight {weight} exceeds round limit {max_transaction_weight}"
                     );
-                    self.requests
+                    if self
+                        .requests
                         .mark_failed(request_hash, reason.as_bytes())
-                        .await?;
+                        .await?
+                    {
+                        crate::monitoring::record_user_request_failed("over_weight");
+                    }
                     return Err(UserRequestError::Invalid(reason));
                 }
                 upper_limit = request_count - 1;
@@ -389,9 +393,13 @@ impl UserRequestProcessor {
                 {
                     let waited = block_height.saturating_sub(stored.block_height);
                     let reason = format!("feed {feed} was not issued in {waited} blocks");
-                    self.requests
+                    if self
+                        .requests
                         .mark_failed(stored.request_hash, reason.as_bytes())
-                        .await?;
+                        .await?
+                    {
+                        crate::monitoring::record_user_request_failed("unpriced_feed");
+                    }
                     tracing::warn!(
                         request_hash = %hex::encode(stored.request_hash),
                         %reason,
@@ -464,9 +472,13 @@ impl UserRequestProcessor {
                     resolved_fee_utxos.push(utxo);
                 }
                 if let Some(reason) = unavailable {
-                    self.requests
+                    if self
+                        .requests
                         .mark_failed(stored.request_hash, reason.as_bytes())
-                        .await?;
+                        .await?
+                    {
+                        crate::monitoring::record_user_request_failed("fee_utxo_unavailable");
+                    }
                     tracing::warn!(
                         request_hash = %hex::encode(stored.request_hash),
                         %reason,

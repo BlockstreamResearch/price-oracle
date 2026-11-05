@@ -325,14 +325,19 @@ impl HighStorm {
             return Ok(None);
         }
 
-        match self
+        let exchanged = self
             .exchange_droplets(
                 request.transaction.clone(),
                 request.signing_hash,
                 self.state.block_height(),
             )
-            .await
-        {
+            .await;
+        monitoring::record_droplets_exchange(match &exchanged {
+            Ok(_) => "broadcast",
+            Err(error) if error.is_retryable() => "retry",
+            Err(_) => "failed",
+        });
+        match exchanged {
             Ok(txid) => {
                 self.state
                     .droplets()
@@ -673,7 +678,21 @@ impl HighStorm {
         if !self.is_coordinator().await {
             return Ok(0);
         }
+        // Counted once this node coordinates the round, preparation included.
+        let issued = self
+            .coordinate_issuance_round(storm_eye_lane, max_transaction_weight)
+            .await;
+        if let Some(outcome) = round_outcome(&issued) {
+            monitoring::record_issuance_round(outcome);
+        }
+        issued
+    }
 
+    async fn coordinate_issuance_round(
+        &self,
+        storm_eye_lane: usize,
+        max_transaction_weight: usize,
+    ) -> Result<usize, user_requests::UserRequestError> {
         let mut prepared = match self
             .state
             .user_requests()
@@ -769,7 +788,22 @@ impl HighStorm {
         if !leader::is_local_leader(&peers, block_height) {
             return Ok(0);
         }
+        // Counted once this node leads the round, preparation included.
+        let burned = self
+            .lead_burn_round(block_height, storm_eye_lane, max_transaction_weight)
+            .await;
+        if let Some(outcome) = round_outcome(&burned) {
+            monitoring::record_burn_round(outcome);
+        }
+        burned
+    }
 
+    async fn lead_burn_round(
+        &self,
+        block_height: u64,
+        storm_eye_lane: usize,
+        max_transaction_weight: usize,
+    ) -> Result<usize, BurningError> {
         let mut prepared = match self
             .state
             .burning()
@@ -892,6 +926,10 @@ impl HighStormHandle {
 
     pub async fn member_migration_ready(&self) -> bool {
         self.storm.member_migration_ready().await
+    }
+
+    pub(crate) async fn open_voting_kinds(&self) -> Result<Vec<&'static str>, VotingError> {
+        self.state.voting().unconfirmed_kinds().await
     }
 
     /// Only a Direct feed has sources. Named with a Cross pair, this and the
@@ -1090,6 +1128,11 @@ impl HighStormHandle {
         Ok(tokio::spawn(async move {
             let _attempt = attempt;
             let result = handle.execute_voting_request_inner(request_hash).await;
+            monitoring::record_voting_execution(match &result {
+                Ok(_) => "broadcast",
+                Err(VotingExecutionError::MemberMigrationNotReady) => "migration_not_ready",
+                Err(_) => "failed",
+            });
             if let Err(error) = &result {
                 tracing::warn!(request_hash = %hex::encode(request_hash), %error, "voting execution attempt failed");
             }
@@ -1335,6 +1378,7 @@ impl HighStormHandle {
                     .confirm(request_hash, txid)
                     .await?;
             }
+            monitoring::record_voting_execution("confirmed");
             confirmed += 1;
         }
 
@@ -1405,6 +1449,15 @@ impl HighStormHandle {
 
     pub async fn network_asset(&self, kind: &str) -> Result<Option<NetworkAsset>, AssetError> {
         self.state.assets().get(kind).await
+    }
+}
+
+/// A round that had nothing to do is not counted.
+fn round_outcome<E>(result: &Result<usize, E>) -> Option<&'static str> {
+    match result {
+        Ok(0) => None,
+        Ok(_) => Some("broadcast"),
+        Err(_) => Some("failed"),
     }
 }
 
