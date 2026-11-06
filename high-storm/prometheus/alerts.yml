@@ -2,6 +2,9 @@
 # catalog. `severity` is `page` (P0: the network or funds are at risk), `warn`
 # (P1: degraded, or signs of an attack) or `info` (P2: for diagnosis), and
 # `catalog` names the catalog item each rule covers.
+#
+# A node shows each new counter at zero to one scrape before counting the
+# events that created it, so `increase()` sees a first event like any other.
 groups:
   - name: high-storm-node
     rules:

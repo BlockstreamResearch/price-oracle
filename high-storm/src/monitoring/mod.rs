@@ -3,6 +3,7 @@
 mod api;
 mod chain;
 mod elements;
+mod exporter;
 mod governance;
 mod health;
 mod messages;
@@ -17,7 +18,7 @@ mod signing;
 use std::time::Duration;
 
 use metrics::{describe_counter, describe_gauge, describe_histogram, gauge};
-use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder};
 use metrics_util::MetricKindMask;
 
 pub(crate) use api::{
@@ -30,6 +31,7 @@ pub(crate) use chain::{
 };
 pub use chain::{set_storm_eye_utxos, spawn_storm_eye_probe};
 pub use elements::spawn_elements_probe;
+pub use exporter::Exporter;
 pub(crate) use governance::{
     record_droplets_exchange, record_voting_approval, record_voting_execution,
     record_voting_request_created,
@@ -70,11 +72,11 @@ const WEIGHT_BUCKETS: &[f64] = &[
 const GAUGE_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Installs the process-wide recorder. Call once, before any metric is emitted.
-pub fn install() -> Result<PrometheusHandle, BuildError> {
-    let handle = builder()?.install_recorder()?;
+pub fn install() -> Result<Exporter, BuildError> {
+    let exporter = Exporter::install(builder()?.build_recorder())?;
     describe();
     record_build_info();
-    Ok(handle)
+    Ok(exporter)
 }
 
 /// Durations render as histograms rather than summaries so alerts can
