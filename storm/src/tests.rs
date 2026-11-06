@@ -339,6 +339,75 @@ async fn authenticated_peer_is_active_once_and_inactive_after_disconnect() {
 }
 
 #[tokio::test]
+async fn releases_an_inbound_connection_whose_setup_fails() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let secp = Secp256k1::new();
+    let mut random = rand::thread_rng();
+    let discovery_secret_key = SecretKey::new(&mut random);
+    let discovery_public_key = discovery_secret_key.public_key(&secp).serialize();
+    let stuck_public_key = SecretKey::new(&mut random).public_key(&secp).serialize();
+    let joining_secret_key = SecretKey::new(&mut random);
+    let joining_public_key = joining_secret_key.public_key(&secp).serialize();
+    let discovery = Storm::discovery(
+        discovery_secret_key,
+        vec![Peer::new(stuck_public_key), Peer::new(joining_public_key)],
+    );
+    // A connected peer that drains nothing, so broadcasting the completed
+    // discovery table to it fails.
+    let (stuck_sender, _stuck_receiver) = mpsc::channel(constants::OUTBOUND_QUEUE_CAPACITY);
+    for _ in 0..constants::OUTBOUND_QUEUE_CAPACITY {
+        stuck_sender.try_send(Vec::new()).unwrap();
+    }
+    {
+        let mut state = discovery.inner.write().await;
+        for peer in &mut state.peers {
+            peer.socket_address = Some("127.0.0.1:1".into());
+            if peer.compressed_public_key == stuck_public_key {
+                peer.status = PeerStatus::Active;
+            }
+        }
+        state.connections.insert(stuck_public_key, stuck_sender);
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let (_client, server) = connect(
+        address,
+        &listener,
+        &joining_secret_key,
+        &discovery_public_key,
+        Arc::clone(&discovery.inner),
+    )
+    .await;
+    let result = timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(result, Err(Error::PeerQueueFull(_))));
+    let state = discovery.inner.read().await;
+    assert!(!state.connections.contains_key(&joining_public_key));
+    assert_eq!(
+        state
+            .peers
+            .iter()
+            .find(|peer| peer.compressed_public_key == joining_public_key)
+            .unwrap()
+            .status,
+        PeerStatus::Inactive
+    );
+    let rendered = recorder.handle().render();
+    let peer = hex::encode(joining_public_key);
+    for line in [
+        format!("storm_peer_connections_total{{peer=\"{peer}\",direction=\"inbound\"}} 1"),
+        format!("storm_peer_disconnections_total{{peer=\"{peer}\",reason=\"other\"}} 1"),
+    ] {
+        assert!(rendered.contains(&line), "missing {line:?} in:\n{rendered}");
+    }
+}
+
+#[tokio::test]
 async fn counts_connections_rejections_and_disconnections() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let _local = metrics::set_default_local_recorder(&recorder);

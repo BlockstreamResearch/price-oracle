@@ -171,11 +171,13 @@ impl Storm {
         let handle = StormHandle {
             inner: Arc::clone(&state),
         };
-        handle.broadcast_discovery_table_if_ready().await?;
-        handle.finish_client_discovery_if_connected().await;
-
-        let result =
-            Self::run_connection(stream, transport, remote_public_key, &state, receiver).await;
+        // The peer is marked connected from here, so a failed setup releases it too.
+        let result = async {
+            handle.broadcast_discovery_table_if_ready().await?;
+            handle.finish_client_discovery_if_connected().await;
+            Self::run_connection(stream, transport, remote_public_key, &state, receiver).await
+        }
+        .await;
 
         Self::release_connection(&state, remote_public_key).await;
         telemetry::record_disconnection(
