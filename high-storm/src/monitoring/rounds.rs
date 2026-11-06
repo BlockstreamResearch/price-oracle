@@ -5,7 +5,7 @@ use tokio::time::MissedTickBehavior;
 
 use super::{
     elements,
-    health::{MonitoringTask, record_task_error, record_task_run},
+    health::{MonitoringTask, record_task_error, record_task_run, record_task_started},
     names,
     refresh::set_retained,
 };
@@ -50,6 +50,7 @@ pub(crate) fn record_user_request_failed(reason: &'static str) {
 /// attestations, operators and balances from the database until the process
 /// exits.
 pub fn spawn_db_gauges(node: HighStormHandle, database: Database, tick_lifetime_blocks: u64) {
+    record_task_started(MonitoringTask::DbGauges);
     tokio::spawn(async move {
         let mut refresh = tokio::time::interval(DB_GAUGES_INTERVAL);
         refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);

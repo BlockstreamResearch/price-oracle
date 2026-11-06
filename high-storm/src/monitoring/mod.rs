@@ -68,7 +68,7 @@ const WEIGHT_BUCKETS: &[f64] = &[
 
 /// Drops a gauge nothing has set for this long, such as one for a peer that
 /// left the network. Gauges an alert relies on are republished by the refresh
-/// task, so they never go idle.
+/// task, and task heartbeats on every scrape, so they never go idle.
 const GAUGE_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Installs the process-wide recorder. Call once, before any metric is emitted.
@@ -101,7 +101,7 @@ fn describe() {
     );
     describe_gauge!(
         names::MONITORING_TASK_LAST_RUN,
-        "Unix time each background metrics task last finished a pass; stale or missing means its gauges are too."
+        "Unix time each background metrics task last finished a pass, or started if it has not finished one; stale means its gauges are too."
     );
     describe_counter!(
         names::MONITORING_TASK_ERRORS,

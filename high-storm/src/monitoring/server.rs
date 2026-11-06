@@ -184,6 +184,7 @@ async fn render(State(state): State<MetricsState>, headers: HeaderMap) -> Respon
             return StatusCode::UNAUTHORIZED.into_response();
         }
     }
+    super::health::record_task_runs();
     state.process.collect();
     (
         [(header::CONTENT_TYPE, CONTENT_TYPE)],

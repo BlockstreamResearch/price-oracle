@@ -5,7 +5,7 @@ use tokio::time::MissedTickBehavior;
 
 use super::{
     elements, flag,
-    health::{MonitoringTask, record_task_error, record_task_run},
+    health::{MonitoringTask, record_task_error, record_task_run, record_task_started},
     names,
     refresh::set_retained,
 };
@@ -50,6 +50,7 @@ pub fn set_storm_eye_utxos(count: usize) {
 /// keeps moving when this node's indexing stalls while blocks keep coming.
 /// Runs until the process exits.
 pub fn spawn_storm_eye_probe(node: HighStormHandle) {
+    record_task_started(MonitoringTask::StormEyeProbe);
     tokio::spawn(async move {
         let mut probe = tokio::time::interval(STORM_EYE_PROBE_INTERVAL);
         probe.set_missed_tick_behavior(MissedTickBehavior::Skip);

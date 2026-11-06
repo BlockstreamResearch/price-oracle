@@ -696,7 +696,9 @@ groups:
           summary: Prometheus scrapes no high-storm node
           description: Every node needs `service.metrics.address` set and a scrape target.
 
-      # The refresh task publishes the gauges most P0 alerts read.
+      # The refresh task publishes the gauges most P0 alerts read. Once a task
+      # starts, the node republishes its heartbeat on every scrape, so a task
+      # that stops shows as stale rather than missing.
       - alert: HighStormMonitoringTaskMissing
         expr: up{job="high-storm"} == 1 unless on (instance) high_storm_monitoring_task_last_run_timestamp_seconds{task="refresh"}
         for: 2m
@@ -705,7 +707,8 @@ groups:
           runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#monitoring
           summary: "{{ $labels.instance }} is scraped but its refresh task reports nothing"
 
-      # Four passes of the slowest task, which runs every 30s.
+      # Four passes of the slowest task, which runs every 30s. A task that never
+      # finishes a pass is stale from its start.
       - alert: HighStormMonitoringTaskStale
         expr: time() - high_storm_monitoring_task_last_run_timestamp_seconds > 120
         for: 1m
