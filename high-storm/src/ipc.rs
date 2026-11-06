@@ -70,17 +70,10 @@ impl IpcServer {
     pub async fn run(self) -> Result<(), Error> {
         loop {
             let (stream, _) = self.listener.accept().await?;
-            let peer_uid = match stream.peer_cred() {
-                Ok(credentials) => credentials.uid(),
-                Err(error) => {
-                    tracing::warn!(%error, "rejected operator IPC connection without credentials");
-                    monitoring::record_ipc_rejected("no_credentials");
-                    continue;
-                }
-            };
-            if !is_authorized_peer(self.owner_uid, peer_uid) {
-                tracing::warn!(peer_uid, "rejected unauthorized operator IPC connection");
-                monitoring::record_ipc_rejected("uid");
+            let peer_uid = stream.peer_cred().map(|credentials| credentials.uid());
+            if let Some(reason) = refusal(self.owner_uid, &peer_uid) {
+                tracing::warn!(?peer_uid, reason, "rejected an operator IPC connection");
+                monitoring::record_ipc_rejected(reason);
                 continue;
             }
             let operators = self.operators.clone();
@@ -90,6 +83,15 @@ impl IpcServer {
                 }
             });
         }
+    }
+}
+
+/// Why a connection to the operator socket is refused, if it is.
+fn refusal(owner_uid: u32, peer_uid: &std::io::Result<u32>) -> Option<&'static str> {
+    match peer_uid {
+        Err(_) => Some("no_credentials"),
+        Ok(peer_uid) if !is_authorized_peer(owner_uid, *peer_uid) => Some("uid"),
+        Ok(_) => None,
     }
 }
 
@@ -221,6 +223,16 @@ mod tests {
         assert!(is_authorized_peer(1000, 1000));
         assert!(is_authorized_peer(1000, 0));
         assert!(!is_authorized_peer(1000, 1001));
+    }
+
+    #[test]
+    fn names_why_a_connection_is_refused() {
+        let unknown = Err(std::io::Error::other("no peer credentials"));
+
+        assert_eq!(refusal(1000, &Ok(1001)), Some("uid"));
+        assert_eq!(refusal(1000, &unknown), Some("no_credentials"));
+        assert_eq!(refusal(1000, &Ok(1000)), None);
+        assert_eq!(refusal(1000, &Ok(0)), None);
     }
 
     #[tokio::test]

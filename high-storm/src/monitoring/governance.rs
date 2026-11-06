@@ -33,7 +33,10 @@ pub(crate) fn record_droplets_exchange(outcome: &'static str) {
 pub(super) async fn record_open_votings(node: &HighStormHandle) {
     match node.open_voting_kinds().await {
         Ok(kinds) => record_open_kinds(&kinds),
-        Err(error) => tracing::debug!(%error, "could not count open voting requests"),
+        Err(error) => {
+            super::health::record_task_error(super::health::MonitoringTask::DbGauges);
+            tracing::debug!(%error, "could not count open voting requests");
+        }
     }
 }
 

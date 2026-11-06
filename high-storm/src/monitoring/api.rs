@@ -104,6 +104,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reports_connections_operators_and_refused_ipc() {
+        let recorder = crate::monitoring::builder().unwrap().build_recorder();
+
+        metrics::with_local_recorder(&recorder, || {
+            let _open = ApiConnection::open();
+            set_operators(2);
+            record_ipc_rejected("uid");
+        });
+
+        let rendered = recorder.handle().render();
+        // Other tests open connections too, so only the gauge's presence is fixed.
+        assert!(rendered.contains("high_storm_api_connections_active "));
+        assert!(rendered.contains("high_storm_operators 2"));
+        assert!(rendered.contains(r#"high_storm_ipc_rejected_total{reason="uid"} 1"#));
+    }
+
+    #[test]
     fn labels_only_standard_methods() {
         assert_eq!(method_label(&Method::POST), "POST");
         assert_eq!(method_label(&Method::from_bytes(b"BREW").unwrap()), "other");

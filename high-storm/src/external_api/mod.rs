@@ -25,7 +25,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Auth, RpcApi};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -429,9 +429,10 @@ async fn detect_auth_network(
     elements_rpc: crate::config::ElementsRpcConfig,
 ) -> Result<AuthNetwork, ExternalApiError> {
     tokio::task::spawn_blocking(move || {
-        let client = Client::new(
+        let client = monitoring::elements_client(
             &elements_rpc.url,
             Auth::UserPass(elements_rpc.username, elements_rpc.password),
+            "api",
         )?;
         let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
         AuthNetwork::from_chain(&chain.chain)

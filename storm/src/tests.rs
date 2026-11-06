@@ -397,6 +397,36 @@ async fn counts_connections_rejections_and_disconnections() {
 }
 
 #[tokio::test]
+async fn counts_failed_lookups_timeouts_and_open_inbound_connections() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let peer = [2; 33];
+
+    // `.invalid` never resolves.
+    crate::handle::connect_tcp(peer, "does-not-exist.invalid:9000".into())
+        .await
+        .unwrap_err();
+    let error = telemetry::timed_out("write", "writing to a peer");
+    let _inbound = telemetry::InboundConnection::open();
+
+    assert!(matches!(
+        error,
+        Error::ConnectionTimeout("writing to a peer")
+    ));
+    let rendered = recorder.handle().render();
+    for line in [
+        format!(
+            "storm_dns_resolution_failures_total{{peer=\"{}\"}} 1",
+            hex::encode(peer)
+        ),
+        r#"storm_connection_timeouts_total{stage="write"} 1"#.into(),
+        "storm_inbound_connections_active ".into(),
+    ] {
+        assert!(rendered.contains(&line), "missing {line:?} in:\n{rendered}");
+    }
+}
+
+#[tokio::test]
 async fn replayed_noise_message_one_cannot_claim_peer_slot_or_change_address() {
     let secp = Secp256k1::new();
     let server_secret = SecretKey::from_slice(&[41; 32]).unwrap();

@@ -43,10 +43,12 @@ pub(super) fn tip_height() -> Option<u64> {
 
 /// Probes the node's Elements daemon until the process exits.
 pub fn spawn_elements_probe(config: &ElementsRpcConfig) -> Result<(), bitcoincore_rpc::Error> {
-    let client = Arc::new(Client::new(
+    let client = Arc::new(super::rpc::elements_client(
         &config.url,
         Auth::UserPass(config.username.clone(), config.password.clone()),
+        "probe",
     )?);
+    super::health::record_task_started(super::health::MonitoringTask::ElementsProbe);
     tokio::spawn(async move {
         let mut probe = tokio::time::interval(PROBE_INTERVAL);
         probe.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -63,6 +65,7 @@ pub fn spawn_elements_probe(config: &ElementsRpcConfig) -> Result<(), bitcoincor
                 TIP_HEIGHT.store(status.tip_height, Ordering::Relaxed);
             }
             record_status(status.is_some(), last_known.as_ref());
+            super::health::record_task_run(super::health::MonitoringTask::ElementsProbe);
         }
     });
     Ok(())

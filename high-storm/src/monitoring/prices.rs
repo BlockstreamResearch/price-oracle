@@ -177,6 +177,7 @@ pub(super) async fn record_peer_attestations(node: &HighStormHandle) {
         let attestations = match node.price_attestations(definition.id).await {
             Ok(attestations) => attestations,
             Err(error) => {
+                super::health::record_task_error(super::health::MonitoringTask::DbGauges);
                 tracing::debug!(%error, "could not read peer price attestations");
                 return;
             }

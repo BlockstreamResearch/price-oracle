@@ -1,0 +1,243 @@
+# Unit tests for the rules whose expressions do more than compare one series:
+# `promtool test rules alerts.test.yml`.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'high_storm_connected_members{instance="node-1:9300",job="high-storm"}'
+        values: "3 1x5"
+      - series: 'high_storm_signing_threshold{instance="node-1:9300",job="high-storm"}'
+        values: "2x6"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: HighStormQuorumLost
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: HighStormQuorumLost
+        exp_alerts:
+          - exp_labels: { severity: page, catalog: "2.2", instance: "node-1:9300", job: high-storm }
+            exp_annotations:
+              runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#22
+              summary: node-1:9300 can reach fewer members than signing needs
+              description: Nothing can be signed, so no issuance, burns or Storm Eye renewal.
+
+  # Only the freshest periodic arm counts, so one stale arm is not a stuck loop.
+  - interval: 1m
+    input_series:
+      - series: 'high_storm_loop_last_tick_timestamp_seconds{instance="node-1:9300",job="high-storm",task="index_blocks"}'
+        values: "0x5"
+      - series: 'high_storm_loop_last_tick_timestamp_seconds{instance="node-1:9300",job="high-storm",task="reconnect"}'
+        values: "0 60 120 120 120 120"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: HighStormMainLoopStuck
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: HighStormMainLoopStuck
+        exp_alerts:
+          - exp_labels: { severity: page, catalog: "1.3", instance: "node-1:9300" }
+            exp_annotations:
+              runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#13
+              summary: node-1:9300 main loop has not ticked for 3m 0s
+
+  # Fires only when no node reaches the coordinator.
+  - interval: 1m
+    input_series:
+      - series: 'high_storm_coordinator_connected{instance="node-2:9300",job="high-storm"}'
+        values: "0x5"
+      - series: 'high_storm_coordinator_connected{instance="node-3:9300",job="high-storm"}'
+        values: "1 1 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: HighStormCoordinatorUnreachable
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: HighStormCoordinatorUnreachable
+        exp_alerts:
+          - exp_labels: { severity: page, catalog: "2.4" }
+            exp_annotations:
+              runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#24
+              summary: No node can reach the coordinator, so the user API is down network-wide
+
+  # A counter appears with its first event, shown at zero to one scrape first.
+  - interval: 1m
+    input_series:
+      - series: 'high_storm_voting_requests_created_total{instance="node-1:9300",job="high-storm",kind="update_network_members",proposer="02aa"}'
+        values: "_ 0 1 1"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HighStormMemberUpdateVote
+        exp_alerts:
+          - exp_labels: { severity: page, catalog: "3.10", instance: "node-1:9300", proposer: "02aa" }
+            exp_annotations:
+              runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#310
+              summary: 02aa proposed adding or removing members
+              description: An operator must review the vote before approving it.
+
+  # A peer that stops attesting while this node's own price keeps moving; a
+  # quiet market, where this node's price is as old, does not alert.
+  - interval: 1m
+    input_series:
+      - series: 'high_storm_price_peer_attestation_timestamp_seconds{instance="node-1:9300",job="high-storm",feed="LBTC/USD",peer="02bb"}'
+        values: "0x12"
+      - series: 'high_storm_price_feed_received_timestamp_seconds{instance="node-1:9300",job="high-storm",feed="LBTC/USD"}'
+        values: "0+60x12"
+      - series: 'high_storm_price_peer_attestation_timestamp_seconds{instance="node-2:9300",job="high-storm",feed="LBTC/USD",peer="02cc"}'
+        values: "0x12"
+      - series: 'high_storm_price_feed_received_timestamp_seconds{instance="node-2:9300",job="high-storm",feed="LBTC/USD"}'
+        values: "0x12"
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: HighStormPeerStoppedAttesting
+        exp_alerts:
+          - exp_labels:
+              { severity: warn, catalog: "5.7", instance: "node-1:9300", job: high-storm, feed: LBTC/USD, peer: "02bb" }
+            exp_annotations:
+              runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#57
+              summary: 02bb has not attested LBTC/USD for 11m 0s
+
+  # 2.4: a cut-off coordinator still reports itself as reachable; only the
+  # other nodes count.
+  - interval: 1m
+    input_series:
+      - series: 'high_storm_is_coordinator{instance="node-1:9300",job="high-storm"}'
+        values: "1x6"
+      - series: 'high_storm_coordinator_connected{instance="node-1:9300",job="high-storm"}'
+        values: "1x6"
+      - series: 'high_storm_coordinator_connected{instance="node-2:9300",job="high-storm"}'
+        values: "0x6"
+      - series: 'high_storm_coordinator_connected{instance="node-3:9300",job="high-storm"}'
+        values: "0 0 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: HighStormCoordinatorUnreachable
+        exp_alerts: []
+      # node-3 reaches it again from 2m, so nothing fires.
+      - eval_time: 6m
+        alertname: HighStormCoordinatorUnreachable
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'high_storm_is_coordinator{instance="node-1:9300",job="high-storm"}'
+        values: "1x6"
+      - series: 'high_storm_coordinator_connected{instance="node-1:9300",job="high-storm"}'
+        values: "1x6"
+      - series: 'high_storm_coordinator_connected{instance="node-2:9300",job="high-storm"}'
+        values: "0x6"
+      - series: 'high_storm_coordinator_connected{instance="node-3:9300",job="high-storm"}'
+        values: "0x6"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HighStormCoordinatorUnreachable
+        exp_alerts:
+          - exp_labels: { severity: page, catalog: "2.4" }
+            exp_annotations:
+              runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#24
+              summary: No node can reach the coordinator, so the user API is down network-wide
+
+  # 1.6: a full pool fails the probe too, which is not the database being down.
+  - interval: 1m
+    input_series:
+      - series: 'high_storm_db_up{instance="node-1:9300",job="high-storm"}'
+        values: "0x7"
+      - series: 'high_storm_db_pool_connections{instance="node-1:9300",job="high-storm",state="used"}'
+        values: "5x7"
+      - series: 'high_storm_db_pool_max_connections{instance="node-1:9300",job="high-storm"}'
+        values: "5x7"
+      - series: 'high_storm_db_up{instance="node-2:9300",job="high-storm"}'
+        values: "0x7"
+      - series: 'high_storm_db_pool_connections{instance="node-2:9300",job="high-storm",state="used"}'
+        values: "0x7"
+      - series: 'high_storm_db_pool_max_connections{instance="node-2:9300",job="high-storm"}'
+        values: "5x7"
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: HighStormDatabaseDown
+        exp_alerts:
+          - exp_labels: { severity: page, catalog: "1.6", instance: "node-2:9300", job: high-storm }
+            exp_annotations:
+              runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#16
+              summary: node-2:9300 cannot reach its database
+              description: A trivial query did not complete within 2s, or no pool connection was free.
+      - eval_time: 7m
+        alertname: HighStormDatabasePoolExhausted
+        exp_alerts:
+          - exp_labels: { severity: warn, catalog: "1.6", instance: "node-1:9300", job: high-storm }
+            exp_annotations:
+              runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#16
+              summary: node-1:9300 has used every database connection for 5 minutes
+
+  # A scraped node whose refresh task reports nothing has frozen gauges.
+  - interval: 1m
+    input_series:
+      - series: 'up{instance="node-1:9300",job="high-storm"}'
+        values: "1x5"
+      - series: 'up{instance="node-2:9300",job="high-storm"}'
+        values: "1x5"
+      - series: 'high_storm_monitoring_task_last_run_timestamp_seconds{instance="node-2:9300",job="high-storm",task="refresh"}'
+        values: "0+60x5"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: HighStormMonitoringTaskMissing
+        exp_alerts:
+          - exp_labels: { severity: page, catalog: "monitoring", instance: "node-1:9300", job: high-storm }
+            exp_annotations:
+              runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#monitoring
+              summary: node-1:9300 is scraped but its refresh task reports nothing
+
+  # A task that stopped keeps its heartbeat, so the alert keeps firing.
+  - interval: 1m
+    input_series:
+      - series: 'high_storm_monitoring_task_last_run_timestamp_seconds{instance="node-1:9300",job="high-storm",task="db_gauges"}'
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: HighStormMonitoringTaskStale
+        exp_alerts:
+          - exp_labels: { severity: page, catalog: "monitoring", instance: "node-1:9300", job: high-storm, task: db_gauges }
+            exp_annotations:
+              runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#monitoring
+              summary: The db_gauges task on node-1:9300 last ran 30m 0s ago
+
+  # One event is enough for an event rule, whatever the scrape timing.
+  - interval: 1m
+    input_series:
+      - series: 'high_storm_burning_reverted_total{instance="node-1:9300",job="high-storm"}'
+        values: "0 0 1 1 1"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HighStormBurnsReverted
+        exp_alerts:
+          - exp_labels: { severity: warn, catalog: "8.4", instance: "node-1:9300", job: high-storm }
+            exp_annotations:
+              runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#84
+              summary: A burn returned to the queue on node-1:9300, unconfirmed after 5 blocks
+      - eval_time: 3m
+        alertname: Watchdog
+        exp_alerts:
+          - exp_labels: { severity: none, catalog: "monitoring" }
+            exp_annotations:
+              runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#monitoring
+              summary: The alerting pipeline is working
+
+  # One replay in a reconnection race stays quiet; a peer that keeps replaying
+  # does not.
+  - interval: 1m
+    input_series:
+      - series: 'storm_messages_rejected_total{instance="node-1:9300",job="high-storm",peer="02aa",reason="replay"}'
+        values: "0 1 1 1 1"
+      - series: 'storm_messages_rejected_total{instance="node-1:9300",job="high-storm",peer="02bb",reason="replay"}'
+        values: "0 1 2 3 4"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: StormPeerReplaysMessages
+        exp_alerts:
+          - exp_labels: { severity: warn, catalog: "3.1", instance: "node-1:9300", peer: "02bb" }
+            exp_annotations:
+              runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#31
+              summary: 02bb replayed messages to node-1:9300
