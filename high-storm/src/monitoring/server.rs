@@ -16,7 +16,6 @@ use axum::{
     routing::get,
 };
 use metrics::counter;
-use metrics_exporter_prometheus::PrometheusHandle;
 use metrics_process::Collector;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -25,7 +24,7 @@ use tokio::{
     time::{MissedTickBehavior, Sleep},
 };
 
-use super::names;
+use super::{Exporter, names};
 
 /// Without a built-in exporter nothing else drains histogram samples.
 const UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
@@ -39,19 +38,19 @@ const CONNECTION_LIFETIME: Duration = Duration::from_secs(60);
 
 pub struct MetricsServer {
     listener: TcpListener,
-    handle: PrometheusHandle,
+    exporter: Exporter,
     bearer_token: Option<String>,
 }
 
 impl MetricsServer {
     pub async fn bind(
         address: SocketAddr,
-        handle: PrometheusHandle,
+        exporter: Exporter,
         bearer_token: Option<String>,
     ) -> io::Result<Self> {
         Ok(Self {
             listener: TcpListener::bind(address).await?,
-            handle,
+            exporter,
             bearer_token,
         })
     }
@@ -68,13 +67,13 @@ impl MetricsServer {
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         };
         let serve =
-            axum::serve(listener, router(self.handle.clone(), self.bearer_token)).into_future();
+            axum::serve(listener, router(self.exporter.clone(), self.bearer_token)).into_future();
         tokio::pin!(serve);
 
         loop {
             tokio::select! {
                 result = &mut serve => return result,
-                _ = upkeep.tick() => self.handle.run_upkeep(),
+                _ = upkeep.tick() => self.exporter.run_upkeep(),
             }
         }
     }
@@ -160,16 +159,16 @@ impl AsyncWrite for LimitedConnection {
 
 #[derive(Clone)]
 struct MetricsState {
-    handle: PrometheusHandle,
+    exporter: Exporter,
     process: Collector,
     bearer_token: Option<Arc<str>>,
 }
 
-fn router(handle: PrometheusHandle, bearer_token: Option<String>) -> Router {
+fn router(exporter: Exporter, bearer_token: Option<String>) -> Router {
     Router::new()
         .route("/metrics", get(render))
         .with_state(MetricsState {
-            handle,
+            exporter,
             process: Collector::default(),
             bearer_token: bearer_token.map(Arc::from),
         })
@@ -188,7 +187,7 @@ async fn render(State(state): State<MetricsState>, headers: HeaderMap) -> Respon
     state.process.collect();
     (
         [(header::CONTENT_TYPE, CONTENT_TYPE)],
-        state.handle.render(),
+        state.exporter.render(),
     )
         .into_response()
 }
@@ -222,11 +221,10 @@ mod tests {
 
     #[tokio::test]
     async fn serves_rendered_metrics() {
-        let recorder = builder().unwrap().build_recorder();
-        let handle = recorder.handle();
+        let (exporter, recorder) = Exporter::new(builder().unwrap().build_recorder());
         metrics::with_local_recorder(&recorder, record_build_info);
 
-        let response = router(handle, None)
+        let response = router(exporter, None)
             .oneshot(request("/metrics"))
             .await
             .unwrap();
@@ -243,11 +241,10 @@ mod tests {
 
     #[tokio::test]
     async fn serves_process_metrics() {
-        let recorder = builder().unwrap().build_recorder();
-        let handle = recorder.handle();
+        let (exporter, recorder) = Exporter::new(builder().unwrap().build_recorder());
         let _local = metrics::set_default_local_recorder(&recorder);
 
-        let response = router(handle, None)
+        let response = router(exporter, None)
             .oneshot(request("/metrics"))
             .await
             .unwrap();
@@ -261,18 +258,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serves_nothing_else() {
-        let handle = builder().unwrap().build_recorder().handle();
+    async fn serves_a_new_counter_at_zero_before_its_first_events() {
+        let (exporter, recorder) = Exporter::new(builder().unwrap().build_recorder());
+        let app = router(exporter, None);
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!(names::CHAIN_REORGS).increment(1);
+        });
 
-        let response = router(handle, None).oneshot(request("/")).await.unwrap();
+        for expected in [0, 1] {
+            let response = app.clone().oneshot(request("/metrics")).await.unwrap();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let line = format!("{} {expected}", names::CHAIN_REORGS);
+            assert!(String::from_utf8(body.to_vec()).unwrap().contains(&line));
+        }
+    }
+
+    #[tokio::test]
+    async fn serves_nothing_else() {
+        let (exporter, _) = Exporter::new(builder().unwrap().build_recorder());
+
+        let response = router(exporter, None).oneshot(request("/")).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn requires_the_bearer_token_when_one_is_set() {
-        let handle = builder().unwrap().build_recorder().handle();
-        let app = router(handle, Some("secret".into()));
+        let (exporter, _) = Exporter::new(builder().unwrap().build_recorder());
+        let app = router(exporter, Some("secret".into()));
         let with = |token: &str| {
             Request::builder()
                 .uri("/metrics")

@@ -63,12 +63,13 @@ tests:
               runbook_url: https://github.com/BlockstreamResearch/price-oracle/blob/master/high-storm/prometheus/RUNBOOK.md#24
               summary: No node can reach the coordinator, so the user API is down network-wide
 
+  # A counter appears with its first event, shown at zero to one scrape first.
   - interval: 1m
     input_series:
       - series: 'high_storm_voting_requests_created_total{instance="node-1:9300",job="high-storm",kind="update_network_members",proposer="02aa"}'
-        values: "0 1 1"
+        values: "_ 0 1 1"
     alert_rule_test:
-      - eval_time: 2m
+      - eval_time: 3m
         alertname: HighStormMemberUpdateVote
         exp_alerts:
           - exp_labels: { severity: page, catalog: "3.10", instance: "node-1:9300", proposer: "02aa" }
