@@ -170,7 +170,11 @@ async fn connect(
     write_frame(&mut client, &buffer[..length]).await.unwrap();
     let response = read_frame(&mut client).await.unwrap();
     handshake.read_message(&response, &mut payload).unwrap();
-    handshake.into_transport_mode().unwrap();
+    let mut transport = handshake.into_transport_mode().unwrap();
+    let length = transport
+        .write_message(crate::network::HANDSHAKE_KEY_CONFIRMATION, &mut buffer)
+        .unwrap();
+    write_frame(&mut client, &buffer[..length]).await.unwrap();
 
     (client, server_handle)
 }
@@ -271,6 +275,13 @@ async fn joining_member_reconnects_when_host_lacks_its_address() {
     joining.start(Some("127.0.0.1:0".into())).await.unwrap();
 
     wait_for_peer_status(&joining, host_public_key, PeerStatus::Active).await;
+    timeout(Duration::from_secs(1), async {
+        while !host.member_migration_ready().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(host.member_migration_ready().await);
 
     host.shutdown().await;
@@ -325,6 +336,192 @@ async fn authenticated_peer_is_active_once_and_inactive_after_disconnect() {
         .unwrap();
     assert!(matches!(first_result, Err(Error::Io(_))));
     assert_eq!(state.read().await.peers[0].status, PeerStatus::Inactive);
+}
+
+#[tokio::test]
+async fn replayed_noise_message_one_cannot_claim_peer_slot_or_change_address() {
+    let secp = Secp256k1::new();
+    let server_secret = SecretKey::from_slice(&[41; 32]).unwrap();
+    let server_public = server_secret.public_key(&secp).serialize();
+    let peer_secret = SecretKey::from_slice(&[42; 32]).unwrap();
+    let peer_public = peer_secret.public_key(&secp).serialize();
+    let state = Arc::new(RwLock::new(StormState::new(
+        server_secret,
+        vec![Peer::new(peer_public)],
+    )));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let mut initiator = crypto::noise_builder()
+        .local_private_key(&peer_secret.secret_bytes())
+        .unwrap()
+        .remote_public_key(&server_public)
+        .unwrap()
+        .prologue(constants::NOISE_PROLOGUE)
+        .unwrap()
+        .build_initiator()
+        .unwrap();
+    let mut buffer = [0_u8; 256];
+    let length = initiator.write_message(&[], &mut buffer).unwrap();
+    let recorded_message = buffer[..length].to_vec();
+    let mut original = TcpStream::connect(address).await.unwrap();
+    let (server, original_address) = listener.accept().await.unwrap();
+    let mut original_server = tokio::spawn(Storm::handle_connection(
+        server,
+        original_address,
+        Arc::clone(&state),
+    ));
+    write_frame(&mut original, &recorded_message).await.unwrap();
+    let response = read_frame(&mut original).await.unwrap();
+    initiator.read_message(&response, &mut buffer).unwrap();
+    let mut transport = initiator.into_transport_mode().unwrap();
+    let length = transport
+        .write_message(crate::network::HANDSHAKE_KEY_CONFIRMATION, &mut buffer)
+        .unwrap();
+    let recorded_confirmation = buffer[..length].to_vec();
+    write_frame(&mut original, &recorded_confirmation)
+        .await
+        .unwrap();
+    wait_for_status(&state, PeerStatus::Active, &mut original_server).await;
+    drop(original);
+    let result = timeout(Duration::from_secs(1), original_server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(Error::Io(_))));
+    drop(transport);
+
+    let mut replay = TcpStream::connect(address).await.unwrap();
+    let (server, replay_address) = listener.accept().await.unwrap();
+    let replay_server = tokio::spawn(Storm::handle_connection(
+        server,
+        replay_address,
+        Arc::clone(&state),
+    ));
+    write_frame(&mut replay, &recorded_message).await.unwrap();
+    read_frame(&mut replay).await.unwrap();
+
+    {
+        let state = state.read().await;
+        assert!(state.connections.is_empty());
+        assert_eq!(state.peers[0].status, PeerStatus::Inactive);
+        assert_eq!(
+            state.peers[0].socket_address,
+            Some(original_address.to_string())
+        );
+    }
+
+    let (genuine, mut genuine_server) = connect(
+        address,
+        &listener,
+        &peer_secret,
+        &server_public,
+        Arc::clone(&state),
+    )
+    .await;
+    assert!(
+        timeout(Duration::from_millis(100), &mut genuine_server)
+            .await
+            .is_err()
+    );
+    wait_for_status(&state, PeerStatus::Active, &mut genuine_server).await;
+    {
+        let state = state.read().await;
+        assert!(state.connections.contains_key(&peer_public));
+        assert_ne!(replay_address, original_address);
+        assert_ne!(
+            state.peers[0].socket_address,
+            Some(replay_address.to_string())
+        );
+    }
+    assert!(!replay_server.is_finished());
+
+    write_frame(&mut replay, &recorded_confirmation)
+        .await
+        .unwrap();
+    let result = timeout(Duration::from_secs(1), replay_server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(Error::Noise(_))));
+    assert_eq!(state.read().await.peers[0].status, PeerStatus::Active);
+
+    drop(genuine);
+    let result = timeout(Duration::from_secs(1), genuine_server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(Error::Io(_))));
+    assert_eq!(state.read().await.peers[0].status, PeerStatus::Inactive);
+}
+
+#[tokio::test]
+async fn invalid_key_confirmation_does_not_register_or_update_a_peer() {
+    let secp = Secp256k1::new();
+    let server_secret = SecretKey::from_slice(&[43; 32]).unwrap();
+    let server_public = server_secret.public_key(&secp).serialize();
+    let peer_secret = SecretKey::from_slice(&[44; 32]).unwrap();
+    let peer_public = peer_secret.public_key(&secp).serialize();
+    let mut peer = Peer::new(peer_public);
+    peer.socket_address = Some("127.0.0.1:9000".into());
+    let state = Arc::new(RwLock::new(StormState::new(server_secret, vec![peer])));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    for payload in [
+        None,
+        Some(b"".as_slice()),
+        Some(b"wrong-confirmation".as_slice()),
+    ] {
+        let mut initiator = crypto::noise_builder()
+            .local_private_key(&peer_secret.secret_bytes())
+            .unwrap()
+            .remote_public_key(&server_public)
+            .unwrap()
+            .prologue(constants::NOISE_PROLOGUE)
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, address) = listener.accept().await.unwrap();
+        let server = tokio::spawn(Storm::handle_connection(
+            server,
+            address,
+            Arc::clone(&state),
+        ));
+        let mut buffer = [0_u8; 256];
+        let length = initiator
+            .write_message(&54321u16.to_be_bytes(), &mut buffer)
+            .unwrap();
+        write_frame(&mut client, &buffer[..length]).await.unwrap();
+        let response = read_frame(&mut client).await.unwrap();
+        initiator.read_message(&response, &mut buffer).unwrap();
+        let mut transport = initiator.into_transport_mode().unwrap();
+        if let Some(payload) = payload {
+            let length = transport.write_message(payload, &mut buffer).unwrap();
+            write_frame(&mut client, &buffer[..length]).await.unwrap();
+        } else {
+            drop(client);
+        }
+
+        let result = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        if payload.is_some() {
+            assert!(matches!(result, Err(Error::UnauthorizedConnection)));
+        } else {
+            assert!(matches!(result, Err(Error::Io(_))));
+        }
+        let state = state.read().await;
+        assert!(state.connections.is_empty());
+        assert_eq!(state.peers[0].status, PeerStatus::Inactive);
+        assert_eq!(
+            state.peers[0].socket_address.as_deref(),
+            Some("127.0.0.1:9000")
+        );
+    }
 }
 
 #[tokio::test]
@@ -1332,7 +1529,7 @@ async fn connects_available_addressed_peers_and_reports_missing_message_recipien
     let error = sender
         .send_message(
             message.clone(),
-            &[receiver_public_key, disconnected_public_key],
+            &[disconnected_public_key, receiver_public_key],
         )
         .await
         .unwrap_err();
@@ -1344,6 +1541,46 @@ async fn connects_available_addressed_peers_and_reports_missing_message_recipien
         .send_message(message, &[receiver_public_key])
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_stuck_recipient_does_not_block_delivery_to_healthy_peers() {
+    let mut random = rand::thread_rng();
+    let stuck = SecretKey::new(&mut random).public_key(&Secp256k1::new());
+    let healthy = SecretKey::new(&mut random).public_key(&Secp256k1::new());
+    let storm = Storm::from_peers(
+        SecretKey::new(&mut random),
+        vec![Peer::new(stuck.serialize()), Peer::new(healthy.serialize())],
+    );
+    let (stuck_sender, _stuck_receiver) = mpsc::channel(1);
+    let (healthy_sender, mut healthy_receiver) = mpsc::channel(constants::OUTBOUND_QUEUE_CAPACITY);
+    stuck_sender.try_send(Vec::new()).unwrap();
+    {
+        let mut state = storm.inner.write().await;
+        state.connections.insert(stuck.serialize(), stuck_sender);
+        state
+            .connections
+            .insert(healthy.serialize(), healthy_sender);
+    }
+    let message = StormMessage {
+        header: StormMessageHeader {
+            payload_id: message_handlers::StormMessagePayloadType::Custom as u32,
+            timestamp: current_timestamp(),
+            protocol_version: constants::PROTOCOL_VERSION,
+        },
+        payload: vec![1, 2, 3],
+    };
+
+    let error = storm
+        .send_message(message.clone(), &[stuck, healthy])
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::PeerQueueFull(key) if key == hex::encode(stuck.serialize())));
+    assert_eq!(
+        healthy_receiver.try_recv().unwrap(),
+        message.to_framed_bytes().unwrap()
+    );
 }
 
 #[tokio::test]

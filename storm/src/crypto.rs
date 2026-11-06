@@ -124,6 +124,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn original_prologue_completes_key_confirmed_handshake() {
+        let initiator_key = noise_builder().generate_keypair().unwrap();
+        let responder_key = noise_builder().generate_keypair().unwrap();
+        let original_prologue = b"
+On the dawn of creation, the last rays of the first star to die forced the last wind to awaken the first storm.
+";
+        let mut initiator = noise_builder()
+            .local_private_key(&initiator_key.private)
+            .unwrap()
+            .remote_public_key(&responder_key.public)
+            .unwrap()
+            .prologue(original_prologue)
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut responder = noise_builder()
+            .local_private_key(&responder_key.private)
+            .unwrap()
+            .prologue(constants::NOISE_PROLOGUE)
+            .unwrap()
+            .build_responder()
+            .unwrap();
+        let mut message = [0_u8; 256];
+        let mut payload = [0_u8; 256];
+        let length = initiator.write_message(&[], &mut message).unwrap();
+
+        responder
+            .read_message(&message[..length], &mut payload)
+            .unwrap();
+        let length = responder.write_message(&[], &mut message).unwrap();
+        initiator
+            .read_message(&message[..length], &mut payload)
+            .unwrap();
+
+        let mut initiator = initiator.into_transport_mode().unwrap();
+        let mut responder = responder.into_transport_mode().unwrap();
+        let length = initiator
+            .write_message(crate::network::HANDSHAKE_KEY_CONFIRMATION, &mut message)
+            .unwrap();
+        let payload_length = responder
+            .read_message(&message[..length], &mut payload)
+            .unwrap();
+
+        assert_eq!(
+            &payload[..payload_length],
+            crate::network::HANDSHAKE_KEY_CONFIRMATION
+        );
+    }
+
+    #[test]
     fn resolver_completes_mutually_authenticated_handshake() {
         let initiator_key = noise_builder().generate_keypair().unwrap();
         let responder_key = noise_builder().generate_keypair().unwrap();

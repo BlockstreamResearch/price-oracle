@@ -11,3 +11,5 @@ price-feed = { path = "../price-feed" }
 
 [dev-dependencies]
 anyhow = "1"
+bitcoincore-rpc.workspace = true
+smplx-regtest = "0.1.1"

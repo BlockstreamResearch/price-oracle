@@ -6,6 +6,8 @@ use std::{
 use secp256k1_zkp::PublicKey;
 use storm::{PeerStatus, Storm, StormHandle};
 
+use crate::monitoring::{self, RenewalOutcome};
+
 mod assets;
 mod burning;
 mod droplets;
@@ -23,6 +25,7 @@ mod voting;
 mod voting_execution;
 
 pub use assets::AssetError;
+pub(crate) use assets::{StormEyeContractData, storm_eye_contract_data};
 pub use burning::BurningError;
 pub use droplets::DropletsError;
 pub(crate) use droplets::exchange_recipient_amount;
@@ -38,6 +41,7 @@ pub use prices::{
     ExchangeRateInfo, FeedRate, FeedSources, PollOutcome, PriceError, PriceSourceError,
     PriceSourceInfo,
 };
+pub(crate) use prices::{PriceHealth, SourceHealth};
 pub use renewal::RenewalError;
 pub use signing::{SigningError, SigningResult};
 use state::NetworkState;
@@ -324,14 +328,19 @@ impl HighStorm {
             return Ok(None);
         }
 
-        match self
+        let exchanged = self
             .exchange_droplets(
                 request.transaction.clone(),
                 request.signing_hash,
                 self.state.block_height(),
             )
-            .await
-        {
+            .await;
+        monitoring::record_droplets_exchange(match &exchanged {
+            Ok(_) => "broadcast",
+            Err(error) if error.is_retryable() => "retry",
+            Err(_) => "failed",
+        });
+        match exchanged {
             Ok(txid) => {
                 self.state
                     .droplets()
@@ -348,6 +357,32 @@ impl HighStorm {
                 Err(error)
             }
         }
+    }
+
+    pub async fn announce_protocol_settings(&self) -> Result<(), SigningError> {
+        let recipients = self
+            .peers()
+            .await
+            .into_iter()
+            .filter(|peer| peer.status == PeerStatus::Active)
+            .map(|peer| {
+                PublicKey::from_slice(&peer.compressed_public_key).map_err(|_| {
+                    SigningError::InvalidMessage("invalid protocol settings recipient".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if recipients.is_empty() {
+            return Ok(());
+        }
+        let message = NodeMessage::new(
+            NodeMessageKind::ProtocolSettings,
+            None,
+            &self.state.protocol_settings(),
+        )?
+        .into_storm_message()?;
+        self.storm.send_message(message, &recipients).await?;
+
+        Ok(())
     }
 
     async fn announce_exchange(&self, notification: &ExchangeRewards) -> Result<(), SigningError> {
@@ -424,14 +459,31 @@ impl HighStorm {
     }
 
     pub async fn index_blocks(&self) -> Result<u64, IndexerError> {
-        let indexed = self.state.indexer().sync().await?;
+        // Any other error says nothing about a halt, which is checked only once
+        // the chain tip has been read.
+        let indexed = match self.state.indexer().sync().await {
+            Ok(indexed) => {
+                monitoring::set_chain_safety_halt(false);
+                indexed
+            }
+            Err(error) => {
+                if matches!(error, IndexerError::SafetyHalt(_)) {
+                    monitoring::set_chain_safety_halt(true);
+                }
+                return Err(error);
+            }
+        };
         if let Some(cursor) = self.state.indexer().cursor().await? {
             self.state.set_block_height(cursor.height);
-            if !self.state.is_spending_paused() {
-                self.state
+            if !self.state.is_spending_paused()
+                && let Err(error) = self
+                    .state
                     .indexer()
                     .recover_droplet_exchanges(cursor.height, self.is_leader().await)
-                    .await?;
+                    .await
+            {
+                // Indexing succeeded; a failed Droplets recovery must not halt burning.
+                tracing::warn!(%error, "Droplets exchange recovery failed");
             }
         }
         Ok(indexed)
@@ -439,6 +491,9 @@ impl HighStorm {
 
     pub async fn reconcile_storm_eye_renewal(&self) -> Result<bool, RenewalError> {
         let confirmed = self.state.renewal().reconcile().await?;
+        if confirmed {
+            monitoring::record_storm_eye_renewal(RenewalOutcome::Confirmed);
+        }
         if !confirmed
             && self.is_coordinator().await
             && let Some(request) = self.state.renewal().pending_request().await?
@@ -458,9 +513,31 @@ impl HighStorm {
             return Ok(None);
         }
         let block_height = self.state.block_height();
-        let Some(mut prepared) = self.state.renewal().prepare(block_height).await? else {
+        let Some(storm_eye) = self.state.renewal().due_storm_eye(block_height).await? else {
             return Ok(None);
         };
+        // Every failure from here on counts, preparation included: a due renewal
+        // that keeps failing, for example for want of Treasury funds, needs an
+        // operator before the rescue height arrives.
+        let renewed = self.renew_due_storm_eye(storm_eye, block_height).await;
+        monitoring::record_storm_eye_renewal(if renewed.is_ok() {
+            RenewalOutcome::Broadcast
+        } else {
+            RenewalOutcome::Failed
+        });
+        renewed.map(Some)
+    }
+
+    async fn renew_due_storm_eye(
+        &self,
+        storm_eye: NetworkAsset,
+        block_height: u64,
+    ) -> Result<[u8; 32], RenewalError> {
+        let mut prepared = self
+            .state
+            .renewal()
+            .prepare(block_height, storm_eye)
+            .await?;
         let chain_tip = self
             .state
             .indexer()
@@ -495,7 +572,7 @@ impl HighStorm {
             tracing::warn!(%error, "failed to announce Storm Eye timelock renewal");
         }
 
-        Ok(Some(txid))
+        Ok(txid)
     }
 
     pub async fn announce_network_assets(&self) -> Result<(), AssetError> {
@@ -604,7 +681,21 @@ impl HighStorm {
         if !self.is_coordinator().await {
             return Ok(0);
         }
+        // Counted once this node coordinates the round, preparation included.
+        let issued = self
+            .coordinate_issuance_round(storm_eye_lane, max_transaction_weight)
+            .await;
+        if let Some(outcome) = round_outcome(&issued) {
+            monitoring::record_issuance_round(outcome);
+        }
+        issued
+    }
 
+    async fn coordinate_issuance_round(
+        &self,
+        storm_eye_lane: usize,
+        max_transaction_weight: usize,
+    ) -> Result<usize, user_requests::UserRequestError> {
         let mut prepared = match self
             .state
             .user_requests()
@@ -677,6 +768,17 @@ impl HighStorm {
             ));
         }
         let block_height = self.state.block_height();
+        let released = self
+            .state
+            .burning()
+            .release_vanished_burns(block_height)
+            .await?;
+        if released > 0 {
+            tracing::info!(
+                released,
+                "returned items whose burning transaction vanished to the burn queue"
+            );
+        }
         let reconciled = self.state.burning().reconcile_mempool(block_height).await?;
         if reconciled > 0 {
             tracing::info!(
@@ -689,7 +791,22 @@ impl HighStorm {
         if !leader::is_local_leader(&peers, block_height) {
             return Ok(0);
         }
+        // Counted once this node leads the round, preparation included.
+        let burned = self
+            .lead_burn_round(block_height, storm_eye_lane, max_transaction_weight)
+            .await;
+        if let Some(outcome) = round_outcome(&burned) {
+            monitoring::record_burn_round(outcome);
+        }
+        burned
+    }
 
+    async fn lead_burn_round(
+        &self,
+        block_height: u64,
+        storm_eye_lane: usize,
+        max_transaction_weight: usize,
+    ) -> Result<usize, BurningError> {
         let mut prepared = match self
             .state
             .burning()
@@ -796,12 +913,26 @@ impl HighStormHandle {
         self.state.is_spending_paused()
     }
 
+    pub(crate) fn is_recovering(&self) -> bool {
+        self.state.is_recovering()
+    }
+
+    /// The height from which anyone may spend the Storm Eye UTXOs, once the
+    /// Storm Eye exists.
+    pub(crate) async fn storm_eye_rescue_height(&self) -> Result<Option<u32>, RenewalError> {
+        self.state.renewal().rescue_height().await
+    }
+
     pub async fn member_migration_request(&self) -> Option<[u8; 32]> {
         self.state.member_migration_request().await
     }
 
     pub async fn member_migration_ready(&self) -> bool {
         self.storm.member_migration_ready().await
+    }
+
+    pub(crate) async fn open_voting_kinds(&self) -> Result<Vec<&'static str>, VotingError> {
+        self.state.voting().unconfirmed_kinds().await
     }
 
     /// Only a Direct feed has sources. Named with a Cross pair, this and the
@@ -868,6 +999,14 @@ impl HighStormHandle {
         self.state.prices().attestations_for(feed).await
     }
 
+    pub(crate) async fn price_health(
+        &self,
+        sources: &[(price_feed::FeedId, usize)],
+        feeds: &[price_feed::FeedId],
+    ) -> PriceHealth {
+        self.state.prices().health(sources, feeds).await
+    }
+
     /// Every feed this node prices, in id order.
     pub fn price_feeds(&self) -> Vec<price_feed::FeedDefinition> {
         self.state.prices().registry().feeds().copied().collect()
@@ -897,8 +1036,20 @@ impl HighStormHandle {
         self.storm.peers().await
     }
 
+    pub(crate) async fn connected_peer_keys(&self) -> BTreeSet<[u8; 33]> {
+        self.storm.connected_peer_keys().await
+    }
+
+    pub(crate) async fn is_local_member(&self) -> bool {
+        self.storm.is_local_member().await
+    }
+
     pub(crate) async fn current_leader(&self) -> Option<[u8; 33]> {
         leader::leader_for_height(&self.peers().await, self.state.block_height())
+    }
+
+    pub(crate) async fn is_leader(&self) -> bool {
+        leader::is_local_leader(&self.peers().await, self.state.block_height())
     }
 
     pub(crate) async fn next_local_leader_height(&self) -> Option<u64> {
@@ -1010,6 +1161,11 @@ impl HighStormHandle {
         Ok(tokio::spawn(async move {
             let _attempt = attempt;
             let result = handle.execute_voting_request_inner(request_hash).await;
+            monitoring::record_voting_execution(match &result {
+                Ok(_) => "broadcast",
+                Err(VotingExecutionError::MemberMigrationNotReady) => "migration_not_ready",
+                Err(_) => "failed",
+            });
             if let Err(error) = &result {
                 tracing::warn!(request_hash = %hex::encode(request_hash), %error, "voting execution attempt failed");
             }
@@ -1023,6 +1179,11 @@ impl HighStormHandle {
     ) -> Result<[u8; 32], VotingExecutionError> {
         let peers = self.peers().await;
         let current_members = voting_member_keys(&peers)?;
+        let local = leader::local_public_key(&peers).ok_or_else(|| {
+            VotingExecutionError::Invalid("local network member is missing".into())
+        })?;
+        handler::authorize_voting_executor(&current_members, local)?;
+
         let vote = self
             .state
             .voting()
@@ -1052,19 +1213,6 @@ impl HighStormHandle {
             .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?;
         request.chain_tip = Some(chain_tip);
         let proposer = request.proposer_public_key;
-        let local = leader::local_public_key(&self.peers().await).ok_or_else(|| {
-            VotingExecutionError::Invalid("local network member is missing".into())
-        })?;
-        let local = PublicKey::from_slice(&local)
-            .map_err(|error| VotingExecutionError::Invalid(error.to_string()))?
-            .x_only_public_key()
-            .0
-            .serialize();
-        if local != proposer {
-            return Err(VotingExecutionError::Invalid(
-                "only the node that proposed a voting request may execute it".into(),
-            ));
-        }
 
         self.state
             .voting_execution()
@@ -1225,6 +1373,10 @@ impl HighStormHandle {
                 .voting_execution()
                 .is_final(inclusion.confirmations)
             {
+                // Peers that missed the first notice can still record it before finality.
+                if let Err(error) = self.announce_voting_execution(request_hash, &request).await {
+                    tracing::warn!(%error, "failed to reannounce voting execution");
+                }
                 continue;
             }
 
@@ -1259,6 +1411,7 @@ impl HighStormHandle {
                     .confirm(request_hash, txid)
                     .await?;
             }
+            monitoring::record_voting_execution("confirmed");
             confirmed += 1;
         }
 
@@ -1329,6 +1482,15 @@ impl HighStormHandle {
 
     pub async fn network_asset(&self, kind: &str) -> Result<Option<NetworkAsset>, AssetError> {
         self.state.assets().get(kind).await
+    }
+}
+
+/// A round that had nothing to do is not counted.
+fn round_outcome<E>(result: &Result<usize, E>) -> Option<&'static str> {
+    match result {
+        Ok(0) => None,
+        Ok(_) => Some("broadcast"),
+        Err(_) => Some("failed"),
     }
 }
 

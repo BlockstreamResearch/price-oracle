@@ -5,17 +5,21 @@ use secp256k1_zkp::PublicKey as TransportPublicKey;
 use storm::{Peer, PeerStatus, StormContext, StormHandle};
 use tokio::sync::Mutex;
 
-use crate::db::voting::{StoredVotingRequest, VotingStore};
+use crate::{
+    db::voting::{StoredVotingRequest, VotingStore},
+    monitoring,
+};
 
 use super::message::{
-    ApproveVotingRequest, MergeStormEyes, NetworkVoteKind, NetworkVoteRequest, NodeMessage,
-    NodeMessageKind, SplitStormEye, UpdateNetworkMembers, VotingSyncApproval, VotingSyncMessage,
-    VotingSyncRequest,
+    ApproveVotingRequest, ExecuteVotingRequest, MergeStormEyes, NetworkVoteKind,
+    NetworkVoteRequest, NodeMessage, NodeMessageKind, SplitStormEye, UpdateNetworkMembers,
+    VotingSyncApproval, VotingSyncMessage, VotingSyncRequest,
 };
 
 pub const VOTING_TIMEOUT_BLOCKS: u64 = 10_080;
 const MAX_ACTIVE_VOTINGS_PER_PROPOSER: usize = 50;
 const MAX_PROPOSAL_FUTURE_BLOCKS: u64 = 1;
+const MAX_MISSING_EXECUTIONS_PER_SYNC: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VotingStatus {
@@ -105,6 +109,7 @@ impl Voting {
         let proposer = controlled_member_key(&peers)?;
         self.ensure_unique_active_request(&request, Some(proposer), block_height)
             .await?;
+        let kind = kind_label(&request);
         let unsigned = NodeMessage::new_voting_request(request.clone(), block_height)?;
         let proposal = super::message::SignedVotingProposal {
             request,
@@ -124,6 +129,7 @@ impl Voting {
         {
             return Err(VotingError::DuplicateRequest(hex::encode(hash)));
         }
+        monitoring::record_voting_request_created(kind, proposer_label(&peers, Some(proposer)));
         send_from_storm(storm, message, &active_remote_peers(&peers)).await?;
         Ok(hash)
     }
@@ -175,9 +181,23 @@ impl Voting {
 
     pub(crate) async fn synchronize(&self, storm: &StormHandle) -> Result<(), VotingError> {
         let peers = storm.peers().await;
+        let missing_executions = self
+            .store
+            .list()
+            .await?
+            .into_iter()
+            .filter(|request| {
+                request.approved_at_block_height.is_some()
+                    && request.execution_txid.is_none()
+                    && !request.execution_confirmed
+            })
+            .map(|request| request.message_hash)
+            .take(MAX_MISSING_EXECUTIONS_PER_SYNC)
+            .collect();
         let request = VotingSyncMessage {
             is_response: false,
             requests: Vec::new(),
+            missing_executions,
         };
         let message = NodeMessage::new(NodeMessageKind::AskAboutVotings, None, &request)?;
         send_from_storm(storm, message, &active_remote_peers(&peers)).await
@@ -210,9 +230,16 @@ impl Voting {
             .await?;
         let hash = message.hash()?;
         let encoded = postcard::to_stdvec(&message)?;
-        self.store
+        if self
+            .store
             .insert_request(hash, &encoded, proposer, block_height)
-            .await?;
+            .await?
+        {
+            monitoring::record_voting_request_created(
+                kind_label(&request),
+                proposer_label(&peers, Some(proposer)),
+            );
+        }
         Ok(())
     }
 
@@ -260,15 +287,16 @@ impl Voting {
             )
             .await
         } else {
-            if !sync.requests.is_empty() {
+            if !sync.requests.is_empty()
+                || sync.missing_executions.len() > MAX_MISSING_EXECUTIONS_PER_SYNC
+            {
                 return Err(VotingError::InvalidRequest(
                     "an ask-about-votings request cannot contain voting records".into(),
                 ));
             }
-            let requests = self
-                .store
-                .list()
-                .await?
+            let stored = self.store.list().await?;
+            let notices = execution_notices(&stored, &sync.missing_executions)?;
+            let requests = stored
                 .into_iter()
                 .filter(|request| !request.execution_confirmed)
                 .map(|request| VotingSyncRequest {
@@ -286,14 +314,15 @@ impl Voting {
             let response = VotingSyncMessage {
                 is_response: true,
                 requests,
+                missing_executions: Vec::new(),
             };
             let response = NodeMessage::new(NodeMessageKind::AskAboutVotings, None, &response)?;
-            send_from_handle(
-                &context.storm_handle,
-                response,
-                context.message_context.peer_public_key,
-            )
-            .await
+            let requester = context.message_context.peer_public_key;
+            send_from_handle(&context.storm_handle, response, requester).await?;
+            for notice in notices {
+                send_from_handle(&context.storm_handle, notice, requester).await?;
+            }
+            Ok(())
         }
     }
 
@@ -304,7 +333,27 @@ impl Voting {
         sender_public_key: [u8; 33],
         block_height: u64,
     ) -> Result<(), VotingError> {
+        let mut first_error = None;
         for synchronized in requests {
+            if let Err(error) = self
+                .accept_synchronized_request(synchronized, storm, sender_public_key, block_height)
+                .await
+            {
+                tracing::debug!(%error, "skipped a synchronized voting record");
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn accept_synchronized_request(
+        &self,
+        synchronized: VotingSyncRequest,
+        storm: &StormHandle,
+        sender_public_key: [u8; 33],
+        block_height: u64,
+    ) -> Result<(), VotingError> {
+        {
             let message: NodeMessage = postcard::from_bytes(&synchronized.message)?;
             if message.decoded_kind() != Some(NodeMessageKind::NetworkVoteRequest)
                 || message.linked_to.is_some()
@@ -316,7 +365,14 @@ impl Voting {
             }
             {
                 let _guard = self.operations.lock().await;
-                if self.store.get(synchronized.message_hash).await?.is_none() {
+                let known = self.store.get(synchronized.message_hash).await?;
+                if known
+                    .as_ref()
+                    .is_some_and(|known| known.execution_confirmed)
+                {
+                    return Ok(());
+                }
+                if known.is_none() {
                     let peers = storm.peers().await;
                     ensure_current_member(
                         &peers,
@@ -327,7 +383,7 @@ impl Voting {
                     if created_at_block_height.is_some_and(|created_at| {
                         created_at.saturating_add(VOTING_TIMEOUT_BLOCKS) <= block_height
                     }) {
-                        continue;
+                        return Ok(());
                     }
                     validate_proposal_height(created_at_block_height, block_height)?;
                     validate_synchronized_request(&request, &peers, self.coordinator)?;
@@ -344,18 +400,25 @@ impl Voting {
                         .await?
                         >= MAX_ACTIVE_VOTINGS_PER_PROPOSER
                     {
-                        continue;
+                        return Ok(());
                     }
                     self.ensure_unique_active_request(&request, proposer, block_height)
                         .await?;
-                    self.store
+                    if self
+                        .store
                         .insert_synchronized_request(
                             synchronized.message_hash,
                             &synchronized.message,
                             proposer,
                             block_height,
                         )
-                        .await?;
+                        .await?
+                    {
+                        monitoring::record_voting_request_created(
+                            kind_label(&request),
+                            proposer_label(&peers, proposer),
+                        );
+                    }
                 }
             }
 
@@ -484,9 +547,9 @@ impl Voting {
         schnorr::verify(&signature, &request_hash, &public_key)
             .map_err(|error| VotingError::InvalidApproval(error.to_string()))?;
 
-        if self.store.get(request_hash).await?.is_none() {
+        let Some(stored) = self.store.get(request_hash).await? else {
             return Err(VotingError::UnknownRequest(hex::encode(request_hash)));
-        }
+        };
         let required = required_approvals(peers.len());
         let encoded = postcard::to_stdvec(&message)?;
         if !self
@@ -504,6 +567,7 @@ impl Voting {
                 approval.public_key,
             )));
         }
+        monitoring::record_voting_approval(stored_kind_label(&stored.message));
         Ok(())
     }
 
@@ -522,6 +586,18 @@ impl Voting {
             .into_iter()
             .map(decode_stored)
             .collect()
+    }
+
+    /// The kind of every vote not yet executed and confirmed. Expired votes
+    /// count until the main loop removes them.
+    pub(crate) async fn unconfirmed_kinds(&self) -> Result<Vec<&'static str>, VotingError> {
+        Ok(self
+            .store
+            .unconfirmed_request_messages()
+            .await?
+            .iter()
+            .map(|(message, _, _)| stored_kind_label(message))
+            .collect())
     }
 
     pub(crate) async fn remove_expired(&self, block_height: u64) -> Result<u64, VotingError> {
@@ -787,6 +863,32 @@ fn ensure_current_member(
     Ok(())
 }
 
+fn kind_label(request: &NetworkVoteRequest) -> &'static str {
+    NetworkVoteKind::from_id(request.kind).map_or("unknown", NetworkVoteKind::as_str)
+}
+
+fn stored_kind_label(message: &[u8]) -> &'static str {
+    postcard::from_bytes::<NodeMessage>(message)
+        .ok()
+        .and_then(|message| message.decode_voting_request().ok())
+        .map_or("unknown", |request| kind_label(&request))
+}
+
+/// The proposer's transport key, as the `peer` label of other metrics shows it.
+fn proposer_label(peers: &[Peer], proposer: Option<[u8; 32]>) -> String {
+    proposer
+        .and_then(|proposer| {
+            peers.iter().find(|peer| {
+                PublicKey::from_slice(&peer.compressed_public_key)
+                    .is_ok_and(|key| key.x_only_public_key().0.serialize() == proposer)
+            })
+        })
+        .map_or_else(
+            || "unknown".into(),
+            |peer| hex::encode(peer.compressed_public_key),
+        )
+}
+
 fn required_approvals(member_count: usize) -> usize {
     (member_count * 2).div_ceil(3)
 }
@@ -797,6 +899,31 @@ pub(super) fn active_remote_peers(peers: &[Peer]) -> Vec<[u8; 33]> {
         .filter(|peer| peer.status == PeerStatus::Active)
         .map(|peer| peer.compressed_public_key)
         .collect()
+}
+
+fn execution_notices(
+    stored: &[StoredVotingRequest],
+    missing: &[[u8; 32]],
+) -> Result<Vec<NodeMessage>, VotingError> {
+    let mut notices = Vec::new();
+    for request in stored
+        .iter()
+        .filter(|request| missing.contains(&request.message_hash))
+    {
+        let (Some(encoded), Some(_)) = (&request.execution_request, request.execution_txid) else {
+            continue;
+        };
+        let notice: ExecuteVotingRequest = postcard::from_bytes(encoded)?;
+        if notice.final_tx.is_none() {
+            continue;
+        }
+        notices.push(NodeMessage::new(
+            NodeMessageKind::ExecuteVotingRequest,
+            Some(request.message_hash),
+            &notice,
+        )?);
+    }
+    Ok(notices)
 }
 
 fn decode_stored(stored: StoredVotingRequest) -> Result<VotingRequest, VotingError> {
@@ -1059,6 +1186,76 @@ mod reshape_tests {
     }
 
     #[tokio::test]
+    async fn counts_each_vote_once_however_it_arrives() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let secret = SecretKey::from_slice(&[21; 32]).unwrap();
+        let public_keys: Vec<_> = (21..=23)
+            .map(|signer| {
+                SecretKey::from_slice(&[signer; 32])
+                    .unwrap()
+                    .public_key(&Secp256k1::new())
+                    .serialize()
+            })
+            .collect();
+        let storm = Storm::from_peers(secret, public_keys.iter().copied().map(Peer::new).collect());
+        let handle = storm.handle();
+        let voting = Voting::new(secret.secret_bytes(), public_keys[0], database.voting());
+        let height = 100;
+        let direct = signed_request(1, height, 22);
+        let relayed = signed_request(2, height, 23);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+
+        {
+            let _local = metrics::set_default_local_recorder(&recorder);
+            let context = StormContext {
+                storm_handle: handle.clone(),
+                storm_message: direct.clone().into_storm_message().unwrap(),
+                message_context: MessageContext {
+                    peer_public_key: public_keys[1],
+                },
+            };
+            voting
+                .handle_request(direct.clone(), &context, height)
+                .await
+                .unwrap();
+            let records = [direct.clone(), relayed]
+                .into_iter()
+                .map(|message| VotingSyncRequest {
+                    message_hash: message.hash().unwrap(),
+                    message: postcard::to_stdvec(&message).unwrap(),
+                    approvals: Vec::new(),
+                })
+                .collect();
+            voting
+                .accept_synchronized(records, &handle, public_keys[1], height)
+                .await
+                .unwrap();
+            let hash = direct.hash().unwrap();
+            voting.approve(&handle, hash, height).await.unwrap();
+            assert!(matches!(
+                voting.approve(&handle, hash, height).await,
+                Err(VotingError::DuplicateApproval(_))
+            ));
+        }
+
+        let rendered = recorder.handle().render();
+        for (proposer, count) in [(public_keys[1], 1), (public_keys[2], 1)] {
+            let line = format!(
+                "high_storm_voting_requests_created_total{{kind=\"split_storm_eye\",proposer=\"{}\"}} {count}",
+                hex::encode(proposer)
+            );
+            assert!(rendered.contains(&line), "missing {line:?} in:\n{rendered}");
+        }
+        assert!(
+            rendered.contains(r#"high_storm_voting_approvals_total{kind="split_storm_eye"} 1"#)
+        );
+        assert_eq!(
+            voting.unconfirmed_kinds().await.unwrap(),
+            ["split_storm_eye", "split_storm_eye"]
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_forged_proposer_attribution() {
         let (voting, storm) = voting_node().await;
         let handle = storm.handle();
@@ -1257,6 +1454,39 @@ mod reshape_tests {
     }
 
     #[tokio::test]
+    async fn a_bad_synchronized_record_does_not_block_later_records() {
+        let (voting, storm) = voting_node().await;
+        let handle = storm.handle();
+        let height = 100;
+        let fresh = NodeMessage::new_voting_request(distinct_request(2), height).unwrap();
+        let fresh_hash = fresh.hash().unwrap();
+        let records = vec![
+            VotingSyncRequest {
+                message_hash: [9; 32],
+                message: postcard::to_stdvec(&signed_request(1, height, 21)).unwrap(),
+                approvals: Vec::new(),
+            },
+            VotingSyncRequest {
+                message_hash: fresh_hash,
+                message: postcard::to_stdvec(&fresh).unwrap(),
+                approvals: Vec::new(),
+            },
+        ];
+
+        let result = voting
+            .accept_synchronized(
+                records,
+                &handle,
+                handle.peers().await[0].compressed_public_key,
+                height,
+            )
+            .await;
+
+        assert!(matches!(result, Err(VotingError::InvalidRequest(_))));
+        assert!(voting.get(fresh_hash).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn skips_expired_synchronized_votes_without_blocking_fresh_ones() {
         let (voting, storm) = voting_node().await;
         let handle = storm.handle();
@@ -1304,6 +1534,66 @@ mod reshape_tests {
         assert!(validate_proposal_height(Some(102), 100).is_err());
         assert!(validate_proposal_height(Some(100), 100 + VOTING_TIMEOUT_BLOCKS - 1).is_ok());
         assert!(validate_proposal_height(Some(100), 100 + VOTING_TIMEOUT_BLOCKS).is_err());
+    }
+
+    #[test]
+    fn replays_only_requested_finalized_execution_notices() {
+        let message = NodeMessage::new(
+            NodeMessageKind::NetworkVoteRequest,
+            None,
+            &distinct_request(1),
+        )
+        .unwrap();
+        let notice = ExecuteVotingRequest {
+            tx: vec![1],
+            final_tx: Some(vec![2]),
+            signing_hashes: vec![[3; 32]],
+            signing_storm_tree_branch: [4; 32],
+            proposer_public_key: [5; 32],
+            chain_tip: Some(super::super::message::ChainTip {
+                height: 6,
+                hash: [7; 32],
+            }),
+        };
+        let executed = StoredVotingRequest {
+            message_hash: [1; 32],
+            message: postcard::to_allocvec(&message).unwrap(),
+            proposer_public_key: Some([5; 32]),
+            block_height: 3,
+            approved_at_block_height: Some(4),
+            execution_started: false,
+            execution_transaction: Some(vec![1]),
+            execution_request: Some(postcard::to_allocvec(&notice).unwrap()),
+            execution_txid: Some([8; 32]),
+            execution_confirmed: true,
+            approvals: Vec::new(),
+        };
+        let pending = StoredVotingRequest {
+            message_hash: [2; 32],
+            execution_request: None,
+            execution_txid: None,
+            execution_confirmed: false,
+            ..executed.clone()
+        };
+
+        let notices =
+            execution_notices(&[executed.clone(), pending.clone()], &[[1; 32], [2; 32]]).unwrap();
+        assert!(
+            execution_notices(&[executed, pending], &[[2; 32]])
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0].decoded_kind(),
+            Some(NodeMessageKind::ExecuteVotingRequest)
+        );
+        assert_eq!(notices[0].linked_to, Some([1; 32]));
+        assert_eq!(
+            notices[0].decode_payload::<ExecuteVotingRequest>().unwrap(),
+            notice
+        );
     }
 
     #[test]

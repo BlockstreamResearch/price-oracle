@@ -1,18 +1,18 @@
-use std::lib::asserts::{assert_eq_1, assert_eq_32, assert_eq_64, assert_eq_256};
+use std::lib::asserts::{assert_eq_32, assert_eq_64, assert_eq_256};
 use std::lib::u8::math::gt_8;
 use std::lib::u8::convert::u8_to_u32;
-use std::lib::u32::math::{safe_add_32, gt_32};
-use std::lib::u64::math::safe_add_64;
-
-use crate::lib::tx::{
-    get_explicit_current_amount,
-    get_explicit_output_amount,
-    get_explicit_input_amount,
-    get_output_script_hash,
-    get_input_script_hash,
-    get_current_asset,
-    assert_output_preserves_utxo
+use std::lib::u32::math::add_32;
+use std::lib::u64::math::add_64;
+use std::lib::utxo::getters::asset_id::get_explicit_current_asset_id;
+use std::lib::utxo::getters::asset_id_with_amount::{
+    get_explicit_current_asset_id_with_amount,
+    get_explicit_output_asset_id_with_amount,
+    get_explicit_input_asset_id_with_amount
 };
+use std::lib::utxo::asserts::asset_id_with_amount::assert_explicit_output_asset_id_with_amount;
+use std::lib::utxo::getters::script_hash::{get_output_script_hash, get_input_script_hash};
+
+use crate::lib::tx::assert_output_preserves_utxo;
 use crate::storm_eye::storage::{get_script_hash_for_storage};
 use crate::storm_eye::storm_tree::{StormTreeBloom, assert_network_authorization};
 
@@ -83,10 +83,7 @@ fn auth_with_update_rescue_block(
 ) {
     // Minutes in 3 years.
     let (merkle_root, current_rescue_block_number): Storage = storage;
-    let expected_new_rescue_block_number: Height = safe_add_32(
-        current_rescue_block_number,
-        1_576_800
-    );
+    let expected_new_rescue_block_number: Height = add_32(current_rescue_block_number, 1_576_800);
     assert_eq_32(new_rescue_block_number, expected_new_rescue_block_number);
 
     let new_storage: Storage = (merkle_root, new_rescue_block_number);
@@ -114,12 +111,12 @@ fn step_collect_total_amount(
             let (
                 output_asset,
                 output_amount
-            ): (u256, u64) = get_explicit_output_amount(output_index);
+            ): (u256, u64) = get_explicit_output_asset_id_with_amount(output_index);
 
             assert_eq_256(get_output_script_hash(output_index), expected_script_hash);
             assert_eq_256(output_asset, current_asset);
 
-            Right(safe_add_64(total_outputs_amount, output_amount))
+            Right(add_64(total_outputs_amount, output_amount))
         },
         false => Left(total_outputs_amount),
     }
@@ -134,7 +131,7 @@ fn auth_split_storm_eye_utxo_into_multiple_utxos(storage: Storage, split_utxos_c
     assert!(gt_8(split_utxos_count, 1));
     assert!(jet::lt_8(split_utxos_count, param::MAX_SPLIT_UTXOS_COUNT));
 
-    let (current_asset, current_amount): (u256, u64) = get_explicit_current_amount();
+    let (current_asset, current_amount): (u256, u64) = get_explicit_current_asset_id_with_amount();
     let ctx: StepUtxosCtx = (split_utxos_count, jet::current_script_hash(), current_asset);
 
     let out: Either<u64, u64> = for_while::<step_collect_total_amount>(0, ctx);
@@ -152,12 +149,15 @@ fn step_collect_input_total_amount(
     match jet::lt_8(counter, utxos_to_merge) {
         true => {
             let input_index: u32 = u8_to_u32(counter);
-            let (input_asset, input_amount): (u256, u64) = get_explicit_input_amount(input_index);
+            let (
+                input_asset,
+                input_amount
+            ): (u256, u64) = get_explicit_input_asset_id_with_amount(input_index);
 
             assert_eq_256(get_input_script_hash(input_index), expected_script_hash);
             assert_eq_256(input_asset, current_asset);
 
-            Right(safe_add_64(total_inputs_amount, input_amount))
+            Right(add_64(total_inputs_amount, input_amount))
         },
         false => Left(total_inputs_amount),
     }
@@ -173,16 +173,14 @@ fn auth_merge_multiple_storm_eyes_into_single_utxo(storage: Storage, utxos_to_me
     assert!(jet::lt_8(utxos_to_merge, param::MAX_MERGE_UTXOS_COUNT));
     assert!(jet::lt_32(jet::current_index(), u8_to_u32(utxos_to_merge)));
 
-    let current_asset: u256 = get_current_asset();
+    let current_asset: u256 = get_explicit_current_asset_id();
     let ctx: StepUtxosCtx = (utxos_to_merge, jet::current_script_hash(), current_asset);
 
     let total_inputs_amount: u64 = unwrap_left::<u64>(
         for_while::<step_collect_input_total_amount>(0, ctx)
     );
 
-    let (output_asset, output_amount): (u256, u64) = get_explicit_output_amount(0);
-    assert_eq_64(output_amount, total_inputs_amount);
-    assert_eq_256(output_asset, current_asset);
+    assert_explicit_output_asset_id_with_amount(0, current_asset, total_inputs_amount);
 }
 
 /// 6. Inclusion in a transaction upon reaching the rescue block number,

@@ -268,7 +268,7 @@ Here are all message kinds that the network might receive.
 | `9` | `execute-voting-request` | Carries the transaction that executes the voting subject; the nodes sign it after validation. If it is a network members update, all subjects of the new network must receive this message; then nodes need to establish a new internal communication session for additional validation. If a new set of members is all online, then the transaction may be signed. |
 | `10` | `attest-price` | Broadcast by each node when they update some price feed changes. |
 | `11` | `network-assets` | Carries a map of asset names and their ID. |
-| `12` | `renew-storm-utxos` | Submitted by the network leader to push the timelock on Storm EYE UTXO farther into the future. |
+| `12` | `renew-storm-utxos` | Submitted by the coordinator node to push the timelock on Storm EYE UTXO farther into the future. |
 
 ## 12\. Network state
 
@@ -596,9 +596,9 @@ When the network changes its members, the root stored inside the contract must b
 
 ## 2\. Storm Eye resurrection
 
-**The Storm Eye UTXOs are also spendable behind the timelock. This timelock is three years in Liquid blocks.** Within a month before UTXOs are unlocked, the network members must update the timelock further into the future by submitting a `renew-storm-utxos` message with a transaction that does it.
+**The Storm Eye UTXOs are also spendable behind the timelock. This timelock is three years in Liquid blocks.** Within a month before UTXOs are unlocked, the coordinator node must update the timelock further into the future by submitting a `renew-storm-utxos` message with a transaction that does it. The network members validate and sign the renewal.
 
-If the Storm Eye UTXO is unlocked via timelock, it indicates that the network failed to push the date and is dead. Other entities can pick up these UTXOs and potentially resurrect the network.
+If the Storm Eye UTXO is unlocked via timelock, it indicates that the network failed to push the date and is dead. Other entities can pick up these UTXOs and potentially resurrect the network. By design, a rescued Storm Eye carries the full network authority: it authorizes Treasury and Account spends and Tick and Oracle Verifier reissuance, as described in the contracts specification.
 
 ## 3\. Storm Eye UTXOs management
 
@@ -688,7 +688,7 @@ struct ApproveVotingRequest {
 
 After the voting request reaches network approval, it can be executed.
 
-The node that created the voting request can send a message to execute it. 
+Any current network member can send a message to execute an approved voting request, whether or not it created the request. The executor must be authenticated as a current member. All nodes still validate network approval, the original proposer, the transaction, and execution state before signing; already broadcast or finalized requests cannot start another execution. A proposer withholding execution therefore cannot veto an approved request.
 
 ```rust
 struct ExecuteVotingRequest {
@@ -714,7 +714,7 @@ The nodes create the new Storm and verify the connection with all new members. I
 
 Each node calculates the new Storm Tree's root and verifies that the transaction updates the state to the correct root.
 
-The nodes start the signing session, and the requestor node, after receiving all the signatures, finalizes the transaction and broadcasts it.
+The nodes start the signing session, and the executing node, after receiving all the signatures, finalizes the transaction and broadcasts it. The executing node need not be the original proposer.
 
 The nodes listen to the Liquid chain via their indexers for this transaction and, after spotting it in the new block, discard the old Storm.
 

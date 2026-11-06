@@ -1,66 +1,9 @@
-use std::lib::asserts::{assert_eq_64, assert_eq_256};
-
-// TODO: Maybe it would be better to separate asset/amount getters into separate file.
-// Add them into std library for future.
-
-// Amount with asset getters
-
-/// Return explicit input asset and amount
-pub fn get_explicit_input_amount(output_index: u32) -> (u256, u64) {
-    let (output_asset, output_amount): (Asset1, Amount1) = unwrap(jet::input_amount(output_index));
-    let output_asset: u256 = unwrap_right::<Point>(output_asset);
-    let output_amount: u64 = unwrap_right::<Point>(output_amount);
-
-    (output_asset, output_amount)
-}
-
-/// Return explicit output asset and amount
-pub fn get_explicit_output_amount(output_index: u32) -> (u256, u64) {
-    let (output_asset, output_amount): (Asset1, Amount1) = unwrap(jet::output_amount(output_index));
-    let output_asset: u256 = unwrap_right::<Point>(output_asset);
-    let output_amount: u64 = unwrap_right::<Point>(output_amount);
-
-    (output_asset, output_amount)
-}
-
-/// Return explicit current asset and amount
-pub fn get_explicit_current_amount() -> (u256, u64) {
-    let (output_asset, output_amount): (Asset1, Amount1) = jet::current_amount();
-    let output_asset: u256 = unwrap_right::<Point>(output_asset);
-    let output_amount: u64 = unwrap_right::<Point>(output_amount);
-
-    (output_asset, output_amount)
-}
+use std::lib::utxo::getters::asset_id_with_amount::get_explicit_current_asset_id_with_amount;
+use std::lib::utxo::asserts::asset_id_with_amount::assert_explicit_output_asset_id_with_amount;
 
 /// The Storm Eye UTXO must be spent in its entirety: same asset, same amount.
 pub fn assert_output_preserves_utxo(output_index: u32) {
-    let (output_asset, output_amount): (u256, u64) = get_explicit_output_amount(output_index);
-    let (current_asset, current_amount): (u256, u64) = get_explicit_current_amount();
+    let (current_asset, current_amount): (u256, u64) = get_explicit_current_asset_id_with_amount();
 
-    assert_eq_256(output_asset, current_asset);
-    assert_eq_64(output_amount, current_amount);
-}
-
-// Asset getters
-
-pub fn get_input_asset(input_index: u32) -> u256 {
-    unwrap_right::<Point>(unwrap(jet::input_asset(input_index)))
-}
-
-pub fn get_output_asset(output_index: u32) -> u256 {
-    unwrap_right::<Point>(unwrap(jet::output_asset(output_index)))
-}
-
-pub fn get_current_asset() -> u256 {
-    unwrap_right::<Point>(jet::current_asset())
-}
-
-// Script hash getters
-
-pub fn get_input_script_hash(input_index: u32) -> u256 {
-    unwrap(jet::input_script_hash(input_index))
-}
-
-pub fn get_output_script_hash(output_index: u32) -> u256 {
-    unwrap(jet::output_script_hash(output_index))
+    assert_explicit_output_asset_id_with_amount(output_index, current_asset, current_amount);
 }

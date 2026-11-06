@@ -204,6 +204,22 @@ pub(crate) fn voucher_program(
     auth_data: [u8; 32],
     signer: Option<[u8; 32]>,
 ) -> Result<VoucherProgram, String> {
+    let arguments = voucher_arguments(storm_eye_asset_id, auth_kind, auth_data)?;
+    let program = VoucherProgram::new(&arguments);
+    let Some(signer) = signer else {
+        return Ok(program);
+    };
+    let signer =
+        XOnlyPublicKey::from_slice(&signer).map_err(|_| "invalid Oracle Verifier signer key")?;
+
+    Ok(program.with_taproot_pubkey(signer))
+}
+
+fn voucher_arguments(
+    storm_eye_asset_id: [u8; 32],
+    auth_kind: u8,
+    auth_data: [u8; 32],
+) -> Result<VoucherArguments, String> {
     let mut arguments = VoucherArguments {
         storm_eye_asset_id,
         auth_method: u32::from(auth_kind),
@@ -217,14 +233,7 @@ pub(crate) fn voucher_program(
         2 => arguments.auth_pubkey = auth_data,
         _ => return Err("unsupported issued UTXO authentication method".into()),
     }
-    let program = VoucherProgram::new(&arguments);
-    let Some(signer) = signer else {
-        return Ok(program);
-    };
-    let signer =
-        XOnlyPublicKey::from_slice(&signer).map_err(|_| "invalid Oracle Verifier signer key")?;
-
-    Ok(program.with_taproot_pubkey(signer))
+    Ok(arguments)
 }
 
 /// All Verifiers of one issuance share a signer.
@@ -296,6 +305,54 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_script_sizes_match_serialized_batches() {
+        for (count, expected_payload_len, expected_script_len) in [
+            (1, 111, 114),
+            (2, 185, 188),
+            (99, 7_363, 7_367),
+            (100, 7_437, 7_441),
+        ] {
+            for signer in [None, Some(SIGNER)] {
+                let descriptors = (0..count)
+                    .map(|output_index| descriptor(output_index, signer))
+                    .collect::<Vec<_>>();
+                let script = IssuedUtxoDescriptor::script_pubkey(&descriptors).unwrap();
+                let mut instructions = script.instructions_minimal();
+
+                assert!(matches!(
+                    instructions.next(),
+                    Some(Ok(Instruction::Op(opcodes::all::OP_RETURN)))
+                ));
+                let Some(Ok(Instruction::PushBytes(payload))) = instructions.next() else {
+                    panic!("descriptor must contain a data push");
+                };
+                assert_eq!(payload.len(), expected_payload_len);
+                assert!(instructions.next().is_none());
+                assert_eq!(script.len(), expected_script_len);
+                assert_eq!(
+                    IssuedUtxoDescriptor::from_script(&script).unwrap(),
+                    Some(descriptors)
+                );
+
+                println!(
+                    "descriptor count={count} verifier={} payload_bytes={} script_bytes={}",
+                    signer.is_some(),
+                    payload.len(),
+                    script.len(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn descriptor_count_boundaries_are_enforced() {
+        assert!(IssuedUtxoDescriptor::script_pubkey(&[]).is_err());
+
+        let descriptors = vec![descriptor(2, None); MAX_ISSUED_DESCRIPTORS + 1];
+        assert!(IssuedUtxoDescriptor::script_pubkey(&descriptors).is_err());
+    }
+
+    #[test]
     fn reads_tick_descriptors_written_before_the_verifier() {
         let mut data = Vec::new();
         data.extend_from_slice(&DESCRIPTOR_MAGIC);
@@ -311,6 +368,27 @@ mod tests {
             IssuedUtxoDescriptor::from_script(&Script::new_op_return(&data)).unwrap(),
             Some(vec![descriptor(2, None)])
         );
+    }
+
+    #[test]
+    fn recognizes_voucher_scripts() {
+        let network = SimplicityNetwork::default_regtest();
+        for auth_kind in [0, 1, 2] {
+            for signer in [None, Some(SIGNER)] {
+                let descriptor = IssuedUtxoDescriptor {
+                    auth_kind,
+                    signer,
+                    ..descriptor(2, None)
+                };
+                let script = descriptor
+                    .voucher_program([8; 32])
+                    .unwrap()
+                    .get_script_pubkey(&network);
+                assert!(descriptor.matches_script([8; 32], &network, &script));
+                assert!(!descriptor.matches_script([9; 32], &network, &script));
+                assert!(!descriptor.matches_script([8; 32], &network, &Script::from(vec![0x51]),));
+            }
+        }
     }
 
     #[test]

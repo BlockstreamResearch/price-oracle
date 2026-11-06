@@ -6,6 +6,70 @@ use storm_tree::{NodePublicKey, StormTreeBranch};
 
 const DOMAIN: &str = "high-storm";
 
+/// The local settings every signer validates rounds against, so members must share them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolSettings {
+    pub tick_lifetime_blocks: u64,
+    pub burn_transaction_fee_sats: u64,
+    pub tick_burn_reserve_sats: u64,
+    pub operational_fee_sats: u64,
+    pub issuance_transaction_fee_sats: u64,
+    pub exchange_transaction_fee_sats: u64,
+}
+
+impl ProtocolSettings {
+    pub fn of(config: &crate::config::ProtocolConfig) -> Self {
+        Self {
+            tick_lifetime_blocks: config.tick_lifetime_blocks,
+            burn_transaction_fee_sats: config.burn_transaction_fee_sats,
+            tick_burn_reserve_sats: config.tick_burn_reserve_sats,
+            operational_fee_sats: config.operational_fee_sats,
+            issuance_transaction_fee_sats: config.issuance_transaction_fee_sats,
+            exchange_transaction_fee_sats: config.exchange_transaction_fee_sats,
+        }
+    }
+
+    /// Each differing setting as `name: local != peer`.
+    pub fn mismatches(&self, peer: &Self) -> Vec<String> {
+        [
+            (
+                "tick_lifetime_blocks",
+                self.tick_lifetime_blocks,
+                peer.tick_lifetime_blocks,
+            ),
+            (
+                "burn_transaction_fee_sats",
+                self.burn_transaction_fee_sats,
+                peer.burn_transaction_fee_sats,
+            ),
+            (
+                "tick_burn_reserve_sats",
+                self.tick_burn_reserve_sats,
+                peer.tick_burn_reserve_sats,
+            ),
+            (
+                "operational_fee_sats",
+                self.operational_fee_sats,
+                peer.operational_fee_sats,
+            ),
+            (
+                "issuance_transaction_fee_sats",
+                self.issuance_transaction_fee_sats,
+                peer.issuance_transaction_fee_sats,
+            ),
+            (
+                "exchange_transaction_fee_sats",
+                self.exchange_transaction_fee_sats,
+                peer.exchange_transaction_fee_sats,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, local, peer)| local != peer)
+        .map(|(name, local, peer)| format!("{name}: {local} != {peer}"))
+        .collect()
+    }
+}
+
 /// A higher-level message carried inside a Storm custom message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeMessage {
@@ -75,6 +139,7 @@ pub enum NodeMessageKind {
     AttestPrice = 10,
     NetworkAssets = 11,
     RenewStormUtxos = 12,
+    ProtocolSettings = 13,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +158,15 @@ impl NetworkVoteKind {
             2 => Self::SplitStormEye,
             _ => return None,
         })
+    }
+
+    /// The `kind` label of governance metrics.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::UpdateNetworkMembers => "update_network_members",
+            Self::MergeStormEyes => "merge_storm_eyes",
+            Self::SplitStormEye => "split_storm_eye",
+        }
     }
 }
 
@@ -302,6 +376,8 @@ pub(crate) struct VotingSyncRequest {
 pub(crate) struct VotingSyncMessage {
     pub(crate) is_response: bool,
     pub(crate) requests: Vec<VotingSyncRequest>,
+    /// Approved votes the requester has no execution for.
+    pub(crate) missing_executions: Vec<[u8; 32]>,
 }
 
 impl NodeMessageKind {
@@ -320,6 +396,7 @@ impl NodeMessageKind {
             10 => Self::AttestPrice,
             11 => Self::NetworkAssets,
             12 => Self::RenewStormUtxos,
+            13 => Self::ProtocolSettings,
             _ => return None,
         })
     }
@@ -329,6 +406,26 @@ impl NodeMessageKind {
             self,
             Self::ExecuteUserRequests | Self::NetworkAssets | Self::RenewStormUtxos
         )
+    }
+
+    /// A metric label.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecuteUserRequests => "execute_user_requests",
+            Self::ExchangeRewards => "exchange_rewards",
+            Self::SigningNonces => "signing_nonces",
+            Self::PartialSignatures => "partial_signatures",
+            Self::BurnExpiredUtxos => "burn_expired_utxos",
+            Self::ExpiredUtxosBurned => "expired_utxos_burned",
+            Self::NetworkVoteRequest => "network_vote_request",
+            Self::ApproveVotingRequest => "approve_voting_request",
+            Self::AskAboutVotings => "ask_about_votings",
+            Self::ExecuteVotingRequest => "execute_voting_request",
+            Self::AttestPrice => "attest_price",
+            Self::NetworkAssets => "network_assets",
+            Self::RenewStormUtxos => "renew_storm_utxos",
+            Self::ProtocolSettings => "protocol_settings",
+        }
     }
 }
 

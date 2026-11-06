@@ -14,7 +14,8 @@ pub(super) const RECONNECT_INTERVAL: Duration = Duration::from_secs(3);
 #[cfg(test)]
 pub(super) const RECONNECT_INTERVAL: Duration = Duration::from_millis(50);
 pub(super) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
-pub(super) const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+// Ten missed heartbeats; handlers make blocking RPC calls that can delay them.
+pub(super) const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) const MESSAGE_CLOCK_SKEW: Duration = Duration::from_secs(5 * 60);
 pub(super) const REPLAY_CACHE_CAPACITY: usize = 256;

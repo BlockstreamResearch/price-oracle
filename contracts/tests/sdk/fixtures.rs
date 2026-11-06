@@ -1,6 +1,7 @@
 use simplex::either::Either;
-use simplex::program::{Program, WitnessTrait};
+use simplex::program::Program;
 use simplex::provider::SimplicityNetwork;
+use simplex::simplicityhl::WitnessValues;
 use simplex::simplicityhl::elements::secp256k1_zkp::{
     Keypair, Message, Secp256k1, SecretKey, XOnlyPublicKey,
 };
@@ -38,7 +39,7 @@ pub fn x_only(secret: [u8; 32]) -> XOnlyPublicKey {
 }
 
 pub fn asset_bytes(asset: AssetId) -> [u8; 32] {
-    asset.into_inner().to_byte_array()
+    asset.to_byte_array()
 }
 
 /// Signs `price` as the network would, and returns it the way a `signed-price-data` response
@@ -129,11 +130,11 @@ impl Consumer {
         &self,
         ft: &mut FinalTransaction,
         utxo: &UTXO,
-        witness: impl WitnessTrait + 'static,
+        witness: impl Into<WitnessValues>,
     ) {
         ft.add_program_input(
             PartialInput::new(utxo.clone()),
-            ProgramInput::new(Box::new(self.program.clone()), Box::new(witness)),
+            ProgramInput::new(Box::new(self.program.clone()), witness),
             RequiredSignature::None,
         );
     }
@@ -150,7 +151,7 @@ impl Consumer {
     pub fn spend(
         &self,
         context: &simplex::TestContext,
-        witness: impl WitnessTrait + 'static,
+        witness: impl Into<WitnessValues>,
     ) -> anyhow::Result<FinalTransaction> {
         let mut ft = FinalTransaction::new();
 
@@ -166,7 +167,7 @@ impl Consumer {
     pub fn spend_with_vouchers(
         &self,
         context: &simplex::TestContext,
-        witness: impl WitnessTrait + 'static,
+        witness: impl Into<WitnessValues>,
         vouchers: &[&Voucher],
         auth_asset: AssetId,
     ) -> anyhow::Result<FinalTransaction> {

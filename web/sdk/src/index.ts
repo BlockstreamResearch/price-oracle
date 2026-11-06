@@ -1,13 +1,18 @@
 import { schnorr, secp256k1 } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils";
+import { bech32m } from "@scure/base";
 
 const REQUEST_TAG = "OracleNetworkV1/NetworkUserRequests";
 export const WALLET_REQUEST_SIGNATURE_SCHEME =
   "bitcoin-signed-message-ecdsa-v1";
 const PRICE_TAG = "OracleNetworkV1/Price";
+const PRICE_VALIDITY_SECONDS = 300n;
+const MAX_STORM_TREE_DEPTH = 17;
 const HEX_32 = /^[0-9a-f]{64}$/i;
 const OUTPOINT = /^[0-9a-f]{64}:[0-9]+$/i;
+const UNSPENDABLE_INTERNAL_KEY =
+  "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
 
 export type OracleNetwork = "liquidv1" | "liquidtestnet" | "elementsregtest";
 
@@ -20,6 +25,20 @@ export type OracleAccount = {
   /** The asset a `signed-price-data` request is issued in. */
   oracle_verifier_asset_id: string;
   network: OracleNetwork;
+};
+
+export type AccountVerification = {
+  ownerPublicKey: string;
+  network: OracleNetwork;
+  stormEyeAssetId: string;
+  tickAssetId: string;
+  verifierAssetId: string;
+  /** Independently compiled Account leaf for this owner and Storm Eye asset. */
+  accountTapleafHash: string;
+  /** Independently compiled voucher leaf for this owner or authentication script. */
+  tickTapleafHash: string;
+  /** Omit for owner signature authentication; otherwise compile the Tick for this script. */
+  authScriptPubKey?: string;
 };
 
 export type OracleUtxo = {
@@ -80,6 +99,22 @@ export type PriceFeedData = {
   price: bigint;
   receivedAt: bigint;
   validUntil: bigint;
+};
+
+export type SignedPriceVerification = {
+  /** Current Storm Eye root from an independently trusted source, not this response. */
+  stormTreeRoot: string;
+  feedId: number;
+  decimals: number;
+  /** Trusted Unix time in seconds. */
+  now: bigint;
+};
+
+export type IssuedPriceVerification = SignedPriceVerification & {
+  /** Verifier asset ID from independently verified network issuance. */
+  verifierAssetId: string;
+  /** Locally compiled voucher leaf for the requested authentication method. */
+  verifierTapleafHash: string;
 };
 
 export type PriceFeedInfo = {
@@ -244,23 +279,44 @@ export class PriceOracleClient {
   readonly #fetch: typeof globalThis.fetch;
 
   constructor(coordinatorUrl: string, fetcher = globalThis.fetch) {
+    const url = new URL(coordinatorUrl);
+    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
+      throw new Error("coordinator URL must use HTTPS (HTTP is loopback-only)");
     this.#coordinatorUrl = coordinatorUrl.replace(/\/$/, "");
     this.#fetch = fetcher.bind(globalThis);
   }
 
   async getAccount(
     publicKey: string,
-    authScriptPubKey?: string,
+    verification: AccountVerification,
   ): Promise<OracleAccount> {
     assertXOnlyPublicKey(publicKey);
-    if (authScriptPubKey !== undefined)
-      validateAuthMethod({
-        kind: "scriptPubKey-auth",
-        auth_data: authScriptPubKey,
-      });
-    return this.#json<OracleAccount>(
+    const expected = deriveAccount(verification);
+    if (publicKey.toLowerCase() !== verification.ownerPublicKey.toLowerCase())
+      throw new Error(
+        "Account verification owner does not match the requested public key",
+      );
+
+    const authScriptPubKey = verification.authScriptPubKey;
+    const account = await this.#json<OracleAccount>(
       `/users/account/${publicKey.toLowerCase()}${authScriptPubKey === undefined ? "" : `?auth_script_pubkey=${encodeURIComponent(authScriptPubKey)}`}`,
     );
+
+    for (const [field, value] of Object.entries(expected)) {
+      const received = account?.[field as keyof OracleAccount];
+      if (
+        typeof received !== "string" ||
+        (field === "address" || field === "network"
+          ? received
+          : received.toLowerCase()) !== value
+      )
+        throw new Error(
+          `coordinator Account ${field} does not match the trusted derivation`,
+        );
+    }
+
+    return expected;
   }
 
   async submitTickRequest(
@@ -290,7 +346,10 @@ export class PriceOracleClient {
   }
 
   async #json<Result>(path: string, init?: RequestInit): Promise<Result> {
-    const response = await this.#fetch(`${this.#coordinatorUrl}${path}`, init);
+    const response = await this.#fetch(`${this.#coordinatorUrl}${path}`, {
+      ...init,
+      redirect: "error",
+    });
     const body = (await response.json()) as Result | { error: string };
     if (!response.ok) {
       throw new Error(
@@ -301,6 +360,66 @@ export class PriceOracleClient {
     }
     return body as Result;
   }
+}
+
+/** Derive an Account and Tick from independently trusted contract leaves and asset IDs. */
+export function deriveAccount(
+  verification: AccountVerification,
+): OracleAccount {
+  if (!verification || typeof verification !== "object")
+    throw new Error("trusted Account verification context is required");
+  assertXOnlyPublicKey(verification.ownerPublicKey);
+  if (
+    !["liquidv1", "liquidtestnet", "elementsregtest"].includes(
+      verification.network,
+    )
+  )
+    throw new Error("unsupported trusted Account network");
+  if (
+    [
+      verification.stormEyeAssetId,
+      verification.tickAssetId,
+      verification.verifierAssetId,
+      verification.accountTapleafHash,
+      verification.tickTapleafHash,
+    ].some((value) => typeof value !== "string" || !HEX_32.test(value))
+  )
+    throw new Error(
+      "trusted Account assets and tapleaf hashes must be 32-byte hex",
+    );
+  if (verification.authScriptPubKey !== undefined)
+    validateAuthMethod({
+      kind: "scriptPubKey-auth",
+      auth_data: verification.authScriptPubKey,
+    });
+
+  const scriptPubKey = elementsTaprootScript(
+    UNSPENDABLE_INTERNAL_KEY,
+    verification.accountTapleafHash,
+  );
+  const tickScriptPubKey = elementsTaprootScript(
+    UNSPENDABLE_INTERNAL_KEY,
+    verification.tickTapleafHash,
+  );
+  const prefix = {
+    liquidv1: "ex",
+    liquidtestnet: "tex",
+    elementsregtest: "ert",
+  }[verification.network];
+  const address = bech32m.encode(prefix, [
+    1,
+    ...bech32m.toWords(hexToBytes(scriptPubKey.slice(4))),
+  ]);
+
+  return {
+    address,
+    script_pubkey: scriptPubKey,
+    storm_eye_asset_id: verification.stormEyeAssetId.toLowerCase(),
+    tick_asset_id: verification.tickAssetId.toLowerCase(),
+    tick_script_pubkey: tickScriptPubKey,
+    oracle_verifier_asset_id: verification.verifierAssetId.toLowerCase(),
+    network: verification.network,
+  };
 }
 
 export function publicKeyFromPrivateKey(privateKey: string): string {
@@ -505,21 +624,66 @@ export function decodePriceData(priceData: string): PriceFeedData {
 }
 
 /**
- * Whether the network signed this rate, under the Storm Tree branch the bloom
- * names. The caller still has to check that branch against the Storm Eye root
- * the chain holds, which this cannot see.
+ * Authenticate a fresh rate against the caller's trusted current Storm Eye root.
+ * This does not establish issuance, confirmation, or unspentness of a Verifier.
  */
-export function verifySignedPriceData(details: SignedPriceData): boolean {
-  const { signature, branch } = details.storm_tree_bloom;
-  if (!HEX_32.test(branch) || !/^[0-9a-f]{128}$/i.test(signature)) {
-    throw new Error("bloom must carry a 32-byte branch and 64-byte signature");
-  }
-  const tagHash = sha256(utf8ToBytes(PRICE_TAG));
-  const message = sha256(
-    new Uint8Array([...tagHash, ...tagHash, ...hexToBytes(details.price_data)]),
-  );
+export function verifySignedPriceData(
+  details: SignedPriceData,
+  verification: SignedPriceVerification,
+): boolean {
+  try {
+    if (!HEX_32.test(verification.stormTreeRoot)) return false;
+    assertFeedId(verification.feedId);
+    assertFeedId(verification.decimals);
+    if (typeof verification.now !== "bigint" || verification.now < 0n)
+      return false;
 
-  return schnorr.verify(hexToBytes(signature), message, hexToBytes(branch));
+    const price = decodePriceData(details.price_data);
+    if (
+      price.feedId !== verification.feedId ||
+      price.decimals !== verification.decimals ||
+      price.receivedAt > verification.now ||
+      price.validUntil <= verification.now ||
+      price.validUntil <= price.receivedAt ||
+      price.validUntil - price.receivedAt > PRICE_VALIDITY_SECONDS
+    )
+      return false;
+
+    const { signature, branch, proof } = details.storm_tree_bloom;
+    if (
+      !HEX_32.test(branch) ||
+      !/^[0-9a-f]{128}$/i.test(signature) ||
+      !Array.isArray(proof) ||
+      proof.length < 1 ||
+      proof.length > MAX_STORM_TREE_DEPTH
+    )
+      return false;
+
+    let root = sha256(new Uint8Array([...hexToBytes(branch), 0x01]));
+    for (const sibling of proof) {
+      if (typeof sibling.right !== "boolean" || !HEX_32.test(sibling.hash))
+        return false;
+      const hash = hexToBytes(sibling.hash);
+      root = sha256(
+        new Uint8Array(sibling.right ? [...hash, ...root] : [...root, ...hash]),
+      );
+    }
+    if (bytesToHex(root) !== verification.stormTreeRoot.toLowerCase())
+      return false;
+
+    const tagHash = sha256(utf8ToBytes(PRICE_TAG));
+    const message = sha256(
+      new Uint8Array([
+        ...tagHash,
+        ...tagHash,
+        ...hexToBytes(details.price_data),
+      ]),
+    );
+
+    return schnorr.verify(hexToBytes(signature), message, hexToBytes(branch));
+  } catch {
+    return false;
+  }
 }
 
 export function parseExecutedTick(
@@ -539,8 +703,10 @@ export function parseExecutedTick(
   };
 }
 
+/** Authenticate an executed response; its returned outpoint is not chain-verified. */
 export function parseExecutedSignedPrice(
   status: TickRequestStatus,
+  verification: SignedPriceVerification,
 ): { txid: string; verifierVout: number; signedPrice: SignedPriceData } | null {
   if (status.status !== "executed") return null;
   const executed = parseExecutedTick(status);
@@ -562,9 +728,79 @@ export function parseExecutedSignedPrice(
     throw new Error("invalid Verifier output index");
   const signedPrice = JSON.parse(result.payload) as SignedPriceData;
   decodePriceData(signedPrice.price_data);
-  if (!verifySignedPriceData(signedPrice))
-    throw new Error("oracle price signature does not verify");
+  if (!verifySignedPriceData(signedPrice, verification))
+    throw new Error("oracle price does not verify against the trusted context");
   return { txid: executed.txid, verifierVout: result.vout, signedPrice };
+}
+
+/** Check a finalized price and its confirmed, unspent Verifier via independent RPC. */
+export async function verifyExecutedSignedPrice(
+  status: TickRequestStatus,
+  verification: IssuedPriceVerification,
+  elements: ElementsRpcClient,
+): Promise<ReturnType<typeof parseExecutedSignedPrice>> {
+  if (
+    !HEX_32.test(verification.verifierAssetId) ||
+    !HEX_32.test(verification.verifierTapleafHash)
+  )
+    throw new Error(
+      "trusted Verifier asset and tapleaf hash must be 32-byte hex",
+    );
+  const executed = parseExecutedSignedPrice(status, verification);
+  if (!executed) return null;
+
+  const branch = executed.signedPrice.storm_tree_bloom.branch;
+  const scriptPubKey = elementsTaprootScript(
+    branch,
+    verification.verifierTapleafHash,
+  );
+
+  const utxo = await elements.call<{
+    confirmations: number;
+    asset?: string;
+    value?: number;
+    scriptPubKey: { hex: string };
+  } | null>("gettxout", [executed.txid, executed.verifierVout, true]);
+  if (
+    !utxo ||
+    !Number.isSafeInteger(utxo.confirmations) ||
+    utxo.confirmations < 1 ||
+    utxo.asset?.toLowerCase() !== verification.verifierAssetId.toLowerCase() ||
+    utxo.value !== 0.00000001 ||
+    utxo.scriptPubKey.hex.toLowerCase() !== scriptPubKey
+  )
+    throw new Error(
+      "confirmed unspent Verifier does not match the trusted context",
+    );
+
+  return executed;
+}
+
+function elementsTaprootScript(
+  internalPublicKey: string,
+  tapleafHash: string,
+): string {
+  const tagHash = sha256(utf8ToBytes("TapTweak/elements"));
+  const tweakHash = sha256(
+    new Uint8Array([
+      ...tagHash,
+      ...tagHash,
+      ...hexToBytes(internalPublicKey),
+      ...hexToBytes(tapleafHash),
+    ]),
+  );
+  const tweak = BigInt(`0x${bytesToHex(tweakHash)}`);
+  if (tweak >= secp256k1.CURVE.n)
+    throw new Error("invalid Elements Taproot tweak");
+
+  const internalKey = secp256k1.ProjectivePoint.fromHex(
+    `02${internalPublicKey}`,
+  );
+  const outputKey =
+    tweak === 0n
+      ? internalKey
+      : internalKey.add(secp256k1.ProjectivePoint.BASE.multiply(tweak));
+  return `5120${bytesToHex(outputKey.toRawBytes(true).slice(1))}`;
 }
 
 export function createTickSpendPlan(

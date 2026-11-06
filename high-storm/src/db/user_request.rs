@@ -280,6 +280,33 @@ impl UserRequestStore {
         Ok(true)
     }
 
+    pub async fn count_by_status(&self) -> Result<Vec<(String, u64)>, Error> {
+        sqlx::query("SELECT status, COUNT(*) AS count FROM network_user_requests GROUP BY status")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("status")?,
+                    decode_height(row.try_get("count")?)?,
+                ))
+            })
+            .collect()
+    }
+
+    /// The height at which the oldest request not yet in a block was submitted.
+    pub async fn oldest_open_block_height(&self) -> Result<Option<u64>, Error> {
+        sqlx::query(
+            "SELECT MIN(block_height) AS height FROM network_user_requests \
+             WHERE status IN ('pending', 'processing')",
+        )
+        .fetch_one(&self.pool)
+        .await?
+        .try_get::<Option<i64>, _>("height")?
+        .map(decode_height)
+        .transpose()
+    }
+
     pub async fn get(&self, request_hash: [u8; 32]) -> Result<Option<StoredUserRequest>, Error> {
         let Some(row) = sqlx::query(
             "SELECT request_hash, request, block_height, status, payload, execution_tx, \
@@ -323,6 +350,10 @@ fn decode_request(row: sqlx::any::AnyRow) -> Result<StoredUserRequest, Error> {
             })
             .transpose()?,
     })
+}
+
+fn decode_height(value: i64) -> Result<u64, Error> {
+    u64::try_from(value).map_err(|error| Error::Sqlx(sqlx::Error::Decode(Box::new(error))))
 }
 
 #[cfg(test)]
@@ -371,6 +402,36 @@ mod tests {
             2,
             "a page is bounded by its limit"
         );
+    }
+
+    #[tokio::test]
+    async fn reports_statuses_and_the_oldest_open_request() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.user_requests();
+        assert_eq!(store.oldest_open_block_height().await.unwrap(), None);
+        for (height, hash) in [(5u64, [1u8; 32]), (9, [2; 32])] {
+            let fee_utxo = FeeUtxo {
+                txid: hash,
+                output_index: 0,
+            };
+            store
+                .insert_pending(hash, b"request", height, std::slice::from_ref(&fee_utxo))
+                .await
+                .unwrap();
+        }
+        store
+            .mark_failed([1; 32], b"input unavailable")
+            .await
+            .unwrap();
+
+        let mut statuses = store.count_by_status().await.unwrap();
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            vec![("failed".to_string(), 1), ("pending".to_string(), 1)]
+        );
+        // The failed request no longer holds up the queue.
+        assert_eq!(store.oldest_open_block_height().await.unwrap(), Some(9));
     }
 
     #[tokio::test]

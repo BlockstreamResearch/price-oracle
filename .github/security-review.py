@@ -15,11 +15,11 @@ import urllib.request
 API_BASE_URL = "https://api.openai.com/v1"
 VECTOR_STORE_NAME = "price-oracle-security-context"
 REPORT_PATH = os.environ.get("SECURITY_REVIEW_REPORT", "security-review.md")
-MODEL = os.environ.get("SECURITY_REVIEW_MODEL", "gpt-5-mini")
+MODEL = os.environ.get("SECURITY_REVIEW_MODEL", "gpt-6.1-sol")
 ARCHITECTURE_PATH = pathlib.Path("specs/oracle-network-architecture.md")
 MAX_ARCHITECTURE_SIZE = 100_000
 MAX_CODEBASE_CONTEXT_SIZE = 10_000_000
-TEXT_SUFFIXES = {".json", ".md", ".py", ".rs", ".toml", ".yaml", ".yml"}
+TEXT_SUFFIXES = {".json", ".md", ".py", ".rs", ".simf", ".toml", ".yaml", ".yml"}
 TEXT_FILENAMES = {".gitignore", "Cargo.lock", "LICENSE", "rust-toolchain.toml"}
 EXCLUDED_DIRECTORIES = {".git", "target"}
 EXCLUDED_FILES = {"pr.diff", "pr.json", REPORT_PATH}

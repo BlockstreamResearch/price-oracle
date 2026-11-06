@@ -23,7 +23,7 @@ impl Treasury {
     #[must_use]
     pub fn new(params: TreasuryParameters) -> Self {
         let program = TreasuryProgram::new(&TreasuryArguments {
-            storm_eye_asset_id: params.storm_eye_asset_id.into_inner().to_byte_array(),
+            storm_eye_asset_id: params.storm_eye_asset_id.to_byte_array(),
         });
 
         Self { program, params }
@@ -51,9 +51,9 @@ impl Treasury {
             PartialInput::new(treasury_utxo.clone()),
             ProgramInput::new(
                 Box::new(self.program.as_ref().clone()),
-                Box::new(TreasuryWitness {
+                TreasuryWitness {
                     storm_eye_input_index,
-                }),
+                },
             ),
             RequiredSignature::None,
         );

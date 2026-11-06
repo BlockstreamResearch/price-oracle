@@ -12,14 +12,14 @@ use secp256k1_zkp::{Message, PublicKey, Secp256k1, XOnlyPublicKey, schnorr::Sign
 use simplex::simplicityhl::elements::{opcodes, script::Instruction};
 use simplex::{
     either::Either,
-    program::{ProgramTrait, WitnessTrait},
+    program::ProgramTrait,
     provider::SimplicityNetwork,
     simplicityhl::{
+        WitnessValues,
         elements::{
             Address, AddressParams, AssetId, BlockHash, Script, TxOut, Txid, encode,
             pset::PartiallySignedTransaction,
         },
-        simplicity::hashes::Hash,
     },
     transaction::{
         FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
@@ -275,7 +275,7 @@ impl Droplets {
             &client,
             &storm_eye.contract_script,
             Some(storm_eye.asset_id),
-            StormEyePool::NetworkLeader(0),
+            StormEyePool::AnyNetworkLeader,
         )?;
         let contract_data: StormEyeContractData =
             postcard::from_bytes(storm_eye.contract_data.as_deref().ok_or_else(|| {
@@ -288,7 +288,7 @@ impl Droplets {
             PartialInput::new(storm_eye_utxo.clone()),
             ProgramInput::new(
                 Box::new(auth_program.as_ref().clone()),
-                Box::new(AuthWitness {
+                AuthWitness {
                     path: Either::Left((
                         (contract_data.storm_tree_root, contract_data.rescue_height),
                         (
@@ -298,7 +298,7 @@ impl Droplets {
                         ),
                         Either::Left(0),
                     )),
-                }),
+                },
             ),
             RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
         );
@@ -307,9 +307,9 @@ impl Droplets {
                 PartialInput::new(utxo.clone()),
                 ProgramInput::new(
                     Box::new(treasury.as_ref().clone()),
-                    Box::new(TreasuryWitness {
+                    TreasuryWitness {
                         storm_eye_input_index: 0,
-                    }),
+                    },
                 ),
                 RequiredSignature::None,
             );
@@ -416,6 +416,11 @@ impl Droplets {
         signing_hash: [u8; 32],
         expected_leader: [u8; 33],
     ) -> Result<ValidatedExchange, DropletsError> {
+        if let Some((height, reason)) = self.store.ledger_halt().await? {
+            return Err(DropletsError::Invalid(format!(
+                "Droplets ledger is halted at block {height}: {reason}"
+            )));
+        }
         let storm_eye = self
             .assets
             .get(STORM_EYE_KIND)
@@ -534,26 +539,28 @@ impl Droplets {
                 Either::Left(0),
             )),
         };
-        pset.inputs_mut()[0].final_script_witness = Some(auth_program.as_ref().finalize(
-            &pset,
-            &auth_witness.build_witness(),
-            0,
-            &network,
-        )?);
+        pset.inputs_mut()[0].final_script_witness = Some(
+            auth_program
+                .as_ref()
+                .finalize(&pset, &WitnessValues::from(auth_witness), 0, &network)?
+                .into(),
+        );
         let treasury = TreasuryProgram::new(&TreasuryArguments {
             storm_eye_asset_id: storm_eye.asset_id,
         });
         for index in 1..pset.inputs().len() {
             pset.inputs_mut()[index].final_script_witness = Some(
-                treasury.as_ref().finalize(
-                    &pset,
-                    &TreasuryWitness {
-                        storm_eye_input_index: 0,
-                    }
-                    .build_witness(),
-                    index,
-                    &network,
-                )?,
+                treasury
+                    .as_ref()
+                    .finalize(
+                        &pset,
+                        &WitnessValues::from(TreasuryWitness {
+                            storm_eye_input_index: 0,
+                        }),
+                        index,
+                        &network,
+                    )?
+                    .into(),
             );
         }
         if signing_hash(&pset, &storm_eye, &network)? != request.signing_hash {

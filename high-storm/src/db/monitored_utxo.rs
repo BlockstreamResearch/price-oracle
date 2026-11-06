@@ -71,13 +71,15 @@ impl MonitoredUtxoStore {
         transaction.commit().await
     }
 
+    /// Returns how many burns reverted to `expired` because their transaction
+    /// was not confirmed within `BURNING_BLOCKS`.
     pub(crate) async fn apply_block_in(
         transaction: &mut Transaction<'_, Any>,
         block: &IndexedBlock,
         issued: &[MonitoredUtxo],
         spent: &[([u8; 32], u32, [u8; 32])],
         active_blocks: u64,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<u64, sqlx::Error> {
         for utxo in issued {
             sqlx::query(
                 "INSERT INTO monitored_utxos \
@@ -119,15 +121,39 @@ impl MonitoredUtxoStore {
         .bind(encode_u64(active_blocks)?)
         .execute(&mut **transaction)
         .await?;
-        sqlx::query(
+        let reverted = sqlx::query(
             "UPDATE monitored_utxos SET status = 'expired', status_block_height = $1, \
              burn_txid = NULL WHERE status = 'burning' AND status_block_height + $2 <= $1",
         )
         .bind(encode_u64(block.height)?)
         .bind(encode_u64(BURNING_BLOCKS)?)
         .execute(&mut **transaction)
-        .await?;
-        Ok(())
+        .await?
+        .rows_affected();
+        Ok(reverted)
+    }
+
+    pub async fn count_by_status(&self) -> Result<Vec<(String, u64)>, sqlx::Error> {
+        sqlx::query("SELECT status, COUNT(*) AS count FROM monitored_utxos GROUP BY status")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| Ok((row.try_get("status")?, decode_u64(row.try_get("count")?)?)))
+            .collect()
+    }
+
+    /// The issue height of the oldest Tick or Verifier that expired and is still
+    /// not burned.
+    pub async fn oldest_unburned_block_height(&self) -> Result<Option<u64>, sqlx::Error> {
+        sqlx::query(
+            "SELECT MIN(block_height) AS height FROM monitored_utxos \
+             WHERE status IN ('expired', 'burning')",
+        )
+        .fetch_one(&self.pool)
+        .await?
+        .try_get::<Option<i64>, _>("height")?
+        .map(decode_u64)
+        .transpose()
     }
 
     pub(crate) async fn record_cursor(
@@ -251,6 +277,34 @@ impl MonitoredUtxoStore {
         }
         transaction.commit().await?;
         Ok(updated)
+    }
+
+    pub async fn burning_txids(&self) -> Result<Vec<[u8; 32]>, sqlx::Error> {
+        sqlx::query(
+            "SELECT DISTINCT burn_txid FROM monitored_utxos \
+             WHERE status = 'burning' AND burn_txid IS NOT NULL ORDER BY burn_txid",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| decode_hash(row.try_get("burn_txid")?))
+        .collect()
+    }
+
+    pub async fn release_burning(
+        &self,
+        burn_txid: [u8; 32],
+        block_height: u64,
+    ) -> Result<u64, sqlx::Error> {
+        Ok(sqlx::query(
+            "UPDATE monitored_utxos SET status = 'expired', status_block_height = $1, \
+             burn_txid = NULL WHERE status = 'burning' AND burn_txid = $2",
+        )
+        .bind(encode_u64(block_height)?)
+        .bind(burn_txid.to_vec())
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
     }
 
     pub async fn quarantine_unburnable(
@@ -417,6 +471,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reports_statuses_the_oldest_unburned_utxo_and_reverted_burns() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.monitored_utxos();
+        let block = |height: u64| IndexedBlock {
+            height,
+            hash: [height as u8; 32],
+        };
+        let mut second = monitored(10);
+        second.output_index = 4;
+        store
+            .apply_block("burning-v1", &block(10), &[monitored(10), second], &[], 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.count_by_status().await.unwrap(),
+            vec![("active".to_string(), 2)]
+        );
+        assert_eq!(store.oldest_unburned_block_height().await.unwrap(), None);
+
+        store
+            .apply_block("burning-v1", &block(70), &[], &[], 60)
+            .await
+            .unwrap();
+        store
+            .mark_burning(&[([1; 32], 2)], [8; 32], 70)
+            .await
+            .unwrap();
+        let mut statuses = store.count_by_status().await.unwrap();
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            vec![("burning".to_string(), 1), ("expired".to_string(), 1)]
+        );
+        assert_eq!(
+            store.oldest_unburned_block_height().await.unwrap(),
+            Some(10)
+        );
+
+        // Unconfirmed after five blocks, the burn goes back to the queue.
+        let mut transaction = store.pool.begin().await.unwrap();
+        let reverted =
+            MonitoredUtxoStore::apply_block_in(&mut transaction, &block(75), &[], &[], 60)
+                .await
+                .unwrap();
+        transaction.commit().await.unwrap();
+        assert_eq!(reverted, 1);
+        assert_eq!(
+            store.count_by_status().await.unwrap(),
+            vec![("expired".to_string(), 2)]
+        );
+    }
+
+    #[tokio::test]
     async fn batched_burning_reservations_preserve_pairs_order_and_statuses() {
         let database = Database::connect("sqlite::memory:", 1).await.unwrap();
         let store = database.monitored_utxos();
@@ -569,6 +676,126 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.list_expired(10).await.unwrap()[0].status, "expired");
+    }
+
+    #[tokio::test]
+    async fn expiry_remains_anchored_to_issuance_height() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.monitored_utxos();
+        let issued = monitored(100);
+
+        store
+            .apply_block(
+                "burning-v1",
+                &IndexedBlock {
+                    height: 100,
+                    hash: [100; 32],
+                },
+                std::slice::from_ref(&issued),
+                &[],
+                60,
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            store
+                .apply_block(
+                    "burning-v1",
+                    &IndexedBlock {
+                        height: 159,
+                        hash: [159; 32],
+                    },
+                    &[],
+                    &[],
+                    60,
+                )
+                .await
+                .unwrap();
+            assert!(store.list_expired(10).await.unwrap().is_empty());
+        }
+
+        for height in [160, 161] {
+            store
+                .apply_block(
+                    "burning-v1",
+                    &IndexedBlock {
+                        height,
+                        hash: [height as u8; 32],
+                    },
+                    &[],
+                    &[],
+                    60,
+                )
+                .await
+                .unwrap();
+            let expired = store.list_expired(10).await.unwrap();
+            assert_eq!(expired.len(), 1);
+            assert_eq!(expired[0].block_height, 100);
+            assert_eq!(expired[0].status_block_height, 160);
+        }
+    }
+
+    #[tokio::test]
+    async fn burn_retry_waits_for_five_confirmed_heights() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.monitored_utxos();
+        let issued = monitored(100);
+
+        store
+            .apply_block(
+                "burning-v1",
+                &IndexedBlock {
+                    height: 160,
+                    hash: [160; 32],
+                },
+                std::slice::from_ref(&issued),
+                &[],
+                60,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .mark_burning(&[(issued.txid, issued.output_index)], [9; 32], 160)
+                .await
+                .unwrap(),
+            1
+        );
+
+        for height in [160, 164, 164, 165] {
+            store
+                .apply_block(
+                    "burning-v1",
+                    &IndexedBlock {
+                        height,
+                        hash: [height as u8; 32],
+                    },
+                    &[],
+                    &[],
+                    60,
+                )
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .is_reserved_for_burning(
+                        issued.burning_fee_txid,
+                        issued.burning_fee_output_index,
+                    )
+                    .await
+                    .unwrap()
+            );
+            let expired = store.list_expired(10).await.unwrap();
+            if height < 165 {
+                assert!(expired.is_empty());
+            } else {
+                assert_eq!(expired.len(), 1);
+                assert_eq!(expired[0].block_height, 100);
+                assert_eq!(expired[0].status_block_height, 165);
+                assert_eq!(expired[0].burn_txid, None);
+            }
+        }
     }
 
     #[tokio::test]

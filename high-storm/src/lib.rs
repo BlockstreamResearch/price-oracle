@@ -5,6 +5,7 @@ pub mod db;
 pub mod external_api;
 pub mod high_storm;
 pub mod ipc;
+pub mod monitoring;
 pub mod sources;
 
 use std::{collections::HashSet, time::Duration};

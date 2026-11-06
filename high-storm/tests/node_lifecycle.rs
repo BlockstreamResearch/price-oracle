@@ -104,26 +104,9 @@ async fn initializes_persists_and_restores_a_network() {
     host_node.assets.activate(STORM_EYE_KIND).await.unwrap();
     host.announce_network_assets().await.unwrap();
 
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if join_node
-                .assets
-                .get(STORM_EYE_KIND)
-                .await
-                .unwrap()
-                .is_some()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("joiner did not persist announced network assets");
-    assert_eq!(
-        join_node.assets.get(STORM_EYE_KIND).await.unwrap(),
-        Some(pending_asset.asset)
-    );
+    // The joiner cannot fetch this asset's issuance from Elements, so it must not trust it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(join_node.assets.get(STORM_EYE_KIND).await.unwrap(), None);
     let join_public_key = hex::decode(&join_node.public_key)
         .unwrap()
         .try_into()

@@ -68,6 +68,7 @@ impl TestNode {
                     max_connections: 1,
                 },
                 price_sources: Default::default(),
+                metrics: Default::default(),
             },
         };
 

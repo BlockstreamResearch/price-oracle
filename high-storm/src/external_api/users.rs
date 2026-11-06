@@ -41,6 +41,7 @@ const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
 pub(super) fn router() -> axum::Router<ExternalApiState> {
     axum::Router::new()
+        .route("/network", axum::routing::get(get_network))
         .route("/account/{public_key}", axum::routing::get(get_account))
         .route("/check-fee-utxos", axum::routing::post(check_fee_utxos))
         .route("/requests", axum::routing::post(create_request))
@@ -59,6 +60,53 @@ struct OracleAccount {
     network: super::operators::auth::AuthNetwork,
 }
 
+#[derive(Serialize)]
+struct OracleNetwork {
+    storm_eye_asset_id: AssetId,
+    storm_tree_root: String,
+    tick_asset_id: AssetId,
+    oracle_verifier_asset_id: AssetId,
+    network: super::operators::auth::AuthNetwork,
+}
+
+async fn network_metadata(state: &ExternalApiState) -> Result<OracleNetwork, ApiError> {
+    let mut asset_ids = Vec::with_capacity(3);
+    let mut storm_tree_root = None;
+    for (kind, name) in [
+        (STORM_EYE_KIND, "Storm Eye"),
+        (TICK_ASSET_KIND, "Tick"),
+        (ORACLE_VERIFIER_KIND, "Oracle Verifier"),
+    ] {
+        let asset = state
+            .node
+            .network_asset(kind)
+            .await
+            .map_err(ApiError::unavailable)?
+            .ok_or_else(|| ApiError::unavailable(format!("{name} asset is not active")))?;
+        if kind == STORM_EYE_KIND {
+            let data: crate::high_storm::StormEyeContractData =
+                crate::high_storm::storm_eye_contract_data(&asset)
+                    .map_err(ApiError::unavailable)?;
+            storm_tree_root = Some(hex::encode(data.storm_tree_root));
+        }
+        asset_ids.push(AssetId::from_byte_array(asset.asset_id));
+    }
+    Ok(OracleNetwork {
+        storm_eye_asset_id: asset_ids[0],
+        storm_tree_root: storm_tree_root
+            .ok_or_else(|| ApiError::unavailable("Storm Eye root is not available"))?,
+        tick_asset_id: asset_ids[1],
+        oracle_verifier_asset_id: asset_ids[2],
+        network: state.auth.network(),
+    })
+}
+
+async fn get_network(
+    State(state): State<ExternalApiState>,
+) -> Result<Json<OracleNetwork>, ApiError> {
+    Ok(Json(network_metadata(&state).await?))
+}
+
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AccountQuery {
@@ -73,30 +121,13 @@ async fn get_account(
     let owner = parse_hex_array::<32>(&public_key, "user public key")?;
     let owner = XOnlyPublicKey::from_byte_array(owner)
         .map_err(|_| ApiError::bad_request("invalid user public key"))?;
-    let storm_eye = state
-        .node
-        .network_asset(STORM_EYE_KIND)
-        .await
-        .map_err(ApiError::unavailable)?
-        .ok_or_else(|| ApiError::unavailable("Storm Eye asset is not active"))?;
-    let network = state.auth.network();
+    let metadata = network_metadata(&state).await?;
+    let network = metadata.network;
     let program = AccountProgram::new(&AccountArguments {
-        storm_eye_asset_id: storm_eye.asset_id,
+        storm_eye_asset_id: metadata.storm_eye_asset_id.to_byte_array(),
         account_owner_pubkey: owner.serialize(),
     });
     let simplicity_network = network.simplicity_network();
-    let tick = state
-        .node
-        .network_asset(TICK_ASSET_KIND)
-        .await
-        .map_err(ApiError::unavailable)?
-        .ok_or_else(|| ApiError::unavailable("Tick asset is not active"))?;
-    let oracle_verifier = state
-        .node
-        .network_asset(ORACLE_VERIFIER_KIND)
-        .await
-        .map_err(ApiError::unavailable)?
-        .ok_or_else(|| ApiError::unavailable("Oracle Verifier asset is not active"))?;
     let auth_method = match query.auth_script_pubkey {
         Some(script) => {
             validate_auth_method(&UtxoAuthMethod {
@@ -115,7 +146,7 @@ async fn get_account(
         },
     };
     let voucher = Voucher::new(VoucherParameters {
-        storm_eye_asset_id: AssetId::from_byte_array(storm_eye.asset_id),
+        storm_eye_asset_id: metadata.storm_eye_asset_id,
         auth_method,
         network: simplicity_network,
     });
@@ -126,10 +157,10 @@ async fn get_account(
             .get_tr_address(&simplicity_network)
             .to_string(),
         script_pubkey: hex::encode(program.get_script_pubkey(&simplicity_network).into_bytes()),
-        storm_eye_asset_id: AssetId::from_byte_array(storm_eye.asset_id).to_string(),
-        tick_asset_id: AssetId::from_byte_array(tick.asset_id).to_string(),
+        storm_eye_asset_id: metadata.storm_eye_asset_id.to_string(),
+        tick_asset_id: metadata.tick_asset_id.to_string(),
         tick_script_pubkey: hex::encode(voucher.get_script_pubkey().into_bytes()),
-        oracle_verifier_asset_id: AssetId::from_byte_array(oracle_verifier.asset_id).to_string(),
+        oracle_verifier_asset_id: metadata.oracle_verifier_asset_id.to_string(),
         network,
     }))
 }

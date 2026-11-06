@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="460" viewBox="0 0 960 460" role="img" aria-labelledby="title desc">
+  <title id="title">Simplicity Oracle flow</title>
+  <desc id="desc">A user request is batched by the coordinator, signed by a two-thirds threshold of members with MuSig2, and issued on Liquid as a Tick and an Oracle Verifier. A consumer contract spends them to verify time and signed data; the rotating leader burns them after 60 blocks.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#111c33"/>
+    </linearGradient>
+    <linearGradient id="chain" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#0e7490"/>
+      <stop offset="1" stop-color="#0369a1"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#818cf8"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="arrow-hot" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#f59e0b"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif; }
+      .card { fill: #1e293b; stroke: #334155; stroke-width: 1.5; }
+      .title { fill: #f8fafc; font-size: 17px; font-weight: 600; }
+      .sub { fill: #94a3b8; font-size: 13px; }
+      .label { fill: #cbd5e1; font-size: 12px; }
+      .flow { stroke: #94a3b8; stroke-width: 2; fill: none; }
+      .burn { stroke: #f59e0b; stroke-width: 2; fill: none; }
+      .pill-text { fill: #0f172a; font-size: 13px; font-weight: 600; }
+    </style>
+  </defs>
+
+  <rect width="960" height="460" rx="18" fill="url(#bg)"/>
+  <text x="40" y="48" fill="#f8fafc" font-size="22" font-weight="700">Simplicity Oracle</text>
+  <text x="40" y="72" class="sub">Time and signed data for Liquid contracts, enforced by Simplicity covenants</text>
+
+  <!-- User -->
+  <rect class="card" x="40" y="110" width="200" height="86" rx="14"/>
+  <text x="60" y="144" class="title">User</text>
+  <text x="60" y="168" class="sub">Requests a Tick or Verifier</text>
+
+  <!-- Coordinator -->
+  <rect class="card" x="300" y="110" width="200" height="86" rx="14"/>
+  <text x="320" y="144" class="title">Coordinator</text>
+  <text x="320" y="168" class="sub">Batches requests into rounds</text>
+
+  <!-- Members -->
+  <rect class="card" x="560" y="110" width="360" height="86" rx="14"/>
+  <text x="580" y="144" class="title">Members</text>
+  <text x="580" y="168" class="sub">MuSig2 signature, any 2/3 threshold</text>
+  <circle cx="842" cy="136" r="13" fill="url(#accent)"/>
+  <circle cx="872" cy="136" r="13" fill="url(#accent)" opacity="0.85"/>
+  <circle cx="857" cy="162" r="13" fill="url(#accent)" opacity="0.7"/>
+
+  <path class="flow" d="M240 153 H296" marker-end="url(#arrow)"/>
+  <text x="248" y="144" class="label">request</text>
+  <path class="flow" d="M500 153 H556" marker-end="url(#arrow)"/>
+  <text x="510" y="144" class="label">round</text>
+
+  <!-- Liquid -->
+  <rect x="40" y="250" width="880" height="96" rx="16" fill="url(#chain)" opacity="0.9"/>
+  <text x="64" y="284" fill="#ecfeff" font-size="17" font-weight="700">Liquid</text>
+  <text x="64" y="308" fill="#cffafe" font-size="13">Storm Eye–gated covenants</text>
+  <rect x="300" y="276" width="170" height="44" rx="22" fill="#ecfeff"/>
+  <text x="385" y="303" class="pill-text" text-anchor="middle">Tick · time</text>
+  <rect x="490" y="276" width="210" height="44" rx="22" fill="#e0e7ff"/>
+  <text x="595" y="303" class="pill-text" text-anchor="middle">Verifier · signed data</text>
+
+  <path class="flow" d="M740 196 V246" marker-end="url(#arrow)"/>
+  <text x="750" y="226" class="label">signed issuance</text>
+
+  <!-- Consumer -->
+  <rect class="card" x="560" y="380" width="360" height="62" rx="14"/>
+  <text x="580" y="408" class="title">Consumer contract</text>
+  <text x="580" y="428" class="sub">Spends both and verifies on-chain</text>
+  <path class="flow" d="M640 346 V376" marker-end="url(#arrow)"/>
+
+  <!-- Leader burn -->
+  <rect class="card" x="40" y="380" width="360" height="62" rx="14"/>
+  <text x="60" y="408" class="title">Leader</text>
+  <text x="60" y="428" class="sub">Rotates every block, burns expired vouchers</text>
+  <path class="burn" d="M300 376 V350" marker-end="url(#arrow-hot)"/>
+  <text x="310" y="368" fill="#fbbf24" font-size="12">burn after 60 blocks</text>
+</svg>

@@ -4,6 +4,10 @@ port = 9000
 # Operator and user HTTP API bind address inside the container.
 external_api_address = "0.0.0.0:9100"
 
+[service.metrics]
+# Prometheus endpoint bind address inside the container.
+address = "0.0.0.0:9300"
+
 [service.signer]
 # Development-only deterministic key. Do not use in production.
 private_key = "0101010101010101010101010101010101010101010101010101010101010101"

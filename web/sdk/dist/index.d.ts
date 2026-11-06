@@ -10,6 +10,19 @@ export type OracleAccount = {
     oracle_verifier_asset_id: string;
     network: OracleNetwork;
 };
+export type AccountVerification = {
+    ownerPublicKey: string;
+    network: OracleNetwork;
+    stormEyeAssetId: string;
+    tickAssetId: string;
+    verifierAssetId: string;
+    /** Independently compiled Account leaf for this owner and Storm Eye asset. */
+    accountTapleafHash: string;
+    /** Independently compiled voucher leaf for this owner or authentication script. */
+    tickTapleafHash: string;
+    /** Omit for owner signature authentication; otherwise compile the Tick for this script. */
+    authScriptPubKey?: string;
+};
 export type OracleUtxo = {
     txid: string;
     vout: number;
@@ -72,6 +85,20 @@ export type PriceFeedData = {
     price: bigint;
     receivedAt: bigint;
     validUntil: bigint;
+};
+export type SignedPriceVerification = {
+    /** Current Storm Eye root from an independently trusted source, not this response. */
+    stormTreeRoot: string;
+    feedId: number;
+    decimals: number;
+    /** Trusted Unix time in seconds. */
+    now: bigint;
+};
+export type IssuedPriceVerification = SignedPriceVerification & {
+    /** Verifier asset ID from independently verified network issuance. */
+    verifierAssetId: string;
+    /** Locally compiled voucher leaf for the requested authentication method. */
+    verifierTapleafHash: string;
 };
 export type PriceFeedInfo = {
     id: number;
@@ -150,7 +177,7 @@ export declare class ElementsRpcClient {
 export declare class PriceOracleClient {
     #private;
     constructor(coordinatorUrl: string, fetcher?: typeof fetch);
-    getAccount(publicKey: string, authScriptPubKey?: string): Promise<OracleAccount>;
+    getAccount(publicKey: string, verification: AccountVerification): Promise<OracleAccount>;
     submitTickRequest(request: TickRequest): Promise<{
         request_hash: string;
     }>;
@@ -158,6 +185,8 @@ export declare class PriceOracleClient {
     getPriceFeeds(): Promise<PriceFeedInfo[]>;
     getPriceFeed(feedId: number): Promise<PriceFeedRate>;
 }
+/** Derive an Account and Tick from independently trusted contract leaves and asset IDs. */
+export declare function deriveAccount(verification: AccountVerification): OracleAccount;
 export declare function publicKeyFromPrivateKey(privateKey: string): string;
 export declare function signSchnorrDigest(privateKey: string, digest: string): string;
 export declare function createWalletTickRequest(compressedPublicKey: string, feeUtxos: string[], authScriptPubKey: string): TickRequest;
@@ -175,18 +204,20 @@ export declare function tickRequestSigningHash(request: TickRequest): Uint8Array
 /** The 32 canonical bytes the network signs, as the numbers they encode. */
 export declare function decodePriceData(priceData: string): PriceFeedData;
 /**
- * Whether the network signed this rate, under the Storm Tree branch the bloom
- * names. The caller still has to check that branch against the Storm Eye root
- * the chain holds, which this cannot see.
+ * Authenticate a fresh rate against the caller's trusted current Storm Eye root.
+ * This does not establish issuance, confirmation, or unspentness of a Verifier.
  */
-export declare function verifySignedPriceData(details: SignedPriceData): boolean;
+export declare function verifySignedPriceData(details: SignedPriceData, verification: SignedPriceVerification): boolean;
 export declare function parseExecutedTick(status: TickRequestStatus): {
     txid: string;
     results: TickRequestResult[];
 } | null;
-export declare function parseExecutedSignedPrice(status: TickRequestStatus): {
+/** Authenticate an executed response; its returned outpoint is not chain-verified. */
+export declare function parseExecutedSignedPrice(status: TickRequestStatus, verification: SignedPriceVerification): {
     txid: string;
     verifierVout: number;
     signedPrice: SignedPriceData;
 } | null;
+/** Check a finalized price and its confirmed, unspent Verifier via independent RPC. */
+export declare function verifyExecutedSignedPrice(status: TickRequestStatus, verification: IssuedPriceVerification, elements: ElementsRpcClient): Promise<ReturnType<typeof parseExecutedSignedPrice>>;
 export declare function createTickSpendPlan(tick: IssuedTick, resolution: PredictionResolution): TickSpendPlan;

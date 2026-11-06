@@ -11,9 +11,8 @@ use serde::Deserialize;
 use simplex::{
     either::Either,
     provider::SimplicityNetwork,
-    simplicityhl::{
-        elements::{BlockHash, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction},
-        simplicity::hashes::Hash,
+    simplicityhl::elements::{
+        BlockHash, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction,
     },
     transaction::{
         FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, UTXO,
@@ -128,10 +127,11 @@ impl Renewal {
         }
     }
 
-    pub(crate) async fn prepare(
+    /// The Storm Eye to renew, once a renewal is due and none is pending.
+    pub(crate) async fn due_storm_eye(
         &self,
         block_height: u64,
-    ) -> Result<Option<PreparedRenewal>, RenewalError> {
+    ) -> Result<Option<NetworkAsset>, RenewalError> {
         if self.assets.pending_storm_eye_renewal().await?.is_some() {
             return Ok(None);
         }
@@ -141,13 +141,24 @@ impl Renewal {
             .await?
             .ok_or(RenewalError::MissingAsset(STORM_EYE_KIND))?;
         let data = storm_eye_contract_data(&storm_eye)?;
-        if !renewal_due(block_height, data.rescue_height) {
-            return Ok(None);
-        }
+        Ok(renewal_due(block_height, data.rescue_height).then_some(storm_eye))
+    }
 
+    pub(crate) async fn prepare(
+        &self,
+        block_height: u64,
+        storm_eye: NetworkAsset,
+    ) -> Result<PreparedRenewal, RenewalError> {
         self.prepare_transaction(block_height, storm_eye, true)
             .await
-            .map(Some)
+    }
+
+    /// The height from which anyone may spend the active Storm Eye UTXOs.
+    pub(crate) async fn rescue_height(&self) -> Result<Option<u32>, RenewalError> {
+        let Some(storm_eye) = self.assets.get(STORM_EYE_KIND).await? else {
+            return Ok(None);
+        };
+        Ok(Some(storm_eye_contract_data(&storm_eye)?.rescue_height))
     }
 
     pub(crate) async fn validate_request(
@@ -240,27 +251,32 @@ impl Renewal {
                 .program_input
                 .as_mut()
                 .expect("Storm Eye is a program input")
-                .witness = Box::new(renewal_witness(
+                .witness = renewal_witness(
                 &data,
                 prepared.request.new_rescue_height,
                 index as u32,
                 *signature.as_ref(),
                 signing.signing_storm_tree_branch,
                 pack_proof(&proof)?,
-            ));
+            )
+            .into();
         }
         for (index, input) in prepared.transaction.inputs().iter().enumerate() {
             let program_input = input
                 .program_input
                 .as_ref()
                 .expect("all renewal inputs are covenant inputs");
-            prepared.pset.inputs_mut()[index].final_script_witness =
-                Some(program_input.program.finalize(
-                    &prepared.pset,
-                    &program_input.witness.build_witness(),
-                    index,
-                    &prepared.network,
-                )?);
+            prepared.pset.inputs_mut()[index].final_script_witness = Some(
+                program_input
+                    .program
+                    .finalize(
+                        &prepared.pset,
+                        &program_input.witness,
+                        index,
+                        &prepared.network,
+                    )?
+                    .into(),
+            );
         }
         if signing_hashes(
             &prepared.pset,
@@ -587,11 +603,7 @@ fn build_transaction(
             PartialInput::new(utxo.clone()),
             ProgramInput::new(
                 Box::new(auth_program.as_ref().clone()),
-                Box::new(placeholder_witness(
-                    &data,
-                    new_rescue_height,
-                    output_index as u32,
-                )),
+                placeholder_witness(&data, new_rescue_height, output_index as u32),
             ),
             RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
         );
@@ -604,9 +616,9 @@ fn build_transaction(
             PartialInput::new(utxo.clone()),
             ProgramInput::new(
                 Box::new(treasury.as_ref().clone()),
-                Box::new(TreasuryWitness {
+                TreasuryWitness {
                     storm_eye_input_index: 0,
-                }),
+                },
             ),
             RequiredSignature::None,
         );

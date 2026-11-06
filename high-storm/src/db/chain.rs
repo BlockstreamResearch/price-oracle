@@ -304,6 +304,12 @@ impl ChainStore {
         sqlx::query("DELETE FROM droplets")
             .execute(&mut *transaction)
             .await?;
+        sqlx::query(
+            "UPDATE chain_recovery_state SET droplets_halt_height = NULL, \
+             droplets_halt_reason = NULL WHERE id = 1",
+        )
+        .execute(&mut *transaction)
+        .await?;
         sqlx::query("DELETE FROM indexer_cursors")
             .execute(&mut *transaction)
             .await?;
