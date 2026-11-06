@@ -363,7 +363,9 @@ alert and the node log before acting.
 - **Watchdog** fires all the time; the paging service should alert when it stops
   arriving, which means Prometheus or Alertmanager is down.
 - **A monitoring task missing, stale or failing** means the gauges it publishes
-  are frozen and the alerts above that read them cannot fire. Check the node log
-  for the task; restart the node if it does not recover.
+  are frozen and the alerts above that read them cannot fire. Missing means the
+  node never started its tasks; stale means one stopped, or never finished a
+  pass. Check the node log for the task; restart the node if it does not
+  recover.
 - **Metrics connections refused** means something holds the metrics endpoint's
   few connections; find the client and restrict who can reach the port.

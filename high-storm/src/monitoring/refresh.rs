@@ -14,7 +14,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use super::{
     flag,
-    health::{MonitoringTask, record_task_run},
+    health::{MonitoringTask, record_task_run, record_task_started},
     names, record_build_info,
 };
 use crate::{HighStormHandle, db::Database};
@@ -89,6 +89,7 @@ fn record_retained() {
 
 /// Republishes the node's gauges until the process exits.
 pub fn spawn_refresh(node: HighStormHandle, database: Database) {
+    record_task_started(MonitoringTask::Refresh);
     tokio::spawn(async move {
         let mut refresh = tokio::time::interval(REFRESH_INTERVAL);
         refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);

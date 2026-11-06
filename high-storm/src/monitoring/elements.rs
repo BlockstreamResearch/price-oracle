@@ -48,6 +48,7 @@ pub fn spawn_elements_probe(config: &ElementsRpcConfig) -> Result<(), bitcoincor
         Auth::UserPass(config.username.clone(), config.password.clone()),
         "probe",
     )?);
+    super::health::record_task_started(super::health::MonitoringTask::ElementsProbe);
     tokio::spawn(async move {
         let mut probe = tokio::time::interval(PROBE_INTERVAL);
         probe.set_missed_tick_behavior(MissedTickBehavior::Skip);
