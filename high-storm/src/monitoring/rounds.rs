@@ -31,8 +31,8 @@ pub(crate) fn record_user_request_failed(reason: &'static str) {
     counter!(names::USER_REQUESTS_FAILED, "reason" => reason).increment(1);
 }
 
-/// Reports monitored UTXOs, user requests and open votes from the database
-/// until the process exits.
+/// Reports monitored UTXOs, user requests, open votes, peer price
+/// attestations and operators from the database until the process exits.
 pub fn spawn_db_gauges(node: HighStormHandle, database: Database, tick_lifetime_blocks: u64) {
     tokio::spawn(async move {
         let mut refresh = tokio::time::interval(DB_GAUGES_INTERVAL);
@@ -76,6 +76,11 @@ pub fn spawn_db_gauges(node: HighStormHandle, database: Database, tick_lifetime_
                 }
             }
             super::governance::record_open_votings(&node).await;
+            super::prices::record_peer_attestations(&node).await;
+            match database.node_operators().count().await {
+                Ok(count) => super::api::set_operators(count),
+                Err(error) => tracing::debug!(%error, "could not count operators"),
+            }
         }
     });
 }

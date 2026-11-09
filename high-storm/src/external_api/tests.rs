@@ -234,6 +234,8 @@ async fn times_out_trickled_bodies_and_releases_capacity() {
 
 #[tokio::test(start_paused = true)]
 async fn isolates_request_limits_by_socket_ip_and_releases_client_capacity() {
+    let recorder = local_recorder();
+    let _local = metrics::set_default_local_recorder(&recorder);
     let (entered, mut arrivals) = tokio::sync::mpsc::channel(MAX_API_REQUESTS_PER_CLIENT + 1);
     let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let gate = release.clone();
@@ -299,6 +301,10 @@ async fn isolates_request_limits_by_socket_ip_and_releases_client_capacity() {
             .status(),
         StatusCode::OK
     );
+    assert_rendered(
+        &recorder,
+        &[r#"high_storm_api_requests_rejected_total{reason="client_inflight"} 1"#],
+    );
 }
 
 #[test]
@@ -324,6 +330,8 @@ async fn limits_connections_before_headers_and_recovers_after_disconnect() {
     use axum::serve::Listener;
     use tokio::io::AsyncReadExt;
 
+    let recorder = local_recorder();
+    let _local = metrics::set_default_local_recorder(&recorder);
     for (global_limit, client_limit) in [(1, 2), (2, 1)] {
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = tcp.local_addr().unwrap();
@@ -358,10 +366,19 @@ async fn limits_connections_before_headers_and_recovers_after_disconnect() {
         drop(accepted);
         drop(replacement);
     }
+    assert_rendered(
+        &recorder,
+        &[
+            r#"high_storm_api_connections_rejected_total{reason="global"} 1"#,
+            r#"high_storm_api_connections_rejected_total{reason="per_client"} 1"#,
+        ],
+    );
 }
 
 #[tokio::test(start_paused = true)]
 async fn sheds_api_overload_across_router_clones_and_releases_capacity() {
+    let recorder = local_recorder();
+    let _local = metrics::set_default_local_recorder(&recorder);
     let (entered, mut arrivals) = tokio::sync::mpsc::channel(MAX_API_CONCURRENCY);
     let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let gate = release.clone();
@@ -405,6 +422,10 @@ async fn sheds_api_overload_across_router_clones_and_releases_capacity() {
     assert_eq!(
         app.oneshot(get_request("/")).await.unwrap().status(),
         StatusCode::OK
+    );
+    assert_rendered(
+        &recorder,
+        &[r#"high_storm_api_requests_rejected_total{reason="busy"} 1"#],
     );
 }
 
@@ -1000,6 +1021,8 @@ async fn derives_oracle_account_from_the_active_storm_eye() {
 #[tokio::test]
 async fn rejects_unsupported_or_invalid_user_requests() {
     let (app, _, _) = setup().await;
+    let recorder = local_recorder();
+    let _local = metrics::set_default_local_recorder(&recorder);
 
     // A request issued at a price has to name the feed.
     let price = signed_user_request("signed-price-data", "signature-auth");
@@ -1033,6 +1056,42 @@ async fn rejects_unsupported_or_invalid_user_requests() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_rendered(
+        &recorder,
+        &[
+            r#"high_storm_user_requests_rejected_total{reason="payload"} 2"#,
+            r#"high_storm_user_requests_rejected_total{reason="signature"} 1"#,
+            r#"high_storm_api_requests_total{route="/users/requests",method="POST",status="400"} 2"#,
+            r#"high_storm_api_requests_total{route="/users/requests",method="POST",status="401"} 1"#,
+            r#"high_storm_api_requests_total{route="/users/requests/{hash}",method="GET",status="404"} 1"#,
+            r#"high_storm_api_request_duration_seconds_count{route="/users/requests"} 3"#,
+        ],
+    );
+}
+
+#[tokio::test]
+async fn labels_unmatched_paths_and_missing_operator_tokens() {
+    let (app, _, _) = setup().await;
+    let recorder = local_recorder();
+    let _local = metrics::set_default_local_recorder(&recorder);
+
+    let response = app
+        .clone()
+        .oneshot(get_request(&format!("/users/{}", hex::encode([9; 32]))))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = app.oneshot(get_request("/operators/state")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    assert_rendered(
+        &recorder,
+        &[
+            r#"high_storm_api_requests_total{route="unmatched",method="GET",status="404"} 1"#,
+            r#"high_storm_api_requests_total{route="/operators/state",method="GET",status="401"} 1"#,
+            r#"high_storm_operator_auth_failures_total{reason="missing_token"} 1"#,
+        ],
+    );
 }
 
 #[tokio::test]
@@ -1340,6 +1399,18 @@ async fn node_setup_with_coordinator(
 
 fn get_request(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
+}
+
+/// Records the metrics of what runs on this thread until it is dropped.
+fn local_recorder() -> metrics_exporter_prometheus::PrometheusRecorder {
+    metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder()
+}
+
+fn assert_rendered(recorder: &metrics_exporter_prometheus::PrometheusRecorder, lines: &[&str]) {
+    let rendered = recorder.handle().render();
+    for line in lines {
+        assert!(rendered.contains(line), "missing {line:?} in:\n{rendered}");
+    }
 }
 
 fn json_request(uri: &str, body: serde_json::Value) -> Request<Body> {

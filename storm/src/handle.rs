@@ -1,13 +1,15 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use secp256k1_zkp::PublicKey;
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, lookup_host};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::timeout;
 
 use crate::{
     Error, MessageContext, Peer, PeerStatus, Storm, StormHandle, StormMessage, constants,
-    message_handlers, state::ConnectionPlan,
+    message_handlers,
+    state::ConnectionPlan,
+    telemetry::{self, Direction},
 };
 
 impl StormHandle {
@@ -226,6 +228,12 @@ impl StormHandle {
 
         for (peer_public_key, connection) in connections {
             if let Err(error) = connection.try_send(framed_message.clone()) {
+                if matches!(error, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                    telemetry::record_outbound_queue_full(telemetry::peer_label(
+                        &*self.inner.read().await,
+                        &peer_public_key,
+                    ));
+                }
                 first_error.get_or_insert(match error {
                     tokio::sync::mpsc::error::TrySendError::Full(_) => {
                         Error::PeerQueueFull(hex::encode(peer_public_key))
@@ -357,12 +365,17 @@ impl StormHandle {
         initializer_secret_key: &[u8],
         listener_port: Option<u16>,
     ) -> Result<(), Error> {
-        let mut stream = timeout(
-            constants::CONNECT_TIMEOUT,
-            TcpStream::connect(socket_address),
-        )
-        .await
-        .map_err(|_| Error::ConnectionTimeout("connecting to a peer"))??;
+        // Resolved apart from connecting, so a DNS failure can be told apart.
+        let connect = async {
+            let addresses = lookup_host(socket_address)
+                .await
+                .inspect_err(|_| telemetry::record_dns_failure(peer_public_key))?
+                .collect::<Vec<_>>();
+            TcpStream::connect(addresses.as_slice()).await
+        };
+        let mut stream = timeout(constants::CONNECT_TIMEOUT, connect)
+            .await
+            .map_err(|_| telemetry::timed_out("connect", "connecting to a peer"))??;
         let transport = timeout(
             constants::HANDSHAKE_TIMEOUT,
             Storm::perform_initiator_handshake(
@@ -373,8 +386,16 @@ impl StormHandle {
             ),
         )
         .await
-        .map_err(|_| Error::ConnectionTimeout("performing the initiator handshake"))??;
-        let receiver = Storm::claim_connection(&self.inner, peer_public_key, None).await?;
+        .map_err(|_| telemetry::timed_out("handshake", "performing the initiator handshake"))
+        .and_then(|handshake| handshake)
+        .inspect_err(|error| telemetry::record_handshake_rejected(Direction::Outbound, error))?;
+        let receiver = Storm::claim_connection(&self.inner, peer_public_key, None)
+            .await
+            .inspect_err(|error| {
+                telemetry::record_handshake_rejected(Direction::Outbound, error)
+            })?;
+        let label = telemetry::peer_label(&*self.inner.read().await, &peer_public_key);
+        telemetry::record_connection(label.clone(), Direction::Outbound);
         self.finish_client_discovery_if_connected().await;
         let state = Arc::clone(&self.inner);
 
@@ -382,6 +403,7 @@ impl StormHandle {
             let result =
                 Storm::run_connection(stream, transport, peer_public_key, &state, receiver).await;
             Storm::release_connection(&state, peer_public_key).await;
+            telemetry::record_disconnection(label, &result);
 
             if let Err(error) = result {
                 log::log!(

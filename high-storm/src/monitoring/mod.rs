@@ -1,5 +1,6 @@
 //! Prometheus metrics, served on the internal `service.metrics` listener.
 
+mod api;
 mod chain;
 mod elements;
 mod governance;
@@ -17,6 +18,11 @@ use metrics::{describe_counter, describe_gauge, describe_histogram, gauge};
 use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
 use metrics_util::MetricKindMask;
 
+pub(crate) use api::{
+    ApiConnection, record_api_connection_rejected, record_api_request, record_api_request_rejected,
+    record_ipc_rejected, record_operator_auth_failure, record_operator_change,
+    record_user_request_rejected,
+};
 pub(crate) use chain::{
     RenewalOutcome, record_chain_reorg, record_storm_eye_renewal, set_chain_safety_halt,
 };
@@ -28,6 +34,10 @@ pub(crate) use governance::{
 };
 pub(crate) use messages::{RejectedMessage, record_rejected_message};
 pub use prices::register_price_source;
+pub(crate) use prices::{
+    record_price_attestation_rejected, record_price_change, record_price_poll,
+    record_price_poll_duration, record_price_poll_error, record_price_poll_rejection,
+};
 pub use refresh::{LoopTask, record_loop_tick, spawn_refresh};
 pub use rounds::spawn_db_gauges;
 pub(crate) use rounds::{
@@ -73,6 +83,10 @@ fn describe() {
     describe_gauge!(
         names::BUILD_INFO,
         "Always 1; the labels identify the running high-storm build."
+    );
+    describe_counter!(
+        names::METRICS_CONNECTIONS_REJECTED,
+        "Connections to this metrics endpoint closed on accept because every slot was taken."
     );
     describe_gauge!(
         names::LOOP_LAST_TICK,
@@ -203,6 +217,74 @@ fn describe() {
         "Unix time the source itself stamped its latest kept observation."
     );
     describe_counter!(
+        names::PRICE_POLLS,
+        "Polls of a feed's source, by outcome: observed, unchanged, failed or skipped."
+    );
+    describe_counter!(
+        names::PRICE_POLL_FAILURES,
+        "Failed polls of a source, by reason."
+    );
+    describe_histogram!(
+        names::PRICE_POLL_DURATION,
+        "Time a source took to answer a poll, failed polls included."
+    );
+    describe_gauge!(
+        names::PRICE_CHANGE,
+        "Change between a source's last two observations of a feed, in basis points."
+    );
+    describe_counter!(
+        names::PRICE_ATTESTATIONS_REJECTED,
+        "Price attestation messages from a peer that this node refused, by reason."
+    );
+    describe_gauge!(
+        names::PRICE_PEER_ATTESTATION,
+        "Unix time a peer's latest stored price for the feed was received by that peer."
+    );
+    describe_gauge!(
+        names::PRICE_PEER_DEVIATION,
+        "How far a peer's still-valid price is from this node's own, in basis points of its own; NaN while either is missing."
+    );
+    describe_gauge!(
+        names::API_CONNECTIONS_ACTIVE,
+        "External API connections open; the listener holds 256, and 16 per client IP."
+    );
+    describe_counter!(
+        names::API_CONNECTIONS_REJECTED,
+        "External API connections closed on accept, by limit: global or per_client."
+    );
+    describe_counter!(
+        names::API_REQUESTS_REJECTED,
+        "External API requests refused by a request limit, by reason."
+    );
+    describe_counter!(
+        names::API_REQUESTS,
+        "External API requests answered, by route template, method and status."
+    );
+    describe_histogram!(
+        names::API_REQUEST_DURATION,
+        "Time taken to answer an external API request, by route template."
+    );
+    describe_counter!(
+        names::OPERATOR_AUTH_FAILURES,
+        "Failed operator authentications, by reason."
+    );
+    describe_counter!(
+        names::USER_REQUESTS_REJECTED,
+        "User requests the API refused to register, by reason."
+    );
+    describe_counter!(
+        names::IPC_REJECTED,
+        "Operator IPC connections refused, by reason: no_credentials or uid."
+    );
+    describe_counter!(
+        names::OPERATOR_CHANGES,
+        "Operators added or removed over IPC, by action."
+    );
+    describe_gauge!(
+        names::OPERATORS,
+        "Operators allowed to use the operator API."
+    );
+    describe_counter!(
         names::NODE_MESSAGES_REJECTED,
         "Node messages from a peer that this node rejected, by kind and reason."
     );
@@ -303,6 +385,7 @@ fn describe() {
         "Queued Droplets exchanges this node ran as leader, by outcome."
     );
     metrics_process::Collector::default().describe();
+    storm::telemetry::describe();
 }
 
 fn flag(value: bool) -> f64 {

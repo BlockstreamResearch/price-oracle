@@ -93,6 +93,8 @@ pub fn spawn_refresh(node: HighStormHandle, database: Database) {
             record_build_info();
             record_loop_ticks();
             record_retained();
+            storm::telemetry::record_gauges();
+            super::api::record_api_gauges();
             record_node(&NodeSnapshot::read(&node).await);
             super::prices::record_prices(&node).await;
             record_database(&database).await;
@@ -202,7 +204,7 @@ async fn record_database(database: &Database) {
     gauge!(names::DB_POOL_CONNECTIONS, "state" => "used").set(pool.used as f64);
 }
 
-fn unix_now() -> u64 {
+pub(super) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

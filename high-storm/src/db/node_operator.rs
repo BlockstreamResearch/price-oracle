@@ -37,6 +37,13 @@ impl NodeOperatorStore {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn count(&self) -> Result<u64, Error> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_operators")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count as u64)
+    }
+
     pub async fn contains(&self, public_key: [u8; 33]) -> Result<bool, Error> {
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM node_operators WHERE public_key = $1")

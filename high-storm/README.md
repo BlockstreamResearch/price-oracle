@@ -175,8 +175,11 @@ value is the database host and optional port, for example `localhost:5432`. Set
 on the same host. The external API binds to `service.external_api_address`, which
 defaults to `127.0.0.1:9001`. Prometheus metrics are served at `/metrics` only when
 `service.metrics.address` is set, for example to `127.0.0.1:9300`; give each process on
-a host its own port. The endpoint is unauthenticated, so expose it only to a private
-monitoring network. Elements must run with `txindex=1` so HighStorm can
+a host its own port. Expose it only to a private monitoring network, and set
+`service.metrics.bearer_token` to require `Authorization: Bearer <token>`: the
+metrics show which members are reachable and who coordinates. The listener holds
+at most 8 connections and closes each after 60 seconds, so a scraper cannot tie up
+the file descriptors the node shares with its P2P port and API. Elements must run with `txindex=1` so HighStorm can
 reconcile confirmed request transactions after they leave the mempool. Protocol-wide
 fee budgets, burn reserves, and Tick lifetime are grouped under `service.protocol`.
 The legacy `service.user_requests` section remains accepted for existing deployments.

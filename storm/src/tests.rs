@@ -339,6 +339,133 @@ async fn authenticated_peer_is_active_once_and_inactive_after_disconnect() {
 }
 
 #[tokio::test]
+async fn releases_an_inbound_connection_whose_setup_fails() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let secp = Secp256k1::new();
+    let mut random = rand::thread_rng();
+    let discovery_secret_key = SecretKey::new(&mut random);
+    let discovery_public_key = discovery_secret_key.public_key(&secp).serialize();
+    let stuck_public_key = SecretKey::new(&mut random).public_key(&secp).serialize();
+    let joining_secret_key = SecretKey::new(&mut random);
+    let joining_public_key = joining_secret_key.public_key(&secp).serialize();
+    let discovery = Storm::discovery(
+        discovery_secret_key,
+        vec![Peer::new(stuck_public_key), Peer::new(joining_public_key)],
+    );
+    // A connected peer that drains nothing, so broadcasting the completed
+    // discovery table to it fails.
+    let (stuck_sender, _stuck_receiver) = mpsc::channel(constants::OUTBOUND_QUEUE_CAPACITY);
+    for _ in 0..constants::OUTBOUND_QUEUE_CAPACITY {
+        stuck_sender.try_send(Vec::new()).unwrap();
+    }
+    {
+        let mut state = discovery.inner.write().await;
+        for peer in &mut state.peers {
+            peer.socket_address = Some("127.0.0.1:1".into());
+            if peer.compressed_public_key == stuck_public_key {
+                peer.status = PeerStatus::Active;
+            }
+        }
+        state.connections.insert(stuck_public_key, stuck_sender);
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let (_client, server) = connect(
+        address,
+        &listener,
+        &joining_secret_key,
+        &discovery_public_key,
+        Arc::clone(&discovery.inner),
+    )
+    .await;
+    let result = timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(result, Err(Error::PeerQueueFull(_))));
+    let state = discovery.inner.read().await;
+    assert!(!state.connections.contains_key(&joining_public_key));
+    assert_eq!(
+        state
+            .peers
+            .iter()
+            .find(|peer| peer.compressed_public_key == joining_public_key)
+            .unwrap()
+            .status,
+        PeerStatus::Inactive
+    );
+    let rendered = recorder.handle().render();
+    let peer = hex::encode(joining_public_key);
+    for line in [
+        format!("storm_peer_connections_total{{peer=\"{peer}\",direction=\"inbound\"}} 1"),
+        format!("storm_peer_disconnections_total{{peer=\"{peer}\",reason=\"other\"}} 1"),
+    ] {
+        assert!(rendered.contains(&line), "missing {line:?} in:\n{rendered}");
+    }
+}
+
+#[tokio::test]
+async fn counts_connections_rejections_and_disconnections() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let secp = Secp256k1::new();
+    let mut random = rand::thread_rng();
+    let server_secret_key = SecretKey::new(&mut random);
+    let server_public_key = server_secret_key.public_key(&secp).serialize();
+    let peer_secret_key = SecretKey::new(&mut random);
+    let peer_public_key = peer_secret_key.public_key(&secp).serialize();
+    let state = Arc::new(RwLock::new(StormState::new(
+        server_secret_key,
+        vec![Peer::new(peer_public_key)],
+    )));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let (first_client, mut first_server) = connect(
+        address,
+        &listener,
+        &peer_secret_key,
+        &server_public_key,
+        Arc::clone(&state),
+    )
+    .await;
+    wait_for_status(&state, PeerStatus::Active, &mut first_server).await;
+    let (_second_client, second_server) = connect(
+        address,
+        &listener,
+        &peer_secret_key,
+        &server_public_key,
+        Arc::clone(&state),
+    )
+    .await;
+    timeout(Duration::from_secs(1), second_server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    drop(first_client);
+    timeout(Duration::from_secs(1), first_server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+
+    let rendered = recorder.handle().render();
+    let peer = hex::encode(peer_public_key);
+    for line in [
+        format!("storm_peer_connections_total{{peer=\"{peer}\",direction=\"inbound\"}} 1"),
+        r#"storm_handshakes_rejected_total{direction="inbound",reason="already_connected"} 1"#
+            .into(),
+        format!("storm_peer_disconnections_total{{peer=\"{peer}\",reason=\"closed_by_peer\"}} 1"),
+    ] {
+        assert!(rendered.contains(&line), "missing {line:?} in:\n{rendered}");
+    }
+}
+
+#[tokio::test]
 async fn replayed_noise_message_one_cannot_claim_peer_slot_or_change_address() {
     let secp = Secp256k1::new();
     let server_secret = SecretKey::from_slice(&[41; 32]).unwrap();
@@ -653,6 +780,8 @@ async fn discovery_host_rejects_an_unregistered_public_key() {
 
 #[tokio::test]
 async fn discoverable_node_accepts_unregistered_connection_but_rejects_messages() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _local = metrics::set_default_local_recorder(&recorder);
     let mut random = rand::thread_rng();
     let local_secret_key = SecretKey::new(&mut random);
     let discovery_secret_key = SecretKey::new(&mut random);
@@ -697,6 +826,14 @@ async fn discoverable_node_accepts_unregistered_connection_but_rejects_messages(
     let result = Storm::handle_message(&storm.inner, unknown_public_key, heartbeat).await;
     assert!(matches!(result, Err(Error::UnauthorizedConnection)));
     assert!(connection_receiver.is_empty());
+    // A key anyone can make up gets no series of its own.
+    let rendered = recorder.handle().render();
+    assert!(
+        rendered.contains(
+            r#"storm_messages_rejected_total{peer="unregistered",reason="unauthorized"} 1"#
+        )
+    );
+    assert!(!rendered.contains(&hex::encode(unknown_public_key)));
 
     Storm::release_connection(&storm.inner, unknown_public_key).await;
     storm.inner.write().await.discovery_table_received = true;
@@ -1176,6 +1313,8 @@ async fn registered_custom_handler_receives_decoded_message() {
 
 #[tokio::test]
 async fn outbound_queue_rejects_messages_when_full() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _local = metrics::set_default_local_recorder(&recorder);
     let mut random = rand::thread_rng();
     let local_secret_key = SecretKey::new(&mut random);
     let peer_secret_key = SecretKey::new(&mut random);
@@ -1213,6 +1352,10 @@ async fn outbound_queue_rejects_messages_when_full() {
         .unwrap_err();
 
     assert!(matches!(error, Error::PeerQueueFull(_)));
+    assert!(recorder.handle().render().contains(&format!(
+        "storm_outbound_queue_full_total{{peer=\"{}\"}} 1",
+        hex::encode(peer_public_key.serialize())
+    )));
 }
 
 #[tokio::test]
@@ -1288,6 +1431,78 @@ async fn authenticated_control_messages_may_repeat() {
     Storm::handle_message(&state, peer_public_key, message)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn counts_rejected_messages_and_records_peer_versions() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let mut random = rand::thread_rng();
+    let local_secret_key = SecretKey::new(&mut random);
+    let peer_public_key = SecretKey::new(&mut random)
+        .public_key(&Secp256k1::new())
+        .serialize();
+    let stranger_public_key = SecretKey::new(&mut random)
+        .public_key(&Secp256k1::new())
+        .serialize();
+    let state = Arc::new(RwLock::new(StormState::new(
+        local_secret_key,
+        vec![Peer::new(peer_public_key)],
+    )));
+    let message = |payload_id, timestamp| StormMessage {
+        header: StormMessageHeader {
+            payload_id,
+            timestamp,
+            protocol_version: constants::PROTOCOL_VERSION,
+        },
+        payload: Vec::new(),
+    };
+    let heartbeat = message(
+        message_handlers::StormMessagePayloadType::Heartbeat as u32,
+        current_timestamp(),
+    );
+    // An empty Custom payload does not decode.
+    let custom = message(
+        message_handlers::StormMessagePayloadType::Custom as u32,
+        current_timestamp(),
+    );
+    let stale = message(
+        message_handlers::StormMessagePayloadType::Heartbeat as u32,
+        current_timestamp().saturating_sub(constants::MESSAGE_CLOCK_SKEW.as_secs() + 1),
+    );
+
+    Storm::handle_message(&state, peer_public_key, heartbeat.clone())
+        .await
+        .unwrap();
+    // The error reply has no connection to go out on.
+    Storm::handle_message(&state, peer_public_key, custom.clone())
+        .await
+        .unwrap_err();
+    Storm::handle_message(&state, peer_public_key, custom)
+        .await
+        .unwrap_err();
+    Storm::handle_message(&state, peer_public_key, stale)
+        .await
+        .unwrap_err();
+    Storm::handle_message(&state, stranger_public_key, heartbeat)
+        .await
+        .unwrap_err();
+
+    let rendered = recorder.handle().render();
+    let peer = hex::encode(peer_public_key);
+    for line in [
+        format!(
+            "storm_peer_protocol_version{{peer=\"{peer}\"}} {}",
+            constants::PROTOCOL_VERSION
+        ),
+        format!("storm_messages_rejected_total{{peer=\"{peer}\",reason=\"invalid_payload\"}} 1"),
+        format!("storm_messages_rejected_total{{peer=\"{peer}\",reason=\"replay\"}} 1"),
+        format!("storm_messages_rejected_total{{peer=\"{peer}\",reason=\"timestamp_window\"}} 1"),
+        // A sender outside the network is not named by its key.
+        r#"storm_messages_rejected_total{peer="unregistered",reason="unauthorized"} 1"#.into(),
+    ] {
+        assert!(rendered.contains(&line), "missing {line:?} in:\n{rendered}");
+    }
 }
 
 #[tokio::test]

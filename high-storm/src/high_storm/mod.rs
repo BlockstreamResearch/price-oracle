@@ -954,9 +954,10 @@ impl HighStormHandle {
         &self,
         feed: price_feed::FeedId,
         index: usize,
+        name: &'static str,
         source: &S,
     ) -> PollOutcome {
-        self.state.prices().poll(feed, index, source).await
+        self.state.prices().poll(feed, index, name, source).await
     }
 
     pub async fn price_attestations(
