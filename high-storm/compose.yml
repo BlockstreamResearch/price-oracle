@@ -399,12 +399,25 @@ services:
     ports:
       - "9202:80"
 
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks:
+      storm:
+        ipv4_address: ${STORM_NETWORK_PREFIX:-172.28.0}.30
+
 volumes:
   postgres-data:
   elements-1-data:
   elements-2-data:
   elements-3-data:
   elements-explorer-data:
+  prometheus-data:
 
 networks:
   storm:

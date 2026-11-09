@@ -1569,3 +1569,15 @@ impl DerefMut for HighStorm {
         &mut self.storm
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_only_rounds_that_had_work() {
+        assert_eq!(round_outcome::<()>(&Ok(0)), None);
+        assert_eq!(round_outcome::<()>(&Ok(2)), Some("broadcast"));
+        assert_eq!(round_outcome(&Err(())), Some("failed"));
+    }
+}

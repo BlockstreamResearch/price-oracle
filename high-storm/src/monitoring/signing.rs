@@ -69,6 +69,8 @@ mod tests {
             record_signing_branch_failure("burn_expired_utxos", true);
             record_missing_signing_contribution("02aa".into(), "burn_expired_utxos", "nonce");
             set_signing_sessions_active(3);
+            record_invalid_partial_signatures("02bb".into(), "execute_user_requests");
+            record_aggregate_invalid("execute_user_requests");
         });
 
         let rendered = recorder.handle().render();
@@ -80,6 +82,8 @@ mod tests {
             r#"high_storm_signing_branch_failures_total{kind="burn_expired_utxos",reason="timeout"} 1"#,
             r#"high_storm_signing_missing_contributions_total{peer="02aa",kind="burn_expired_utxos",stage="nonce"} 1"#,
             "high_storm_signing_sessions_active 3",
+            r#"high_storm_signing_invalid_partial_signatures_total{peer="02bb",kind="execute_user_requests"} 1"#,
+            r#"high_storm_signing_aggregate_invalid_total{kind="execute_user_requests"} 1"#,
         ] {
             assert!(rendered.contains(line), "missing {line:?} in:\n{rendered}");
         }

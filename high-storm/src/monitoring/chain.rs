@@ -3,7 +3,12 @@ use std::time::Duration;
 use metrics::counter;
 use tokio::time::MissedTickBehavior;
 
-use super::{elements, flag, names, refresh::set_retained};
+use super::{
+    elements, flag,
+    health::{MonitoringTask, record_task_error, record_task_run, record_task_started},
+    names,
+    refresh::set_retained,
+};
 use crate::HighStormHandle;
 
 const STORM_EYE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
@@ -45,22 +50,26 @@ pub fn set_storm_eye_utxos(count: usize) {
 /// keeps moving when this node's indexing stalls while blocks keep coming.
 /// Runs until the process exits.
 pub fn spawn_storm_eye_probe(node: HighStormHandle) {
+    record_task_started(MonitoringTask::StormEyeProbe);
     tokio::spawn(async move {
         let mut probe = tokio::time::interval(STORM_EYE_PROBE_INTERVAL);
         probe.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             probe.tick().await;
-            let rescue_height = match node.storm_eye_rescue_height().await {
-                Ok(rescue_height) => rescue_height,
-                Err(error) => {
-                    tracing::debug!(%error, "could not read the Storm Eye rescue height");
-                    continue;
+            match node.storm_eye_rescue_height().await {
+                Ok(rescue_height) => {
+                    if let (Some(rescue_height), Some(tip_height)) =
+                        (rescue_height, elements::tip_height())
+                    {
+                        set_storm_eye_rescue_blocks_remaining(rescue_height, tip_height);
+                    }
                 }
-            };
-            if let (Some(rescue_height), Some(tip_height)) = (rescue_height, elements::tip_height())
-            {
-                set_storm_eye_rescue_blocks_remaining(rescue_height, tip_height);
+                Err(error) => {
+                    record_task_error(MonitoringTask::StormEyeProbe);
+                    tracing::debug!(%error, "could not read the Storm Eye rescue height");
+                }
             }
+            record_task_run(MonitoringTask::StormEyeProbe);
         }
     });
 }

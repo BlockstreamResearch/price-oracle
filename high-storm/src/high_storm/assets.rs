@@ -310,12 +310,13 @@ impl Assets {
                 ))
             })?)
         };
-        let client = Client::new(
+        let client = crate::monitoring::elements_client(
             &self.elements_rpc.url,
             Auth::UserPass(
                 self.elements_rpc.username.clone(),
                 self.elements_rpc.password.clone(),
             ),
+            "asset",
         )?;
         let asset = asset.clone();
         tokio::task::spawn_blocking(move || {
@@ -883,7 +884,11 @@ impl ElementsAssetIssuer {
     }
 
     fn client(&self) -> Result<Client, AssetError> {
-        Ok(Client::new(&self.rpc_url, self.auth.clone())?)
+        Ok(crate::monitoring::elements_client(
+            &self.rpc_url,
+            self.auth.clone(),
+            "asset",
+        )?)
     }
 
     fn prepare_storm_eye(

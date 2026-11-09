@@ -1,3 +1,6 @@
+pub(super) const MONITORING_TASK_LAST_RUN: &str =
+    "high_storm_monitoring_task_last_run_timestamp_seconds";
+pub(super) const MONITORING_TASK_ERRORS: &str = "high_storm_monitoring_task_errors_total";
 pub(super) const METRICS_CONNECTIONS_REJECTED: &str =
     "high_storm_metrics_connections_rejected_total";
 pub(super) const BUILD_INFO: &str = "high_storm_build_info";
@@ -17,12 +20,16 @@ pub(super) const PEER_LAST_SEEN: &str = "storm_peer_last_seen_timestamp_seconds"
 
 pub(super) const DB_UP: &str = "high_storm_db_up";
 pub(super) const DB_PING_DURATION: &str = "high_storm_db_ping_duration_seconds";
+pub(super) const DB_POOL_MAX_CONNECTIONS: &str = "high_storm_db_pool_max_connections";
 pub(super) const DB_POOL_CONNECTIONS: &str = "high_storm_db_pool_connections";
 
 pub(super) const ELEMENTS_RPC_UP: &str = "high_storm_elements_rpc_up";
 pub(super) const ELEMENTS_TIP_HEIGHT: &str = "high_storm_elements_tip_height";
 pub(super) const ELEMENTS_TIP_TIMESTAMP: &str = "high_storm_elements_tip_timestamp_seconds";
 pub(super) const ELEMENTS_PEERS: &str = "high_storm_elements_peers";
+pub(super) const ELEMENTS_RPC_ERRORS: &str = "high_storm_elements_rpc_errors_total";
+pub(super) const ELEMENTS_RPC_DURATION: &str = "high_storm_elements_rpc_duration_seconds";
+pub(super) const TX_BROADCASTS: &str = "high_storm_tx_broadcast_total";
 pub(super) const ELEMENTS_INITIAL_BLOCK_DOWNLOAD: &str =
     "high_storm_elements_initial_block_download";
 
@@ -87,6 +94,9 @@ pub(super) const USER_REQUEST_OLDEST_PENDING_AGE: &str =
     "high_storm_user_request_oldest_pending_age_blocks";
 pub(super) const USER_REQUESTS_FAILED: &str = "high_storm_user_requests_failed_total";
 pub(super) const ISSUANCE_ROUNDS: &str = "high_storm_issuance_rounds_total";
+pub(super) const ISSUANCE_TX_WEIGHT: &str = "high_storm_issuance_tx_weight";
+pub(super) const TREASURY_BALANCE: &str = "high_storm_treasury_balance_sats";
+pub(super) const DROPLETS_BALANCE: &str = "high_storm_droplets_balance_sats";
 
 pub(super) const VOTING_REQUESTS_CREATED: &str = "high_storm_voting_requests_created_total";
 pub(super) const VOTING_APPROVALS: &str = "high_storm_voting_approvals_total";

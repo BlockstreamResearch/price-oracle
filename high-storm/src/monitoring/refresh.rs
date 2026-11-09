@@ -12,7 +12,11 @@ use storm::{Peer, PeerStatus};
 use storm_tree::StormTree;
 use tokio::time::{Instant, MissedTickBehavior};
 
-use super::{flag, names, record_build_info};
+use super::{
+    flag,
+    health::{MonitoringTask, record_task_run, record_task_started},
+    names, record_build_info,
+};
 use crate::{HighStormHandle, db::Database};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -85,6 +89,7 @@ fn record_retained() {
 
 /// Republishes the node's gauges until the process exits.
 pub fn spawn_refresh(node: HighStormHandle, database: Database) {
+    record_task_started(MonitoringTask::Refresh);
     tokio::spawn(async move {
         let mut refresh = tokio::time::interval(REFRESH_INTERVAL);
         refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -98,6 +103,7 @@ pub fn spawn_refresh(node: HighStormHandle, database: Database) {
             record_node(&NodeSnapshot::read(&node).await);
             super::prices::record_prices(&node).await;
             record_database(&database).await;
+            record_task_run(MonitoringTask::Refresh);
         }
     });
 }
@@ -202,6 +208,7 @@ async fn record_database(database: &Database) {
     let pool = database.pool_connections();
     gauge!(names::DB_POOL_CONNECTIONS, "state" => "idle").set(pool.idle as f64);
     gauge!(names::DB_POOL_CONNECTIONS, "state" => "used").set(pool.used as f64);
+    gauge!(names::DB_POOL_MAX_CONNECTIONS).set(f64::from(pool.max));
 }
 
 pub(super) fn unix_now() -> u64 {
@@ -378,5 +385,6 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(connections("idle") + connections("used"), 1.0);
+        assert!(rendered.contains("high_storm_db_pool_max_connections 1"));
     }
 }

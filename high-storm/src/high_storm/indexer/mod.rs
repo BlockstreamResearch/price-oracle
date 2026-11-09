@@ -556,12 +556,13 @@ impl Indexer {
 
     fn client(&self) -> Result<Client, IndexerError> {
         let url = url::Url::parse(&self.elements_rpc.url)?;
-        Ok(Client::new(
+        Ok(crate::monitoring::elements_client(
             url.as_str(),
             Auth::UserPass(
                 self.elements_rpc.username.clone(),
                 self.elements_rpc.password.clone(),
             ),
+            "rebroadcast",
         )?)
     }
 }

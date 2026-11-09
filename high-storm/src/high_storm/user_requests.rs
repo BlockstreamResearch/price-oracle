@@ -890,6 +890,7 @@ impl UserRequestProcessor {
                 "broadcast transaction id mismatch".into(),
             ));
         }
+        crate::monitoring::record_issuance_tx_weight(final_tx.weight());
 
         fn verify_tx_amt_proofs(
             transaction: &simplex::simplicityhl::elements::Transaction,
@@ -1011,12 +1012,13 @@ impl UserRequestProcessor {
             .pop_if_empty()
             .push("wallet")
             .push(&self.elements_rpc.wallet);
-        Ok(Client::new(
+        Ok(crate::monitoring::elements_client(
             url.as_str(),
             Auth::UserPass(
                 self.elements_rpc.username.clone(),
                 self.elements_rpc.password.clone(),
             ),
+            "issuance",
         )?)
     }
 }
