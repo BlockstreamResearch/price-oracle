@@ -10,7 +10,7 @@ pub mod source;
 
 pub use clock::Clock;
 pub use cross::{ComputationPath, CrossPairError};
-pub use feed_state::{FeedAvailability, FeedState, FeedStates};
+pub use feed_state::{FeedAvailability, FeedState, FeedStates, SourceStatus};
 pub use instruction::ValidationError;
 pub use price_data::{DecodeError, PRICE_FEED_DATA_LEN, PriceFeedData};
 pub use reduce::{MedianReducer, Reducer};
