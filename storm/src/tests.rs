@@ -27,6 +27,40 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+fn storm_message(
+    payload_type: message_handlers::StormMessagePayloadType,
+    timestamp: u64,
+    payload: Vec<u8>,
+) -> StormMessage {
+    StormMessage {
+        header: StormMessageHeader {
+            payload_id: payload_type as u32,
+            timestamp,
+            protocol_version: constants::PROTOCOL_VERSION,
+        },
+        payload,
+    }
+}
+
+/// A Storm state with a random local key and one random registered peer.
+fn state_with_one_peer() -> (Arc<RwLock<StormState>>, [u8; 33]) {
+    let mut random = rand::thread_rng();
+    let local_secret_key = SecretKey::new(&mut random);
+    let (_, peer_public_key) = random_key_pair();
+    let state = Arc::new(RwLock::new(StormState::new(
+        local_secret_key,
+        vec![Peer::new(peer_public_key)],
+    )));
+    (state, peer_public_key)
+}
+
+/// A random secret key and its serialized public key.
+fn random_key_pair() -> (SecretKey, [u8; 33]) {
+    let secret_key = SecretKey::new(&mut rand::thread_rng());
+    let public_key = secret_key.public_key(&Secp256k1::new()).serialize();
+    (secret_key, public_key)
+}
+
 fn ordered_key_pair() -> (SecretKey, SecretKey) {
     let secp = Secp256k1::new();
     let mut random = rand::thread_rng();
@@ -292,8 +326,7 @@ async fn joining_member_reconnects_when_host_lacks_its_address() {
 async fn authenticated_peer_is_active_once_and_inactive_after_disconnect() {
     let secp = Secp256k1::new();
     let mut random = rand::thread_rng();
-    let server_secret_key = SecretKey::new(&mut random);
-    let server_public_key = server_secret_key.public_key(&secp).serialize();
+    let (server_secret_key, server_public_key) = random_key_pair();
     let peer_secret_key = SecretKey::new(&mut random);
     let peer_public_key = peer_secret_key.public_key(&secp);
     let state = Arc::new(RwLock::new(StormState::new(
@@ -344,11 +377,9 @@ async fn releases_an_inbound_connection_whose_setup_fails() {
     let _local = metrics::set_default_local_recorder(&recorder);
     let secp = Secp256k1::new();
     let mut random = rand::thread_rng();
-    let discovery_secret_key = SecretKey::new(&mut random);
-    let discovery_public_key = discovery_secret_key.public_key(&secp).serialize();
+    let (discovery_secret_key, discovery_public_key) = random_key_pair();
     let stuck_public_key = SecretKey::new(&mut random).public_key(&secp).serialize();
-    let joining_secret_key = SecretKey::new(&mut random);
-    let joining_public_key = joining_secret_key.public_key(&secp).serialize();
+    let (joining_secret_key, joining_public_key) = random_key_pair();
     let discovery = Storm::discovery(
         discovery_secret_key,
         vec![Peer::new(stuck_public_key), Peer::new(joining_public_key)],
@@ -411,12 +442,8 @@ async fn releases_an_inbound_connection_whose_setup_fails() {
 async fn counts_connections_rejections_and_disconnections() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let _local = metrics::set_default_local_recorder(&recorder);
-    let secp = Secp256k1::new();
-    let mut random = rand::thread_rng();
-    let server_secret_key = SecretKey::new(&mut random);
-    let server_public_key = server_secret_key.public_key(&secp).serialize();
-    let peer_secret_key = SecretKey::new(&mut random);
-    let peer_public_key = peer_secret_key.public_key(&secp).serialize();
+    let (server_secret_key, server_public_key) = random_key_pair();
+    let (peer_secret_key, peer_public_key) = random_key_pair();
     let state = Arc::new(RwLock::new(StormState::new(
         server_secret_key,
         vec![Peer::new(peer_public_key)],
@@ -683,15 +710,10 @@ async fn invalid_key_confirmation_does_not_register_or_update_a_peer() {
 
 #[tokio::test]
 async fn initialization_modes_normalize_peer_state() {
-    let secp = Secp256k1::new();
-    let mut random = rand::thread_rng();
-    let remote_secret_key = SecretKey::new(&mut random);
-    let remote_public_key = remote_secret_key.public_key(&secp).serialize();
-    let banned_secret_key = SecretKey::new(&mut random);
-    let banned_public_key = banned_secret_key.public_key(&secp).serialize();
+    let (_, remote_public_key) = random_key_pair();
+    let (_, banned_public_key) = random_key_pair();
 
-    let host_secret_key = SecretKey::new(&mut random);
-    let host_public_key = host_secret_key.public_key(&secp).serialize();
+    let (host_secret_key, host_public_key) = random_key_pair();
     let mut registered_peer = Peer::new(remote_public_key);
     registered_peer.socket_address = Some("127.0.0.1:9000".to_string());
     registered_peer.status = PeerStatus::Active;
@@ -724,8 +746,7 @@ async fn initialization_modes_normalize_peer_state() {
     assert_eq!(banned_peer.status, PeerStatus::Banned);
     assert!(!banned_peer.discovery);
 
-    let client_secret_key = SecretKey::new(&mut random);
-    let client_public_key = client_secret_key.public_key(&secp).serialize();
+    let (client_secret_key, client_public_key) = random_key_pair();
     let mut discovery_peer = Peer::new(remote_public_key);
     discovery_peer.socket_address = Some("127.0.0.1:9001".to_string());
     discovery_peer.status = PeerStatus::Active;
@@ -744,8 +765,7 @@ async fn initialization_modes_normalize_peer_state() {
     assert_eq!(discovery_peer.status, PeerStatus::Inactive);
     assert!(discovery_peer.discovery);
 
-    let saved_secret_key = SecretKey::new(&mut random);
-    let saved_public_key = saved_secret_key.public_key(&secp).serialize();
+    let (saved_secret_key, saved_public_key) = random_key_pair();
     let mut saved_local_peer = Peer::new(saved_public_key);
     saved_local_peer.status = PeerStatus::Active;
     saved_local_peer.discovery = true;
@@ -775,14 +795,9 @@ async fn initialization_modes_normalize_peer_state() {
 
 #[tokio::test]
 async fn discovery_host_rejects_an_unregistered_public_key() {
-    let secp = Secp256k1::new();
-    let mut random = rand::thread_rng();
-    let host_secret_key = SecretKey::new(&mut random);
-    let host_public_key = host_secret_key.public_key(&secp).serialize();
-    let registered_secret_key = SecretKey::new(&mut random);
-    let registered_public_key = registered_secret_key.public_key(&secp).serialize();
-    let unregistered_secret_key = SecretKey::new(&mut random);
-    let unregistered_public_key = unregistered_secret_key.public_key(&secp).serialize();
+    let (host_secret_key, host_public_key) = random_key_pair();
+    let (_, registered_public_key) = random_key_pair();
+    let (unregistered_secret_key, unregistered_public_key) = random_key_pair();
     let host = Storm::discovery(host_secret_key, vec![Peer::new(registered_public_key)]);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
@@ -815,8 +830,7 @@ async fn discoverable_node_accepts_unregistered_connection_but_rejects_messages(
     let mut random = rand::thread_rng();
     let local_secret_key = SecretKey::new(&mut random);
     let discovery_secret_key = SecretKey::new(&mut random);
-    let unknown_secret_key = SecretKey::new(&mut random);
-    let unknown_public_key = unknown_secret_key.public_key(&Secp256k1::new()).serialize();
+    let (_, unknown_public_key) = random_key_pair();
     let mut discovery_peer = Peer::new(
         discovery_secret_key
             .public_key(&Secp256k1::new())
@@ -845,14 +859,11 @@ async fn discoverable_node_accepts_unregistered_connection_but_rejects_messages(
             .all(|peer| peer.compressed_public_key != unknown_public_key)
     );
 
-    let heartbeat = StormMessage {
-        header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Heartbeat as u32,
-            timestamp: 123,
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: Vec::new(),
-    };
+    let heartbeat = storm_message(
+        message_handlers::StormMessagePayloadType::Heartbeat,
+        123,
+        Vec::new(),
+    );
     let result = Storm::handle_message(&storm.inner, unknown_public_key, heartbeat).await;
     assert!(matches!(result, Err(Error::UnauthorizedConnection)));
     assert!(connection_receiver.is_empty());
@@ -917,16 +928,10 @@ async fn discoverable_node_limits_provisional_connections() {
 async fn member_migration_admits_only_targets_and_activates_atomically() {
     use std::collections::BTreeSet;
 
-    let secp = Secp256k1::new();
-    let mut random = rand::thread_rng();
-    let local_secret_key = SecretKey::new(&mut random);
-    let local_public_key = local_secret_key.public_key(&secp).serialize();
-    let retained_secret_key = SecretKey::new(&mut random);
-    let retained_public_key = retained_secret_key.public_key(&secp).serialize();
-    let joining_secret_key = SecretKey::new(&mut random);
-    let joining_public_key = joining_secret_key.public_key(&secp).serialize();
-    let rejected_secret_key = SecretKey::new(&mut random);
-    let rejected_public_key = rejected_secret_key.public_key(&secp).serialize();
+    let (local_secret_key, local_public_key) = random_key_pair();
+    let (_, retained_public_key) = random_key_pair();
+    let (_, joining_public_key) = random_key_pair();
+    let (_, rejected_public_key) = random_key_pair();
     let storm = Storm::from_peers(
         local_secret_key,
         vec![Peer::new(local_public_key), Peer::new(retained_public_key)],
@@ -1045,8 +1050,7 @@ async fn removed_member_does_not_wait_for_target_connections() {
 
     let secp = Secp256k1::new();
     let mut random = rand::thread_rng();
-    let local_secret_key = SecretKey::new(&mut random);
-    let local_public_key = local_secret_key.public_key(&secp).serialize();
+    let (local_secret_key, local_public_key) = random_key_pair();
     let retained_public_key = SecretKey::new(&mut random).public_key(&secp).serialize();
     let joining_public_key = SecretKey::new(&mut random).public_key(&secp).serialize();
     let mut retained_peer = Peer::new(retained_public_key);
@@ -1089,10 +1093,8 @@ async fn staged_member_requests_the_target_peer_table() {
 
     let secp = Secp256k1::new();
     let mut random = rand::thread_rng();
-    let local_secret_key = SecretKey::new(&mut random);
-    let local_public_key = local_secret_key.public_key(&secp).serialize();
-    let connected_secret_key = SecretKey::new(&mut random);
-    let connected_public_key = connected_secret_key.public_key(&secp).serialize();
+    let (local_secret_key, local_public_key) = random_key_pair();
+    let (_, connected_public_key) = random_key_pair();
     let joining_public_key = SecretKey::new(&mut random).public_key(&secp).serialize();
     let mut connected_peer = Peer::new(connected_public_key);
     connected_peer.status = PeerStatus::Active;
@@ -1127,14 +1129,9 @@ async fn staged_member_requests_the_target_peer_table() {
 async fn joining_member_discovers_staged_network_over_existing_listener() {
     use std::collections::BTreeSet;
 
-    let secp = Secp256k1::new();
-    let mut random = rand::thread_rng();
-    let host_secret_key = SecretKey::new(&mut random);
-    let host_public_key = host_secret_key.public_key(&secp).serialize();
-    let removed_secret_key = SecretKey::new(&mut random);
-    let removed_public_key = removed_secret_key.public_key(&secp).serialize();
-    let joining_secret_key = SecretKey::new(&mut random);
-    let joining_public_key = joining_secret_key.public_key(&secp).serialize();
+    let (host_secret_key, host_public_key) = random_key_pair();
+    let (_, removed_public_key) = random_key_pair();
+    let (joining_secret_key, joining_public_key) = random_key_pair();
     let mut host = Storm::from_peers(
         host_secret_key,
         vec![Peer::new(host_public_key), Peer::new(removed_public_key)],
@@ -1195,14 +1192,9 @@ async fn joining_member_discovers_staged_network_over_existing_listener() {
 
 #[tokio::test]
 async fn accepted_connection_can_complete_client_discovery() {
-    let secp = Secp256k1::new();
-    let mut random = rand::thread_rng();
-    let local_secret_key = SecretKey::new(&mut random);
-    let local_public_key = local_secret_key.public_key(&secp).serialize();
-    let discovery_secret_key = SecretKey::new(&mut random);
-    let discovery_public_key = discovery_secret_key.public_key(&secp).serialize();
-    let inbound_secret_key = SecretKey::new(&mut random);
-    let inbound_public_key = inbound_secret_key.public_key(&secp).serialize();
+    let (local_secret_key, local_public_key) = random_key_pair();
+    let (_, discovery_public_key) = random_key_pair();
+    let (_, inbound_public_key) = random_key_pair();
 
     let mut local_peer = Peer::new(local_public_key);
     local_peer.status = PeerStatus::Controlled;
@@ -1246,8 +1238,7 @@ async fn accepted_connection_can_complete_client_discovery() {
 async fn banned_peer_cannot_connect_or_process_messages_and_remains_banned() {
     let mut random = rand::thread_rng();
     let local_secret_key = SecretKey::new(&mut random);
-    let banned_secret_key = SecretKey::new(&mut random);
-    let banned_public_key = banned_secret_key.public_key(&Secp256k1::new()).serialize();
+    let (_, banned_public_key) = random_key_pair();
     let mut banned_peer = Peer::new(banned_public_key);
     banned_peer.status = PeerStatus::Banned;
     let state = Arc::new(RwLock::new(StormState::new(
@@ -1259,14 +1250,11 @@ async fn banned_peer_cannot_connect_or_process_messages_and_remains_banned() {
     assert!(matches!(result, Err(Error::UnauthorizedConnection)));
     assert_eq!(state.read().await.peers[0].status, PeerStatus::Banned);
 
-    let heartbeat = StormMessage {
-        header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Heartbeat as u32,
-            timestamp: 123,
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: Vec::new(),
-    };
+    let heartbeat = storm_message(
+        message_handlers::StormMessagePayloadType::Heartbeat,
+        123,
+        Vec::new(),
+    );
     let result = Storm::handle_message(&state, banned_public_key, heartbeat).await;
     assert!(matches!(result, Err(Error::UnauthorizedConnection)));
     assert_eq!(state.read().await.peers[0].status, PeerStatus::Banned);
@@ -1285,8 +1273,7 @@ async fn banned_peer_cannot_connect_or_process_messages_and_remains_banned() {
 async fn registered_custom_handler_receives_decoded_message() {
     let mut random = rand::thread_rng();
     let local_secret_key = SecretKey::new(&mut random);
-    let peer_secret_key = SecretKey::new(&mut random);
-    let peer_public_key = peer_secret_key.public_key(&Secp256k1::new()).serialize();
+    let (_, peer_public_key) = random_key_pair();
     let storm = Storm::from_peers(local_secret_key, vec![Peer::new(peer_public_key)]);
     let (callback_sender, mut callback_receiver) = mpsc::unbounded_channel();
     let (connection_sender, mut connection_receiver) =
@@ -1316,14 +1303,11 @@ async fn registered_custom_handler_receives_decoded_message() {
         domain: "oracle".to_string(),
         payload: vec![1, 2, 3],
     };
-    let message = StormMessage {
-        header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Custom as u32,
-            timestamp: current_timestamp(),
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: postcard::to_stdvec(&custom_message).unwrap(),
-    };
+    let message = storm_message(
+        message_handlers::StormMessagePayloadType::Custom,
+        current_timestamp(),
+        postcard::to_stdvec(&custom_message).unwrap(),
+    );
 
     Storm::handle_message(&storm.inner, peer_public_key, message.clone())
         .await
@@ -1361,14 +1345,11 @@ async fn outbound_queue_rejects_messages_when_full() {
         .await
         .connections
         .insert(peer_public_key.serialize(), connection_sender);
-    let message = StormMessage {
-        header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Heartbeat as u32,
-            timestamp: current_timestamp(),
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: Vec::new(),
-    };
+    let message = storm_message(
+        message_handlers::StormMessagePayloadType::Heartbeat,
+        current_timestamp(),
+        Vec::new(),
+    );
 
     for _ in 0..constants::OUTBOUND_QUEUE_CAPACITY {
         storm
@@ -1390,22 +1371,12 @@ async fn outbound_queue_rejects_messages_when_full() {
 
 #[tokio::test]
 async fn authenticated_messages_reject_stale_timestamps_and_replays() {
-    let mut random = rand::thread_rng();
-    let local_secret_key = SecretKey::new(&mut random);
-    let peer_secret_key = SecretKey::new(&mut random);
-    let peer_public_key = peer_secret_key.public_key(&Secp256k1::new()).serialize();
-    let state = Arc::new(RwLock::new(StormState::new(
-        local_secret_key,
-        vec![Peer::new(peer_public_key)],
-    )));
-    let message = StormMessage {
-        header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Custom as u32,
-            timestamp: current_timestamp(),
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: Vec::new(),
-    };
+    let (state, peer_public_key) = state_with_one_peer();
+    let message = storm_message(
+        message_handlers::StormMessagePayloadType::Custom,
+        current_timestamp(),
+        Vec::new(),
+    );
 
     state
         .write()
@@ -1419,15 +1390,11 @@ async fn authenticated_messages_reject_stale_timestamps_and_replays() {
         .unwrap_err();
     assert!(matches!(replay_error, Error::ReplayedMessage));
 
-    let stale_message = StormMessage {
-        header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Heartbeat as u32,
-            timestamp: current_timestamp()
-                .saturating_sub(constants::MESSAGE_CLOCK_SKEW.as_secs() + 1),
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: Vec::new(),
-    };
+    let stale_message = storm_message(
+        message_handlers::StormMessagePayloadType::Heartbeat,
+        current_timestamp().saturating_sub(constants::MESSAGE_CLOCK_SKEW.as_secs() + 1),
+        Vec::new(),
+    );
     let stale_error = state
         .write()
         .await
@@ -1438,22 +1405,12 @@ async fn authenticated_messages_reject_stale_timestamps_and_replays() {
 
 #[tokio::test]
 async fn authenticated_control_messages_may_repeat() {
-    let mut random = rand::thread_rng();
-    let local_secret_key = SecretKey::new(&mut random);
-    let peer_secret_key = SecretKey::new(&mut random);
-    let peer_public_key = peer_secret_key.public_key(&Secp256k1::new()).serialize();
-    let state = Arc::new(RwLock::new(StormState::new(
-        local_secret_key,
-        vec![Peer::new(peer_public_key)],
-    )));
-    let message = StormMessage {
-        header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Heartbeat as u32,
-            timestamp: current_timestamp(),
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: Vec::new(),
-    };
+    let (state, peer_public_key) = state_with_one_peer();
+    let message = storm_message(
+        message_handlers::StormMessagePayloadType::Heartbeat,
+        current_timestamp(),
+        Vec::new(),
+    );
 
     Storm::handle_message(&state, peer_public_key, message.clone())
         .await
@@ -1537,23 +1494,13 @@ async fn counts_rejected_messages_and_records_peer_versions() {
 
 #[tokio::test]
 async fn authenticated_control_messages_have_an_independent_rate_limit() {
-    let mut random = rand::thread_rng();
-    let local_secret_key = SecretKey::new(&mut random);
-    let peer_secret_key = SecretKey::new(&mut random);
-    let peer_public_key = peer_secret_key.public_key(&Secp256k1::new()).serialize();
-    let state = Arc::new(RwLock::new(StormState::new(
-        local_secret_key,
-        vec![Peer::new(peer_public_key)],
-    )));
+    let (state, peer_public_key) = state_with_one_peer();
     let received_at = current_timestamp();
-    let control_message = StormMessage {
-        header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Heartbeat as u32,
-            timestamp: received_at,
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: Vec::new(),
-    };
+    let control_message = storm_message(
+        message_handlers::StormMessagePayloadType::Heartbeat,
+        received_at,
+        Vec::new(),
+    );
 
     for _ in 0..constants::CONTROL_MESSAGE_RATE_CAPACITY {
         state
@@ -1579,14 +1526,11 @@ async fn authenticated_control_messages_have_an_independent_rate_limit() {
         )
         .unwrap();
 
-    let application_message = StormMessage {
-        header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Custom as u32,
-            timestamp: received_at,
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: b"application".to_vec(),
-    };
+    let application_message = storm_message(
+        message_handlers::StormMessagePayloadType::Custom,
+        received_at,
+        b"application".to_vec(),
+    );
     state
         .write()
         .await
@@ -1596,24 +1540,14 @@ async fn authenticated_control_messages_have_an_independent_rate_limit() {
 
 #[tokio::test]
 async fn authenticated_messages_cannot_evict_replay_fingerprints() {
-    let mut random = rand::thread_rng();
-    let local_secret_key = SecretKey::new(&mut random);
-    let peer_secret_key = SecretKey::new(&mut random);
-    let peer_public_key = peer_secret_key.public_key(&Secp256k1::new()).serialize();
-    let state = Arc::new(RwLock::new(StormState::new(
-        local_secret_key,
-        vec![Peer::new(peer_public_key)],
-    )));
+    let (state, peer_public_key) = state_with_one_peer();
 
     for sequence in 0..constants::REPLAY_CACHE_CAPACITY {
-        let message = StormMessage {
-            header: StormMessageHeader {
-                payload_id: message_handlers::StormMessagePayloadType::Custom as u32,
-                timestamp: current_timestamp(),
-                protocol_version: constants::PROTOCOL_VERSION,
-            },
-            payload: sequence.to_be_bytes().to_vec(),
-        };
+        let message = storm_message(
+            message_handlers::StormMessagePayloadType::Custom,
+            current_timestamp(),
+            sequence.to_be_bytes().to_vec(),
+        );
         state
             .write()
             .await
@@ -1621,14 +1555,11 @@ async fn authenticated_messages_cannot_evict_replay_fingerprints() {
             .unwrap();
     }
 
-    let excess_message = StormMessage {
-        header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Custom as u32,
-            timestamp: current_timestamp(),
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: b"excess".to_vec(),
-    };
+    let excess_message = storm_message(
+        message_handlers::StormMessagePayloadType::Custom,
+        current_timestamp(),
+        b"excess".to_vec(),
+    );
     let error = state
         .write()
         .await
@@ -1661,22 +1592,18 @@ fn custom_message_constructor_uses_the_custom_wire_format() {
 async fn handler_failure_sends_error_without_error_response_loops() {
     let mut random = rand::thread_rng();
     let local_secret_key = SecretKey::new(&mut random);
-    let peer_secret_key = SecretKey::new(&mut random);
-    let peer_public_key = peer_secret_key.public_key(&Secp256k1::new()).serialize();
+    let (_, peer_public_key) = random_key_pair();
     let mut peer = Peer::new(peer_public_key);
     peer.status = PeerStatus::Active;
     let mut state = StormState::new(local_secret_key, vec![peer]);
     let (sender, mut receiver) = mpsc::channel(constants::OUTBOUND_QUEUE_CAPACITY);
     state.connections.insert(peer_public_key, sender);
     let state = Arc::new(RwLock::new(state));
-    let invalid_custom_message = StormMessage {
-        header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Custom as u32,
-            timestamp: current_timestamp(),
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: vec![0x80],
-    };
+    let invalid_custom_message = storm_message(
+        message_handlers::StormMessagePayloadType::Custom,
+        current_timestamp(),
+        vec![0x80],
+    );
 
     Storm::handle_message(&state, peer_public_key, invalid_custom_message)
         .await
@@ -1713,14 +1640,11 @@ async fn handler_failure_sends_error_without_error_response_loops() {
         message_handlers::StormMessagePayloadType::Custom as u32
     );
 
-    let invalid_error = StormMessage {
-        header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Error as u32,
-            timestamp: current_timestamp(),
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: vec![0x80],
-    };
+    let invalid_error = storm_message(
+        message_handlers::StormMessagePayloadType::Error,
+        current_timestamp(),
+        vec![0x80],
+    );
     Storm::handle_message(&state, peer_public_key, invalid_error)
         .await
         .unwrap();
@@ -1763,14 +1687,11 @@ async fn connects_available_addressed_peers_and_reports_missing_message_recipien
     wait_for_peer_status(&sender, receiver_public_key.serialize(), PeerStatus::Active).await;
     wait_for_peer_status(&receiver, sender_public_key.serialize(), PeerStatus::Active).await;
 
-    let message = StormMessage {
-        header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Custom as u32,
-            timestamp: current_timestamp(),
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: vec![1, 2, 3],
-    };
+    let message = storm_message(
+        message_handlers::StormMessagePayloadType::Custom,
+        current_timestamp(),
+        vec![1, 2, 3],
+    );
     let error = sender
         .send_message(
             message.clone(),
@@ -1807,14 +1728,11 @@ async fn a_stuck_recipient_does_not_block_delivery_to_healthy_peers() {
             .connections
             .insert(healthy.serialize(), healthy_sender);
     }
-    let message = StormMessage {
-        header: StormMessageHeader {
-            payload_id: message_handlers::StormMessagePayloadType::Custom as u32,
-            timestamp: current_timestamp(),
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: vec![1, 2, 3],
-    };
+    let message = storm_message(
+        message_handlers::StormMessagePayloadType::Custom,
+        current_timestamp(),
+        vec![1, 2, 3],
+    );
 
     let error = storm
         .send_message(message.clone(), &[stuck, healthy])
