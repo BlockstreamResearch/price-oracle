@@ -361,51 +361,25 @@ impl HighStorm {
     }
 
     pub async fn announce_protocol_settings(&self) -> Result<(), SigningError> {
-        let recipients = self
-            .peers()
-            .await
-            .into_iter()
-            .filter(|peer| peer.status == PeerStatus::Active)
-            .map(|peer| {
-                PublicKey::from_slice(&peer.compressed_public_key).map_err(|_| {
-                    SigningError::InvalidMessage("invalid protocol settings recipient".into())
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if recipients.is_empty() {
-            return Ok(());
-        }
-        let message = NodeMessage::new(
+        announce(
+            &self.storm.handle(),
             NodeMessageKind::ProtocolSettings,
             None,
             &self.state.protocol_settings(),
-        )?
-        .into_storm_message()?;
-        self.storm.send_message(message, &recipients).await?;
-
-        Ok(())
+            "invalid protocol settings recipient",
+        )
+        .await
     }
 
     async fn announce_exchange(&self, notification: &ExchangeRewards) -> Result<(), SigningError> {
-        let recipients = self
-            .peers()
-            .await
-            .into_iter()
-            .filter(|peer| peer.status == PeerStatus::Active)
-            .map(|peer| {
-                PublicKey::from_slice(&peer.compressed_public_key).map_err(|_| {
-                    SigningError::InvalidMessage("invalid exchange notification recipient".into())
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if recipients.is_empty() {
-            return Ok(());
-        }
-        let message = NodeMessage::new(NodeMessageKind::ExchangeRewards, None, notification)?
-            .into_storm_message()?;
-        self.storm.send_message(message, &recipients).await?;
-
-        Ok(())
+        announce(
+            &self.storm.handle(),
+            NodeMessageKind::ExchangeRewards,
+            None,
+            notification,
+            "invalid exchange notification recipient",
+        )
+        .await
     }
 
     pub async fn create_voting_request(
@@ -863,25 +837,14 @@ impl HighStorm {
     }
 
     async fn announce_burn(&self, notification: &ExpiredUtxosBurned) -> Result<(), SigningError> {
-        let recipients = self
-            .peers()
-            .await
-            .into_iter()
-            .filter(|peer| peer.status == PeerStatus::Active)
-            .map(|peer| {
-                PublicKey::from_slice(&peer.compressed_public_key).map_err(|_| {
-                    SigningError::InvalidMessage("invalid burn notification recipient".into())
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if recipients.is_empty() {
-            return Ok(());
-        }
-        let message = NodeMessage::new(NodeMessageKind::ExpiredUtxosBurned, None, notification)?
-            .into_storm_message()?;
-        self.storm.send_message(message, &recipients).await?;
-
-        Ok(())
+        announce(
+            &self.storm.handle(),
+            NodeMessageKind::ExpiredUtxosBurned,
+            None,
+            notification,
+            "invalid burn notification recipient",
+        )
+        .await
     }
 
     pub async fn reconcile_user_requests(&self) -> Result<usize, user_requests::UserRequestError> {
@@ -1438,28 +1401,14 @@ impl HighStormHandle {
         request_hash: [u8; 32],
         notification: &ExecuteVotingRequest,
     ) -> Result<(), SigningError> {
-        let recipients = self
-            .peers()
-            .await
-            .into_iter()
-            .filter(|peer| peer.status == PeerStatus::Active)
-            .map(|peer| {
-                PublicKey::from_slice(&peer.compressed_public_key).map_err(|_| {
-                    SigningError::InvalidMessage("invalid voting notification recipient".into())
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if recipients.is_empty() {
-            return Ok(());
-        }
-        let message = NodeMessage::new(
+        announce(
+            &self.storm,
             NodeMessageKind::ExecuteVotingRequest,
             Some(request_hash),
             notification,
-        )?
-        .into_storm_message()?;
-        self.storm.send_message(message, &recipients).await?;
-        Ok(())
+            "invalid voting notification recipient",
+        )
+        .await
     }
 
     pub async fn voting_request(
@@ -1494,6 +1443,34 @@ fn round_outcome<E>(result: &Result<usize, E>) -> Option<&'static str> {
         Ok(_) => Some("broadcast"),
         Err(_) => Some("failed"),
     }
+}
+
+/// Sends `payload` as a `kind` message to every active peer of `storm`, if there
+/// is any; `invalid_recipient` is the error for a peer whose key does not parse.
+async fn announce<T: serde::Serialize>(
+    storm: &StormHandle,
+    kind: NodeMessageKind,
+    linked_to: Option<[u8; 32]>,
+    payload: &T,
+    invalid_recipient: &str,
+) -> Result<(), SigningError> {
+    let recipients = storm
+        .peers()
+        .await
+        .into_iter()
+        .filter(|peer| peer.status == PeerStatus::Active)
+        .map(|peer| {
+            PublicKey::from_slice(&peer.compressed_public_key)
+                .map_err(|_| SigningError::InvalidMessage(invalid_recipient.into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if recipients.is_empty() {
+        return Ok(());
+    }
+    let message = NodeMessage::new(kind, linked_to, payload)?.into_storm_message()?;
+    storm.send_message(message, &recipients).await?;
+
+    Ok(())
 }
 
 fn voting_member_keys(peers: &[storm::Peer]) -> Result<BTreeSet<[u8; 32]>, VotingExecutionError> {
