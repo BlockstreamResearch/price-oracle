@@ -451,12 +451,7 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
 
     let unauthorized = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/operators/voting")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(get_request("/operators/voting"))
         .await
         .unwrap();
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
@@ -491,16 +486,10 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
 
     let voting = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/operators/voting")
-                .header(
-                    header::AUTHORIZATION,
-                    format!("Bearer {}", token["token"].as_str().unwrap()),
-                )
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authorized_get_request(
+            "/operators/voting",
+            &format!("Bearer {}", token["token"].as_str().unwrap()),
+        ))
         .await
         .unwrap();
     assert_eq!(voting.status(), StatusCode::OK);
@@ -509,13 +498,7 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
     let authorization = format!("Bearer {}", token["token"].as_str().unwrap());
     let network = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/operators/state")
-                .header(header::AUTHORIZATION, &authorization)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authorized_get_request("/operators/state", &authorization))
         .await
         .unwrap();
     assert_eq!(network.status(), StatusCode::OK);
@@ -528,13 +511,10 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
 
     let peers = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/operators/state/peers")
-                .header(header::AUTHORIZATION, &authorization)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authorized_get_request(
+            "/operators/state/peers",
+            &authorization,
+        ))
         .await
         .unwrap();
     assert_eq!(peers.status(), StatusCode::OK);
@@ -547,13 +527,10 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
 
     let droplets = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/operators/droplets")
-                .header(header::AUTHORIZATION, authorization)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authorized_get_request(
+            "/operators/droplets",
+            &authorization,
+        ))
         .await
         .unwrap();
     assert_eq!(droplets.status(), StatusCode::OK);
@@ -570,15 +547,7 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
         })
     );
 
-    let users = app
-        .oneshot(
-            Request::builder()
-                .uri("/users/pending")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let users = app.oneshot(get_request("/users/pending")).await.unwrap();
     assert_eq!(users.status(), StatusCode::NOT_FOUND);
 }
 
@@ -595,12 +564,7 @@ async fn authenticates_operator_reads_with_a_humid_signature() {
 
     let config = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/operators/auth/config")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(get_request("/operators/auth/config"))
         .await
         .unwrap();
     assert_eq!(config.status(), StatusCode::OK);
@@ -645,16 +609,10 @@ async fn authenticates_operator_reads_with_a_humid_signature() {
     let token = response_json(token).await;
 
     let voting = app
-        .oneshot(
-            Request::builder()
-                .uri("/operators/voting")
-                .header(
-                    header::AUTHORIZATION,
-                    format!("Bearer {}", token["token"].as_str().unwrap()),
-                )
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authorized_get_request(
+            "/operators/voting",
+            &format!("Bearer {}", token["token"].as_str().unwrap()),
+        ))
         .await
         .unwrap();
     assert_eq!(voting.status(), StatusCode::OK);
@@ -673,10 +631,7 @@ fn assert_xonly_public_key(value: &serde_json::Value) {
 #[tokio::test]
 async fn creates_and_approves_voting_with_signed_requests() {
     let (app, private_key, public_key) = setup().await;
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let timestamp = now();
     let proposal = serde_json::json!({
         "kind": "split_storm_eye",
         "utxo_to_split": {
@@ -751,10 +706,7 @@ async fn creates_and_approves_voting_with_signed_requests() {
 #[tokio::test]
 async fn rejects_invalid_droplets_exchange_fields_before_registration() {
     let (app, private_key, public_key) = setup().await;
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let timestamp = now();
     let response = app
         .oneshot(signed_request(
             &private_key,
@@ -780,10 +732,7 @@ async fn rejects_invalid_droplets_exchange_fields_before_registration() {
 #[tokio::test]
 async fn rejects_malformed_droplets_destination_before_registration() {
     let (app, private_key, public_key) = setup().await;
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let timestamp = now();
     let response = app
         .oneshot(signed_request(
             &private_key,
@@ -819,12 +768,7 @@ async fn registers_tick_requests_and_returns_pending_status() {
 
     let status = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/users/requests/{request_hash}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(get_request(&format!("/users/requests/{request_hash}")))
         .await
         .unwrap();
     assert_eq!(status.status(), StatusCode::OK);
@@ -968,12 +912,7 @@ async fn derives_oracle_account_from_the_active_storm_eye() {
     let (app, _, public_key) = setup().await;
 
     let response = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/users/account/{public_key}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(get_request(&format!("/users/account/{public_key}")))
         .await
         .unwrap();
 
@@ -1189,13 +1128,10 @@ async fn lets_an_operator_freeze_and_unfreeze_a_price_source() {
     let authorization = bearer(&app, &private_key, &public_key).await;
     let listed = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/operators/price-sources")
-                .header(header::AUTHORIZATION, &authorization)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authorized_get_request(
+            "/operators/price-sources",
+            &authorization,
+        ))
         .await
         .unwrap();
     assert_eq!(listed.status(), StatusCode::OK);
@@ -1571,6 +1507,14 @@ async fn node_setup_with_coordinator(
 
 fn get_request(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
+}
+
+fn authorized_get_request(uri: &str, authorization: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header(header::AUTHORIZATION, authorization)
+        .body(Body::empty())
+        .unwrap()
 }
 
 /// Records the metrics of what runs on this thread until it is dropped.
