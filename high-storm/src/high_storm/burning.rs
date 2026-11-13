@@ -4,10 +4,7 @@ use std::{
 };
 
 use bitcoincore_rpc::{Client, RpcApi};
-use contracts::artifacts::{
-    account::{AccountProgram, derived_account::AccountArguments},
-    auth::derived_auth::AuthWitness,
-};
+use contracts::artifacts::account::{AccountProgram, derived_account::AccountArguments};
 use contracts::voucher::VoucherSpendPath;
 use secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
 use simplex::{
@@ -631,17 +628,13 @@ impl Burning {
             .program_input
             .as_mut()
             .expect("Storm Eye is a program input")
-            .witness = AuthWitness {
-            path: Either::Left((
-                (contract_data.storm_tree_root, contract_data.rescue_height),
-                (
-                    *signature.as_ref(),
-                    signing.signing_storm_tree_branch,
-                    pack_proof(&proof)?,
-                ),
-                Either::Left(0),
-            )),
-        }
+            .witness = elements::storm_eye_witness(
+            &contract_data,
+            *signature.as_ref(),
+            signing.signing_storm_tree_branch,
+            pack_proof(&proof)?,
+            Either::Left(0),
+        )
         .into();
         let mut pset = prepared.pset;
         for (index, input) in transaction.inputs().iter().enumerate() {
@@ -816,23 +809,11 @@ fn build_burn_transaction(
     let signing_branch = contract_data.storm_tree_root;
 
     let mut final_transaction = FinalTransaction::new();
-    final_transaction.add_program_input(
-        PartialInput::new(storm_eye_utxo.clone()),
-        ProgramInput::new(
-            Box::new(auth_program.as_ref().clone()),
-            AuthWitness {
-                path: Either::Left((
-                    (contract_data.storm_tree_root, contract_data.rescue_height),
-                    (
-                        [0; 64],
-                        signing_branch,
-                        std::array::from_fn(|_| Either::Left(())),
-                    ),
-                    Either::Left(0),
-                )),
-            },
-        ),
-        RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+    elements::add_storm_eye_input(
+        &mut final_transaction,
+        storm_eye_utxo,
+        &auth_program,
+        elements::placeholder_storm_eye_witness(&contract_data, Either::Left(0)),
     );
 
     let mut spent_utxos = vec![storm_eye_utxo.txout.clone()];

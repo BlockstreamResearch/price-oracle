@@ -17,10 +17,7 @@ use simplex::{
     simplicityhl::elements::{
         AssetId, BlockHash, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction,
     },
-    transaction::{
-        FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
-        UTXO,
-    },
+    transaction::{FinalTransaction, PartialOutput, SigMessage, UTXO},
 };
 use storm_tree::{StormTree, StormTreeProof};
 
@@ -1087,13 +1084,11 @@ fn build_transaction(
 
     let mut transaction = FinalTransaction::new();
     for (output_index, utxo) in storm_eye_utxos.iter().enumerate() {
-        transaction.add_program_input(
-            PartialInput::new(utxo.clone()),
-            ProgramInput::new(
-                Box::new(auth_program.as_ref().clone()),
-                placeholder_witness(&contract_data, &operation, output_index as u32),
-            ),
-            RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+        elements::add_storm_eye_input(
+            &mut transaction,
+            utxo,
+            &auth_program,
+            placeholder_witness(&contract_data, &operation, output_index as u32),
         );
     }
 
@@ -1479,7 +1474,12 @@ fn placeholder_witness(
     operation: &ReshapeOperation,
     output_index: u32,
 ) -> AuthWitness {
-    let kind = match operation {
+    elements::placeholder_storm_eye_witness(data, reshape_spend(operation, output_index))
+}
+
+/// The witness spend arm of a reshape `operation` writing output `output_index`.
+fn reshape_spend(operation: &ReshapeOperation, output_index: u32) -> elements::StormEyeSpend {
+    match operation {
         ReshapeOperation::Split(_, count) => Either::Right(Either::Right(Either::Left(*count))),
         ReshapeOperation::Merge(outpoints) => {
             Either::Right(Either::Right(Either::Right(outpoints.len() as u8)))
@@ -1487,17 +1487,6 @@ fn placeholder_witness(
         ReshapeOperation::UpdateMembers { new_root, .. } => {
             Either::Right(Either::Left(Either::Left((*new_root, output_index))))
         }
-    };
-    AuthWitness {
-        path: Either::Left((
-            (data.storm_tree_root, data.rescue_height),
-            (
-                [0; 64],
-                data.storm_tree_root,
-                std::array::from_fn(|_| Either::Left(())),
-            ),
-            kind,
-        )),
     }
 }
 
@@ -1563,26 +1552,13 @@ fn reshape_witness(
     signature: [u8; 64],
     output_index: u32,
 ) -> Result<AuthWitness, VotingExecutionError> {
-    let kind = match operation {
-        ReshapeOperation::Split(_, count) => Either::Right(Either::Right(Either::Left(*count))),
-        ReshapeOperation::Merge(outpoints) => {
-            Either::Right(Either::Right(Either::Right(outpoints.len() as u8)))
-        }
-        ReshapeOperation::UpdateMembers { new_root, .. } => {
-            Either::Right(Either::Left(Either::Left((*new_root, output_index))))
-        }
-    };
-    Ok(AuthWitness {
-        path: Either::Left((
-            (data.storm_tree_root, data.rescue_height),
-            (
-                signature,
-                signing.signing_storm_tree_branch,
-                pack_proof(proof)?,
-            ),
-            kind,
-        )),
-    })
+    Ok(elements::storm_eye_witness(
+        data,
+        signature,
+        signing.signing_storm_tree_branch,
+        pack_proof(proof)?,
+        reshape_spend(operation, output_index),
+    ))
 }
 
 fn migrated_storm_eye_script(
