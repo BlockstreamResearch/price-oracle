@@ -243,6 +243,15 @@ impl NetworkAssetStore {
         Ok(true)
     }
 
+    /// The active asset of `kind`, or `missing(kind)` when there is none.
+    pub(crate) async fn require<E: From<Error>>(
+        &self,
+        kind: &'static str,
+        missing: fn(&'static str) -> E,
+    ) -> Result<NetworkAsset, E> {
+        self.get(kind).await?.ok_or(missing(kind))
+    }
+
     pub async fn get(&self, kind: &str) -> Result<Option<NetworkAsset>, Error> {
         sqlx::query(
             "SELECT kind, name, asset_id, reissuance_token_id, entropy, issuance_txid,

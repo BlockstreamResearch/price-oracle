@@ -192,11 +192,7 @@ impl Droplets {
         Address::from_str(destination)
             .map_err(|_| DropletsError::Invalid("invalid destination address".into()))?;
 
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(DropletsError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let indexed_utxos = self.store.treasury_utxos().await?;
         let (transaction, signing_hash) = self.prepare_exchange_transaction(
             amount,
@@ -408,11 +404,7 @@ impl Droplets {
                 "Droplets ledger is halted at block {height}: {reason}"
             )));
         }
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(DropletsError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let pset: PartiallySignedTransaction = encode::deserialize(transaction)?;
         let client = self.client()?;
         for (index, input) in pset.inputs().iter().enumerate() {
@@ -474,11 +466,7 @@ impl Droplets {
         proof: storm_tree::StormTreeProof,
         exchange: &ValidatedExchange,
     ) -> Result<([u8; 32], Vec<u8>), DropletsError> {
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(DropletsError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let network = self.network(&self.client()?)?;
         let contract_data: StormEyeContractData =
             postcard::from_bytes(storm_eye.contract_data.as_deref().ok_or_else(|| {
@@ -590,6 +578,10 @@ impl Droplets {
             ));
         }
         Ok((txid.to_byte_array(), final_bytes))
+    }
+
+    async fn asset(&self, kind: &'static str) -> Result<crate::NetworkAsset, DropletsError> {
+        self.assets.require(kind, DropletsError::MissingAsset).await
     }
 
     fn client(&self) -> Result<Client, DropletsError> {

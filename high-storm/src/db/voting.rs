@@ -238,10 +238,7 @@ impl VotingStore {
         .execute(&self.pool)
         .await?
         .rows_affected();
-        if updated != 1 {
-            return Err(Error::ExecutionStateNotUpdated);
-        }
-        Ok(())
+        updated_one(updated)
     }
 
     pub async fn record_broadcast(
@@ -271,10 +268,7 @@ impl VotingStore {
         .execute(&self.pool)
         .await?
         .rows_affected();
-        if updated != 1 {
-            return Err(Error::ExecutionStateNotUpdated);
-        }
-        Ok(())
+        updated_one(updated)
     }
 
     pub async fn confirm_execution(
@@ -293,10 +287,7 @@ impl VotingStore {
         .execute(&self.pool)
         .await?
         .rows_affected();
-        if updated != 1 {
-            return Err(Error::ExecutionStateNotUpdated);
-        }
-        Ok(())
+        updated_one(updated)
     }
 
     pub async fn mark_execution_included(
@@ -318,10 +309,7 @@ impl VotingStore {
         .execute(&self.pool)
         .await?
         .rows_affected();
-        if updated != 1 {
-            return Err(Error::ExecutionStateNotUpdated);
-        }
-        Ok(())
+        updated_one(updated)
     }
 
     pub async fn mark_execution_orphaned(
@@ -412,6 +400,14 @@ impl VotingStore {
             approvals,
         })
     }
+}
+
+/// Execution state updates change exactly one voting request.
+fn updated_one(updated: u64) -> Result<(), Error> {
+    if updated != 1 {
+        return Err(Error::ExecutionStateNotUpdated);
+    }
+    Ok(())
 }
 
 fn height_to_i64(height: u64) -> Result<i64, Error> {

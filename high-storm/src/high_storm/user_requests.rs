@@ -241,11 +241,7 @@ impl UserRequestProcessor {
         &self,
         request: &ExecuteUserRequests,
     ) -> Result<Option<PriceFeedData>, UserRequestError> {
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(UserRequestError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let tick_asset = self.assets.get(TICK_ASSET_KIND).await?;
         let verifier_asset = self.assets.get(ORACLE_VERIFIER_KIND).await?;
         let network = self.network()?;
@@ -351,11 +347,7 @@ impl UserRequestProcessor {
         if pending.is_empty() {
             return Ok(None);
         }
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(UserRequestError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let network = self.network()?;
         let rpc = self.client()?;
         let storm_eye_utxo = find_contract_utxo(
@@ -760,17 +752,12 @@ impl UserRequestProcessor {
 
     async fn asset(&self, kind: &'static str) -> Result<NetworkAsset, UserRequestError> {
         self.assets
-            .get(kind)
-            .await?
-            .ok_or(UserRequestError::MissingAsset(kind))
+            .require(kind, UserRequestError::MissingAsset)
+            .await
     }
 
     pub(crate) async fn storm_eye_utxo_count(&self) -> Result<usize, UserRequestError> {
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(UserRequestError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let client = self.client()?;
 
         Ok(scan_contract_utxos(
