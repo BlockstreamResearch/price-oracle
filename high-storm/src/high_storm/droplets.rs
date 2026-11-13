@@ -300,18 +300,7 @@ impl Droplets {
             ),
             RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
         );
-        for utxo in &selected {
-            transaction.add_program_input(
-                PartialInput::new(utxo.clone()),
-                ProgramInput::new(
-                    Box::new(treasury.as_ref().clone()),
-                    TreasuryWitness {
-                        storm_eye_input_index: 0,
-                    },
-                ),
-                RequiredSignature::None,
-            );
-        }
+        elements::add_treasury_inputs(&mut transaction, &treasury, &selected);
 
         transaction.add_output(output_from_utxo(&storm_eye_utxo));
         transaction.add_output(PartialOutput::new(

@@ -6,10 +6,7 @@ use std::{
 use bitcoincore_rpc::{Client, RpcApi};
 use contracts::artifacts::{
     auth::derived_auth::AuthWitness,
-    treasury::{
-        TreasuryProgram,
-        derived_treasury::{TreasuryArguments, TreasuryWitness},
-    },
+    treasury::{TreasuryProgram, derived_treasury::TreasuryArguments},
 };
 use secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
 use serde::Deserialize;
@@ -458,23 +455,12 @@ impl VotingExecution {
                 .expect("Storm Eye is a program input")
                 .witness = witness.into();
         }
-        for (index, input) in prepared.transaction.inputs().iter().enumerate() {
-            let program_input = input
-                .program_input
-                .as_ref()
-                .expect("all voting transaction inputs are covenant inputs");
-            prepared.pset.inputs_mut()[index].final_script_witness = Some(
-                program_input
-                    .program
-                    .finalize(
-                        &prepared.pset,
-                        &program_input.witness,
-                        index,
-                        &prepared.network,
-                    )?
-                    .into(),
-            );
-        }
+        elements::finalize_program_inputs(
+            &mut prepared.pset,
+            &prepared.transaction,
+            &prepared.network,
+            "all voting transaction inputs are covenant inputs",
+        )?;
         if signing_hashes(
             &prepared.pset,
             &prepared.storm_eye,
@@ -1124,18 +1110,7 @@ fn build_transaction(
     let treasury = TreasuryProgram::new(&TreasuryArguments {
         storm_eye_asset_id: storm_eye.asset_id,
     });
-    for utxo in &treasury_utxos {
-        transaction.add_program_input(
-            PartialInput::new(utxo.clone()),
-            ProgramInput::new(
-                Box::new(treasury.as_ref().clone()),
-                TreasuryWitness {
-                    storm_eye_input_index: 0,
-                },
-            ),
-            RequiredSignature::None,
-        );
-    }
+    elements::add_treasury_inputs(&mut transaction, &treasury, &treasury_utxos);
 
     let storm_eye_asset = asset_id(storm_eye.asset_id)?;
     let storm_eye_script = Script::from(storm_eye.contract_script.clone());
