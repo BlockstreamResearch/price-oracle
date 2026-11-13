@@ -1,27 +1,14 @@
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
 use crate::{
-    MessageContext, StormMessage, StormMessageHeader, StormState, constants,
-    message::StormErrorCode, message_handlers::StormMessagePayloadType,
+    MessageContext, StormMessage, StormState, message::StormErrorCode,
+    message_handlers::StormMessagePayloadType,
 };
 
 pub(crate) fn message() -> StormMessage {
-    StormMessage {
-        header: StormMessageHeader {
-            payload_id: StormMessagePayloadType::Heartbeat as u32,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: Vec::new(),
-    }
+    StormMessage::new(StormMessagePayloadType::Heartbeat, Vec::new())
 }
 
 pub(super) async fn handle(

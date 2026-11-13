@@ -1,16 +1,13 @@
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::{HashMap, HashSet};
 
 use secp256k1_zkp::PublicKey;
 #[cfg(test)]
 use secp256k1_zkp::Secp256k1;
 
 use crate::{
-    MessageContext, Peer, PeerStatus, StormHandle, StormMessage, StormMessageHeader, StormState,
-    constants, message::StormErrorCode, message_handlers::StormMessagePayloadType,
+    MessageContext, Peer, PeerStatus, StormHandle, StormMessage, StormState,
+    message::StormErrorCode, message_handlers::StormMessagePayloadType,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,17 +49,10 @@ pub(crate) fn message(peers: &[Peer]) -> Result<StormMessage, (StormErrorCode, S
         )
     })?;
 
-    Ok(StormMessage {
-        header: StormMessageHeader {
-            payload_id: StormMessagePayloadType::PeersSocketInfo as u32,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
+    Ok(StormMessage::new(
+        StormMessagePayloadType::PeersSocketInfo,
         payload,
-    })
+    ))
 }
 
 pub(super) async fn handle(
@@ -330,6 +320,7 @@ fn replace_discovered_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants;
     use secp256k1_zkp::{SecretKey, rand};
     use std::sync::Arc;
     use tokio::sync::RwLock;

@@ -3,19 +3,43 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use metrics::{counter, describe_counter, describe_gauge, gauge};
+use metrics::{counter, gauge};
 
 use crate::{Error, StormState};
 
-const PEER_CONNECTIONS: &str = "storm_peer_connections_total";
-const PEER_DISCONNECTIONS: &str = "storm_peer_disconnections_total";
-const HANDSHAKES_REJECTED: &str = "storm_handshakes_rejected_total";
-const INBOUND_CONNECTIONS_ACTIVE: &str = "storm_inbound_connections_active";
-const DNS_RESOLUTION_FAILURES: &str = "storm_dns_resolution_failures_total";
-const MESSAGES_REJECTED: &str = "storm_messages_rejected_total";
-const OUTBOUND_QUEUE_FULL: &str = "storm_outbound_queue_full_total";
-const CONNECTION_TIMEOUTS: &str = "storm_connection_timeouts_total";
-const PEER_PROTOCOL_VERSION: &str = "storm_peer_protocol_version";
+/// Declares a constant per metric name and `describe`, which registers the
+/// help text of each metric, in table order.
+macro_rules! metrics {
+    ($($describe:ident $name:ident = $metric:literal, $help:literal;)*) => {
+        $(const $name: &str = $metric;)*
+
+        /// Describes Storm's metrics to the installed recorder.
+        pub fn describe() {
+            $(metrics::$describe!($name, $help);)*
+        }
+    };
+}
+
+metrics! {
+    describe_counter PEER_CONNECTIONS = "storm_peer_connections_total",
+        "Connections established with a peer, by direction.";
+    describe_counter PEER_DISCONNECTIONS = "storm_peer_disconnections_total",
+        "Established peer connections that ended, by reason.";
+    describe_counter HANDSHAKES_REJECTED = "storm_handshakes_rejected_total",
+        "Connections rejected during the handshake or when claiming the peer's slot, by direction and reason.";
+    describe_gauge INBOUND_CONNECTIONS_ACTIVE = "storm_inbound_connections_active",
+        "Inbound connections open, handshakes included; the listener stops accepting at 128.";
+    describe_counter DNS_RESOLUTION_FAILURES = "storm_dns_resolution_failures_total",
+        "Failed lookups of a peer's DNS address.";
+    describe_counter MESSAGES_REJECTED = "storm_messages_rejected_total",
+        "Messages from a peer that were dropped, by reason.";
+    describe_counter OUTBOUND_QUEUE_FULL = "storm_outbound_queue_full_total",
+        "Messages not queued for a peer because it is not draining its queue.";
+    describe_counter CONNECTION_TIMEOUTS = "storm_connection_timeouts_total",
+        "Connection operations that timed out, by stage: connect, handshake, write or idle.";
+    describe_gauge PEER_PROTOCOL_VERSION = "storm_peer_protocol_version",
+        "Storm protocol version of the peer's latest message.";
+}
 
 /// Accepted inbound connections, each holding one of the listener's permits.
 static INBOUND_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -33,46 +57,6 @@ impl Direction {
             Self::Outbound => "outbound",
         }
     }
-}
-
-/// Describes Storm's metrics to the installed recorder.
-pub fn describe() {
-    describe_counter!(
-        PEER_CONNECTIONS,
-        "Connections established with a peer, by direction."
-    );
-    describe_counter!(
-        PEER_DISCONNECTIONS,
-        "Established peer connections that ended, by reason."
-    );
-    describe_counter!(
-        HANDSHAKES_REJECTED,
-        "Connections rejected during the handshake or when claiming the peer's slot, by direction and reason."
-    );
-    describe_gauge!(
-        INBOUND_CONNECTIONS_ACTIVE,
-        "Inbound connections open, handshakes included; the listener stops accepting at 128."
-    );
-    describe_counter!(
-        DNS_RESOLUTION_FAILURES,
-        "Failed lookups of a peer's DNS address."
-    );
-    describe_counter!(
-        MESSAGES_REJECTED,
-        "Messages from a peer that were dropped, by reason."
-    );
-    describe_counter!(
-        OUTBOUND_QUEUE_FULL,
-        "Messages not queued for a peer because it is not draining its queue."
-    );
-    describe_counter!(
-        CONNECTION_TIMEOUTS,
-        "Connection operations that timed out, by stage: connect, handshake, write or idle."
-    );
-    describe_gauge!(
-        PEER_PROTOCOL_VERSION,
-        "Storm protocol version of the peer's latest message."
-    );
 }
 
 /// Publishes Storm's gauges again, so a recorder that drops gauges left

@@ -6,6 +6,9 @@ use tokio::sync::mpsc;
 
 use crate::{CustomHandler, Error, Peer, PeerStatus, StormMessage, constants};
 
+/// X-only public keys that identify Storm members.
+type Identities = BTreeSet<[u8; 32]>;
+
 struct RecentMessage {
     fingerprint: [u8; 32],
     received_at: u64,
@@ -102,78 +105,77 @@ impl StormState {
         })
     }
 
-    pub(crate) fn peer_identities_unique(peers: &[Peer]) -> bool {
+    fn identities<'a>(peers: impl IntoIterator<Item = &'a Peer>) -> Identities {
         peers
-            .iter()
+            .into_iter()
             .map(|peer| Self::x_only_public_key(&peer.compressed_public_key))
-            .collect::<BTreeSet<_>>()
-            .len()
-            == peers.len()
+            .collect()
+    }
+
+    pub(crate) fn peer_identities_unique(peers: &[Peer]) -> bool {
+        Self::identities(peers).len() == peers.len()
+    }
+
+    /// The staged members and the identities of the staged peer table, if a
+    /// migration is staged and no identity repeats in the table.
+    fn unique_migration_identities(&self) -> Option<(&Identities, Identities)> {
+        let members = self.migration_members.as_ref()?;
+        let identities = Self::identities(&self.migration_peers);
+        (identities.len() == self.migration_peers.len()).then_some((members, identities))
     }
 
     pub(crate) fn migration_peer_identities_valid(&self) -> bool {
-        let Some(members) = &self.migration_members else {
-            return false;
-        };
-        let identities = self
-            .migration_peers
-            .iter()
-            .map(|peer| Self::x_only_public_key(&peer.compressed_public_key))
-            .collect::<BTreeSet<_>>();
-
-        identities.len() == self.migration_peers.len() && identities.is_subset(members)
+        self.unique_migration_identities()
+            .is_some_and(|(members, identities)| identities.is_subset(members))
     }
 
     pub(crate) fn migration_peer_table_matches_members(&self) -> bool {
-        let Some(members) = &self.migration_members else {
-            return false;
-        };
-        let identities = self
-            .migration_peers
-            .iter()
-            .map(|peer| Self::x_only_public_key(&peer.compressed_public_key))
-            .collect::<BTreeSet<_>>();
+        self.unique_migration_identities()
+            .is_some_and(|(members, identities)| &identities == members)
+    }
 
-        identities.len() == self.migration_peers.len() && &identities == members
+    /// Whether the staged peers that pass `include` are exactly the staged members.
+    fn migration_members_among(&self, include: impl Fn(&Peer) -> bool) -> bool {
+        if !self.migration_peer_table_matches_members() {
+            return false;
+        }
+        let members = self
+            .migration_members
+            .as_ref()
+            .expect("migration is staged");
+
+        &Self::identities(self.migration_peers.iter().filter(|peer| include(peer))) == members
     }
 
     pub(crate) fn migration_ready(&self) -> bool {
-        if !self.migration_peer_table_matches_members() {
-            return false;
-        }
-        let members = self
-            .migration_members
-            .as_ref()
-            .expect("migration is staged");
-        let connected = self
-            .migration_peers
-            .iter()
-            .filter(|peer| {
-                peer.compressed_public_key == self.initializer_public_key
-                    || peer.status == PeerStatus::Active
-            })
-            .map(|peer| Self::x_only_public_key(&peer.compressed_public_key))
-            .collect::<BTreeSet<_>>();
-
-        &connected == members
+        self.migration_members_among(|peer| {
+            peer.compressed_public_key == self.initializer_public_key
+                || peer.status == PeerStatus::Active
+        })
     }
 
     pub(crate) fn migration_table_complete(&self) -> bool {
-        if !self.migration_peer_table_matches_members() {
-            return false;
-        }
-        let members = self
-            .migration_members
-            .as_ref()
-            .expect("migration is staged");
-        let known = self
-            .migration_peers
-            .iter()
-            .filter(|peer| peer.socket_address.is_some())
-            .map(|peer| Self::x_only_public_key(&peer.compressed_public_key))
-            .collect::<BTreeSet<_>>();
+        self.migration_members_among(|peer| peer.socket_address.is_some())
+    }
 
-        &known == members
+    /// The checks a staged peer table passes before it can be read or activated.
+    pub(crate) fn ensure_migration_activatable(&self) -> Result<(), Error> {
+        if self.migration_members.is_none() {
+            return Err(Error::MigrationNotStaged);
+        }
+        if !self.migration_peer_identities_valid() {
+            return Err(Error::InvalidMigrationPeerTable);
+        }
+        if !self.migration_ready()
+            && (self.migration_contains(&self.initializer_public_key)
+                || !self.migration_table_complete())
+        {
+            return Err(Error::MigrationNotReady);
+        }
+        if !self.migration_peer_table_matches_members() {
+            return Err(Error::InvalidMigrationPeerTable);
+        }
+        Ok(())
     }
 
     pub(crate) fn connection_plan(&self) -> ConnectionPlan {
