@@ -10,9 +10,7 @@ use simplex::{
     simplicityhl::elements::{
         BlockHash, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction,
     },
-    transaction::{
-        FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, UTXO,
-    },
+    transaction::{FinalTransaction, PartialOutput, UTXO},
 };
 use storm::{PeerStatus, StormHandle};
 
@@ -36,7 +34,7 @@ use super::{
     droplets::member_script,
     message::{NodeMessage, NodeMessageKind, RenewStormUtxos},
     signing::SigningError,
-    user_requests::{STORM_EYE_TAG, asset_id, pack_proof},
+    user_requests::{asset_id, pack_proof},
     voting_execution::{
         VotingExecutionError, network, scan_storm_eye_utxos, scan_storm_eye_utxos_ignoring_mempool,
         signing_hashes, verify_voting_amounts,
@@ -570,13 +568,11 @@ fn build_transaction(
 
     let mut transaction = FinalTransaction::new();
     for (output_index, utxo) in storm_eye_utxos.iter().enumerate() {
-        transaction.add_program_input(
-            PartialInput::new(utxo.clone()),
-            ProgramInput::new(
-                Box::new(auth_program.as_ref().clone()),
-                placeholder_witness(&data, new_rescue_height, output_index as u32),
-            ),
-            RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+        elements::add_storm_eye_input(
+            &mut transaction,
+            utxo,
+            &auth_program,
+            placeholder_witness(&data, new_rescue_height, output_index as u32),
         );
     }
     let treasury = TreasuryProgram::new(&TreasuryArguments {
@@ -660,16 +656,16 @@ fn renewal_witness(
     branch: [u8; 32],
     proof: [Either<(), (bool, [u8; 32])>; storm_tree::TREE_DEPTH as usize],
 ) -> AuthWitness {
-    AuthWitness {
-        path: Either::Left((
-            (data.storm_tree_root, data.rescue_height),
-            (signature, branch, proof),
-            Either::Right(Either::Left(Either::Right((
-                new_rescue_height,
-                output_index,
-            )))),
-        )),
-    }
+    elements::storm_eye_witness(
+        data,
+        signature,
+        branch,
+        proof,
+        Either::Right(Either::Left(Either::Right((
+            new_rescue_height,
+            output_index,
+        )))),
+    )
 }
 
 fn renewal_due(block_height: u64, rescue_height: u32) -> bool {
