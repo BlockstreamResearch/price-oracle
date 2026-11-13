@@ -70,31 +70,46 @@ pub(crate) struct HighStormDependencies {
 }
 
 impl HighStormDependencies {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         network_store: crate::db::network::NetworkStore,
-        voting_store: crate::db::voting::VotingStore,
-        network_assets: crate::db::network_asset::NetworkAssetStore,
-        monitored_utxos: crate::db::monitored_utxo::MonitoredUtxoStore,
-        droplets: crate::db::droplet::DropletStore,
-        user_requests: crate::db::user_request::UserRequestStore,
-        price_attestations: crate::db::price_attestation::PriceAttestationStore,
         elements_rpc: crate::config::ElementsRpcConfig,
         protocol_config: crate::config::ProtocolConfig,
     ) -> Self {
-        let chain = network_store.chain();
         Self {
+            chain: network_store.chain(),
+            voting_store: network_store.voting(),
+            network_assets: network_store.network_assets(),
+            monitored_utxos: network_store.monitored_utxos(),
+            droplets: network_store.droplets(),
+            user_requests: network_store.user_requests(),
+            price_attestations: network_store.price_attestations(),
             network_store,
-            chain,
-            voting_store,
-            network_assets,
-            monitored_utxos,
-            droplets,
-            user_requests,
-            price_attestations,
             elements_rpc,
             protocol_config,
         }
+    }
+
+    /// The stores of `database`, with an Elements node nothing listens on.
+    #[cfg(test)]
+    pub(crate) fn for_tests(database: &crate::db::Database) -> Self {
+        Self::new(
+            database.network(),
+            crate::config::ElementsRpcConfig {
+                url: "http://127.0.0.1:18884".to_string(),
+                username: "unused".to_string(),
+                password: "unused".to_string(),
+                wallet: "unused".to_string(),
+            },
+            crate::config::ProtocolConfig {
+                operational_fee_sats: 1_000,
+                tick_burn_reserve_sats: 1_000,
+                issuance_transaction_fee_sats: 1_000,
+                burn_transaction_fee_sats: 500,
+                exchange_transaction_fee_sats: 500,
+                tick_lifetime_blocks: 60,
+                finality_confirmations: 2,
+            },
+        )
     }
 }
 
