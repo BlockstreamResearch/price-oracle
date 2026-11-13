@@ -118,11 +118,7 @@ async fn stalled_uploads_do_not_take_execution_slots() {
             }
         },
     ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let (address, server) = crate::high_storm::test_rpc::serve(app).await;
     let mut uploads = Vec::new();
     for _ in 0..MAX_API_BODY_READS {
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
@@ -848,10 +844,7 @@ async fn classifies_fee_utxos_reserved_for_burning() {
         .monitored_utxos()
         .apply_block(
             "burning-v1",
-            &IndexedBlock {
-                height: 10,
-                hash: [10; 32],
-            },
+            &IndexedBlock::at(10),
             &[MonitoredUtxo {
                 txid: [1; 32],
                 output_index: 2,
@@ -1729,7 +1722,7 @@ async fn response_json(response: Response) -> serde_json::Value {
     serde_json::from_slice(&body).unwrap()
 }
 
-fn sign(private_key: &PrivateKey, message: &str) -> String {
+pub(crate) fn sign(private_key: &PrivateKey, message: &str) -> String {
     let public_key = private_key
         .public_key(&secp256k1::Secp256k1::new())
         .inner
@@ -1750,7 +1743,7 @@ fn sign(private_key: &PrivateKey, message: &str) -> String {
     .unwrap()
 }
 
-fn sign_humid(private_key: &PrivateKey, message: &str) -> String {
+pub(crate) fn sign_humid(private_key: &PrivateKey, message: &str) -> String {
     let message = Message::from_digest(signed_msg_hash(message).to_byte_array());
     let signature =
         secp256k1::Secp256k1::signing_only().sign_ecdsa_recoverable(&message, &private_key.inner);

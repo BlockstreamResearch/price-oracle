@@ -673,10 +673,7 @@ mod tests {
         store
             .apply_block(
                 "droplets-v1",
-                &IndexedBlock {
-                    height: 10,
-                    hash: [10; 32],
-                },
+                &IndexedBlock::at(10),
                 &[TreasuryTransaction {
                     txid: [4; 32],
                     inputs: vec![],
@@ -719,10 +716,7 @@ mod tests {
         store
             .apply_block(
                 "droplets-v1",
-                &IndexedBlock {
-                    height: 12,
-                    hash: [12; 32],
-                },
+                &IndexedBlock::at(12),
                 &[TreasuryTransaction {
                     txid: [5; 32],
                     inputs: vec![([4; 32], 0)],
@@ -829,10 +823,7 @@ mod tests {
         let database = Database::connect("sqlite::memory:", 1).await.unwrap();
         let store = database.droplets();
         let members = [[1; 32]];
-        let block = IndexedBlock {
-            height: 61,
-            hash: [61; 32],
-        };
+        let block = IndexedBlock::at(61);
         let tick = MonitoredUtxo {
             txid: [9; 32],
             output_index: 0,
@@ -858,15 +849,7 @@ mod tests {
             exchange_member: None,
         };
         store
-            .apply_block(
-                "droplets-v1",
-                &IndexedBlock {
-                    height: 60,
-                    hash: [60; 32],
-                },
-                &[deposit],
-                &members,
-            )
+            .apply_block("droplets-v1", &IndexedBlock::at(60), &[deposit], &members)
             .await
             .unwrap();
         let unmarked_spend = TreasuryTransaction {
@@ -930,10 +913,7 @@ mod tests {
         store
             .apply_block(
                 "droplets-v1",
-                &IndexedBlock {
-                    height: 10,
-                    hash: [10; 32],
-                },
+                &IndexedBlock::at(10),
                 &[
                     TreasuryTransaction {
                         txid: [10; 32],
@@ -957,10 +937,7 @@ mod tests {
         store
             .apply_block(
                 "droplets-v1",
-                &IndexedBlock {
-                    height: 11,
-                    hash: [11; 32],
-                },
+                &IndexedBlock::at(11),
                 &[TreasuryTransaction {
                     txid: [12; 32],
                     inputs: vec![([10; 32], 0)],
@@ -979,10 +956,7 @@ mod tests {
         store
             .apply_block(
                 "droplets-v1",
-                &IndexedBlock {
-                    height: 13,
-                    hash: [13; 32],
-                },
+                &IndexedBlock::at(13),
                 &[
                     TreasuryTransaction {
                         txid: [13; 32],
@@ -1006,10 +980,7 @@ mod tests {
         store
             .apply_block(
                 "droplets-v1",
-                &IndexedBlock {
-                    height: 14,
-                    hash: [14; 32],
-                },
+                &IndexedBlock::at(14),
                 &[TreasuryTransaction {
                     txid: [15; 32],
                     inputs: vec![([13; 32], 0)],
@@ -1037,10 +1008,7 @@ mod tests {
             store
                 .apply_block(
                     "droplets-v1",
-                    &IndexedBlock {
-                        height: 15,
-                        hash: [15; 32],
-                    },
+                    &IndexedBlock::at(15),
                     &[removed_member_exchange],
                     &next_members,
                 )
@@ -1060,10 +1028,7 @@ mod tests {
         store
             .apply_block(
                 "droplets-v1",
-                &IndexedBlock {
-                    height: 10,
-                    hash: [10; 32],
-                },
+                &IndexedBlock::at(10),
                 &[TreasuryTransaction {
                     txid: [4; 32],
                     inputs: vec![],
@@ -1089,10 +1054,7 @@ mod tests {
         store
             .apply_block(
                 "droplets-v1",
-                &IndexedBlock {
-                    height: 10,
-                    hash: [10; 32],
-                },
+                &IndexedBlock::at(10),
                 &[TreasuryTransaction {
                     txid: [4; 32],
                     inputs: vec![],
@@ -1116,10 +1078,7 @@ mod tests {
             store
                 .apply_block(
                     "droplets-v1",
-                    &IndexedBlock {
-                        height: 11,
-                        hash: [11; 32],
-                    },
+                    &IndexedBlock::at(11),
                     std::slice::from_ref(&invalid_spend),
                     &[member],
                 )
@@ -1135,10 +1094,7 @@ mod tests {
         store
             .apply_block(
                 "droplets-v1",
-                &IndexedBlock {
-                    height: 11,
-                    hash: [11; 32],
-                },
+                &IndexedBlock::at(11),
                 &[TreasuryTransaction {
                     exchange_member: Some(member),
                     ..invalid_spend

@@ -1770,9 +1770,7 @@ mod inventory_tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (address, server) = crate::high_storm::test_rpc::serve(app).await;
         let result = tokio::task::spawn_blocking(move || {
             let client =
                 Client::new(&format!("http://{address}"), bitcoincore_rpc::Auth::None).unwrap();

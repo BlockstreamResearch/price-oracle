@@ -703,11 +703,13 @@ fn unix_time() -> Result<u64, AuthError> {
 mod tests {
     use bitcoin::{
         Network, PrivateKey,
-        secp256k1::{self, Message, Secp256k1},
-        sign_message::signed_msg_hash,
+        secp256k1::{self, Secp256k1},
     };
 
-    use crate::db::Database;
+    use crate::{
+        db::Database,
+        external_api::tests::{sign, sign_humid},
+    };
 
     use super::*;
 
@@ -1017,36 +1019,5 @@ mod tests {
             private_key,
             hex::encode(public_key),
         )
-    }
-
-    fn sign_humid(private_key: &PrivateKey, message: &str) -> String {
-        let message = Message::from_digest(signed_msg_hash(message).to_byte_array());
-        let signature =
-            Secp256k1::signing_only().sign_ecdsa_recoverable(&message, &private_key.inner);
-        let (recovery_id, compact) = signature.serialize_compact();
-        let mut encoded = Vec::from(compact);
-        encoded.push(recovery_id.to_i32() as u8);
-        hex::encode(encoded)
-    }
-
-    fn sign(private_key: &PrivateKey, message: &str) -> String {
-        let public_key = private_key
-            .public_key(&secp256k1::Secp256k1::new())
-            .inner
-            .x_only_public_key()
-            .0;
-        bip322::sign_simple_encoded(
-            &Address::p2tr(
-                &secp256k1::Secp256k1::new(),
-                public_key,
-                None,
-                Network::Regtest,
-            )
-            .to_string(),
-            message,
-            &[private_key.to_wif()],
-            None,
-        )
-        .unwrap()
     }
 }
