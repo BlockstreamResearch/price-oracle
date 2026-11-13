@@ -9,7 +9,7 @@ use simplex::provider::SimplicityNetwork;
 use simplex::simplicityhl::elements::{
     AssetId, Script, Transaction, TxIn, TxOut, TxOutSecrets,
     confidential::{AssetBlindingFactor, ValueBlindingFactor},
-    encode, opcodes,
+    encode,
     script::Instruction,
 };
 use simplex::utils::hash_script;
@@ -18,6 +18,8 @@ use storm::{PeerStatus, StormContext, StormHandle};
 use storm_tree::StormTree;
 use url::Url;
 
+use crate::high_storm::elements;
+use crate::high_storm::elements::{ChainInfo, SidechainInfo};
 use crate::{
     NetworkAsset, NetworkAssets,
     config::ElementsRpcConfig,
@@ -137,18 +139,10 @@ fn members_script(
 pub(crate) fn initial_members_from_script(
     script: &Script,
 ) -> Result<Option<Vec<[u8; 32]>>, AssetError> {
-    let mut instructions = script.instructions_minimal();
-    if !matches!(
-        instructions.next(),
-        Some(Ok(Instruction::Op(opcodes::all::OP_RETURN)))
-    ) {
-        return Ok(None);
-    }
-    let Some(Ok(Instruction::PushBytes(data))) = instructions.next() else {
+    let Some(data) = elements::op_return_data(script) else {
         return Ok(None);
     };
-    if instructions.next().is_some()
-        || data.len() < INITIAL_MEMBERS_MAGIC.len()
+    if data.len() < INITIAL_MEMBERS_MAGIC.len()
         || data[..INITIAL_MEMBERS_MAGIC.len()] != INITIAL_MEMBERS_MAGIC
     {
         return Ok(None);
@@ -173,18 +167,8 @@ pub(crate) fn initial_members_from_script(
 
 /// Parses third-party chain data, so a malformed payload is "not a marker" rather than an error.
 pub(crate) fn migrated_members_proposer_from_script(script: &Script) -> Option<[u8; 32]> {
-    let mut instructions = script.instructions_minimal();
-    if !matches!(
-        instructions.next(),
-        Some(Ok(Instruction::Op(opcodes::all::OP_RETURN)))
-    ) {
-        return None;
-    }
-    let Some(Ok(Instruction::PushBytes(data))) = instructions.next() else {
-        return None;
-    };
-    if instructions.next().is_some()
-        || data.len() < INITIAL_MEMBERS_MAGIC.len()
+    let data = elements::op_return_data(script)?;
+    if data.len() < INITIAL_MEMBERS_MAGIC.len()
         || data[..INITIAL_MEMBERS_MAGIC.len()] != INITIAL_MEMBERS_MAGIC
     {
         return None;
@@ -312,10 +296,7 @@ impl Assets {
         };
         let client = crate::monitoring::elements_client(
             &self.elements_rpc.url,
-            Auth::UserPass(
-                self.elements_rpc.username.clone(),
-                self.elements_rpc.password.clone(),
-            ),
+            self.elements_rpc.auth(),
             "asset",
         )?;
         let asset = asset.clone();
@@ -879,7 +860,7 @@ impl ElementsAssetIssuer {
 
         Ok(Self {
             rpc_url: url.to_string(),
-            auth: Auth::UserPass(config.username.clone(), config.password.clone()),
+            auth: config.auth(),
         })
     }
 
@@ -1291,16 +1272,6 @@ impl ReissuableAssetIssuer for ElementsAssetIssuer {
     ) -> Result<PendingNetworkAsset, AssetError> {
         self.prepare_reissuable_asset(kind, name, storm_eye_asset_id)
     }
-}
-
-#[derive(Deserialize)]
-struct ChainInfo {
-    chain: String,
-}
-
-#[derive(Deserialize)]
-struct SidechainInfo {
-    pegged_asset: String,
 }
 
 #[derive(Deserialize)]

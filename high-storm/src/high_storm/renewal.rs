@@ -1,4 +1,4 @@
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Client, RpcApi};
 use contracts::artifacts::{
     auth::derived_auth::AuthWitness,
     treasury::{
@@ -7,7 +7,6 @@ use contracts::artifacts::{
     },
 };
 use secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
-use serde::Deserialize;
 use simplex::{
     either::Either,
     provider::SimplicityNetwork,
@@ -19,8 +18,8 @@ use simplex::{
     },
 };
 use storm::{PeerStatus, StormHandle};
-use url::Url;
 
+use crate::high_storm::elements::RawTransactionInfo;
 use crate::{
     NetworkAsset,
     config::ElementsRpcConfig,
@@ -473,18 +472,10 @@ impl Renewal {
     }
 
     fn client(&self) -> Result<Client, RenewalError> {
-        let mut url = Url::parse(&self.elements_rpc.url)?;
-        url.path_segments_mut()
-            .map_err(|_| url::ParseError::RelativeUrlWithCannotBeABaseBase)?
-            .pop_if_empty()
-            .push("wallet")
-            .push(&self.elements_rpc.wallet);
+        let url = self.elements_rpc.wallet_url()?;
         Ok(crate::monitoring::elements_client(
             url.as_str(),
-            Auth::UserPass(
-                self.elements_rpc.username.clone(),
-                self.elements_rpc.password.clone(),
-            ),
+            self.elements_rpc.auth(),
             "renewal",
         )?)
     }
@@ -758,14 +749,6 @@ fn live_treasury_utxo(
             )?,
         )
     }
-}
-
-#[derive(Deserialize)]
-struct RawTransactionInfo {
-    #[serde(default)]
-    confirmations: u64,
-    #[serde(default, rename = "blockhash")]
-    block_hash: Option<String>,
 }
 
 pub(crate) async fn announce(

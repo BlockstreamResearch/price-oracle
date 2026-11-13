@@ -5,8 +5,8 @@ use contracts::artifacts::account::{AccountProgram, derived_account::AccountArgu
 use serde::Deserialize;
 use serde_json::{Number, Value};
 use simplex::{provider::SimplicityNetwork, simplicityhl::elements::secp256k1_zkp::XOnlyPublicKey};
-use url::Url;
 
+use crate::high_storm::elements::{ChainInfo, SidechainInfo};
 use crate::{
     config::{ElementsRpcConfig, ProtocolConfig},
     db::{
@@ -75,17 +75,12 @@ impl FeeUtxoValidator {
         monitored_utxos: MonitoredUtxoStore,
         protocol: &ProtocolConfig,
     ) -> Result<Self, FeeUtxoValidationError> {
-        let mut url = Url::parse(&config.url)?;
-        url.path_segments_mut()
-            .map_err(|_| url::ParseError::RelativeUrlWithCannotBeABaseBase)?
-            .pop_if_empty()
-            .push("wallet")
-            .push(&config.wallet);
+        let url = config.wallet_url()?;
 
         Ok(Self {
             inner: FeeUtxoValidatorInner::Elements(Arc::new(ElementsFeeUtxoValidator {
                 rpc_url: url.to_string(),
-                auth: Auth::UserPass(config.username.clone(), config.password.clone()),
+                auth: config.auth(),
                 assets,
                 protocol: protocol.clone(),
             })),
@@ -292,16 +287,6 @@ pub(crate) fn parse_coin_value(value: &Number) -> Option<u64> {
         let divisor = 10u64.checked_pow(scale.unsigned_abs())?;
         (digits % divisor == 0).then_some(digits / divisor)
     }
-}
-
-#[derive(Deserialize)]
-struct ChainInfo {
-    chain: String,
-}
-
-#[derive(Deserialize)]
-struct SidechainInfo {
-    pegged_asset: String,
 }
 
 #[derive(Deserialize)]

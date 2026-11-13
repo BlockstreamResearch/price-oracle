@@ -3,7 +3,7 @@ use std::{
     str::FromStr,
 };
 
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Client, RpcApi};
 use contracts::artifacts::{
     auth::derived_auth::AuthWitness,
     treasury::{
@@ -26,8 +26,9 @@ use simplex::{
     },
 };
 use storm_tree::{StormTree, StormTreeProof};
-use url::Url;
 
+use crate::high_storm::elements;
+use crate::high_storm::elements::RawTransactionInfo;
 use crate::{
     ExecuteVotingRequest, MergeStormEyes, NetworkAsset, NetworkVoteKind, NodeMessage,
     SplitStormEye, StormEyeUtxo, UpdateNetworkMembers,
@@ -778,18 +779,10 @@ impl VotingExecution {
     }
 
     fn client(&self) -> Result<Client, VotingExecutionError> {
-        let mut url = Url::parse(&self.elements_rpc.url)?;
-        url.path_segments_mut()
-            .map_err(|_| url::ParseError::RelativeUrlWithCannotBeABaseBase)?
-            .pop_if_empty()
-            .push("wallet")
-            .push(&self.elements_rpc.wallet);
+        let url = self.elements_rpc.wallet_url()?;
         Ok(crate::monitoring::elements_client(
             url.as_str(),
-            Auth::UserPass(
-                self.elements_rpc.username.clone(),
-                self.elements_rpc.password.clone(),
-            ),
+            self.elements_rpc.auth(),
             "voting",
         )?)
     }
@@ -938,14 +931,6 @@ struct ScannedUtxo {
     #[serde(default)]
     asset: Option<String>,
     height: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct RawTransactionInfo {
-    #[serde(default)]
-    confirmations: u64,
-    #[serde(default, rename = "blockhash")]
-    block_hash: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1684,36 +1669,9 @@ pub(crate) fn signing_hashes(
 }
 
 pub(crate) fn network(client: &Client) -> Result<SimplicityNetwork, VotingExecutionError> {
-    #[derive(serde::Deserialize)]
-    struct ChainInfo {
-        chain: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct SidechainInfo {
-        pegged_asset: String,
-    }
-
-    let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
-    match chain.chain.as_str() {
-        "liquidv1" => Ok(SimplicityNetwork::Liquid),
-        "liquidtestnet" => Ok(SimplicityNetwork::LiquidTestnet),
-        "elementsregtest" => {
-            let sidechain: SidechainInfo = client.call("getsidechaininfo", &[])?;
-            let genesis_hash: String = client.call("getblockhash", &[0.into()])?;
-            Ok(SimplicityNetwork::ElementsCustom {
-                policy_asset: AssetId::from_str(&sidechain.pegged_asset).map_err(|_| {
-                    VotingExecutionError::Invalid("invalid regtest policy asset".into())
-                })?,
-                genesis_hash: BlockHash::from_str(&genesis_hash).map_err(|_| {
-                    VotingExecutionError::Invalid("invalid regtest genesis hash".into())
-                })?,
-            })
-        }
-        _ => Err(VotingExecutionError::Invalid(format!(
-            "unsupported Elements chain '{}'",
-            chain.chain
-        ))),
-    }
+    elements::network(client, VotingExecutionError::Invalid, |chain| {
+        VotingExecutionError::Invalid(format!("unsupported Elements chain '{chain}'"))
+    })
 }
 
 #[cfg(test)]

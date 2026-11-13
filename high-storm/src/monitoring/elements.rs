@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Client, RpcApi};
 use metrics::gauge;
 use serde::Deserialize;
 use tokio::time::MissedTickBehavior;
@@ -45,7 +45,7 @@ pub(super) fn tip_height() -> Option<u64> {
 pub fn spawn_elements_probe(config: &ElementsRpcConfig) -> Result<(), bitcoincore_rpc::Error> {
     let client = Arc::new(super::rpc::elements_client(
         &config.url,
-        Auth::UserPass(config.username.clone(), config.password.clone()),
+        config.auth(),
         "probe",
     )?);
     super::health::record_task_started(super::health::MonitoringTask::ElementsProbe);

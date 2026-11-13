@@ -3,7 +3,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Client, RpcApi};
 use contracts::artifacts::{
     account::{AccountProgram, derived_account::AccountArguments},
     auth::derived_auth::AuthWitness,
@@ -31,8 +31,9 @@ use simplex::{
         partial_input::IssuanceInput, utxo::UTXO,
     },
 };
-use url::Url;
 
+use crate::high_storm::elements::RawTransactionInfo;
+use crate::high_storm::elements::{ChainInfo, SidechainInfo};
 use crate::{
     NetworkAsset,
     config::{ElementsRpcConfig, ProtocolConfig},
@@ -1006,18 +1007,10 @@ impl UserRequestProcessor {
     }
 
     fn client(&self) -> Result<Client, UserRequestError> {
-        let mut url = Url::parse(&self.elements_rpc.url)?;
-        url.path_segments_mut()
-            .map_err(|_| url::ParseError::RelativeUrlWithCannotBeABaseBase)?
-            .pop_if_empty()
-            .push("wallet")
-            .push(&self.elements_rpc.wallet);
+        let url = self.elements_rpc.wallet_url()?;
         Ok(crate::monitoring::elements_client(
             url.as_str(),
-            Auth::UserPass(
-                self.elements_rpc.username.clone(),
-                self.elements_rpc.password.clone(),
-            ),
+            self.elements_rpc.auth(),
             "issuance",
         )?)
     }
@@ -1584,11 +1577,6 @@ struct GetTxOut {
 #[derive(Deserialize)]
 struct GetTxOutScript {
     hex: String,
-}
-
-#[derive(Deserialize)]
-struct SidechainInfo {
-    pegged_asset: String,
 }
 
 pub(crate) fn get_explicit_outpoint(
@@ -2494,11 +2482,6 @@ fn decode_array(encoded: &str) -> Result<[u8; 32], UserRequestError> {
 }
 
 #[derive(Deserialize)]
-struct ChainInfo {
-    chain: String,
-}
-
-#[derive(Deserialize)]
 struct ScanResult {
     unspents: Vec<ScannedUtxo>,
 }
@@ -2517,17 +2500,10 @@ struct SpendingPrevout {
     spending_txid: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct RawTransactionInfo {
-    #[serde(default)]
-    confirmations: u64,
-    #[serde(default, rename = "blockhash")]
-    block_hash: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoincore_rpc::Auth;
     use secp256k1::{Keypair, SecretKey, schnorr};
 
     const NOW: u64 = 1_700_000_000;

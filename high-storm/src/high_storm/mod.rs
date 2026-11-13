@@ -11,6 +11,7 @@ use crate::monitoring::{self, RenewalOutcome};
 mod assets;
 mod burning;
 mod droplets;
+pub(crate) mod elements;
 mod handler;
 mod indexer;
 mod issuance;

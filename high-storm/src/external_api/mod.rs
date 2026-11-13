@@ -25,8 +25,8 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
-use bitcoincore_rpc::{Auth, RpcApi};
-use serde::{Deserialize, Serialize};
+use bitcoincore_rpc::RpcApi;
+use serde::Serialize;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
@@ -38,6 +38,7 @@ use tower_http::{
     timeout::TimeoutLayer,
 };
 
+use crate::high_storm::elements::ChainInfo;
 use crate::{
     HighStormHandle, VotingError,
     db::{Database, node_operator::NodeOperatorStore, user_request::UserRequestStore},
@@ -420,20 +421,11 @@ pub enum ExternalApiError {
     ChainDetectionTask(#[from] tokio::task::JoinError),
 }
 
-#[derive(Deserialize)]
-struct ChainInfo {
-    chain: String,
-}
-
 async fn detect_auth_network(
     elements_rpc: crate::config::ElementsRpcConfig,
 ) -> Result<AuthNetwork, ExternalApiError> {
     tokio::task::spawn_blocking(move || {
-        let client = monitoring::elements_client(
-            &elements_rpc.url,
-            Auth::UserPass(elements_rpc.username, elements_rpc.password),
-            "api",
-        )?;
+        let client = monitoring::elements_client(&elements_rpc.url, elements_rpc.auth(), "api")?;
         let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
         AuthNetwork::from_chain(&chain.chain)
             .ok_or_else(|| ExternalApiError::UnsupportedChain(chain.chain))
