@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Client, RpcApi};
 use contracts::artifacts::{
     auth::derived_auth::AuthWitness,
     treasury::{
@@ -9,7 +9,6 @@ use contracts::artifacts::{
     },
 };
 use secp256k1_zkp::{Message, PublicKey, Secp256k1, XOnlyPublicKey, schnorr::Signature};
-use simplex::simplicityhl::elements::{opcodes, script::Instruction};
 use simplex::{
     either::Either,
     program::ProgramTrait,
@@ -17,16 +16,15 @@ use simplex::{
     simplicityhl::{
         WitnessValues,
         elements::{
-            Address, AddressParams, AssetId, BlockHash, Script, TxOut, Txid, encode,
-            pset::PartiallySignedTransaction,
+            Address, AddressParams, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction,
         },
     },
     transaction::{
         FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
     },
 };
-use url::Url;
 
+use crate::high_storm::elements;
 use crate::{
     NetworkAsset,
     config::ElementsRpcConfig,
@@ -606,53 +604,18 @@ impl Droplets {
     }
 
     fn client(&self) -> Result<Client, DropletsError> {
-        let mut url = Url::parse(&self.elements_rpc.url)?;
-        url.path_segments_mut()
-            .map_err(|_| url::ParseError::RelativeUrlWithCannotBeABaseBase)?
-            .pop_if_empty()
-            .push("wallet")
-            .push(&self.elements_rpc.wallet);
+        let url = self.elements_rpc.wallet_url()?;
         Ok(crate::monitoring::elements_client(
             url.as_str(),
-            Auth::UserPass(
-                self.elements_rpc.username.clone(),
-                self.elements_rpc.password.clone(),
-            ),
+            self.elements_rpc.auth(),
             "exchange",
         )?)
     }
 
     fn network(&self, client: &Client) -> Result<SimplicityNetwork, DropletsError> {
-        #[derive(serde::Deserialize)]
-        struct ChainInfo {
-            chain: String,
-        }
-        #[derive(serde::Deserialize)]
-        struct SidechainInfo {
-            pegged_asset: String,
-        }
-
-        let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
-        match chain.chain.as_str() {
-            "liquidv1" => Ok(SimplicityNetwork::Liquid),
-            "liquidtestnet" => Ok(SimplicityNetwork::LiquidTestnet),
-            "elementsregtest" => {
-                let sidechain: SidechainInfo = client.call("getsidechaininfo", &[])?;
-                let genesis_hash: String = client.call("getblockhash", &[0.into()])?;
-                Ok(SimplicityNetwork::ElementsCustom {
-                    policy_asset: AssetId::from_str(&sidechain.pegged_asset).map_err(|_| {
-                        DropletsError::Invalid("invalid regtest policy asset".into())
-                    })?,
-                    genesis_hash: BlockHash::from_str(&genesis_hash).map_err(|_| {
-                        DropletsError::Invalid("invalid regtest genesis hash".into())
-                    })?,
-                })
-            }
-            _ => Err(DropletsError::Invalid(format!(
-                "unsupported Elements chain '{}'",
-                chain.chain
-            ))),
-        }
+        elements::network(client, DropletsError::Invalid, |chain| {
+            DropletsError::Invalid(format!("unsupported Elements chain '{chain}'"))
+        })
     }
 }
 
@@ -675,21 +638,8 @@ fn address_params(network: &SimplicityNetwork) -> &'static AddressParams {
 }
 
 pub(crate) fn member_from_script(script: &Script) -> Option<[u8; 32]> {
-    let mut instructions = script.instructions_minimal();
-    if !matches!(
-        instructions.next(),
-        Some(Ok(Instruction::Op(opcodes::all::OP_RETURN)))
-    ) {
-        return None;
-    }
-    let Some(Ok(Instruction::PushBytes(data))) = instructions.next() else {
-        return None;
-    };
-    if instructions.next().is_some()
-        || data.len() != MEMBER_DATA_LEN
-        || data[..2] != MEMBER_MAGIC
-        || data[2] != MEMBER_VERSION
-    {
+    let data = elements::op_return_data(script)?;
+    if data.len() != MEMBER_DATA_LEN || data[..2] != MEMBER_MAGIC || data[2] != MEMBER_VERSION {
         return None;
     }
     data[3..].try_into().ok()
@@ -892,7 +842,7 @@ mod tests {
     use crate::NetworkAsset;
     use secp256k1_zkp::SecretKey;
     use simplex::simplicityhl::elements::{
-        LockTime, OutPoint, Transaction, TxIn, TxOut, TxOutSecrets, Txid,
+        AssetId, BlockHash, LockTime, OutPoint, Transaction, TxIn, TxOut, TxOutSecrets, Txid,
         confidential::{self, AssetBlindingFactor, ValueBlindingFactor},
     };
 

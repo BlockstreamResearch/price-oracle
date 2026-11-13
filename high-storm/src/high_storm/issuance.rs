@@ -1,11 +1,12 @@
 use contracts::artifacts::voucher::{VoucherProgram, derived_voucher::VoucherArguments};
 use simplex::{
     provider::SimplicityNetwork,
-    simplicityhl::elements::{Script, opcodes, schnorr::XOnlyPublicKey, script::Instruction},
+    simplicityhl::elements::{Script, schnorr::XOnlyPublicKey},
     utils::hash_script,
 };
 
 use crate::external_api::users::UtxoAuthMethod;
+use crate::high_storm::elements;
 
 const DESCRIPTOR_MAGIC: [u8; 2] = *b"OT";
 /// Ticks only; still read for older issuances.
@@ -99,19 +100,10 @@ impl IssuedUtxoDescriptor {
     }
 
     pub(crate) fn from_script(script: &Script) -> Result<Option<Vec<Self>>, String> {
-        let mut instructions = script.instructions_minimal();
-        if !matches!(
-            instructions.next(),
-            Some(Ok(Instruction::Op(opcodes::all::OP_RETURN)))
-        ) {
-            return Ok(None);
-        }
-        let Some(Ok(Instruction::PushBytes(data))) = instructions.next() else {
+        let Some(data) = elements::op_return_data(script) else {
             return Ok(None);
         };
-        if instructions.next().is_some()
-            || data.len() < DESCRIPTOR_MAGIC.len()
-            || data[..DESCRIPTOR_MAGIC.len()] != DESCRIPTOR_MAGIC
+        if data.len() < DESCRIPTOR_MAGIC.len() || data[..DESCRIPTOR_MAGIC.len()] != DESCRIPTOR_MAGIC
         {
             return Ok(None);
         }
@@ -263,6 +255,7 @@ fn decode_32(encoded: &str, name: &str) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use simplex::simplicityhl::elements::{opcodes, script::Instruction};
 
     const SIGNER: [u8; 32] = [
         0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b,

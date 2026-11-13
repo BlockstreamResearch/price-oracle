@@ -3,29 +3,27 @@ use std::{
     str::FromStr,
 };
 
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Client, RpcApi};
 use contracts::artifacts::{
     account::{AccountProgram, derived_account::AccountArguments},
     auth::derived_auth::AuthWitness,
 };
 use contracts::voucher::VoucherSpendPath;
 use secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
-use serde::Deserialize;
 use simplex::{
     either::Either,
     program::ProgramTrait,
     provider::SimplicityNetwork,
     simplicityhl::elements::{
-        AssetId, BlockHash, Script, Transaction, TxOut, Txid, encode,
-        pset::PartiallySignedTransaction,
+        AssetId, Script, Transaction, TxOut, Txid, encode, pset::PartiallySignedTransaction,
     },
     transaction::{
         FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
         utxo::UTXO,
     },
 };
-use url::Url;
 
+use crate::high_storm::elements;
 use crate::{
     NetworkAsset,
     config::{ElementsRpcConfig, ProtocolConfig},
@@ -725,39 +723,18 @@ impl Burning {
 
     fn network(&self) -> Result<SimplicityNetwork, BurningError> {
         let client = self.client()?;
-        let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
-        match chain.chain.as_str() {
-            "liquidv1" => Ok(SimplicityNetwork::Liquid),
-            "liquidtestnet" => Ok(SimplicityNetwork::LiquidTestnet),
-            "elementsregtest" => {
-                let sidechain: SidechainInfo = client.call("getsidechaininfo", &[])?;
-                let genesis_hash: String = client.call("getblockhash", &[0.into()])?;
-                Ok(SimplicityNetwork::ElementsCustom {
-                    policy_asset: AssetId::from_str(&sidechain.pegged_asset).map_err(|_| {
-                        BurningError::Invalid("invalid regtest policy asset".into())
-                    })?,
-                    genesis_hash: BlockHash::from_str(&genesis_hash).map_err(|_| {
-                        BurningError::Invalid("invalid regtest genesis hash".into())
-                    })?,
-                })
-            }
-            _ => Err(BurningError::UnsupportedChain(chain.chain)),
-        }
+        elements::network(
+            &client,
+            BurningError::Invalid,
+            BurningError::UnsupportedChain,
+        )
     }
 
     fn client(&self) -> Result<Client, BurningError> {
-        let mut url = Url::parse(&self.elements_rpc.url)?;
-        url.path_segments_mut()
-            .map_err(|_| url::ParseError::RelativeUrlWithCannotBeABaseBase)?
-            .pop_if_empty()
-            .push("wallet")
-            .push(&self.elements_rpc.wallet);
+        let url = self.elements_rpc.wallet_url()?;
         Ok(crate::monitoring::elements_client(
             url.as_str(),
-            Auth::UserPass(
-                self.elements_rpc.username.clone(),
-                self.elements_rpc.password.clone(),
-            ),
+            self.elements_rpc.auth(),
             "burn",
         )?)
     }
@@ -1317,20 +1294,11 @@ fn decode_32(bytes: &[u8]) -> Result<[u8; 32], BurningError> {
         .map_err(|_| BurningError::Invalid("invalid 32-byte covenant argument".into()))
 }
 
-#[derive(Deserialize)]
-struct ChainInfo {
-    chain: String,
-}
-
-#[derive(Deserialize)]
-struct SidechainInfo {
-    pegged_asset: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{external_api::users::UtxoAuthMethod, high_storm::issuance::IssuedUtxoDescriptor};
+    use simplex::simplicityhl::elements::BlockHash;
 
     /// x of the secp256k1 generator, a valid signing branch.
     const SIGNER: [u8; 32] = [
