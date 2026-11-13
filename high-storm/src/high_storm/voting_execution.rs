@@ -193,11 +193,7 @@ impl VotingExecution {
         let ReshapeOperation::UpdateMembers { new_root, .. } = operation else {
             return Ok(None);
         };
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(VotingExecutionError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let network = network(&self.client()?)?;
         Ok(Some(migrated_storm_eye(&storm_eye, new_root, &network)?))
     }
@@ -206,11 +202,7 @@ impl VotingExecution {
         &self,
         block_height: u64,
     ) -> Result<Vec<StormEyeInventoryItem>, VotingExecutionError> {
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(VotingExecutionError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let reservations = storm_eye_reservations(&self.votes.list().await?)?;
         let client = self.client()?;
         let descriptor = format!("raw({})", hex::encode(&storm_eye.contract_script));
@@ -288,11 +280,7 @@ impl VotingExecution {
             .proposer_public_key
             .ok_or(VotingExecutionError::MissingProposer)?;
         let operation = decode_operation(stored, current_members)?;
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(VotingExecutionError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let indexed_treasury = self.droplets.treasury_utxos().await?;
         let client = self.client()?;
         let network = network(&client)?;
@@ -408,11 +396,7 @@ impl VotingExecution {
             ));
         }
         let operation = decode_operation(&stored, current_members)?;
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(VotingExecutionError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let indexed_treasury = self.droplets.treasury_utxos().await?;
         let client = self.client()?;
         let network = network(&client)?;
@@ -762,6 +746,12 @@ impl VotingExecution {
         Err(VotingExecutionError::Invalid(
             "Treasury cannot cover the voting transaction fee".into(),
         ))
+    }
+
+    async fn asset(&self, kind: &'static str) -> Result<crate::NetworkAsset, VotingExecutionError> {
+        self.assets
+            .require(kind, VotingExecutionError::MissingAsset)
+            .await
     }
 
     fn client(&self) -> Result<Client, VotingExecutionError> {

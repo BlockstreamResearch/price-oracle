@@ -291,11 +291,7 @@ impl Burning {
             return Ok(None);
         }
 
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(BurningError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let burn_assets = self.burn_assets().await?;
         let network = self.network()?;
         let client = self.client()?;
@@ -422,11 +418,7 @@ impl Burning {
         &self,
         request: &BurnExpiredUtxos,
     ) -> Result<(), BurningError> {
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(BurningError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let burn_assets = self.burn_assets().await?;
         let expired = self.store.list_expired(u32::MAX).await?;
         let pset: PartiallySignedTransaction = encode::deserialize(&request.tx)?;
@@ -728,6 +720,10 @@ impl Burning {
             BurningError::Invalid,
             BurningError::UnsupportedChain,
         )
+    }
+
+    async fn asset(&self, kind: &'static str) -> Result<crate::NetworkAsset, BurningError> {
+        self.assets.require(kind, BurningError::MissingAsset).await
     }
 
     fn client(&self) -> Result<Client, BurningError> {
