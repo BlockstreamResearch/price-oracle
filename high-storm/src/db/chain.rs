@@ -1,6 +1,7 @@
 use secp256k1_zkp::PublicKey;
 use sqlx::{Any, AnyPool, Row, Transaction};
 
+use super::{decode_u64, encode_u64};
 use crate::NetworkAsset;
 
 pub(crate) const CANONICAL_JOURNAL_RETENTION_BLOCKS: u64 = 144;
@@ -345,14 +346,6 @@ fn decode_block(row: sqlx::any::AnyRow) -> Result<CanonicalBlock, sqlx::Error> {
         hash: decode_hash(row.try_get("block_hash")?)?,
         parent_hash: decode_hash(row.try_get("parent_hash")?)?,
     })
-}
-
-fn encode_u64(value: u64) -> Result<i64, sqlx::Error> {
-    i64::try_from(value).map_err(|error| sqlx::Error::Encode(Box::new(error)))
-}
-
-fn decode_u64(value: i64) -> Result<u64, sqlx::Error> {
-    u64::try_from(value).map_err(|error| sqlx::Error::Decode(Box::new(error)))
 }
 
 fn decode_hash(bytes: Vec<u8>) -> Result<[u8; 32], sqlx::Error> {

@@ -242,18 +242,7 @@ impl UserRequestStore {
         .bind(request_hash.to_vec())
         .execute(&mut *transaction)
         .await?;
-        if result.rows_affected() == 0 {
-            transaction.rollback().await?;
-            return Ok(false);
-        }
-
-        sqlx::query("DELETE FROM network_user_request_fee_utxos WHERE request_hash = $1")
-            .bind(request_hash.to_vec())
-            .execute(&mut *transaction)
-            .await?;
-        transaction.commit().await?;
-
-        Ok(true)
+        release_fee_utxos(transaction, result.rows_affected(), request_hash).await
     }
 
     pub async fn mark_failed(&self, request_hash: [u8; 32], reason: &[u8]) -> Result<bool, Error> {
@@ -266,18 +255,7 @@ impl UserRequestStore {
         .bind(reason)
         .execute(&mut *transaction)
         .await?;
-        if result.rows_affected() == 0 {
-            transaction.rollback().await?;
-            return Ok(false);
-        }
-
-        sqlx::query("DELETE FROM network_user_request_fee_utxos WHERE request_hash = $1")
-            .bind(request_hash.to_vec())
-            .execute(&mut *transaction)
-            .await?;
-        transaction.commit().await?;
-
-        Ok(true)
+        release_fee_utxos(transaction, result.rows_affected(), request_hash).await
     }
 
     pub async fn count_by_status(&self) -> Result<Vec<(String, u64)>, Error> {
@@ -321,6 +299,27 @@ impl UserRequestStore {
         };
         Ok(Some(decode_request(row)?))
     }
+}
+
+/// Finishes a status change: when it updated a row, drops the request's fee
+/// UTXOs and commits; otherwise rolls back.
+async fn release_fee_utxos(
+    mut transaction: sqlx::Transaction<'_, sqlx::Any>,
+    rows_affected: u64,
+    request_hash: [u8; 32],
+) -> Result<bool, Error> {
+    if rows_affected == 0 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+
+    sqlx::query("DELETE FROM network_user_request_fee_utxos WHERE request_hash = $1")
+        .bind(request_hash.to_vec())
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+
+    Ok(true)
 }
 
 fn decode_request(row: sqlx::any::AnyRow) -> Result<StoredUserRequest, Error> {

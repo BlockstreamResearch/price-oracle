@@ -132,11 +132,7 @@ impl Renewal {
         if self.assets.pending_storm_eye_renewal().await?.is_some() {
             return Ok(None);
         }
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(RenewalError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let data = storm_eye_contract_data(&storm_eye)?;
         Ok(renewal_due(block_height, data.rescue_height).then_some(storm_eye))
     }
@@ -180,11 +176,7 @@ impl Renewal {
         request: &RenewStormUtxos,
         include_mempool: bool,
     ) -> Result<(), RenewalError> {
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(RenewalError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let expected = self
             .prepare_transaction(request.block_height, storm_eye, include_mempool)
             .await?;
@@ -291,11 +283,7 @@ impl Renewal {
         request: &RenewStormUtxos,
     ) -> Result<[u8; 32], RenewalError> {
         let (txid, final_tx) = finalized_transaction(request)?;
-        let current = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(RenewalError::MissingAsset(STORM_EYE_KIND))?;
+        let current = self.asset(STORM_EYE_KIND).await?;
         let renewed = renewed_storm_eye(&current, &network(&self.client()?)?)?;
         if storm_eye_contract_data(&renewed)?.rescue_height != request.new_rescue_height {
             return Err(RenewalError::Invalid(
@@ -456,6 +444,10 @@ impl Renewal {
         Err(RenewalError::Invalid(
             "Treasury cannot cover the Storm Eye renewal fee".into(),
         ))
+    }
+
+    async fn asset(&self, kind: &'static str) -> Result<crate::NetworkAsset, RenewalError> {
+        self.assets.require(kind, RenewalError::MissingAsset).await
     }
 
     fn client(&self) -> Result<Client, RenewalError> {

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use super::{decode_hash, decode_u64, encode_u64};
 use sqlx::{Any, AnyPool, QueryBuilder, Row, Transaction};
 
 const BURNING_BLOCKS: u64 = 5;
@@ -375,22 +376,8 @@ fn decode_monitored_utxo(row: sqlx::any::AnyRow) -> Result<MonitoredUtxo, sqlx::
     })
 }
 
-fn encode_u64(value: u64) -> Result<i64, sqlx::Error> {
-    i64::try_from(value).map_err(|error| sqlx::Error::Encode(Box::new(error)))
-}
-
-fn decode_u64(value: i64) -> Result<u64, sqlx::Error> {
-    u64::try_from(value).map_err(|error| sqlx::Error::Decode(Box::new(error)))
-}
-
 fn decode_u32(value: i64) -> Result<u32, sqlx::Error> {
     u32::try_from(value).map_err(|error| sqlx::Error::Decode(Box::new(error)))
-}
-
-fn decode_hash(value: Vec<u8>) -> Result<[u8; 32], sqlx::Error> {
-    value
-        .try_into()
-        .map_err(|_| sqlx::Error::Decode("invalid hash length".into()))
 }
 
 #[cfg(test)]
