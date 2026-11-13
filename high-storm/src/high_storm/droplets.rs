@@ -312,11 +312,7 @@ impl Droplets {
         if change > 0 {
             transaction.add_output(PartialOutput::new(treasury_script, change, policy_asset));
         }
-        let member = PublicKey::from_slice(&expected_member)
-            .map_err(|_| DropletsError::Invalid("invalid local public key".into()))?
-            .x_only_public_key()
-            .0
-            .serialize();
+        let member = local_member_key(&expected_member)?;
         transaction.add_output(PartialOutput::new(member_script(member), 0, policy_asset));
         transaction.add_output(PartialOutput::new(
             Script::new(),
@@ -606,6 +602,15 @@ impl Droplets {
             DropletsError::Invalid(format!("unsupported Elements chain '{chain}'"))
         })
     }
+}
+
+/// The x-only key a member holds Droplets under, from its compressed key.
+pub(crate) fn local_member_key(compressed: &[u8; 33]) -> Result<[u8; 32], DropletsError> {
+    Ok(PublicKey::from_slice(compressed)
+        .map_err(|_| DropletsError::Invalid("invalid local public key".into()))?
+        .x_only_public_key()
+        .0
+        .serialize())
 }
 
 pub(crate) fn member_script(member: [u8; 32]) -> Script {

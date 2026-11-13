@@ -115,18 +115,7 @@ impl NetworkState {
             protocol_config,
         } = dependencies;
 
-        let initial_members = storm
-            .peers()
-            .await
-            .into_iter()
-            .map(|peer| {
-                PublicKey::from_slice(&peer.compressed_public_key)
-                    .expect("Storm peers contain validated public keys")
-                    .x_only_public_key()
-                    .0
-                    .serialize()
-            })
-            .collect();
+        let initial_members = x_only_keys(storm.peers().await);
         let migration_paused = chain
             .recovery_state()
             .await
@@ -375,6 +364,20 @@ impl NetworkState {
         )
         .await
     }
+}
+
+/// The x-only keys of `peers`, whose keys Storm has already validated.
+pub(super) fn x_only_keys<C: FromIterator<[u8; 32]>>(peers: Vec<storm::Peer>) -> C {
+    peers
+        .into_iter()
+        .map(|peer| {
+            PublicKey::from_slice(&peer.compressed_public_key)
+                .expect("Storm peers contain validated public keys")
+                .x_only_public_key()
+                .0
+                .serialize()
+        })
+        .collect()
 }
 
 #[cfg(test)]

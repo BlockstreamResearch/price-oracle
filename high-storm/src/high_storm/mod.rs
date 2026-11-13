@@ -332,11 +332,7 @@ impl HighStorm {
         let Some(local) = leader::local_public_key(&peers) else {
             return Ok(None);
         };
-        let member = PublicKey::from_slice(&local)
-            .map_err(|_| DropletsError::Invalid("invalid local public key".into()))?
-            .x_only_public_key()
-            .0
-            .serialize();
+        let member = droplets::local_member_key(&local)?;
         let Some(request) = self.state.droplets().state(member).await?.1 else {
             return Ok(None);
         };
@@ -586,18 +582,7 @@ impl HighStorm {
         }
 
         let storm_tree_root = self.state.signing().storm_tree_root().await?;
-        let initial_members = self
-            .peers()
-            .await
-            .into_iter()
-            .map(|peer| {
-                PublicKey::from_slice(&peer.compressed_public_key)
-                    .expect("Storm peers contain validated public keys")
-                    .x_only_public_key()
-                    .0
-                    .serialize()
-            })
-            .collect();
+        let initial_members = state::x_only_keys(self.peers().await);
         self.state
             .assets()
             .initialize_storm_eye(
@@ -1036,6 +1021,13 @@ impl HighStormHandle {
         leader::next_local_leader_height(&self.peers().await, self.state.block_height())
     }
 
+    /// The x-only key this node holds Droplets under.
+    async fn local_droplet_member(&self) -> Result<[u8; 32], DropletsError> {
+        let local = leader::local_public_key(&self.peers().await)
+            .ok_or_else(|| DropletsError::Invalid("local network member is missing".into()))?;
+        droplets::local_member_key(&local)
+    }
+
     pub(crate) async fn droplet_state(
         &self,
     ) -> Result<
@@ -1045,26 +1037,14 @@ impl HighStormHandle {
         ),
         DropletsError,
     > {
-        let local = leader::local_public_key(&self.peers().await)
-            .ok_or_else(|| DropletsError::Invalid("local network member is missing".into()))?;
-        let member = PublicKey::from_slice(&local)
-            .map_err(|_| DropletsError::Invalid("invalid local public key".into()))?
-            .x_only_public_key()
-            .0
-            .serialize();
+        let member = self.local_droplet_member().await?;
         self.state.droplets().state(member).await
     }
 
     pub(crate) async fn droplet_history(
         &self,
     ) -> Result<Vec<crate::db::droplet::DropletExchangeRequest>, DropletsError> {
-        let local = leader::local_public_key(&self.peers().await)
-            .ok_or_else(|| DropletsError::Invalid("local network member is missing".into()))?;
-        let member = PublicKey::from_slice(&local)
-            .map_err(|_| DropletsError::Invalid("invalid local public key".into()))?
-            .x_only_public_key()
-            .0
-            .serialize();
+        let member = self.local_droplet_member().await?;
         self.state.droplets().history(member).await
     }
 
