@@ -10,6 +10,11 @@ const MAX_STORM_TREE_DEPTH = 17;
 const HEX_32 = /^[0-9a-f]{64}$/i;
 const OUTPOINT = /^[0-9a-f]{64}:[0-9]+$/i;
 const UNSPENDABLE_INTERNAL_KEY = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
+const NETWORKS = [
+    "liquidv1",
+    "liquidtestnet",
+    "elementsregtest",
+];
 export class ElementsRpcClient {
     #options;
     #requestId = 0;
@@ -84,6 +89,44 @@ export class PriceOracleClient {
         this.#coordinatorUrl = coordinatorUrl.replace(/\/$/, "");
         this.#fetch = fetcher.bind(globalThis);
     }
+    /**
+     * Read the active network assets and Storm Tree root. They are the
+     * coordinator's own claims: pin the values held from an independent source
+     * to have the response checked against them.
+     */
+    async getNetwork(verification = {}) {
+        const trusted = {
+            storm_eye_asset_id: verification.stormEyeAssetId,
+            storm_tree_root: verification.stormTreeRoot,
+            tick_asset_id: verification.tickAssetId,
+            oracle_verifier_asset_id: verification.verifierAssetId,
+        };
+        if ((verification.network !== undefined &&
+            !NETWORKS.includes(verification.network)) ||
+            Object.values(trusted).some((value) => value !== undefined &&
+                (typeof value !== "string" || !HEX_32.test(value))))
+            throw new Error("trusted network values must be a supported network and 32-byte hex");
+        const info = await this.#json("/users/network");
+        if (!NETWORKS.includes(info?.network))
+            throw new Error("coordinator network is not supported");
+        if (verification.network !== undefined &&
+            info.network !== verification.network)
+            throw new Error("coordinator network does not match the trusted value");
+        for (const [field, value] of Object.entries(trusted)) {
+            const received = info[field];
+            if (typeof received !== "string" || !HEX_32.test(received))
+                throw new Error(`coordinator network ${field} must be 32-byte hex`);
+            if (value !== undefined && received.toLowerCase() !== value.toLowerCase())
+                throw new Error(`coordinator network ${field} does not match the trusted value`);
+        }
+        return {
+            network: info.network,
+            storm_eye_asset_id: info.storm_eye_asset_id.toLowerCase(),
+            storm_tree_root: info.storm_tree_root.toLowerCase(),
+            tick_asset_id: info.tick_asset_id.toLowerCase(),
+            oracle_verifier_asset_id: info.oracle_verifier_asset_id.toLowerCase(),
+        };
+    }
     async getAccount(publicKey, verification) {
         assertXOnlyPublicKey(publicKey);
         const expected = deriveAccount(verification);
@@ -114,6 +157,28 @@ export class PriceOracleClient {
         }
         return this.#json(`/users/requests/${requestHash}`);
     }
+    /**
+     * Poll a request until it is `executed`. A `failed` request rejects with the
+     * coordinator's reason, as does a timeout or an aborted `signal`.
+     */
+    async waitForTickRequest(requestHash, options = {}) {
+        const { timeoutMs = 900_000, intervalMs = 5_000, signal } = options;
+        if (!(timeoutMs > 0) || !(intervalMs > 0))
+            throw new Error("timeout and interval must be positive milliseconds");
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+            signal?.throwIfAborted();
+            const status = await this.getTickRequest(requestHash);
+            options.onStatus?.(status);
+            if (status.status === "executed")
+                return status;
+            if (status.status === "failed")
+                throw new Error(`user request failed: ${status.payload ?? "no reason given"}`);
+            if (Date.now() + intervalMs > deadline)
+                throw new Error(`user request is still ${status.status} after ${timeoutMs} ms`);
+            await sleep(intervalMs, signal);
+        }
+    }
     getPriceFeeds() {
         return this.#json("/price-feeds");
     }
@@ -140,7 +205,7 @@ export function deriveAccount(verification) {
     if (!verification || typeof verification !== "object")
         throw new Error("trusted Account verification context is required");
     assertXOnlyPublicKey(verification.ownerPublicKey);
-    if (!["liquidv1", "liquidtestnet", "elementsregtest"].includes(verification.network))
+    if (!NETWORKS.includes(verification.network))
         throw new Error("unsupported trusted Account network");
     if ([
         verification.stormEyeAssetId,
@@ -256,17 +321,18 @@ export function createTickRequest(privateKey, feeUtxos, authMethod) {
 }
 /**
  * A priced request: issues an Oracle Verifier and returns the signed rate,
- * checked by {@link verifySignedPriceData}.
+ * checked by {@link verifySignedPriceData}. `withTick` orders a Tick in the
+ * same batch, at the fees of a second output.
  */
-export function createSignedPriceRequest(privateKey, feeUtxos, priceFeedId, authMethod) {
+export function createSignedPriceRequest(privateKey, feeUtxos, priceFeedId, authMethod, options = {}) {
     if (!Number.isInteger(priceFeedId) ||
         priceFeedId < 0 ||
         priceFeedId > 0xffffffff) {
         throw new Error("price feed id must be an unsigned 32-bit integer");
     }
-    return buildRequest(privateKey, feeUtxos, "signed-price-data", authMethod, priceFeedId);
+    return buildRequest(privateKey, feeUtxos, "signed-price-data", authMethod, priceFeedId, options.withTick);
 }
-function buildRequest(privateKey, feeUtxos, kind, authMethod, priceFeedId) {
+function buildRequest(privateKey, feeUtxos, kind, authMethod, priceFeedId, withTick) {
     assertPrivateKey(privateKey);
     if (feeUtxos.length === 0 ||
         feeUtxos.some((outpoint) => !OUTPOINT.test(outpoint))) {
@@ -292,6 +358,13 @@ function buildRequest(privateKey, feeUtxos, kind, authMethod, priceFeedId) {
         },
         requests: [{ kind, payload }],
     };
+    // A contract holds a price against the time of a Tick spent beside its
+    // Verifier, so one batch can order both under the same authentication.
+    if (withTick)
+        request.requests.push({
+            kind: "tick-utxo",
+            payload: JSON.stringify({ utxo_auth_method: selectedAuth }),
+        });
     request.header.signature = bytesToHex(schnorr.sign(tickRequestSigningHash(request), privateKey));
     return request;
 }
@@ -373,8 +446,8 @@ export function parseExecutedTick(status) {
     }
     return JSON.parse(status.payload);
 }
-/** Authenticate an executed response; its returned outpoint is not chain-verified. */
-export function parseExecutedSignedPrice(status, verification) {
+/** The one result of `kind` in a finalized batch, or null before it is final. */
+function executedResult(status, kind, name) {
     if (status.status !== "executed")
         return null;
     const executed = parseExecutedTick(status);
@@ -382,21 +455,32 @@ export function parseExecutedSignedPrice(status, verification) {
         return null;
     if (!HEX_32.test(executed.txid) || !Array.isArray(executed.results))
         throw new Error("invalid issuance result");
-    const results = executed.results.filter((result) => result.kind === "signed-price-data");
+    const results = executed.results.filter((result) => result.kind === kind);
     if (results.length !== 1)
-        throw new Error("expected exactly one issued Verifier");
+        throw new Error(`expected exactly one issued ${name}`);
     const result = results[0];
     if (!result)
-        throw new Error("issuance result has no Verifier");
+        throw new Error(`issuance result has no ${name}`);
     if (!Number.isInteger(result.vout) ||
         result.vout < 0 ||
         result.vout > 0xffffffff)
-        throw new Error("invalid Verifier output index");
-    const signedPrice = JSON.parse(result.payload);
+        throw new Error(`invalid ${name} output index`);
+    return { txid: executed.txid, result };
+}
+/** Authenticate an executed response; its returned outpoint is not chain-verified. */
+export function parseExecutedSignedPrice(status, verification) {
+    const executed = executedResult(status, "signed-price-data", "Verifier");
+    if (!executed)
+        return null;
+    const signedPrice = JSON.parse(executed.result.payload);
     decodePriceData(signedPrice.price_data);
     if (!verifySignedPriceData(signedPrice, verification))
         throw new Error("oracle price does not verify against the trusted context");
-    return { txid: executed.txid, verifierVout: result.vout, signedPrice };
+    return {
+        txid: executed.txid,
+        verifierVout: executed.result.vout,
+        signedPrice,
+    };
 }
 /** Check a finalized price and its confirmed, unspent Verifier via independent RPC. */
 export async function verifyExecutedSignedPrice(status, verification, elements) {
@@ -408,7 +492,11 @@ export async function verifyExecutedSignedPrice(status, verification, elements) 
         return null;
     const branch = executed.signedPrice.storm_tree_bloom.branch;
     const scriptPubKey = elementsTaprootScript(branch, verification.verifierTapleafHash);
-    const utxo = await elements.call("gettxout", [executed.txid, executed.verifierVout, true]);
+    const utxo = await elements.call("gettxout", [
+        executed.txid,
+        executed.verifierVout,
+        true,
+    ]);
     if (!utxo ||
         !Number.isSafeInteger(utxo.confirmations) ||
         utxo.confirmations < 1 ||
@@ -417,6 +505,42 @@ export async function verifyExecutedSignedPrice(status, verification, elements) 
         utxo.scriptPubKey.hex.toLowerCase() !== scriptPubKey)
         throw new Error("confirmed unspent Verifier does not match the trusted context");
     return executed;
+}
+/**
+ * Check a finalized Tick via independent RPC: confirmed, unspent, in the Tick
+ * asset, locked by the trusted voucher leaf, and carrying the reported time.
+ */
+export async function verifyExecutedTick(status, verification, elements) {
+    if (!HEX_32.test(verification.tickAssetId) ||
+        !HEX_32.test(verification.tickTapleafHash))
+        throw new Error("trusted Tick asset and tapleaf hash must be 32-byte hex");
+    const executed = executedResult(status, "tick-utxo", "Tick");
+    if (!executed)
+        return null;
+    const { timestamp } = JSON.parse(executed.result.payload);
+    if (!Number.isSafeInteger(timestamp) || timestamp <= 0)
+        throw new Error("invalid Tick timestamp");
+    const scriptPubKey = elementsTaprootScript(UNSPENDABLE_INTERNAL_KEY, verification.tickTapleafHash);
+    const utxo = await elements.call("gettxout", [
+        executed.txid,
+        executed.result.vout,
+        true,
+    ]);
+    if (!utxo ||
+        !Number.isSafeInteger(utxo.confirmations) ||
+        utxo.confirmations < 1 ||
+        utxo.asset?.toLowerCase() !== verification.tickAssetId.toLowerCase() ||
+        utxo.value === undefined ||
+        Math.round(utxo.value * 100_000_000) !== timestamp ||
+        utxo.scriptPubKey.hex.toLowerCase() !== scriptPubKey)
+        throw new Error("confirmed unspent Tick does not match the trusted context");
+    return {
+        txid: executed.txid,
+        vout: executed.result.vout,
+        asset: verification.tickAssetId.toLowerCase(),
+        timestamp,
+        scriptPubKey,
+    };
 }
 function elementsTaprootScript(internalPublicKey, tapleafHash) {
     const tagHash = sha256(utf8ToBytes("TapTweak/elements"));
@@ -468,6 +592,21 @@ export function createTickSpendPlan(tick, resolution) {
             payoutOutputIndex: 0,
         },
     };
+}
+function sleep(milliseconds, signal) {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted)
+            return reject(signal.reason);
+        const abort = () => {
+            clearTimeout(timer);
+            reject(signal?.reason);
+        };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener("abort", abort);
+            resolve();
+        }, milliseconds);
+        signal?.addEventListener("abort", abort, { once: true });
+    });
 }
 function validateAuthMethod(method) {
     if (method.kind === "scriptPubKey-auth") {
