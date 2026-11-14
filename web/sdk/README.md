@@ -9,6 +9,7 @@ import {
   PriceOracleClient,
   createTickRequest,
   publicKeyFromPrivateKey,
+  verifyExecutedTick,
 } from "@price-oracle/sdk";
 
 const privateKey = "<development-only 32-byte hex key>";
@@ -32,7 +33,63 @@ const request = createTickRequest(
   feeUtxos.map(({ txid, vout }) => `${txid}:${vout}`),
 );
 const { request_hash } = await oracle.submitTickRequest(request);
+
+const status = await oracle.waitForTickRequest(request_hash);
+const tick = await verifyExecutedTick(status, verification, elements);
 ```
+
+## Network Metadata
+
+`getNetwork()` reads the active `network`, the Storm Eye, Tick and Oracle
+Verifier asset IDs and the current `storm_tree_root` from the coordinator.
+These are that node's own claims: using them unchecked delegates deployment and
+root selection to it. Pin the values held from an independent source and each
+one supplied is compared with the response:
+
+```ts
+const network = await oracle.getNetwork({
+  network: "liquidv1",
+  stormEyeAssetId: trustedStormEyeAssetId,
+  tickAssetId: trustedTickAssetId,
+  verifierAssetId: trustedVerifierAssetId,
+});
+```
+
+A mismatch throws, and a malformed pinned value fails before fetching. Any
+subset may be pinned; a field left out is returned as received and is not a
+trust anchor for the checks below. `stormTreeRoot` can be pinned too, but it
+changes with membership.
+
+## Waiting for a Request
+
+`waitForTickRequest(requestHash, options)` polls the request until it is
+`executed` and returns that status. The earlier statuses are not final:
+`processing` is broadcast, and `included` is in a block a reorg can still
+orphan. A `failed` request rejects with the coordinator's reason.
+
+`options` takes `timeoutMs` (15 minutes by default), `intervalMs` (5 seconds),
+an `AbortSignal`, and an `onStatus` callback called with every status read. A
+timeout or abort ends the wait, not the request: it stays queued and can be
+waited on again. An error from a status read is not retried.
+
+Issuance follows block production. With one-minute blocks and two finality
+confirmations a request takes a few minutes, and a priced one can wait up to ten
+blocks for a feed the coordinator cannot price before it fails.
+
+## Tick Verification
+
+`verifyExecutedTick(status, verification, elements)` is the Tick counterpart of
+`verifyExecutedSignedPrice`. It takes the batch's single `tick-utxo` result and
+checks it through an independently trusted Elements RPC endpoint: the output is
+unspent, mempool spends included, has at least one confirmation, carries the
+trusted Tick asset, an amount equal to the reported timestamp, and the Elements
+Taproot script of the trusted voucher leaf under the fixed unspendable internal
+key. It returns the `IssuedTick` that `createTickSpendPlan` takes, `null` before
+the request is `executed`, and throws on any mismatch.
+
+`verification` needs `tickAssetId` and `tickTapleafHash`, so the
+`AccountVerification` given to `getAccount` can be passed as it is. This is a
+point-in-time check, not a guarantee against later spends, expiry, or reorgs.
 
 ## Humid Wallet Requests
 
@@ -133,6 +190,15 @@ included, requires at least one confirmation, the explicit Verifier asset and
 one-unit amount, and the Elements Taproot script committing to the signed branch
 and trusted leaf. This is a point-in-time check, not a guarantee against later
 spends, expiry, or reorgs; on-chain consumers must still enforce their covenant.
+
+A contract holds a signed price against the time of a Tick spent beside its
+Verifier. `createSignedPriceRequest(privateKey, feeUtxos, feedId, authMethod,
+{ withTick: true })` orders both in one batch under the same authentication
+method, as `createWalletSignedPriceRequest` does for a wallet. Both are issued
+in one transaction: the batch pays the per-output fee twice and the issuance fee
+once, and its fee UTXOs must also cover a burn reserve for each output. Check
+the Verifier with `verifyExecutedSignedPrice` and the Tick with
+`verifyExecutedTick`.
 
 Coordinator URLs must use HTTPS, except HTTP on `localhost`, `127.0.0.1`, or
 `[::1]` for local development. Redirects are rejected. HTTPS does not replace

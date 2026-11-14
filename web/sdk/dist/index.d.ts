@@ -1,5 +1,21 @@
 export declare const WALLET_REQUEST_SIGNATURE_SCHEME = "bitcoin-signed-message-ecdsa-v1";
 export type OracleNetwork = "liquidv1" | "liquidtestnet" | "elementsregtest";
+/** The active network assets and Storm Tree root, as the coordinator reports them. */
+export type OracleNetworkInfo = {
+    network: OracleNetwork;
+    storm_eye_asset_id: string;
+    storm_tree_root: string;
+    tick_asset_id: string;
+    oracle_verifier_asset_id: string;
+};
+/** Independently pinned network values; each one supplied must match the response. */
+export type NetworkVerification = {
+    network?: OracleNetwork;
+    stormEyeAssetId?: string;
+    tickAssetId?: string;
+    verifierAssetId?: string;
+    stormTreeRoot?: string;
+};
 export type OracleAccount = {
     address: string;
     script_pubkey: string;
@@ -66,6 +82,15 @@ export type TickRequestStatus = {
     status: "pending" | "processing" | "included" | "executed" | "failed";
     payload: string | null;
 };
+export type WaitOptions = {
+    /** Give up after this long; 15 minutes by default. */
+    timeoutMs?: number;
+    /** Pause between status reads; 5 seconds by default. */
+    intervalMs?: number;
+    signal?: AbortSignal;
+    /** Called with every status read, the final one included. */
+    onStatus?: (status: TickRequestStatus) => void;
+};
 export type StormTreeBloom = {
     signature: string;
     branch: string;
@@ -128,6 +153,12 @@ export type IssuedTick = {
     timestamp: number;
     scriptPubKey: string;
 };
+export type IssuedTickVerification = {
+    /** Tick asset ID from independently verified network issuance. */
+    tickAssetId: string;
+    /** Locally compiled voucher leaf for the requested authentication method. */
+    tickTapleafHash: string;
+};
 export type PredictionResolution = {
     predictionId: string;
     occurredAt: number;
@@ -177,11 +208,22 @@ export declare class ElementsRpcClient {
 export declare class PriceOracleClient {
     #private;
     constructor(coordinatorUrl: string, fetcher?: typeof fetch);
+    /**
+     * Read the active network assets and Storm Tree root. They are the
+     * coordinator's own claims: pin the values held from an independent source
+     * to have the response checked against them.
+     */
+    getNetwork(verification?: NetworkVerification): Promise<OracleNetworkInfo>;
     getAccount(publicKey: string, verification: AccountVerification): Promise<OracleAccount>;
     submitTickRequest(request: TickRequest): Promise<{
         request_hash: string;
     }>;
     getTickRequest(requestHash: string): Promise<TickRequestStatus>;
+    /**
+     * Poll a request until it is `executed`. A `failed` request rejects with the
+     * coordinator's reason, as does a timeout or an aborted `signal`.
+     */
+    waitForTickRequest(requestHash: string, options?: WaitOptions): Promise<TickRequestStatus>;
     getPriceFeeds(): Promise<PriceFeedInfo[]>;
     getPriceFeed(feedId: number): Promise<PriceFeedRate>;
 }
@@ -197,9 +239,12 @@ export declare function createWalletSignedPriceRequest(compressedPublicKey: stri
 export declare function createTickRequest(privateKey: string, feeUtxos: string[], authMethod?: TickAuthMethod): TickRequest;
 /**
  * A priced request: issues an Oracle Verifier and returns the signed rate,
- * checked by {@link verifySignedPriceData}.
+ * checked by {@link verifySignedPriceData}. `withTick` orders a Tick in the
+ * same batch, at the fees of a second output.
  */
-export declare function createSignedPriceRequest(privateKey: string, feeUtxos: string[], priceFeedId: number, authMethod?: TickAuthMethod): TickRequest;
+export declare function createSignedPriceRequest(privateKey: string, feeUtxos: string[], priceFeedId: number, authMethod?: TickAuthMethod, options?: {
+    withTick?: boolean;
+}): TickRequest;
 export declare function tickRequestSigningHash(request: TickRequest): Uint8Array;
 /** The 32 canonical bytes the network signs, as the numbers they encode. */
 export declare function decodePriceData(priceData: string): PriceFeedData;
@@ -220,4 +265,9 @@ export declare function parseExecutedSignedPrice(status: TickRequestStatus, veri
 } | null;
 /** Check a finalized price and its confirmed, unspent Verifier via independent RPC. */
 export declare function verifyExecutedSignedPrice(status: TickRequestStatus, verification: IssuedPriceVerification, elements: ElementsRpcClient): Promise<ReturnType<typeof parseExecutedSignedPrice>>;
+/**
+ * Check a finalized Tick via independent RPC: confirmed, unspent, in the Tick
+ * asset, locked by the trusted voucher leaf, and carrying the reported time.
+ */
+export declare function verifyExecutedTick(status: TickRequestStatus, verification: IssuedTickVerification, elements: ElementsRpcClient): Promise<IssuedTick | null>;
 export declare function createTickSpendPlan(tick: IssuedTick, resolution: PredictionResolution): TickSpendPlan;
