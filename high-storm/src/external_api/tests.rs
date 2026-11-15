@@ -774,11 +774,77 @@ async fn registers_tick_requests_and_returns_pending_status() {
     assert_eq!(status.status(), StatusCode::OK);
     assert_eq!(
         response_json(status).await,
-        serde_json::json!({"status": "pending", "payload": null})
+        serde_json::json!({
+            "status": "pending",
+            "payload": null,
+            "waiting": {"reason": "round", "blocks": 0},
+        })
     );
 
     let duplicate = app.oneshot(user_request(&request)).await.unwrap();
     assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn a_pending_priced_request_says_what_it_waits_for() {
+    let (app, node, ..) = node_setup().await;
+    let request = signed_price_request(LBTC_USD);
+
+    let created = app.clone().oneshot(user_request(&request)).await.unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = response_json(created).await;
+    let uri = format!(
+        "/users/requests/{}",
+        created["request_hash"].as_str().unwrap()
+    );
+    let waiting = |reason: &str| {
+        serde_json::json!({
+            "status": "pending",
+            "payload": null,
+            "waiting": {
+                "reason": reason,
+                "price_feed_id": LBTC_USD,
+                "blocks": 0,
+                "fails_after_blocks": 10,
+            },
+        })
+    };
+
+    // No source has reported yet, so the node holds no rate for the feed.
+    let status = app.clone().oneshot(get_request(&uri)).await.unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(response_json(status).await, waiting("price"));
+
+    // Once it holds one, only a round is left to wait for.
+    let at = now();
+    node.handle()
+        .record_price_observation(
+            LBTC_USD,
+            0,
+            SourceObservation::new(9_876_543_210, 8, at, at),
+        )
+        .await;
+    let status = app.oneshot(get_request(&uri)).await.unwrap();
+    assert_eq!(response_json(status).await, waiting("round"));
+}
+
+#[tokio::test]
+async fn exposes_the_request_policy_it_is_configured_with() {
+    let (app, _, _) = setup().await;
+    let response = app.oneshot(get_request("/users/policy")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "operational_fee_sats": 1_000,
+            "tick_burn_reserve_sats": 1_000,
+            "issuance_transaction_fee_sats": 1_000,
+            "min_fee_utxo_confirmations": 1,
+            "finality_confirmations": 2,
+            "tick_lifetime_blocks": 60,
+            "max_unpriced_request_blocks": 10,
+        })
+    );
 }
 
 #[tokio::test]
@@ -1455,13 +1521,16 @@ async fn node_setup_with_coordinator(
         .serialize();
     operators.add(compressed_operator_public_key).await.unwrap();
 
+    // The router serves the policy of the protocol the node runs with.
+    let dependencies = crate::high_storm::HighStormDependencies::for_tests(&database);
+    let protocol = dependencies.protocol_config().clone();
     let node_secret = SecretKey::from_slice(&NODE_KEY).unwrap();
     let storm = Storm::from_peers(node_secret, vec![Peer::new(node_public_key())]);
     let node = HighStorm::new(
         storm,
         node_secret.secret_bytes(),
         coordinator_public_key,
-        crate::high_storm::HighStormDependencies::for_tests(&database),
+        dependencies,
     )
     .await;
 
@@ -1471,6 +1540,7 @@ async fn node_setup_with_coordinator(
         database.user_requests(),
         FeeUtxoValidator::allow_all(database.monitored_utxos()),
         AuthNetwork::ElementsRegtest,
+        &protocol,
     );
 
     (

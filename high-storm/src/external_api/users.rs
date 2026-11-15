@@ -25,7 +25,7 @@ use super::{ApiError, ExternalApiState, require_coordinator};
 use crate::crypto::tagged_hash;
 use crate::db::{
     network_asset::{ORACLE_VERIFIER_KIND, STORM_EYE_KIND, TICK_ASSET_KIND},
-    user_request::{FeeUtxo, InsertPendingResult},
+    user_request::{FeeUtxo, InsertPendingResult, StoredUserRequest},
 };
 use crate::monitoring;
 
@@ -43,6 +43,7 @@ const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 pub(super) fn router() -> axum::Router<ExternalApiState> {
     axum::Router::new()
         .route("/network", axum::routing::get(get_network))
+        .route("/policy", axum::routing::get(get_policy))
         .route("/account/{public_key}", axum::routing::get(get_account))
         .route("/check-fee-utxos", axum::routing::post(check_fee_utxos))
         .route("/requests", axum::routing::post(create_request))
@@ -106,6 +107,45 @@ async fn get_network(
     State(state): State<ExternalApiState>,
 ) -> Result<Json<OracleNetwork>, ApiError> {
     Ok(Json(network_metadata(&state).await?))
+}
+
+/// What a batch has to bring and how long the network holds its results, as
+/// this node is configured. Every signer validates a round against its own
+/// fees and Tick lifetime, so the members share those; the confirmation
+/// counts and the wait for a rate are the coordinator's own.
+#[derive(Clone, Copy, Serialize)]
+pub(crate) struct RequestPolicy {
+    /// Charged for every request of a batch.
+    operational_fee_sats: u64,
+    /// Held back for every request of a batch, to pay for burning what it issued.
+    tick_burn_reserve_sats: u64,
+    /// Charged once for the transaction issuing a batch.
+    issuance_transaction_fee_sats: u64,
+    min_fee_utxo_confirmations: u64,
+    /// Confirmations after which an included batch reads `executed`.
+    finality_confirmations: u64,
+    /// Blocks after which the network burns a Tick nobody spent.
+    tick_lifetime_blocks: u64,
+    /// Blocks a priced batch waits for a rate before it fails.
+    max_unpriced_request_blocks: u64,
+}
+
+impl From<&crate::config::ProtocolConfig> for RequestPolicy {
+    fn from(protocol: &crate::config::ProtocolConfig) -> Self {
+        Self {
+            operational_fee_sats: protocol.operational_fee_sats,
+            tick_burn_reserve_sats: protocol.tick_burn_reserve_sats,
+            issuance_transaction_fee_sats: protocol.issuance_transaction_fee_sats,
+            min_fee_utxo_confirmations: super::fee_utxo::MIN_FEE_UTXO_CONFIRMATIONS,
+            finality_confirmations: protocol.finality_confirmations,
+            tick_lifetime_blocks: protocol.tick_lifetime_blocks,
+            max_unpriced_request_blocks: crate::high_storm::MAX_UNPRICED_REQUEST_BLOCKS,
+        }
+    }
+}
+
+async fn get_policy(State(state): State<ExternalApiState>) -> Json<RequestPolicy> {
+    Json(state.policy)
 }
 
 #[derive(Default, Deserialize)]
@@ -219,6 +259,58 @@ struct CreatedRequest {
 struct UserRequestStatus {
     status: String,
     payload: Option<String>,
+    /// What a pending request is waiting for; absent in every other status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waiting: Option<Waiting>,
+}
+
+#[derive(Serialize)]
+struct Waiting {
+    /// `price` while this node holds no rate a round could be issued at for
+    /// the feed the batch names, `round` once only the next round is awaited.
+    reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    price_feed_id: Option<FeedId>,
+    /// Blocks since the batch was queued.
+    blocks: u64,
+    /// A priced batch fails once it has waited more blocks than this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fails_after_blocks: Option<u64>,
+}
+
+/// Read when the status is, not recorded by the rounds that passed the batch
+/// over: it says what holds the batch up now.
+async fn waiting(state: &ExternalApiState, stored: &StoredUserRequest) -> Option<Waiting> {
+    if stored.status != "pending" {
+        return None;
+    }
+    let blocks = state
+        .node
+        .block_height()
+        .saturating_sub(stored.block_height);
+    let feed = serde_json::from_slice::<NetworkUserRequests>(&stored.request)
+        .ok()
+        .and_then(|request| validate_payload(&request).ok())
+        .and_then(|(_, feed)| feed);
+    let Some(feed) = feed else {
+        return Some(Waiting {
+            reason: "round",
+            price_feed_id: None,
+            blocks,
+            fails_after_blocks: None,
+        });
+    };
+
+    Some(Waiting {
+        reason: if state.node.has_round_rate(feed).await {
+            "round"
+        } else {
+            "price"
+        },
+        price_feed_id: Some(feed),
+        blocks,
+        fails_after_blocks: Some(crate::high_storm::MAX_UNPRICED_REQUEST_BLOCKS),
+    })
 }
 
 #[derive(Deserialize)]
@@ -340,6 +432,7 @@ async fn get_request(
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("user request does not exist"))?;
+    let waiting = waiting(&state, &request).await;
     let payload = request
         .payload
         .map(String::from_utf8)
@@ -348,6 +441,7 @@ async fn get_request(
     Ok(Json(UserRequestStatus {
         status: request.status,
         payload,
+        waiting,
     }))
 }
 

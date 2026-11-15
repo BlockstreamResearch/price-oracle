@@ -211,6 +211,7 @@ pub(super) struct ExternalApiState {
     pub(super) auth: AuthService,
     pub(super) user_requests: UserRequestStore,
     pub(super) fee_utxos: FeeUtxoValidator,
+    pub(super) policy: users::RequestPolicy,
 }
 
 pub struct ExternalApiServer {
@@ -242,6 +243,7 @@ impl ExternalApiServer {
                 database.user_requests(),
                 fee_utxos,
                 auth_network,
+                protocol_config,
             ),
         })
     }
@@ -266,12 +268,14 @@ pub(crate) fn router(
     user_requests: UserRequestStore,
     fee_utxos: FeeUtxoValidator,
     auth_network: AuthNetwork,
+    protocol: &crate::config::ProtocolConfig,
 ) -> Router {
     let state = ExternalApiState {
         node,
         auth: AuthService::new(operators, auth_network),
         user_requests,
         fee_utxos,
+        policy: users::RequestPolicy::from(protocol),
     };
     with_request_limits(
         Router::new()
