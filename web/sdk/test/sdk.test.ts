@@ -5,6 +5,9 @@ import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 
 import {
   ElementsRpcClient,
+  ElementsRpcError,
+  EsploraClient,
+  EsploraError,
   OracleApiError,
   PriceOracleClient,
   deriveAccount,
@@ -23,6 +26,7 @@ import {
   verifyExecutedSignedPrice,
   verifyExecutedTick,
   type AccountVerification,
+  type ChainOutput,
   type NetworkVerification,
 } from "../src";
 
@@ -1389,5 +1393,208 @@ describe("Price Oracle SDK", () => {
     expect(
       () => new PriceOracleClient(["https://a.test", "http://b.test"]),
     ).toThrow("HTTPS");
+  });
+
+  test("hands on the reason an Elements node gives for a failed call", async () => {
+    const rpc = (response: () => Response) =>
+      new ElementsRpcClient({
+        url: "http://127.0.0.1:18884",
+        fetch: async () => response(),
+      });
+    const failed = (await rpc(() =>
+      Response.json(
+        {
+          result: null,
+          error: {
+            code: -5,
+            message: "No such mempool or blockchain transaction",
+          },
+        },
+        { status: 500 },
+      ),
+    )
+      .getTransactionConfirmations("ab".repeat(32))
+      .catch((error) => error)) as ElementsRpcError;
+    expect(failed).toBeInstanceOf(ElementsRpcError);
+    expect([failed.message, failed.code, failed.status]).toEqual([
+      "No such mempool or blockchain transaction",
+      -5,
+      500,
+    ]);
+
+    const refused = (await rpc(() => new Response("", { status: 401 }))
+      .call("getblockcount")
+      .catch((error) => error)) as ElementsRpcError;
+    expect([refused.message, refused.code, refused.status]).toEqual([
+      "Elements RPC returned HTTP 401",
+      undefined,
+      401,
+    ]);
+    await expect(
+      rpc(() => new Response("not json")).call("getblockcount"),
+    ).rejects.toThrow("not JSON");
+  });
+
+  test("gives a chain endpoint a limited time to answer", async () => {
+    const silent = (): Promise<Response> => new Promise(() => {});
+    const esplora = new EsploraClient("https://esplora.test", {
+      fetch: silent,
+      timeoutMs: 20,
+    });
+    const elements = new ElementsRpcClient({
+      url: "https://rpc.test",
+      fetch: silent,
+      timeoutMs: 20,
+    });
+
+    const late = await esplora
+      .getScriptUtxos(ACCOUNT.script_pubkey)
+      .catch((error) => error);
+    expect(late).toBeInstanceOf(EsploraError);
+    expect(late).toMatchObject({
+      status: 0,
+      message: "Esplora did not answer within 20 ms",
+    });
+    const rpc = await elements.call("getblockcount").catch((error) => error);
+    expect(rpc).toBeInstanceOf(ElementsRpcError);
+    expect(rpc).toMatchObject({
+      status: 0,
+      message: "Elements RPC did not answer within 20 ms",
+    });
+
+    for (const timeoutMs of [0, -1, Number.NaN]) {
+      expect(
+        () => new EsploraClient("https://esplora.test", { timeoutMs }),
+      ).toThrow("timeoutMs");
+      expect(
+        () => new ElementsRpcClient({ url: "https://rpc.test", timeoutMs }),
+      ).toThrow("timeoutMs");
+    }
+  });
+
+  test("reads the same chain facts through Esplora as through Elements RPC", async () => {
+    const script = ACCOUNT.script_pubkey;
+    const txid = "ab".repeat(32);
+    const routes: Record<string, unknown> = {
+      [`/scripthash/${bytesToHex(sha256(hexToBytes(script)))}/utxo`]: [
+        {
+          txid,
+          vout: 1,
+          value: 100_000,
+          asset: "05".repeat(32),
+          status: { confirmed: true, block_height: 98 },
+        },
+        // Unconfirmed, so it cannot pay a request yet, and confidential:
+        // no amount to report.
+        { txid, vout: 2, value: 7, status: { confirmed: false } },
+        { txid, vout: 3, valuecommitment: "08".repeat(33), status: {} },
+      ],
+      [`/tx/${txid}`]: {
+        vout: [
+          { scriptpubkey: "6a" },
+          { scriptpubkey: script, value: 100_000, asset: "05".repeat(32) },
+          { scriptpubkey: script, valuecommitment: "08".repeat(33) },
+        ],
+        status: { confirmed: true, block_height: 98 },
+      },
+      [`/tx/${txid}/status`]: { confirmed: true, block_height: 98 },
+      [`/tx/${txid}/outspend/1`]: { spent: false },
+      [`/tx/${txid}/outspend/2`]: { spent: false },
+      "/blocks/tip/height": 100,
+    };
+    const asked: string[] = [];
+    const esplora = new EsploraClient(
+      "https://esplora.test/api/",
+      async (url, init) => {
+        expect(init?.redirect).toBe("error");
+        const path = url.replace("https://esplora.test/api", "");
+        asked.push(path);
+        return path in routes
+          ? Response.json(routes[path])
+          : new Response("Transaction not found", { status: 404 });
+      },
+    );
+
+    expect(await esplora.getScriptUtxos(script)).toEqual([
+      {
+        txid,
+        vout: 1,
+        scriptPubKey: script,
+        amountSats: 100_000,
+        asset: "05".repeat(32),
+        height: 98,
+      },
+    ]);
+
+    const explicit: ChainOutput = {
+      confirmations: 3,
+      scriptPubKey: script,
+      asset: "05".repeat(32),
+      amountSats: 100_000,
+    };
+    expect(await esplora.getUnspentOutput(txid, 1)).toEqual(explicit);
+    expect(await esplora.getUnspentOutput(txid, 2)).toEqual({
+      confirmations: 3,
+      scriptPubKey: script,
+    });
+    expect(await esplora.getTransactionConfirmations(txid)).toBe(3);
+
+    // Spent in a block or in the mempool, and anything short of "not spent".
+    for (const outspend of [{ spent: true }, {}, null]) {
+      routes[`/tx/${txid}/outspend/1`] = outspend;
+      expect(await esplora.getUnspentOutput(txid, 1)).toBeNull();
+    }
+    routes[`/tx/${txid}/outspend/1`] = { spent: false };
+    // No such output, no such transaction.
+    expect(await esplora.getUnspentOutput(txid, 9)).toBeNull();
+    expect(await esplora.getUnspentOutput("cd".repeat(32), 0)).toBeNull();
+    expect(await esplora.getTransactionConfirmations("cd".repeat(32))).toBe(0);
+
+    // Not yet in a block, and a tip that lags behind the transaction.
+    routes[`/tx/${txid}`] = {
+      ...(routes[`/tx/${txid}`] as object),
+      status: { confirmed: false },
+    };
+    asked.length = 0;
+    expect((await esplora.getUnspentOutput(txid, 1))?.confirmations).toBe(0);
+    expect(asked).not.toContain("/blocks/tip/height");
+    routes[`/tx/${txid}/status`] = { confirmed: true, block_height: 105 };
+    expect(await esplora.getTransactionConfirmations(txid)).toBe(0);
+
+    // The same answer as `gettxout` gives for the same output.
+    const rpc = new ElementsRpcClient({
+      url: "http://127.0.0.1:18884",
+      fetch: async () =>
+        Response.json({
+          result: {
+            confirmations: 3,
+            asset: "05".repeat(32),
+            value: 0.001,
+            scriptPubKey: { hex: script },
+          },
+          error: null,
+        }),
+    });
+    expect(await rpc.getUnspentOutput(txid, 1)).toEqual(explicit);
+
+    const failed = (await new EsploraClient(
+      "https://esplora.test",
+      async () => new Response("backend is syncing", { status: 503 }),
+    )
+      .getScriptUtxos(script)
+      .catch((error) => error)) as EsploraError;
+    expect(failed).toBeInstanceOf(EsploraError);
+    expect([failed.status, failed.message]).toEqual([
+      503,
+      "Esplora returned HTTP 503: backend is syncing",
+    ]);
+    expect(() => new EsploraClient("http://esplora.test")).toThrow("HTTPS");
+    expect(() => new EsploraClient("http://127.0.0.1:3001")).not.toThrow();
+    await expect(esplora.getUnspentOutput("xyz", 0)).rejects.toThrow(
+      "outpoint",
+    );
+    await expect(esplora.getUnspentOutput(txid, -1)).rejects.toThrow(
+      "outpoint",
+    );
   });
 });
