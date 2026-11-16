@@ -16,6 +16,16 @@ const NETWORKS = [
     "elementsregtest",
 ];
 const NOT_COORDINATOR = "this node is not the coordinator";
+const MAX_REQUESTS_PER_BATCH = 100;
+const POLICY_FIELDS = [
+    "operational_fee_sats",
+    "tick_burn_reserve_sats",
+    "issuance_transaction_fee_sats",
+    "min_fee_utxo_confirmations",
+    "finality_confirmations",
+    "tick_lifetime_blocks",
+    "max_unpriced_request_blocks",
+];
 /** A node answer that is not a success, or no answer at all. */
 export class OracleApiError extends Error {
     code;
@@ -307,6 +317,20 @@ export class PriceOracleClient {
             oracle_verifier_asset_id: info.oracle_verifier_asset_id.toLowerCase(),
         };
     }
+    /**
+     * Read what a batch costs and how long the network holds its results, as
+     * the answering node is configured. Every signer validates a round against
+     * its own fees and Tick lifetime, so the members share those.
+     */
+    async getPolicy() {
+        const policy = await this.#json("/users/policy");
+        for (const field of POLICY_FIELDS) {
+            const value = policy?.[field];
+            if (!Number.isSafeInteger(value) || value < 0)
+                throw new Error(`coordinator policy ${field} must be a non-negative integer`);
+        }
+        return Object.fromEntries(POLICY_FIELDS.map((field) => [field, policy[field]]));
+    }
     async getAccount(publicKey, verification) {
         assertXOnlyPublicKey(publicKey);
         const expected = deriveAccount(verification);
@@ -447,6 +471,21 @@ export class PriceOracleClient {
             throw new OracleApiError("coordinator returned a response that is not JSON", "invalid_response", response.status);
         return body;
     }
+}
+/**
+ * What a batch of `requests` needs in its fee UTXOs and what issuing it
+ * takes. The rest returns to the Account as change, which the network holds
+ * as the burn reserve of what the batch issued.
+ */
+export function estimateRequestFee(policy, requests) {
+    const count = typeof requests === "number" ? requests : requests.requests.length;
+    if (!Number.isInteger(count) || count < 1 || count > MAX_REQUESTS_PER_BATCH)
+        throw new Error(`a batch holds 1 to ${MAX_REQUESTS_PER_BATCH} requests`);
+    const charged = policy.operational_fee_sats * count + policy.issuance_transaction_fee_sats;
+    const required = charged + policy.tick_burn_reserve_sats * count;
+    if (!Number.isSafeInteger(required) || required < 0)
+        throw new Error("fee policy must hold non-negative integers");
+    return { required, charged };
 }
 /** Derive an Account and Tick from independently trusted contract leaves and asset IDs. */
 export function deriveAccount(verification) {
@@ -890,9 +929,12 @@ export function createTickSpendPlan(tick, resolution) {
 }
 /** Why a wait ended before the request was final. */
 function stillWaiting(status, timeoutMs) {
-    return new Error(status === undefined
-        ? `user request status was not read within ${timeoutMs} ms`
-        : `user request is still ${status.status} after ${timeoutMs} ms`);
+    if (status === undefined)
+        return new Error(`user request status was not read within ${timeoutMs} ms`);
+    const feed = status.waiting?.reason === "price"
+        ? `, waiting for a rate of feed ${status.waiting.price_feed_id}`
+        : "";
+    return new Error(`user request is still ${status.status} after ${timeoutMs} ms${feed}`);
 }
 /** A failure that asking again, or asking another node, may get past. */
 function isTransient(error) {

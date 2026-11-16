@@ -19,6 +19,16 @@ const NETWORKS: readonly string[] = [
   "elementsregtest",
 ];
 const NOT_COORDINATOR = "this node is not the coordinator";
+const MAX_REQUESTS_PER_BATCH = 100;
+const POLICY_FIELDS = [
+  "operational_fee_sats",
+  "tick_burn_reserve_sats",
+  "issuance_transaction_fee_sats",
+  "min_fee_utxo_confirmations",
+  "finality_confirmations",
+  "tick_lifetime_blocks",
+  "max_unpriced_request_blocks",
+] as const;
 
 /** `fetch`, as far as the SDK calls it. */
 export type FetchLike = (
@@ -107,6 +117,33 @@ export type NetworkVerification = {
   stormTreeRoot?: string;
 };
 
+/** What a batch has to bring and how long the network holds its results. */
+export type OraclePolicy = {
+  /** Charged for every request of a batch. */
+  operational_fee_sats: number;
+  /** Held back for every request of a batch, to pay for burning what it issued. */
+  tick_burn_reserve_sats: number;
+  /** Charged once for the transaction issuing a batch. */
+  issuance_transaction_fee_sats: number;
+  min_fee_utxo_confirmations: number;
+  /** Confirmations after which an included batch reads `executed`. */
+  finality_confirmations: number;
+  /** Blocks after which the network burns a Tick nobody spent. */
+  tick_lifetime_blocks: number;
+  /** Blocks a priced batch waits for a rate before it fails. */
+  max_unpriced_request_blocks: number;
+};
+
+export type FeeEstimate = {
+  /** The least the batch's fee UTXOs must hold for it to be accepted. */
+  required: number;
+  /**
+   * The most its issuance takes: the fee of every request, and the whole
+   * transaction fee, which batches issued in one round share.
+   */
+  charged: number;
+};
+
 export type OracleAccount = {
   address: string;
   script_pubkey: string;
@@ -170,6 +207,19 @@ export type TickRequestResult = {
 export type TickRequestStatus = {
   status: "pending" | "processing" | "included" | "executed" | "failed";
   payload: string | null;
+  /** What a `pending` request waits for; absent in every other status. */
+  waiting?: {
+    /**
+     * `price` while the coordinator holds no rate to issue the named feed at,
+     * `round` once only the next issuance round is awaited.
+     */
+    reason: "round" | "price";
+    price_feed_id?: number;
+    /** Blocks since the request was queued. */
+    blocks: number;
+    /** A priced request fails once it has waited more blocks than this. */
+    fails_after_blocks?: number;
+  };
 };
 
 export type WaitOptions = {
@@ -731,6 +781,26 @@ export class PriceOracleClient {
     };
   }
 
+  /**
+   * Read what a batch costs and how long the network holds its results, as
+   * the answering node is configured. Every signer validates a round against
+   * its own fees and Tick lifetime, so the members share those.
+   */
+  async getPolicy(): Promise<OraclePolicy> {
+    const policy = await this.#json<OraclePolicy>("/users/policy");
+    for (const field of POLICY_FIELDS) {
+      const value = policy?.[field];
+      if (!Number.isSafeInteger(value) || value < 0)
+        throw new Error(
+          `coordinator policy ${field} must be a non-negative integer`,
+        );
+    }
+
+    return Object.fromEntries(
+      POLICY_FIELDS.map((field) => [field, policy[field]]),
+    ) as OraclePolicy;
+  }
+
   async getAccount(
     publicKey: string,
     verification: AccountVerification,
@@ -936,6 +1006,33 @@ export class PriceOracleClient {
       );
     return body as Result;
   }
+}
+
+/**
+ * What a batch of `requests` needs in its fee UTXOs and what issuing it
+ * takes. The rest returns to the Account as change, which the network holds
+ * as the burn reserve of what the batch issued.
+ */
+export function estimateRequestFee(
+  policy: Pick<
+    OraclePolicy,
+    | "operational_fee_sats"
+    | "tick_burn_reserve_sats"
+    | "issuance_transaction_fee_sats"
+  >,
+  requests: number | TickRequest,
+): FeeEstimate {
+  const count =
+    typeof requests === "number" ? requests : requests.requests.length;
+  if (!Number.isInteger(count) || count < 1 || count > MAX_REQUESTS_PER_BATCH)
+    throw new Error(`a batch holds 1 to ${MAX_REQUESTS_PER_BATCH} requests`);
+  const charged =
+    policy.operational_fee_sats * count + policy.issuance_transaction_fee_sats;
+  const required = charged + policy.tick_burn_reserve_sats * count;
+  if (!Number.isSafeInteger(required) || required < 0)
+    throw new Error("fee policy must hold non-negative integers");
+
+  return { required, charged };
 }
 
 /** Derive an Account and Tick from independently trusted contract leaves and asset IDs. */
@@ -1581,10 +1678,14 @@ function stillWaiting(
   status: TickRequestStatus | undefined,
   timeoutMs: number,
 ): Error {
+  if (status === undefined)
+    return new Error(`user request status was not read within ${timeoutMs} ms`);
+  const feed =
+    status.waiting?.reason === "price"
+      ? `, waiting for a rate of feed ${status.waiting.price_feed_id}`
+      : "";
   return new Error(
-    status === undefined
-      ? `user request status was not read within ${timeoutMs} ms`
-      : `user request is still ${status.status} after ${timeoutMs} ms`,
+    `user request is still ${status.status} after ${timeoutMs} ms${feed}`,
   );
 }
 
