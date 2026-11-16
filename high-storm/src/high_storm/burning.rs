@@ -1339,6 +1339,33 @@ mod tests {
         0x17, 0x98,
     ];
 
+    /// A Burning over `store` whose Elements RPC wallet is `test` at `url`.
+    fn test_burning(
+        store: &MonitoredUtxoStore,
+        database: &crate::db::Database,
+        url: String,
+    ) -> Burning {
+        Burning::new(
+            store.clone(),
+            database.network_assets(),
+            ElementsRpcConfig {
+                url,
+                username: String::new(),
+                password: String::new(),
+                wallet: "test".into(),
+            },
+            ProtocolConfig {
+                operational_fee_sats: 1_000,
+                tick_burn_reserve_sats: 1_000,
+                issuance_transaction_fee_sats: 500,
+                burn_transaction_fee_sats: 500,
+                exchange_transaction_fee_sats: 500,
+                tick_lifetime_blocks: 60,
+                finality_confirmations: 2,
+            },
+        )
+    }
+
     fn verifier(txid: u8, output_index: u32, reserve: u8, owner: u8) -> MonitoredUtxo {
         MonitoredUtxo {
             asset_kind: ORACLE_VERIFIER_KIND.into(),
@@ -1397,9 +1424,7 @@ mod tests {
                     async move { axum::Json(response) }
                 }),
             );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let (address, server) = crate::high_storm::test_rpc::serve(app).await;
             let result = tokio::task::spawn_blocking(move || {
                 let client =
                     Client::new(&format!("http://{address}"), bitcoincore_rpc::Auth::None).unwrap();
@@ -1493,10 +1518,7 @@ mod tests {
         store
             .apply_block(
                 "burning-v1",
-                &IndexedBlock {
-                    height: 61,
-                    hash: [61; 32],
-                },
+                &IndexedBlock::at(61),
                 &[spent.clone(), available.clone()],
                 &[],
                 60,
@@ -1539,30 +1561,8 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let burning = Burning::new(
-            store.clone(),
-            database.network_assets(),
-            ElementsRpcConfig {
-                url: format!("http://{address}"),
-                username: String::new(),
-                password: String::new(),
-                wallet: "test".into(),
-            },
-            ProtocolConfig {
-                operational_fee_sats: 1_000,
-                tick_burn_reserve_sats: 1_000,
-                issuance_transaction_fee_sats: 500,
-                burn_transaction_fee_sats: 500,
-                exchange_transaction_fee_sats: 500,
-                tick_lifetime_blocks: 60,
-                finality_confirmations: 2,
-            },
-        );
+        let (address, server) = crate::high_storm::test_rpc::serve(app).await;
+        let burning = test_burning(&store, &database, format!("http://{address}"));
 
         let result = tokio::task::spawn_blocking(move || {
             tokio::runtime::Handle::current().block_on(async {
@@ -1596,16 +1596,7 @@ mod tests {
         let store = database.monitored_utxos();
         let items = (1..=4).map(|txid| tick(txid, 0, 9, 4)).collect::<Vec<_>>();
         store
-            .apply_block(
-                "burning-v1",
-                &IndexedBlock {
-                    height: 61,
-                    hash: [61; 32],
-                },
-                &items,
-                &[],
-                60,
-            )
+            .apply_block("burning-v1", &IndexedBlock::at(61), &items, &[], 60)
             .await
             .unwrap();
         let pending = [10; 32];
@@ -1644,28 +1635,8 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let burning = Burning::new(
-            store.clone(),
-            database.network_assets(),
-            ElementsRpcConfig {
-                url: format!("http://{address}"),
-                username: String::new(),
-                password: String::new(),
-                wallet: "test".into(),
-            },
-            ProtocolConfig {
-                operational_fee_sats: 1_000,
-                tick_burn_reserve_sats: 1_000,
-                issuance_transaction_fee_sats: 500,
-                burn_transaction_fee_sats: 500,
-                exchange_transaction_fee_sats: 500,
-                tick_lifetime_blocks: 60,
-                finality_confirmations: 2,
-            },
-        );
+        let (address, server) = crate::high_storm::test_rpc::serve(app).await;
+        let burning = test_burning(&store, &database, format!("http://{address}"));
 
         assert_eq!(burning.release_vanished_burns(62).await.unwrap(), 2);
         assert_eq!(burning.release_vanished_burns(62).await.unwrap(), 0);
@@ -1700,10 +1671,7 @@ mod tests {
         store
             .apply_block(
                 "burning-v1",
-                &IndexedBlock {
-                    height: 61,
-                    hash: [61; 32],
-                },
+                &IndexedBlock::at(61),
                 &[
                     unspent.clone(),
                     spent_in_mempool.clone(),
@@ -1751,28 +1719,8 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let burning = Burning::new(
-            store.clone(),
-            database.network_assets(),
-            ElementsRpcConfig {
-                url: format!("http://{address}"),
-                username: String::new(),
-                password: String::new(),
-                wallet: "test".into(),
-            },
-            ProtocolConfig {
-                operational_fee_sats: 1_000,
-                tick_burn_reserve_sats: 1_000,
-                issuance_transaction_fee_sats: 500,
-                burn_transaction_fee_sats: 500,
-                exchange_transaction_fee_sats: 500,
-                tick_lifetime_blocks: 60,
-                finality_confirmations: 2,
-            },
-        );
+        let (address, server) = crate::high_storm::test_rpc::serve(app).await;
+        let burning = test_burning(&store, &database, format!("http://{address}"));
         let group = select_groups(store.list_expired(10).await.unwrap(), MAX_TICKS_PER_BURN)
             .unwrap()
             .remove(0);
@@ -2135,35 +2083,14 @@ mod tests {
         store
             .apply_block(
                 "burning-v1",
-                &IndexedBlock {
-                    height: 61,
-                    hash: [61; 32],
-                },
+                &IndexedBlock::at(61),
                 &[faulty[0].clone(), faulty[1].clone(), healthy.clone()],
                 &[],
                 60,
             )
             .await
             .unwrap();
-        let burning = Burning::new(
-            store.clone(),
-            database.network_assets(),
-            ElementsRpcConfig {
-                url: "http://127.0.0.1:9".into(),
-                username: String::new(),
-                password: String::new(),
-                wallet: "test".into(),
-            },
-            ProtocolConfig {
-                operational_fee_sats: 1_000,
-                tick_burn_reserve_sats: 1_000,
-                issuance_transaction_fee_sats: 500,
-                burn_transaction_fee_sats: 500,
-                exchange_transaction_fee_sats: 500,
-                tick_lifetime_blocks: 60,
-                finality_confirmations: 2,
-            },
-        );
+        let burning = test_burning(&store, &database, "http://127.0.0.1:9".into());
 
         burning
             .quarantine_group(([5; 32], 7), &faulty, 61, "indexed issued UTXO changed")

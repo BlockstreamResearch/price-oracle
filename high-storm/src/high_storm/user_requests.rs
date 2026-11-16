@@ -2641,11 +2641,7 @@ mod tests {
                     }
                 }),
             );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
+            let (address, server) = crate::high_storm::test_rpc::serve(app).await;
             let result = tokio::task::spawn_blocking(move || {
                 let client = Client::new(&format!("http://{address}"), Auth::None).unwrap();
                 find_mempool_spender(&client, outpoint).map_err(|_| ())
@@ -2852,9 +2848,7 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (address, server) = crate::high_storm::test_rpc::serve(app).await;
         let result = tokio::task::spawn_blocking(move || {
             let client = Client::new(&format!("http://{address}"), Auth::None).unwrap();
             let find = |pool| {
@@ -3468,10 +3462,7 @@ mod tests {
             store
                 .apply_block(
                     "burning-v1",
-                    &IndexedBlock {
-                        height: 1,
-                        hash: [1; 32],
-                    },
+                    &IndexedBlock::at(1),
                     &[MonitoredUtxo {
                         txid: [10; 32],
                         output_index: 0,
@@ -3541,10 +3532,7 @@ mod tests {
         store
             .apply_block(
                 "burning-v1",
-                &IndexedBlock {
-                    height: 10,
-                    hash: [10; 32],
-                },
+                &IndexedBlock::at(10),
                 &[MonitoredUtxo {
                     txid: [1; 32],
                     output_index: 2,
@@ -3599,11 +3587,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let (address, server) = crate::high_storm::test_rpc::serve(app).await;
         let client = Client::new(&format!("http://{address}"), Auth::None).unwrap();
         let fee = |txid: u8, output_index: u32| FeeUtxo {
             txid: [txid; 32],
