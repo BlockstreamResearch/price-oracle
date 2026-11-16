@@ -189,6 +189,16 @@ export type IssuedTickVerification = {
     /** Locally compiled voucher leaf for the requested authentication method. */
     tickTapleafHash: string;
 };
+/** No clock: the pair is held against the Tick's own time, as a contract holds it. */
+export type IssuedTickWithPriceVerification = Omit<IssuedPriceVerification, "now"> & IssuedTickVerification;
+export type IssuedTickWithPrice = {
+    txid: string;
+    tick: IssuedTick;
+    verifierVout: number;
+    signedPrice: SignedPriceData;
+    /** The signed rate, decoded. */
+    price: PriceFeedData;
+};
 /** An output as the chain checks read it; a confidential one has no asset or amount. */
 export type ChainOutput = {
     confirmations: number;
@@ -358,4 +368,12 @@ export declare function verifyExecutedSignedPrice(status: TickRequestStatus, ver
  * reported time.
  */
 export declare function verifyExecutedTick(status: TickRequestStatus, verification: IssuedTickVerification, chain: ChainClient): Promise<IssuedTick | null>;
+/**
+ * Check the Tick and the Verifier one batch issued, as a contract spending
+ * them together does: each is the confirmed, unspent output its covenant
+ * expects, a current member signed the rate, and the rate is still valid at
+ * the time the Tick carries. No clock is read: the pair is held against the
+ * Tick's time alone, which is what `verify_tick_with_price` enforces.
+ */
+export declare function verifyExecutedTickWithPrice(status: TickRequestStatus, verification: IssuedTickWithPriceVerification, chain: ChainClient): Promise<IssuedTickWithPrice | null>;
 export declare function createTickSpendPlan(tick: IssuedTick, resolution: PredictionResolution): TickSpendPlan;
