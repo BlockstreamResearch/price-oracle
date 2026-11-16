@@ -17,6 +17,18 @@ export declare class OracleApiError extends Error {
     readonly status: number;
     constructor(message: string, code: OracleErrorCode, status: number, options?: ErrorOptions);
 }
+/** An Elements RPC failure, with the node's own message when it sent one. */
+export declare class ElementsRpcError extends Error {
+    readonly status: number;
+    /** The JSON-RPC error code, such as -5 for an unknown transaction. */
+    readonly code: number | undefined;
+    constructor(message: string, status: number, code?: number);
+}
+/** An Esplora answer that is not a success. */
+export declare class EsploraError extends Error {
+    readonly status: number;
+    constructor(message: string, status: number);
+}
 export type OracleNetwork = "liquidv1" | "liquidtestnet" | "elementsregtest";
 /** The active network assets and Storm Tree root, as the coordinator reports them. */
 export type OracleNetworkInfo = {
@@ -177,6 +189,20 @@ export type IssuedTickVerification = {
     /** Locally compiled voucher leaf for the requested authentication method. */
     tickTapleafHash: string;
 };
+/** An output as the chain checks read it; a confidential one has no asset or amount. */
+export type ChainOutput = {
+    confirmations: number;
+    scriptPubKey: string;
+    asset?: string;
+    amountSats?: number;
+};
+/** Read access to the chain, through Elements RPC or Esplora. */
+export interface ChainClient {
+    /** The script's confirmed, explicit outputs: those a request can be paid from. */
+    getScriptUtxos(scriptPubKey: string): Promise<OracleUtxo[]>;
+    /** The output while it is unspent, mempool spends included; null otherwise. */
+    getUnspentOutput(txid: string, vout: number): Promise<ChainOutput | null>;
+}
 export type PredictionResolution = {
     predictionId: string;
     occurredAt: number;
@@ -214,14 +240,38 @@ export type RpcOptions = {
     username?: string;
     password?: string;
     fetch?: FetchLike;
+    /** How long the node is given to answer; 15 seconds by default. */
+    timeoutMs?: number;
 };
-export declare class ElementsRpcClient {
+export declare class ElementsRpcClient implements ChainClient {
     #private;
     constructor(options: RpcOptions);
     call<Result>(method: string, params?: unknown[]): Promise<Result>;
+    getUnspentOutput(txid: string, vout: number): Promise<ChainOutput | null>;
     getScriptUtxos(scriptPubKey: string): Promise<OracleUtxo[]>;
     getTransactionConfirmations(txid: string): Promise<number>;
     broadcast(transactionHex: string, maxBurnSats?: number): Promise<string>;
+}
+/**
+ * Chain reads through an Esplora HTTP API, which public Liquid explorers
+ * serve to browsers. It does not broadcast: a Tick redemption burns, and only
+ * a node asked directly lifts its burn limit for one transaction.
+ */
+export type EsploraClientOptions = {
+    fetch?: FetchLike;
+    /** How long Esplora is given to answer; 15 seconds by default. */
+    timeoutMs?: number;
+};
+export declare class EsploraClient implements ChainClient {
+    #private;
+    constructor(url: string, options?: FetchLike | EsploraClientOptions);
+    /**
+     * Confirmed, explicit outputs, as Elements RPC lists them: an unconfirmed
+     * one cannot pay a request yet, and a confidential one has no amount to report.
+     */
+    getScriptUtxos(scriptPubKey: string): Promise<OracleUtxo[]>;
+    getUnspentOutput(txid: string, vout: number): Promise<ChainOutput | null>;
+    getTransactionConfirmations(txid: string): Promise<number>;
 }
 export type OracleClientOptions = {
     fetch?: FetchLike;
@@ -300,11 +350,12 @@ export declare function parseExecutedSignedPrice(status: TickRequestStatus, veri
     verifierVout: number;
     signedPrice: SignedPriceData;
 } | null;
-/** Check a finalized price and its confirmed, unspent Verifier via independent RPC. */
-export declare function verifyExecutedSignedPrice(status: TickRequestStatus, verification: IssuedPriceVerification, elements: ElementsRpcClient): Promise<ReturnType<typeof parseExecutedSignedPrice>>;
+/** Check a finalized price and its confirmed, unspent Verifier via an independent chain source. */
+export declare function verifyExecutedSignedPrice(status: TickRequestStatus, verification: IssuedPriceVerification, chain: ChainClient): Promise<ReturnType<typeof parseExecutedSignedPrice>>;
 /**
- * Check a finalized Tick via independent RPC: confirmed, unspent, in the Tick
- * asset, locked by the trusted voucher leaf, and carrying the reported time.
+ * Check a finalized Tick via an independent chain source: confirmed, unspent,
+ * in the Tick asset, locked by the trusted voucher leaf, and carrying the
+ * reported time.
  */
-export declare function verifyExecutedTick(status: TickRequestStatus, verification: IssuedTickVerification, elements: ElementsRpcClient): Promise<IssuedTick | null>;
+export declare function verifyExecutedTick(status: TickRequestStatus, verification: IssuedTickVerification, chain: ChainClient): Promise<IssuedTick | null>;
 export declare function createTickSpendPlan(tick: IssuedTick, resolution: PredictionResolution): TickSpendPlan;
