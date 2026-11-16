@@ -76,3 +76,28 @@ jobs:
           docker run --rm --entrypoint promtool
           -v "$PWD:/etc/prometheus:ro" -w /etc/prometheus
           prom/prometheus:v3.5.0 test rules alerts.test.yml
+
+  web-sdk:
+    name: Web SDK checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        working-directory: web/sdk
+        run: bun install --frozen-lockfile
+
+      - name: Build and test
+        working-directory: web/sdk
+        run: bun run check
+
+      # dist is committed, so it has to be what the sources build to.
+      - name: Check the committed build
+        run: git diff --exit-code -- web/sdk/dist
