@@ -176,6 +176,21 @@ fn rejected(
     error
 }
 
+/// Whether `kind` asks for, or reports, a spend of the network's covenant outputs.
+fn signs_or_reports_a_spend(kind: NodeMessageKind) -> bool {
+    matches!(
+        kind,
+        NodeMessageKind::ExecuteUserRequests
+            | NodeMessageKind::ExchangeRewards
+            | NodeMessageKind::SigningNonces
+            | NodeMessageKind::PartialSignatures
+            | NodeMessageKind::BurnExpiredUtxos
+            | NodeMessageKind::ExpiredUtxosBurned
+            | NodeMessageKind::ExecuteVotingRequest
+            | NodeMessageKind::RenewStormUtxos
+    )
+}
+
 /// Sets `requests_signature` once the payload shows the message asks this
 /// node to sign: the same kinds also carry notices of a broadcast transaction.
 async fn dispatch(
@@ -185,34 +200,10 @@ async fn dispatch(
     context: StormContext,
     requests_signature: &mut bool,
 ) -> Result<(), HandlerError> {
-    if state.is_recovering()
-        && matches!(
-            kind,
-            NodeMessageKind::ExecuteUserRequests
-                | NodeMessageKind::ExchangeRewards
-                | NodeMessageKind::SigningNonces
-                | NodeMessageKind::PartialSignatures
-                | NodeMessageKind::BurnExpiredUtxos
-                | NodeMessageKind::ExpiredUtxosBurned
-                | NodeMessageKind::ExecuteVotingRequest
-                | NodeMessageKind::RenewStormUtxos
-        )
-    {
+    if state.is_recovering() && signs_or_reports_a_spend(kind) {
         return Err(HandlerError::Recovering);
     }
-    if state.is_spending_paused()
-        && matches!(
-            kind,
-            NodeMessageKind::ExecuteUserRequests
-                | NodeMessageKind::ExchangeRewards
-                | NodeMessageKind::SigningNonces
-                | NodeMessageKind::PartialSignatures
-                | NodeMessageKind::BurnExpiredUtxos
-                | NodeMessageKind::ExpiredUtxosBurned
-                | NodeMessageKind::ExecuteVotingRequest
-                | NodeMessageKind::RenewStormUtxos
-        )
-    {
+    if state.is_spending_paused() && signs_or_reports_a_spend(kind) {
         return Err(HandlerError::MigrationFinalizing);
     }
     authorize_sender(

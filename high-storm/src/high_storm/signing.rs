@@ -561,34 +561,16 @@ impl Signing {
                 "invalid user request issuance transaction".into(),
             ));
         }
-        let request_hash = message.hash()?;
-        let peers = context.storm_handle.peers().await;
-        let sender = node_key(&context.message_context.peer_public_key)?;
-        let outbound = {
-            let mut state = self.state.lock().await;
-            state.refresh_members(&peers)?;
-            state.remove_expired_sessions();
-            state.start_session(
-                request_hash,
-                sender,
-                SigningRequest {
-                    kind: NodeMessageKind::ExecuteUserRequests,
-                    signing_storm_tree_branch: request.signing_storm_tree_branch,
-                    message_hashes: execute_message_hashes(request.signing_hash, price_hash),
-                },
-                None,
-            )?
-        };
-        if let Some(outbound) = outbound {
-            send_from_handle(
-                &context.storm_handle,
-                outbound,
-                self.session_recipients(request_hash).await?,
-            )
-            .await?;
-        }
-
-        Ok(())
+        self.join_session(
+            &message,
+            context,
+            SigningRequest {
+                kind: NodeMessageKind::ExecuteUserRequests,
+                signing_storm_tree_branch: request.signing_storm_tree_branch,
+                message_hashes: execute_message_hashes(request.signing_hash, price_hash),
+            },
+        )
+        .await
     }
 
     pub(crate) async fn handle_burn_expired_utxos(
@@ -608,34 +590,16 @@ impl Signing {
                 "invalid Tick burn transaction".into(),
             ));
         }
-        let request_hash = message.hash()?;
-        let peers = context.storm_handle.peers().await;
-        let sender = node_key(&context.message_context.peer_public_key)?;
-        let outbound = {
-            let mut state = self.state.lock().await;
-            state.refresh_members(&peers)?;
-            state.remove_expired_sessions();
-            state.start_session(
-                request_hash,
-                sender,
-                SigningRequest {
-                    kind: NodeMessageKind::BurnExpiredUtxos,
-                    signing_storm_tree_branch: request.signing_storm_tree_branch,
-                    message_hashes: vec![request.signing_hash],
-                },
-                None,
-            )?
-        };
-        if let Some(outbound) = outbound {
-            send_from_handle(
-                &context.storm_handle,
-                outbound,
-                self.session_recipients(request_hash).await?,
-            )
-            .await?;
-        }
-
-        Ok(())
+        self.join_session(
+            &message,
+            context,
+            SigningRequest {
+                kind: NodeMessageKind::BurnExpiredUtxos,
+                signing_storm_tree_branch: request.signing_storm_tree_branch,
+                message_hashes: vec![request.signing_hash],
+            },
+        )
+        .await
     }
 
     pub(crate) async fn handle_exchange_rewards(
@@ -655,34 +619,16 @@ impl Signing {
                 "invalid Droplets exchange transaction".into(),
             ));
         }
-        let request_hash = message.hash()?;
-        let peers = context.storm_handle.peers().await;
-        let sender = node_key(&context.message_context.peer_public_key)?;
-        let outbound = {
-            let mut state = self.state.lock().await;
-            state.refresh_members(&peers)?;
-            state.remove_expired_sessions();
-            state.start_session(
-                request_hash,
-                sender,
-                SigningRequest {
-                    kind: NodeMessageKind::ExchangeRewards,
-                    signing_storm_tree_branch: request.signing_storm_tree_branch,
-                    message_hashes: vec![request.signing_hash],
-                },
-                None,
-            )?
-        };
-        if let Some(outbound) = outbound {
-            send_from_handle(
-                &context.storm_handle,
-                outbound,
-                self.session_recipients(request_hash).await?,
-            )
-            .await?;
-        }
-
-        Ok(())
+        self.join_session(
+            &message,
+            context,
+            SigningRequest {
+                kind: NodeMessageKind::ExchangeRewards,
+                signing_storm_tree_branch: request.signing_storm_tree_branch,
+                message_hashes: vec![request.signing_hash],
+            },
+        )
+        .await
     }
 
     pub(crate) async fn handle_execute_voting_request(
@@ -696,33 +642,16 @@ impl Signing {
                 "invalid voting execution transaction".into(),
             ));
         }
-        let request_hash = message.hash()?;
-        let peers = context.storm_handle.peers().await;
-        let sender = node_key(&context.message_context.peer_public_key)?;
-        let outbound = {
-            let mut state = self.state.lock().await;
-            state.refresh_members(&peers)?;
-            state.remove_expired_sessions();
-            state.start_session(
-                request_hash,
-                sender,
-                SigningRequest {
-                    kind: NodeMessageKind::ExecuteVotingRequest,
-                    signing_storm_tree_branch: request.signing_storm_tree_branch,
-                    message_hashes: request.signing_hashes,
-                },
-                None,
-            )?
-        };
-        if let Some(outbound) = outbound {
-            send_from_handle(
-                &context.storm_handle,
-                outbound,
-                self.session_recipients(request_hash).await?,
-            )
-            .await?;
-        }
-        Ok(())
+        self.join_session(
+            &message,
+            context,
+            SigningRequest {
+                kind: NodeMessageKind::ExecuteVotingRequest,
+                signing_storm_tree_branch: request.signing_storm_tree_branch,
+                message_hashes: request.signing_hashes,
+            },
+        )
+        .await
     }
 
     pub(crate) async fn handle_renew_storm_utxos(
@@ -737,6 +666,26 @@ impl Signing {
                 "invalid Storm Eye renewal transaction".into(),
             ));
         }
+        self.join_session(
+            &message,
+            context,
+            SigningRequest {
+                kind: NodeMessageKind::RenewStormUtxos,
+                signing_storm_tree_branch: request.signing_storm_tree_branch,
+                message_hashes: request.signing_hashes,
+            },
+        )
+        .await
+    }
+
+    /// Starts the session that signs `request` for the leader message `message`,
+    /// and sends this node's first signing round, if any, to the session members.
+    async fn join_session(
+        &self,
+        message: &NodeMessage,
+        context: &StormContext,
+        request: SigningRequest,
+    ) -> Result<(), SigningError> {
         let request_hash = message.hash()?;
         let peers = context.storm_handle.peers().await;
         let sender = node_key(&context.message_context.peer_public_key)?;
@@ -744,16 +693,7 @@ impl Signing {
             let mut state = self.state.lock().await;
             state.refresh_members(&peers)?;
             state.remove_expired_sessions();
-            state.start_session(
-                request_hash,
-                sender,
-                SigningRequest {
-                    kind: NodeMessageKind::RenewStormUtxos,
-                    signing_storm_tree_branch: request.signing_storm_tree_branch,
-                    message_hashes: request.signing_hashes,
-                },
-                None,
-            )?
+            state.start_session(request_hash, sender, request, None)?
         };
         if let Some(outbound) = outbound {
             send_from_handle(

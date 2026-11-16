@@ -1461,30 +1461,7 @@ async fn node_setup_with_coordinator(
         storm,
         node_secret.secret_bytes(),
         coordinator_public_key,
-        crate::high_storm::HighStormDependencies::new(
-            database.network(),
-            database.voting(),
-            database.network_assets(),
-            database.monitored_utxos(),
-            database.droplets(),
-            database.user_requests(),
-            database.price_attestations(),
-            crate::config::ElementsRpcConfig {
-                url: "http://127.0.0.1:18884".to_string(),
-                username: "unused".to_string(),
-                password: "unused".to_string(),
-                wallet: "unused".to_string(),
-            },
-            crate::config::ProtocolConfig {
-                operational_fee_sats: 1_000,
-                tick_burn_reserve_sats: 1_000,
-                issuance_transaction_fee_sats: 1_000,
-                burn_transaction_fee_sats: 500,
-                exchange_transaction_fee_sats: 500,
-                tick_lifetime_blocks: 60,
-                finality_confirmations: 2,
-            },
-        ),
+        crate::high_storm::HighStormDependencies::for_tests(&database),
     )
     .await;
 

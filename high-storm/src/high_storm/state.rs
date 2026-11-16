@@ -115,18 +115,7 @@ impl NetworkState {
             protocol_config,
         } = dependencies;
 
-        let initial_members = storm
-            .peers()
-            .await
-            .into_iter()
-            .map(|peer| {
-                PublicKey::from_slice(&peer.compressed_public_key)
-                    .expect("Storm peers contain validated public keys")
-                    .x_only_public_key()
-                    .0
-                    .serialize()
-            })
-            .collect();
+        let initial_members = x_only_keys(storm.peers().await);
         let migration_paused = chain
             .recovery_state()
             .await
@@ -371,33 +360,24 @@ impl NetworkState {
             storm,
             secret_key,
             coordinator_public_key,
-            HighStormDependencies::new(
-                database.network(),
-                database.voting(),
-                database.network_assets(),
-                database.monitored_utxos(),
-                database.droplets(),
-                database.user_requests(),
-                database.price_attestations(),
-                crate::config::ElementsRpcConfig {
-                    url: "http://127.0.0.1:18884".to_string(),
-                    username: "unused".to_string(),
-                    password: "unused".to_string(),
-                    wallet: "unused".to_string(),
-                },
-                crate::config::ProtocolConfig {
-                    operational_fee_sats: 1_000,
-                    tick_burn_reserve_sats: 1_000,
-                    issuance_transaction_fee_sats: 1_000,
-                    burn_transaction_fee_sats: 500,
-                    exchange_transaction_fee_sats: 500,
-                    tick_lifetime_blocks: 60,
-                    finality_confirmations: 2,
-                },
-            ),
+            HighStormDependencies::for_tests(database),
         )
         .await
     }
+}
+
+/// The x-only keys of `peers`, whose keys Storm has already validated.
+pub(super) fn x_only_keys<C: FromIterator<[u8; 32]>>(peers: Vec<storm::Peer>) -> C {
+    peers
+        .into_iter()
+        .map(|peer| {
+            PublicKey::from_slice(&peer.compressed_public_key)
+                .expect("Storm peers contain validated public keys")
+                .x_only_public_key()
+                .0
+                .serialize()
+        })
+        .collect()
 }
 
 #[cfg(test)]
