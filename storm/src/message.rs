@@ -51,6 +51,24 @@ impl StormErrorCode {
 }
 
 impl StormMessage {
+    /// A message of `payload_type` stamped with the current time.
+    pub(crate) fn new(
+        payload_type: crate::message_handlers::StormMessagePayloadType,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            header: StormMessageHeader {
+                payload_id: payload_type as u32,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                protocol_version: crate::constants::PROTOCOL_VERSION,
+            },
+            payload,
+        }
+    }
+
     /// Serializes this message with postcard.
     pub fn to_bytes(&self) -> Result<Vec<u8>, MessageError> {
         let bytes = postcard::to_stdvec(self)?;

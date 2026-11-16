@@ -109,42 +109,14 @@ impl StormHandle {
     /// Returns the complete staged peer table when it is ready to activate.
     pub async fn member_migration_peers(&self) -> Result<Vec<Peer>, Error> {
         let state = self.inner.read().await;
-        if state.migration_members.is_none() {
-            return Err(Error::MigrationNotStaged);
-        }
-        if !state.migration_peer_identities_valid() {
-            return Err(Error::InvalidMigrationPeerTable);
-        }
-        if !state.migration_ready()
-            && (state.migration_contains(&state.initializer_public_key)
-                || !state.migration_table_complete())
-        {
-            return Err(Error::MigrationNotReady);
-        }
-        if !state.migration_peer_table_matches_members() {
-            return Err(Error::InvalidMigrationPeerTable);
-        }
+        state.ensure_migration_activatable()?;
         Ok(state.migration_peers.clone())
     }
 
     /// Activates the staged peer table after every target member is connected.
     pub async fn activate_member_migration(&self) -> Result<Vec<Peer>, Error> {
         let mut state = self.inner.write().await;
-        if state.migration_members.is_none() {
-            return Err(Error::MigrationNotStaged);
-        }
-        if !state.migration_peer_identities_valid() {
-            return Err(Error::InvalidMigrationPeerTable);
-        }
-        if !state.migration_ready()
-            && (state.migration_contains(&state.initializer_public_key)
-                || !state.migration_table_complete())
-        {
-            return Err(Error::MigrationNotReady);
-        }
-        if !state.migration_peer_table_matches_members() {
-            return Err(Error::InvalidMigrationPeerTable);
-        }
+        state.ensure_migration_activatable()?;
 
         state.peers = std::mem::take(&mut state.migration_peers);
         state.migration_members = None;
