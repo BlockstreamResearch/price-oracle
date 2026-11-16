@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Client, RpcApi};
 use contracts::artifacts::account::{AccountProgram, derived_account::AccountArguments};
 use contracts::artifacts::treasury::{TreasuryProgram, derived_treasury::TreasuryArguments};
 use secp256k1_zkp::Secp256k1;
@@ -21,6 +21,7 @@ use simplex::{
 use storm_tree::StormTree;
 use tokio::sync::Mutex;
 
+use crate::high_storm::elements;
 use crate::{
     NetworkAsset,
     config::{ElementsRpcConfig, ProtocolConfig},
@@ -558,10 +559,7 @@ impl Indexer {
         let url = url::Url::parse(&self.elements_rpc.url)?;
         Ok(crate::monitoring::elements_client(
             url.as_str(),
-            Auth::UserPass(
-                self.elements_rpc.username.clone(),
-                self.elements_rpc.password.clone(),
-            ),
+            self.elements_rpc.auth(),
             "rebroadcast",
         )?)
     }
@@ -1155,34 +1153,9 @@ fn previous_output(
 }
 
 fn network(client: &Client) -> Result<SimplicityNetwork, IndexerError> {
-    #[derive(serde::Deserialize)]
-    struct ChainInfo {
-        chain: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct SidechainInfo {
-        pegged_asset: String,
-    }
-
-    let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
-    match chain.chain.as_str() {
-        "liquidv1" => Ok(SimplicityNetwork::Liquid),
-        "liquidtestnet" => Ok(SimplicityNetwork::LiquidTestnet),
-        "elementsregtest" => {
-            let sidechain: SidechainInfo = client.call("getsidechaininfo", &[])?;
-            let genesis_hash: String = client.call("getblockhash", &[0.into()])?;
-            Ok(SimplicityNetwork::ElementsCustom {
-                policy_asset: AssetId::from_str(&sidechain.pegged_asset)
-                    .map_err(|_| IndexerError::Invalid("invalid regtest policy asset".into()))?,
-                genesis_hash: BlockHash::from_str(&genesis_hash)
-                    .map_err(|_| IndexerError::Invalid("invalid regtest genesis hash".into()))?,
-            })
-        }
-        _ => Err(IndexerError::Invalid(format!(
-            "unsupported Elements chain '{}'",
-            chain.chain
-        ))),
-    }
+    elements::network(client, IndexerError::Invalid, |chain| {
+        IndexerError::Invalid(format!("unsupported Elements chain '{chain}'"))
+    })
 }
 
 fn spent_monitored_outpoints(transactions: &[Transaction]) -> Vec<([u8; 32], u32, [u8; 32])> {
@@ -1256,6 +1229,7 @@ fn get_block(client: &Client, hash: [u8; 32]) -> Result<Block, IndexerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoincore_rpc::Auth;
     use secp256k1_zkp::PublicKey;
     use simplex::simplicityhl::elements::{
         Script, TxOut, TxOutSecrets, Txid,

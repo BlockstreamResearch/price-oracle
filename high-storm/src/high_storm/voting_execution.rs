@@ -3,13 +3,10 @@ use std::{
     str::FromStr,
 };
 
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Client, RpcApi};
 use contracts::artifacts::{
     auth::derived_auth::AuthWitness,
-    treasury::{
-        TreasuryProgram,
-        derived_treasury::{TreasuryArguments, TreasuryWitness},
-    },
+    treasury::{TreasuryProgram, derived_treasury::TreasuryArguments},
 };
 use secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
 use serde::Deserialize;
@@ -26,8 +23,9 @@ use simplex::{
     },
 };
 use storm_tree::{StormTree, StormTreeProof};
-use url::Url;
 
+use crate::high_storm::elements;
+use crate::high_storm::elements::RawTransactionInfo;
 use crate::{
     ExecuteVotingRequest, MergeStormEyes, NetworkAsset, NetworkVoteKind, NodeMessage,
     SplitStormEye, StormEyeUtxo, UpdateNetworkMembers,
@@ -457,23 +455,12 @@ impl VotingExecution {
                 .expect("Storm Eye is a program input")
                 .witness = witness.into();
         }
-        for (index, input) in prepared.transaction.inputs().iter().enumerate() {
-            let program_input = input
-                .program_input
-                .as_ref()
-                .expect("all voting transaction inputs are covenant inputs");
-            prepared.pset.inputs_mut()[index].final_script_witness = Some(
-                program_input
-                    .program
-                    .finalize(
-                        &prepared.pset,
-                        &program_input.witness,
-                        index,
-                        &prepared.network,
-                    )?
-                    .into(),
-            );
-        }
+        elements::finalize_program_inputs(
+            &mut prepared.pset,
+            &prepared.transaction,
+            &prepared.network,
+            "all voting transaction inputs are covenant inputs",
+        )?;
         if signing_hashes(
             &prepared.pset,
             &prepared.storm_eye,
@@ -778,18 +765,10 @@ impl VotingExecution {
     }
 
     fn client(&self) -> Result<Client, VotingExecutionError> {
-        let mut url = Url::parse(&self.elements_rpc.url)?;
-        url.path_segments_mut()
-            .map_err(|_| url::ParseError::RelativeUrlWithCannotBeABaseBase)?
-            .pop_if_empty()
-            .push("wallet")
-            .push(&self.elements_rpc.wallet);
+        let url = self.elements_rpc.wallet_url()?;
         Ok(crate::monitoring::elements_client(
             url.as_str(),
-            Auth::UserPass(
-                self.elements_rpc.username.clone(),
-                self.elements_rpc.password.clone(),
-            ),
+            self.elements_rpc.auth(),
             "voting",
         )?)
     }
@@ -938,14 +917,6 @@ struct ScannedUtxo {
     #[serde(default)]
     asset: Option<String>,
     height: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct RawTransactionInfo {
-    #[serde(default)]
-    confirmations: u64,
-    #[serde(default, rename = "blockhash")]
-    block_hash: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1139,18 +1110,7 @@ fn build_transaction(
     let treasury = TreasuryProgram::new(&TreasuryArguments {
         storm_eye_asset_id: storm_eye.asset_id,
     });
-    for utxo in &treasury_utxos {
-        transaction.add_program_input(
-            PartialInput::new(utxo.clone()),
-            ProgramInput::new(
-                Box::new(treasury.as_ref().clone()),
-                TreasuryWitness {
-                    storm_eye_input_index: 0,
-                },
-            ),
-            RequiredSignature::None,
-        );
-    }
+    elements::add_treasury_inputs(&mut transaction, &treasury, &treasury_utxos);
 
     let storm_eye_asset = asset_id(storm_eye.asset_id)?;
     let storm_eye_script = Script::from(storm_eye.contract_script.clone());
@@ -1684,36 +1644,9 @@ pub(crate) fn signing_hashes(
 }
 
 pub(crate) fn network(client: &Client) -> Result<SimplicityNetwork, VotingExecutionError> {
-    #[derive(serde::Deserialize)]
-    struct ChainInfo {
-        chain: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct SidechainInfo {
-        pegged_asset: String,
-    }
-
-    let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
-    match chain.chain.as_str() {
-        "liquidv1" => Ok(SimplicityNetwork::Liquid),
-        "liquidtestnet" => Ok(SimplicityNetwork::LiquidTestnet),
-        "elementsregtest" => {
-            let sidechain: SidechainInfo = client.call("getsidechaininfo", &[])?;
-            let genesis_hash: String = client.call("getblockhash", &[0.into()])?;
-            Ok(SimplicityNetwork::ElementsCustom {
-                policy_asset: AssetId::from_str(&sidechain.pegged_asset).map_err(|_| {
-                    VotingExecutionError::Invalid("invalid regtest policy asset".into())
-                })?,
-                genesis_hash: BlockHash::from_str(&genesis_hash).map_err(|_| {
-                    VotingExecutionError::Invalid("invalid regtest genesis hash".into())
-                })?,
-            })
-        }
-        _ => Err(VotingExecutionError::Invalid(format!(
-            "unsupported Elements chain '{}'",
-            chain.chain
-        ))),
-    }
+    elements::network(client, VotingExecutionError::Invalid, |chain| {
+        VotingExecutionError::Invalid(format!("unsupported Elements chain '{chain}'"))
+    })
 }
 
 #[cfg(test)]
