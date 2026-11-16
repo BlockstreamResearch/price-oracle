@@ -16,10 +16,7 @@ use simplex::{
     transaction::{FinalTransaction, PartialInput, ProgramInput, RequiredSignature, UTXO},
 };
 
-use super::{
-    assets::StormEyeContractData,
-    user_requests::{PackedStormTreeProof, STORM_EYE_TAG},
-};
+use super::{assets::StormEyeContractData, user_requests::UserRequestError};
 
 #[derive(Deserialize)]
 pub(crate) struct ChainInfo {
@@ -169,4 +166,71 @@ pub(crate) fn network<E: From<bitcoincore_rpc::Error>>(
         }
         _ => Err(unsupported(chain.chain)),
     }
+}
+
+pub(crate) const STORM_EYE_TAG: &str = "OracleNetworkV1/StormEye";
+
+const STORM_EYE_AUTH_WITNESS_TEMPLATE: [usize; 4] = [512, 2_048, 32, 129];
+
+pub(crate) type PackedStormTreeProof =
+    [Either<(), (bool, [u8; 32])>; storm_tree::TREE_DEPTH as usize];
+
+pub(crate) fn finalized_dummy_weight(
+    transaction: &FinalTransaction,
+    pset: &PartiallySignedTransaction,
+    network: &SimplicityNetwork,
+) -> Result<usize, UserRequestError> {
+    let mut pset = pset.clone();
+    let storm_eye_input = pset.inputs_mut().get_mut(0).ok_or_else(|| {
+        UserRequestError::Invalid("cannot estimate a transaction without inputs".into())
+    })?;
+    storm_eye_input.final_script_witness = Some(
+        STORM_EYE_AUTH_WITNESS_TEMPLATE
+            .map(|length| vec![0; length])
+            .to_vec()
+            .into(),
+    );
+    for (index, input) in transaction.inputs().iter().enumerate() {
+        let Some(program_input) = &input.program_input else {
+            continue;
+        };
+        if index == 0 {
+            continue;
+        }
+        let final_witness = program_input
+            .program
+            .finalize(&pset, &program_input.witness, index, network)
+            .map_err(|error| {
+                UserRequestError::Invalid(format!(
+                    "failed to estimate covenant input {index} weight: {error}"
+                ))
+            })?;
+        pset.inputs_mut()[index].final_script_witness = Some(final_witness.into());
+    }
+    let transaction = pset
+        .extract_tx()
+        .map_err(|error| UserRequestError::Pset(error.to_string()))?;
+
+    Ok(transaction.weight())
+}
+
+pub(crate) fn pack_proof(
+    proof: &storm_tree::StormTreeProof,
+) -> Result<PackedStormTreeProof, UserRequestError> {
+    if proof.siblings.len() > storm_tree::TREE_DEPTH as usize {
+        return Err(UserRequestError::Invalid(
+            "Storm Tree proof is too deep".into(),
+        ));
+    }
+    Ok(std::array::from_fn(|index| {
+        proof
+            .siblings
+            .get(index)
+            .copied()
+            .map_or(Either::Left(()), Either::Right)
+    }))
+}
+
+pub(crate) fn asset_id(bytes: [u8; 32]) -> Result<AssetId, UserRequestError> {
+    Ok(AssetId::from_byte_array(bytes))
 }

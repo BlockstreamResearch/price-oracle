@@ -32,12 +32,12 @@ use crate::{
 use super::{
     SigningResult,
     assets::{StormEyeContractData, storm_eye_program},
+    elements::{STORM_EYE_TAG, asset_id, pack_proof},
     message::ExchangeRewards,
     signing::SigningError,
-    user_requests::{
-        STORM_EYE_TAG, StormEyePool, asset_id, find_contract_utxo, get_optional_explicit_outpoint,
-        is_fully_explicit_output, output_from_utxo, pack_proof, require_explicit_utxo,
-        require_preserved_output, witness_utxo,
+    utxo::{
+        StormEyePool, find_contract_utxo, get_optional_explicit_outpoint, is_fully_explicit_output,
+        output_from_utxo, require_explicit_utxo, require_preserved_output, witness_utxo,
     },
 };
 

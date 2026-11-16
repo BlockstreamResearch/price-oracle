@@ -38,9 +38,10 @@ use super::{
     SigningResult,
     assets::{StormEyeContractData, migrated_members_script, storm_eye_program},
     droplets::member_script,
-    user_requests::{
-        STORM_EYE_TAG, asset_id, get_explicit_outpoint, get_optional_explicit_outpoint,
-        is_fully_explicit_output, pack_proof, witness_utxo,
+    elements::{STORM_EYE_TAG, asset_id, pack_proof},
+    utxo::{
+        get_explicit_outpoint, get_optional_explicit_outpoint, is_fully_explicit_output,
+        witness_utxo,
     },
 };
 
@@ -1000,7 +1001,7 @@ fn scan_storm_eye_utxos_with_mempool(
             let utxo = if include_mempool {
                 get_explicit_outpoint(client, txid, unspent.vout)?
             } else {
-                super::user_requests::get_optional_explicit_outpoint_ignoring_mempool(
+                super::utxo::get_optional_explicit_outpoint_ignoring_mempool(
                     client,
                     txid,
                     unspent.vout,

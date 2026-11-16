@@ -22,6 +22,7 @@ mod renewal;
 mod signing;
 mod state;
 mod user_requests;
+mod utxo;
 mod voting;
 mod voting_execution;
 
