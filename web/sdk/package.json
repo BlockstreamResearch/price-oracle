@@ -12,6 +12,7 @@
   "files": ["dist"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:leaves": "leaves/build.sh",
     "test": "bun test",
     "check": "bun run build && bun test"
   },

@@ -10,6 +10,9 @@ high-storm/.env
 # SimplicityHL
 contracts/deps
 contracts/src/artifacts
+# Written by web/sdk/leaves/build.sh: the lock it copies and the module it builds
+web/sdk/leaves/Cargo.lock
+web/sdk/dist/leaves.wasm
 
 node_modules/
 .vite/
