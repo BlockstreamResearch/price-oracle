@@ -432,38 +432,10 @@ impl Assets {
     where
         I: AssetIssuer + Clone + Send + 'static,
     {
-        if let Some(asset) = self.store.get(STORM_EYE_KIND).await? {
-            return Ok(asset);
-        }
-
-        let pending = if let Some(pending) = self.store.get_pending(STORM_EYE_KIND).await? {
-            pending
-        } else {
-            let issuer = issuer.clone();
-            let pending = tokio::task::spawn_blocking(move || {
-                issuer.prepare(storm_tree_root, &initial_members)
-            })
-            .await??;
-
-            if !self.store.insert_pending(&pending).await? {
-                self.store
-                    .get_pending(STORM_EYE_KIND)
-                    .await?
-                    .ok_or_else(|| AssetError::Conflict(STORM_EYE_KIND.to_string()))?
-            } else {
-                pending
-            }
-        };
-
-        let issuer = issuer.clone();
-        let issuance_tx = pending.issuance_tx.clone();
-        let issuance_txid = pending.asset.issuance_txid;
-        tokio::task::spawn_blocking(move || issuer.broadcast(&issuance_tx, issuance_txid))
-            .await??;
-
-        self.store.activate(STORM_EYE_KIND).await?;
-
-        Ok(pending.asset)
+        self.ensure_asset(STORM_EYE_KIND, issuer, move |issuer| {
+            issuer.prepare(storm_tree_root, &initial_members)
+        })
+        .await
     }
 
     async fn ensure_reissuable_asset<I>(
@@ -476,6 +448,25 @@ impl Assets {
     where
         I: ReissuableAssetIssuer + Clone + Send + 'static,
     {
+        self.ensure_asset(kind, issuer, move |issuer| {
+            issuer.prepare_reissuable_asset(kind, name, storm_eye_asset_id)
+        })
+        .await
+    }
+
+    /// Returns the active asset of `kind`. Otherwise takes the pending
+    /// issuance, or prepares and stores one with `prepare`, then broadcasts and
+    /// activates it.
+    async fn ensure_asset<I, P>(
+        &self,
+        kind: &'static str,
+        issuer: I,
+        prepare: P,
+    ) -> Result<NetworkAsset, AssetError>
+    where
+        I: AssetIssuer + Clone + Send + 'static,
+        P: FnOnce(I) -> Result<PendingNetworkAsset, AssetError> + Send + 'static,
+    {
         if let Some(asset) = self.store.get(kind).await? {
             return Ok(asset);
         }
@@ -484,10 +475,7 @@ impl Assets {
             pending
         } else {
             let issuer = issuer.clone();
-            let pending = tokio::task::spawn_blocking(move || {
-                issuer.prepare_reissuable_asset(kind, name, storm_eye_asset_id)
-            })
-            .await??;
+            let pending = tokio::task::spawn_blocking(move || prepare(issuer)).await??;
 
             if !self.store.insert_pending(&pending).await? {
                 self.store

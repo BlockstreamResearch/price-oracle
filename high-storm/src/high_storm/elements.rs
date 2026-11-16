@@ -1,15 +1,24 @@
 use std::str::FromStr;
 
 use bitcoincore_rpc::{Client, RpcApi};
-use contracts::artifacts::treasury::{TreasuryProgram, derived_treasury::TreasuryWitness};
+use contracts::artifacts::{
+    auth::{AuthProgram, derived_auth::AuthWitness},
+    treasury::{TreasuryProgram, derived_treasury::TreasuryWitness},
+};
 use serde::Deserialize;
 use simplex::{
+    either::Either,
     program::ProgramError,
     provider::SimplicityNetwork,
     simplicityhl::elements::{
         AssetId, BlockHash, Script, opcodes, pset::PartiallySignedTransaction, script::Instruction,
     },
     transaction::{FinalTransaction, PartialInput, ProgramInput, RequiredSignature, UTXO},
+};
+
+use super::{
+    assets::StormEyeContractData,
+    user_requests::{PackedStormTreeProof, STORM_EYE_TAG},
 };
 
 #[derive(Deserialize)]
@@ -31,6 +40,56 @@ pub(crate) struct RawTransactionInfo {
 }
 
 /// Adds each of `utxos` as a Treasury input that defers to the Storm Eye at input 0.
+/// The spend arm of a Storm Eye witness, as `AuthKind` in `auth.simf`.
+pub(crate) type StormEyeSpend =
+    Either<u32, Either<Either<([u8; 32], u32), (u32, u32)>, Either<u8, u8>>>;
+
+/// A Storm Eye witness for the authorized spend `kind`, signed by `branch`.
+pub(crate) fn storm_eye_witness(
+    data: &StormEyeContractData,
+    signature: [u8; 64],
+    branch: [u8; 32],
+    proof: PackedStormTreeProof,
+    kind: StormEyeSpend,
+) -> AuthWitness {
+    AuthWitness {
+        path: Either::Left((
+            (data.storm_tree_root, data.rescue_height),
+            (signature, branch, proof),
+            kind,
+        )),
+    }
+}
+
+/// The witness a Storm Eye input carries until it is signed: a zero
+/// signature, the root as branch and an empty proof.
+pub(crate) fn placeholder_storm_eye_witness(
+    data: &StormEyeContractData,
+    kind: StormEyeSpend,
+) -> AuthWitness {
+    storm_eye_witness(
+        data,
+        [0; 64],
+        data.storm_tree_root,
+        std::array::from_fn(|_| Either::Left(())),
+        kind,
+    )
+}
+
+/// Adds a Storm Eye input signed through the tagged `PATH` witness.
+pub(crate) fn add_storm_eye_input(
+    transaction: &mut FinalTransaction,
+    utxo: &UTXO,
+    program: &AuthProgram,
+    witness: AuthWitness,
+) {
+    transaction.add_program_input(
+        PartialInput::new(utxo.clone()),
+        ProgramInput::new(Box::new(program.as_ref().clone()), witness),
+        RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+    );
+}
+
 pub(crate) fn add_treasury_inputs<'a>(
     transaction: &mut FinalTransaction,
     treasury: &TreasuryProgram,

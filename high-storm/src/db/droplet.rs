@@ -1,6 +1,7 @@
 use sqlx::{Any, AnyPool, Row, Transaction};
 
 use super::monitored_utxo::{IndexedBlock, MonitoredUtxoStore};
+use super::{decode_hash, decode_u64, encode_u64};
 
 /// A credit repays any deficit before it adds to the balance.
 const CREDIT_SQL: &str = "INSERT INTO droplets (xonly_pubkey, amount, block_height) VALUES ($1, $2, $3) \
@@ -546,20 +547,6 @@ fn decode_exchange_request(row: sqlx::any::AnyRow) -> Result<DropletExchangeRequ
             .transpose()?,
         last_error: row.try_get("last_error")?,
     })
-}
-
-fn encode_u64(value: u64) -> Result<i64, sqlx::Error> {
-    i64::try_from(value).map_err(|error| sqlx::Error::Encode(Box::new(error)))
-}
-
-fn decode_u64(value: i64) -> Result<u64, sqlx::Error> {
-    u64::try_from(value).map_err(|error| sqlx::Error::Decode(Box::new(error)))
-}
-
-fn decode_hash(value: Vec<u8>) -> Result<[u8; 32], sqlx::Error> {
-    value
-        .try_into()
-        .map_err(|_| sqlx::Error::Decode("invalid hash length".into()))
 }
 
 #[cfg(test)]
