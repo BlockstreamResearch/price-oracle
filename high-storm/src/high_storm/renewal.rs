@@ -32,9 +32,9 @@ use super::{
         storm_eye_contract_data, storm_eye_program,
     },
     droplets::member_script,
+    elements::{asset_id, pack_proof},
     message::{NodeMessage, NodeMessageKind, RenewStormUtxos},
     signing::SigningError,
-    user_requests::{asset_id, pack_proof},
     voting_execution::{
         VotingExecutionError, network, scan_storm_eye_utxos, scan_storm_eye_utxos_ignoring_mempool,
         signing_hashes, verify_voting_amounts,
@@ -699,14 +699,14 @@ fn live_treasury_utxo(
 ) -> Result<Option<UTXO>, RenewalError> {
     let txid = Txid::from_byte_array(indexed.txid);
     if include_mempool {
-        Ok(super::user_requests::get_optional_explicit_outpoint(
+        Ok(super::utxo::get_optional_explicit_outpoint(
             client,
             txid,
             indexed.output_index,
         )?)
     } else {
         Ok(
-            super::user_requests::get_optional_explicit_outpoint_ignoring_mempool(
+            super::utxo::get_optional_explicit_outpoint_ignoring_mempool(
                 client,
                 txid,
                 indexed.output_index,
