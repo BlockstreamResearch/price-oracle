@@ -11,6 +11,7 @@ import {
   OracleApiError,
   PriceOracleClient,
   deriveAccount,
+  estimateRequestFee,
   createSignedPriceRequest,
   createTickRequest,
   createWalletTickRequest,
@@ -1395,6 +1396,87 @@ describe("Price Oracle SDK", () => {
     expect(
       () => new PriceOracleClient(["https://a.test", "http://b.test"]),
     ).toThrow("HTTPS");
+  });
+
+  test("reads the request policy and prices a batch by it", async () => {
+    const policy = {
+      operational_fee_sats: 1000,
+      tick_burn_reserve_sats: 700,
+      issuance_transaction_fee_sats: 300,
+      min_fee_utxo_confirmations: 1,
+      finality_confirmations: 2,
+      tick_lifetime_blocks: 60,
+      max_unpriced_request_blocks: 10,
+    };
+    let response: unknown = { ...policy, something_new: 1 };
+    const client = new PriceOracleClient(
+      "https://coordinator.test",
+      async (request) => {
+        expect(request).toBe("https://coordinator.test/users/policy");
+        return Response.json(response);
+      },
+    );
+    // Only the fields the SDK knows are handed on.
+    expect(await client.getPolicy()).toEqual(policy);
+
+    for (const broken of [
+      { ...policy, operational_fee_sats: "1000" },
+      { ...policy, tick_burn_reserve_sats: -1 },
+      { ...policy, finality_confirmations: 1.5 },
+      { ...policy, tick_lifetime_blocks: undefined },
+      null,
+    ]) {
+      response = broken;
+      await expect(client.getPolicy()).rejects.toThrow("coordinator policy");
+    }
+
+    // The node's own rule: fee and reserve per request, one transaction fee.
+    expect(estimateRequestFee(policy, 1)).toEqual({
+      required: 2000,
+      charged: 1300,
+    });
+    expect(estimateRequestFee(policy, 3)).toEqual({
+      required: 5400,
+      charged: 3300,
+    });
+    const paired = createSignedPriceRequest(
+      PRIVATE_KEY,
+      [`${"01".repeat(32)}:0`],
+      4,
+      undefined,
+      { withTick: true },
+    );
+    expect(estimateRequestFee(policy, paired)).toEqual(
+      estimateRequestFee(policy, 2),
+    );
+    for (const count of [0, 101, 1.5, Number.NaN])
+      expect(() => estimateRequestFee(policy, count)).toThrow("1 to 100");
+  });
+
+  test("says what a request still pending at the timeout waits for", async () => {
+    const hash = "ab".repeat(32);
+    const client = (waiting: object) =>
+      new PriceOracleClient("https://coordinator.test", async () =>
+        Response.json({ status: "pending", payload: null, waiting }),
+      );
+    const options = { intervalMs: 1, timeoutMs: 5 };
+
+    const seen: unknown[] = [];
+    await expect(
+      client({
+        reason: "price",
+        price_feed_id: 9,
+        blocks: 4,
+        fails_after_blocks: 10,
+      }).waitForTickRequest(hash, {
+        ...options,
+        onStatus: ({ waiting }) => seen.push(waiting?.blocks),
+      }),
+    ).rejects.toThrow("still pending after 5 ms, waiting for a rate of feed 9");
+    expect(seen[0]).toBe(4);
+    await expect(
+      client({ reason: "round", blocks: 1 }).waitForTickRequest(hash, options),
+    ).rejects.toThrow(/still pending after 5 ms$/);
   });
 
   test("hands on the reason an Elements node gives for a failed call", async () => {
