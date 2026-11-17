@@ -264,9 +264,31 @@ Verifier. `createSignedPriceRequest(privateKey, feeUtxos, feedId, authMethod,
 { withTick: true })` orders both in one batch under the same authentication
 method, as `createWalletSignedPriceRequest` does for a wallet. Both are issued
 in one transaction: the batch pays the per-output fee twice and the issuance fee
-once, and its fee UTXOs must also cover a burn reserve for each output. Check
-the Verifier with `verifyExecutedSignedPrice` and the Tick with
-`verifyExecutedTick`.
+once, and its fee UTXOs must also cover a burn reserve for each output.
+
+`verifyExecutedTickWithPrice(status, verification, chain)` checks such a batch
+as the contract's `verify_tick_with_price` will: the Tick and the Verifier are
+each the confirmed, unspent output their covenant expects, a member of the
+trusted Storm Tree signed the rate for the expected feed and decimals, and the
+rate is still valid at the time the Tick carries.
+
+```ts
+const pair = await verifyExecutedTickWithPrice(status, {
+  stormTreeRoot: trustedCurrentStormEyeRoot,
+  feedId: expectedFeedId,
+  decimals: expectedDecimals,
+  verifierAssetId: trustedVerifierAssetId,
+  verifierTapleafHash: tickTapleafHash,
+  tickAssetId: trustedTickAssetId,
+  tickTapleafHash,
+}, chain);
+```
+
+It takes no `now`: the contract holds the rate against the Tick's time, not
+against a clock, so a pair that passes stays spendable together until the Tick
+expires. It returns the `IssuedTick`, the Verifier's output index, the signed
+rate and its decoded `price`, and `null` before the request is `executed`.
+`verifyExecutedSignedPrice` and `verifyExecutedTick` check either output alone.
 
 Coordinator URLs must use HTTPS, except HTTP on `localhost`, `127.0.0.1`, or
 `[::1]` for local development. Redirects are rejected. HTTPS does not replace
