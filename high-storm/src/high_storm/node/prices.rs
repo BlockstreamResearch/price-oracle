@@ -99,4 +99,9 @@ impl HighStormHandle {
 
         self.state.prices().rate_for(feed, &members).await
     }
+
+    /// Whether a round prepared now would hold a rate to issue this feed at.
+    pub async fn has_round_rate(&self, feed: price_feed::FeedId) -> bool {
+        user_requests::has_round_rate(self.state.prices(), feed).await
+    }
 }

@@ -310,6 +310,7 @@ migration period. New clients send
 | `POST` | `/operators/price-sources/freeze` | Signed request envelope |
 | `POST` | `/operators/price-sources/unfreeze` | Signed request envelope |
 | `GET` | `/users/network` | None |
+| `GET` | `/users/policy` | None |
 | `GET` | `/users/account/{public_key}` | None |
 | `POST` | `/users/requests` | User Schnorr signature in JSON |
 | `GET` | `/users/requests/{request_hash}` | None; coordinator node only |
@@ -325,6 +326,16 @@ invalid. Trusting these values delegates deployment and root selection to this
 node; independently pinned clients must verify them against their own anchors.
 Account lookup uses the same asset metadata and additionally derives
 the supplied user's account and voucher scripts.
+
+`GET /users/policy` returns what a batch has to bring and how long its results
+are held, as this node is configured: `operational_fee_sats` and
+`tick_burn_reserve_sats` for every request of a batch,
+`issuance_transaction_fee_sats` once for the batch, `min_fee_utxo_confirmations`,
+`finality_confirmations`, `tick_lifetime_blocks`, and
+`max_unpriced_request_blocks`. A batch is accepted when its fee UTXOs hold the
+fee and the reserve of every request plus the transaction fee. Every signer
+validates a round against its own fees and Tick lifetime, so the members share
+those; the other values are this node's own.
 
 Challenge and token requests use these shapes:
 
@@ -401,8 +412,14 @@ order. Encode the 64-byte Schnorr signature as hex in `header.signature`.
 
 Accepted submissions return `201` and a `request_hash`; submitting the same
 request, or another request using one of its reserved fee UTXOs, returns `409`.
-`GET /users/requests/{request_hash}` initially returns
-`{"status":"pending","payload":null}`. After each newly indexed Liquid block, the
+`GET /users/requests/{request_hash}` initially returns `"status":"pending"` with
+a null `payload` and a `waiting` object, which no other status carries. Its
+`reason` is `price` while this node holds no rate a round could be issued at
+for the feed the batch names, and `round` once only the next issuance round is
+awaited; `blocks` counts the blocks since the batch was queued, and a priced
+batch also carries its `price_feed_id` and the `fails_after_blocks` it may wait.
+The reason is read when the status is, not recorded by the rounds that passed
+the batch over. After each newly indexed Liquid block, the
 coordinator divides the first half of the live Storm Eye UTXOs into issuance rounds
 across the next 60 seconds. With six Storm Eyes, issuance runs at offsets 0, 20, and
 40 seconds; burning uses the other half at offsets 15, 30, and 45 seconds. The
