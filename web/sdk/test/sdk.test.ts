@@ -5,6 +5,7 @@ import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 
 import {
   ElementsRpcClient,
+  OracleApiError,
   PriceOracleClient,
   deriveAccount,
   createSignedPriceRequest,
@@ -1104,5 +1105,289 @@ describe("Price Oracle SDK", () => {
         rpc,
       ),
     ).rejects.toThrow("32-byte hex");
+  });
+
+  test("names the kind of every coordinator failure and keeps its reason", async () => {
+    const failure = async (response: () => Response | Promise<Response>) => {
+      const client = new PriceOracleClient("https://coordinator.test", {
+        fetch: async () => response(),
+        retries: 0,
+      });
+      const error = await client.getPriceFeeds().catch((error) => error);
+      expect(error).toBeInstanceOf(OracleApiError);
+      return error as OracleApiError;
+    };
+    const answered = (status: number, error: string) =>
+      failure(() => Response.json({ error }, { status }));
+
+    for (const [status, code] of [
+      [400, "invalid_request"],
+      [401, "unauthorized"],
+      [404, "not_found"],
+      [408, "timeout"],
+      [409, "conflict"],
+      [429, "rate_limited"],
+      [500, "server_error"],
+      [503, "unavailable"],
+    ] as const) {
+      const error = await answered(status, "the node's own reason");
+      expect([error.code, error.status, error.message]).toEqual([
+        code,
+        status,
+        "the node's own reason",
+      ]);
+    }
+    expect((await answered(503, "this node is not the coordinator")).code).toBe(
+      "not_coordinator",
+    );
+
+    // A proxy's page is not JSON: the status is reported, not a parse error.
+    const gateway = await failure(
+      () => new Response("<html>Bad Gateway</html>", { status: 502 }),
+    );
+    expect([gateway.code, gateway.status, gateway.message]).toEqual([
+      "server_error",
+      502,
+      "HTTP 502",
+    ]);
+    const empty = await failure(() => new Response("", { status: 200 }));
+    expect(empty.code).toBe("invalid_response");
+
+    const cause = new TypeError("fetch failed");
+    const unreachable = await failure(() => Promise.reject(cause));
+    expect([unreachable.code, unreachable.status, unreachable.message]).toEqual(
+      ["network", 0, "fetch failed"],
+    );
+    expect(unreachable.cause).toBe(cause);
+  });
+
+  test("retries a read no node answered, and never a submission", async () => {
+    const request = createTickRequest(PRIVATE_KEY, [`${"01".repeat(32)}:0`]);
+    let calls = 0;
+    // Fails `failures` times in the way given, then answers.
+    const client = (
+      failures: number,
+      fail: () => Response | Promise<Response>,
+      options: object = {},
+    ) => {
+      calls = 0;
+      return new PriceOracleClient("https://coordinator.test", {
+        fetch: async () =>
+          calls++ < failures ? fail() : Response.json({ request_hash: "ok" }),
+        retryDelayMs: 1,
+        ...options,
+      });
+    };
+    const unreachable = () => Promise.reject(new TypeError("fetch failed"));
+    const status = (code: number) => () =>
+      Response.json({ error: "busy" }, { status: code });
+
+    for (const fail of [
+      unreachable,
+      status(408),
+      status(429),
+      status(500),
+      status(502),
+      status(503),
+      status(504),
+    ]) {
+      expect(await client(2, fail).getPriceFeeds()).toEqual({
+        request_hash: "ok",
+      } as never);
+      expect(calls).toBe(3);
+    }
+    // Two retries by default, so a third failure surfaces.
+    await expect(client(3, unreachable).getPriceFeeds()).rejects.toThrow(
+      "fetch failed",
+    );
+    expect(calls).toBe(3);
+    await expect(
+      client(1, unreachable, { retries: 0 }).getPriceFeeds(),
+    ).rejects.toThrow("fetch failed");
+    expect(calls).toBe(1);
+
+    // What the node decided is not asked again.
+    for (const fail of [status(400), status(404), status(409)]) {
+      await expect(client(1, fail).getPriceFeeds()).rejects.toThrow("busy");
+      expect(calls).toBe(1);
+    }
+    // A submission that was not answered may still have been queued.
+    for (const fail of [unreachable, status(500), status(502)]) {
+      await expect(
+        client(1, fail).submitTickRequest(request),
+      ).rejects.toThrow();
+      expect(calls).toBe(1);
+    }
+
+    for (const options of [
+      { retries: -1 },
+      { retries: 1.5 },
+      { retryDelayMs: -1 },
+    ])
+      expect(
+        () => new PriceOracleClient("https://coordinator.test", options),
+      ).toThrow("retries");
+  });
+
+  test("gives a node a limited time to answer, and a wait never outlasts its own limit", async () => {
+    const hash = "ab".repeat(32);
+    let calls = 0;
+    // Takes the request and never answers, heeding the abort or not.
+    const silent =
+      (heeds: boolean) =>
+      (_: string, init?: RequestInit): Promise<Response> => {
+        calls++;
+        return new Promise((_, reject) => {
+          if (heeds)
+            init?.signal?.addEventListener("abort", () =>
+              reject(init.signal?.reason),
+            );
+        });
+      };
+
+    for (const heeds of [true, false]) {
+      calls = 0;
+      const oracle = new PriceOracleClient("https://coordinator.test", {
+        fetch: silent(heeds),
+        timeoutMs: 20,
+        retries: 1,
+        retryDelayMs: 1,
+      });
+      const error = await oracle.getPriceFeeds().catch((caught) => caught);
+      expect(error).toBeInstanceOf(OracleApiError);
+      expect(error).toMatchObject({ code: "timeout", status: 0 });
+      expect(error.message).toBe("node did not answer within 20 ms");
+      expect(calls).toBe(2);
+    }
+    // A submission that timed out may have been queued, so it is not resent.
+    calls = 0;
+    await expect(
+      new PriceOracleClient("https://coordinator.test", {
+        fetch: silent(false),
+        timeoutMs: 20,
+      }).submitTickRequest(
+        createTickRequest(PRIVATE_KEY, [`${"01".repeat(32)}:0`]),
+      ),
+    ).rejects.toMatchObject({ code: "timeout" });
+    expect(calls).toBe(1);
+
+    // A read that times out on one node is asked of the next.
+    const next = new PriceOracleClient(
+      ["https://node-1.test", "https://node-2.test"],
+      {
+        fetch: async (url) =>
+          url.startsWith("https://node-1.test")
+            ? new Promise<Response>(() => {})
+            : Response.json([]),
+        timeoutMs: 20,
+      },
+    );
+    expect(await next.getPriceFeeds()).toEqual([]);
+    expect(next.nodeUrl).toBe("https://node-2.test");
+
+    // A server error in the middle of a wait is read past.
+    let reads = 0;
+    const flaky = new PriceOracleClient("https://coordinator.test", {
+      fetch: async () =>
+        ++reads === 2
+          ? Response.json({ error: "internal server error" }, { status: 500 })
+          : Response.json(
+              reads < 3
+                ? { status: "pending", payload: null }
+                : { status: "executed", payload: "{}" },
+            ),
+      retryDelayMs: 1,
+    });
+    expect(
+      await flaky.waitForTickRequest(hash, { intervalMs: 1 }),
+    ).toMatchObject({ status: "executed" });
+
+    // The wait's own limit and its abort cut short a read never answered.
+    const hung = new PriceOracleClient("https://coordinator.test", {
+      fetch: silent(false),
+    });
+    const started = Date.now();
+    await expect(
+      hung.waitForTickRequest(hash, { timeoutMs: 30 }),
+    ).rejects.toThrow("user request status was not read within 30 ms");
+    expect(Date.now() - started).toBeLessThan(1_000);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error("left the page")), 10);
+    await expect(
+      hung.waitForTickRequest(hash, { signal: controller.signal }),
+    ).rejects.toThrow("left the page");
+
+    for (const timeoutMs of [0, -1, Number.NaN])
+      expect(
+        () => new PriceOracleClient("https://coordinator.test", { timeoutMs }),
+      ).toThrow("timeoutMs");
+  });
+
+  test("finds the coordinator among the nodes it is given and stays with it", async () => {
+    const request = createTickRequest(PRIVATE_KEY, [`${"01".repeat(32)}:0`]);
+    const asked: string[] = [];
+    const notCoordinator = () =>
+      Response.json(
+        { error: "this node is not the coordinator" },
+        { status: 503 },
+      );
+    // The node at `coordinator` answers; `down` does not answer at all.
+    const client = (coordinator: string | null, down: string[] = []) => {
+      asked.length = 0;
+      return new PriceOracleClient(
+        ["https://a.test/", "https://b.test", "https://c.test"],
+        {
+          fetch: async (url) => {
+            const node = new URL(url).origin;
+            asked.push(node);
+            if (down.includes(node)) throw new TypeError("fetch failed");
+            return node === coordinator
+              ? Response.json({ request_hash: node })
+              : notCoordinator();
+          },
+          retryDelayMs: 1,
+        },
+      );
+    };
+
+    const oracle = client("https://c.test");
+    expect(oracle.nodeUrl).toBe("https://a.test");
+    await oracle.getPriceFeeds();
+    expect(asked).toEqual([
+      "https://a.test",
+      "https://b.test",
+      "https://c.test",
+    ]);
+    expect(oracle.nodeUrl).toBe("https://c.test");
+    // The next call goes straight to the node that answered.
+    asked.length = 0;
+    expect(await oracle.submitTickRequest(request)).toEqual({
+      request_hash: "https://c.test",
+    });
+    expect(asked).toEqual(["https://c.test"]);
+
+    // A submission is passed on by a node that refused it, not by a silent one.
+    expect(await client("https://b.test").submitTickRequest(request)).toEqual({
+      request_hash: "https://b.test",
+    });
+    await expect(
+      client("https://b.test", ["https://a.test"]).submitTickRequest(request),
+    ).rejects.toThrow("fetch failed");
+    expect(asked).toEqual(["https://a.test"]);
+    // A read moves past a node that is down.
+    await client("https://b.test", ["https://a.test"]).getPriceFeeds();
+    expect(asked).toEqual(["https://a.test", "https://b.test"]);
+
+    // No coordinator among them: said once, after one pass, without retries.
+    const none = await client(null)
+      .getPriceFeeds()
+      .catch((error) => error);
+    expect(none.code).toBe("not_coordinator");
+    expect(asked).toHaveLength(3);
+
+    expect(() => new PriceOracleClient([])).toThrow("at least one");
+    expect(
+      () => new PriceOracleClient(["https://a.test", "http://b.test"]),
+    ).toThrow("HTTPS");
   });
 });
