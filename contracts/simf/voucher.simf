@@ -22,10 +22,7 @@ type AuthKindRight = Either<SignAuthWit, BurnKind>;
 
 /// SHA-256 of `voucher_input_index` as 4 big-endian bytes
 fn get_burn_tag_hash(voucher_input_index: u32) -> u256 {
-    let hash_ctx: Ctx8 = jet::sha_256_ctx_8_init();
-    let hash_ctx: Ctx8 = jet::sha_256_ctx_8_add_4(hash_ctx, voucher_input_index);
-
-    jet::sha_256_ctx_8_finalize(hash_ctx)
+    raw_hash::<(u32,)>((voucher_input_index,))
 }
 
 fn assert_voucher_utxo_burned(voucher_utxo_output_index: u32) {

@@ -44,9 +44,14 @@ jobs:
         with:
           simplex: ${{ env.SIMPLEX_VERSION }}
       
+      # simfmt is built on SimplicityHL 0.7 and cannot parse `raw_hash`, so the
+      # two sources that use it are left out until a simfmt release can.
       - name: Check contracts formatting
         working-directory: contracts
-        run: simplex fmt --check
+        run: |
+          find simf -name '*.simf' \
+            ! -path simf/voucher.simf ! -path simf/lib/taproot.simf -print0 |
+            xargs -0 simplex fmt --check
 
       - name: Generate contract artifacts
         shell: bash
