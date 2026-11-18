@@ -21,7 +21,7 @@ use simplex::{
         AssetId, BlockHash, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction,
     },
     transaction::{
-        FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
+        FinalTransaction, PartialInput, PartialOutput, ProgramInput, ProgramSignature, SigMessage,
         UTXO,
     },
 };
@@ -91,6 +91,8 @@ pub enum VotingExecutionError {
     Signing(#[from] super::signing::SigningError),
     #[error("failed to extract final voting transaction: {0}")]
     Pset(String),
+    #[error("UTXO asset or amount is unknown: {0}")]
+    Utxo(#[from] simplex::transaction::UtxoError),
 }
 
 pub(crate) struct PreparedVotingExecution {
@@ -229,7 +231,7 @@ impl VotingExecution {
             let Some(utxo) = get_optional_explicit_outpoint(&client, txid, unspent.vout)? else {
                 continue;
             };
-            if utxo.asset() != expected_asset
+            if utxo.asset()? != expected_asset
                 || utxo.txout.script_pubkey.as_bytes() != storm_eye.contract_script
             {
                 continue;
@@ -243,7 +245,7 @@ impl VotingExecution {
             inventory.push(StormEyeInventoryItem {
                 txid: outpoint.txid,
                 output_index: outpoint.output_index,
-                amount: utxo.amount(),
+                amount: utxo.amount()?,
                 confirmations: unspent
                     .height
                     .map(|height| block_height.saturating_sub(height).saturating_add(1))
@@ -761,11 +763,11 @@ impl VotingExecution {
             let Some(utxo) = live_treasury_utxo(client, &indexed)? else {
                 continue;
             };
-            if utxo.asset() != policy_asset || utxo.amount() != indexed.amount {
+            if utxo.asset()? != policy_asset || utxo.amount()? != indexed.amount {
                 continue;
             }
             total = total
-                .checked_add(utxo.amount())
+                .checked_add(utxo.amount()?)
                 .ok_or_else(|| VotingExecutionError::Invalid("Treasury input overflow".into()))?;
             selected.push(utxo);
             if total >= self.transaction_fee_sats {
@@ -988,7 +990,7 @@ fn operation_utxos(
                 Txid::from_byte_array(outpoint.txid),
                 outpoint.output_index,
             )?;
-            if utxo.asset() != expected_asset
+            if utxo.asset()? != expected_asset
                 || utxo.txout.script_pubkey.as_bytes() != storm_eye.contract_script
             {
                 return Err(VotingExecutionError::Invalid(
@@ -1051,7 +1053,7 @@ fn scan_storm_eye_utxos_with_mempool(
                     VotingExecutionError::Invalid("required Storm Eye UTXO is unavailable".into())
                 })?
             };
-            if utxo.asset() != expected_asset
+            if utxo.asset()? != expected_asset
                 || utxo.txout.script_pubkey.as_bytes() != storm_eye.contract_script
             {
                 return Err(VotingExecutionError::Invalid(
@@ -1112,12 +1114,12 @@ fn build_transaction(
     let storm_eye_inputs = storm_eye_utxos.len();
     let storm_eye_amount = storm_eye_utxos.iter().try_fold(0u64, |total, utxo| {
         total
-            .checked_add(utxo.amount())
+            .checked_add(utxo.amount()?)
             .ok_or_else(|| VotingExecutionError::Invalid("Storm Eye amount overflow".into()))
     })?;
     let treasury_amount = treasury_utxos.iter().try_fold(0u64, |total, utxo| {
         total
-            .checked_add(utxo.amount())
+            .checked_add(utxo.amount()?)
             .ok_or_else(|| VotingExecutionError::Invalid("Treasury amount overflow".into()))
     })?;
     let treasury_change = treasury_amount
@@ -1132,7 +1134,11 @@ fn build_transaction(
                 Box::new(auth_program.as_ref().clone()),
                 placeholder_witness(&contract_data, &operation, output_index as u32),
             ),
-            RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+            Some(
+                ProgramSignature::new("PATH")
+                    .at_path(["Left", "1", "0"])
+                    .tagged(STORM_EYE_TAG),
+            ),
         );
     }
 
@@ -1148,7 +1154,7 @@ fn build_transaction(
                     storm_eye_input_index: 0,
                 },
             ),
-            RequiredSignature::None,
+            None,
         );
     }
 
@@ -1181,7 +1187,7 @@ fn build_transaction(
             for utxo in &storm_eye_utxos {
                 transaction.add_output(PartialOutput::new(
                     destination_script.clone(),
-                    utxo.amount(),
+                    utxo.amount()?,
                     storm_eye_asset,
                 ));
             }
@@ -1215,7 +1221,9 @@ fn build_transaction(
         .chain(&treasury_utxos)
         .map(|utxo| utxo.txout.clone())
         .collect();
-    let (pset, _) = transaction.extract_pst();
+    let (pset, _) = transaction
+        .extract_pst()
+        .map_err(|error| VotingExecutionError::Pset(error.to_string()))?;
     let request = ExecuteVotingRequest {
         tx: encode::serialize(&pset),
         final_tx: None,

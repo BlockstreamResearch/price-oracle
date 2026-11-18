@@ -6,7 +6,9 @@
 # out_dir = "./src/artifacts"
 
 [dependencies]
-std = { git = "https://github.com/BlockstreamResearch/simplicityhl-std.git", tag = "v0.2.0" }
+# Tag v0.2.0, pinned by its commit: Simplex fetches a tag with
+# `git clone --revision`, which needs Git 2.49, newer than the node image's.
+std = { git = "https://github.com/BlockstreamResearch/simplicityhl-std.git", rev = "b04a022420d81f094f49bbb8439b4e4eb679f6b7" }
 
 # [regtest]
 # mnemonic = "exist carry drive collect lend cereal occur much tiger just involve mean"

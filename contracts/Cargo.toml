@@ -12,4 +12,4 @@ price-feed = { path = "../price-feed" }
 [dev-dependencies]
 anyhow = "1"
 bitcoincore-rpc.workspace = true
-smplx-regtest = "0.1.1"
+smplx-regtest = { git = "https://github.com/BlockstreamResearch/smplx.git", rev = "299c1e61add3d7b62466399d17eace06005b917b" }

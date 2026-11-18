@@ -1,6 +1,6 @@
 use simplex::simplicityhl::elements::{AssetId, LockTime, Script, Sequence};
 use simplex::transaction::{
-    FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, utxo::UTXO,
+    FinalTransaction, PartialInput, PartialOutput, ProgramInput, utxo::UTXO,
 };
 
 use crate::artifacts::auth::AuthProgram;
@@ -72,7 +72,7 @@ impl Auth {
                 Box::new(self.program.as_ref().clone()),
                 build_rescue_witness(self.storage, output_index),
             ),
-            RequiredSignature::None,
+            None,
         );
 
         ft.set_locktime(

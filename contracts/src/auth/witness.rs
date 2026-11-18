@@ -1,4 +1,4 @@
-use simplex::{either::Either, transaction::RequiredSignature};
+use simplex::{either::Either, transaction::ProgramSignature};
 
 use crate::{
     artifacts::auth::derived_auth::AuthWitness,
@@ -34,11 +34,11 @@ pub enum AuthSpendPath {
 impl AuthSpendPath {
     /// The tagged witness path every authorized spend shares.
     #[must_use]
-    pub fn required_signature() -> RequiredSignature {
-        RequiredSignature::witness_tagged(
-            "PATH",
-            vec!["Left".to_string(), "1".to_string(), "0".to_string()],
-            "OracleNetworkV1/StormEye",
+    pub fn required_signature() -> Option<ProgramSignature> {
+        Some(
+            ProgramSignature::new("PATH")
+                .at_path(["Left", "1", "0"])
+                .tagged("OracleNetworkV1/StormEye"),
         )
     }
 
