@@ -1770,7 +1770,7 @@ mod inventory_tests {
                 }
             }),
         );
-        let (address, server) = crate::high_storm::test_rpc::serve(app).await;
+        let (address, server) = crate::test_support::serve(app).await;
         let result = tokio::task::spawn_blocking(move || {
             let client =
                 Client::new(&format!("http://{address}"), bitcoincore_rpc::Auth::None).unwrap();

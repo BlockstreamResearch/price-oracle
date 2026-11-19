@@ -7,6 +7,8 @@ pub mod high_storm;
 pub mod ipc;
 pub mod monitoring;
 pub mod sources;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use std::{collections::HashSet, time::Duration};
 

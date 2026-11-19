@@ -1604,8 +1604,6 @@ impl DerefMut for HighStorm {
 }
 
 #[cfg(test)]
-pub(crate) mod test_rpc;
-#[cfg(test)]
 mod tests {
     use super::*;
 

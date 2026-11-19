@@ -118,7 +118,7 @@ async fn stalled_uploads_do_not_take_execution_slots() {
             }
         },
     ));
-    let (address, server) = crate::high_storm::test_rpc::serve(app).await;
+    let (address, server) = crate::test_support::serve(app).await;
     let mut uploads = Vec::new();
     for _ in 0..MAX_API_BODY_READS {
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
@@ -484,18 +484,15 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
     assert_eq!(token.status(), StatusCode::OK);
     let token: serde_json::Value = response_json(token).await;
 
+    let authorization = format!("Bearer {}", token["token"].as_str().unwrap());
     let voting = app
         .clone()
-        .oneshot(authorized_get_request(
-            "/operators/voting",
-            &format!("Bearer {}", token["token"].as_str().unwrap()),
-        ))
+        .oneshot(authorized_get_request("/operators/voting", &authorization))
         .await
         .unwrap();
     assert_eq!(voting.status(), StatusCode::OK);
     assert_eq!(response_json(voting).await, serde_json::json!([]));
 
-    let authorization = format!("Bearer {}", token["token"].as_str().unwrap());
     let network = app
         .clone()
         .oneshot(authorized_get_request("/operators/state", &authorization))
@@ -979,12 +976,10 @@ async fn rejects_unsupported_or_invalid_user_requests() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     let response = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/users/requests/{}", hex::encode([9; 32])))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(get_request(&format!(
+            "/users/requests/{}",
+            hex::encode([9; 32])
+        )))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);

@@ -1492,7 +1492,7 @@ mod tests {
                 }
             }),
         );
-        let (address, server) = crate::high_storm::test_rpc::serve(app).await;
+        let (address, server) = crate::test_support::serve(app).await;
         let result = tokio::task::spawn_blocking(move || {
             let client = Client::new(&format!("http://{address}"), Auth::None).unwrap();
             let mut unrelated = candidate.clone();
@@ -1588,7 +1588,7 @@ mod tests {
                 }
             }),
         );
-        let (address, server) = crate::high_storm::test_rpc::serve(app).await;
+        let (address, server) = crate::test_support::serve(app).await;
         let result = tokio::task::spawn_blocking(move || {
             let client = Client::new(&format!("http://{address}"), Auth::None).unwrap();
             let pending = exchange(Txid::from_byte_array([3; 32]), 0);

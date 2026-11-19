@@ -1424,7 +1424,7 @@ mod tests {
                     async move { axum::Json(response) }
                 }),
             );
-            let (address, server) = crate::high_storm::test_rpc::serve(app).await;
+            let (address, server) = crate::test_support::serve(app).await;
             let result = tokio::task::spawn_blocking(move || {
                 let client =
                     Client::new(&format!("http://{address}"), bitcoincore_rpc::Auth::None).unwrap();
@@ -1561,7 +1561,7 @@ mod tests {
                 }
             }),
         );
-        let (address, server) = crate::high_storm::test_rpc::serve(app).await;
+        let (address, server) = crate::test_support::serve(app).await;
         let burning = test_burning(&store, &database, format!("http://{address}"));
 
         let result = tokio::task::spawn_blocking(move || {
@@ -1635,7 +1635,7 @@ mod tests {
                 }
             }),
         );
-        let (address, server) = crate::high_storm::test_rpc::serve(app).await;
+        let (address, server) = crate::test_support::serve(app).await;
         let burning = test_burning(&store, &database, format!("http://{address}"));
 
         assert_eq!(burning.release_vanished_burns(62).await.unwrap(), 2);
@@ -1719,7 +1719,7 @@ mod tests {
                 }
             }),
         );
-        let (address, server) = crate::high_storm::test_rpc::serve(app).await;
+        let (address, server) = crate::test_support::serve(app).await;
         let burning = test_burning(&store, &database, format!("http://{address}"));
         let group = select_groups(store.list_expired(10).await.unwrap(), MAX_TICKS_PER_BURN)
             .unwrap()

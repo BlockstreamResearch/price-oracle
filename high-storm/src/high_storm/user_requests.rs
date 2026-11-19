@@ -2641,7 +2641,7 @@ mod tests {
                     }
                 }),
             );
-            let (address, server) = crate::high_storm::test_rpc::serve(app).await;
+            let (address, server) = crate::test_support::serve(app).await;
             let result = tokio::task::spawn_blocking(move || {
                 let client = Client::new(&format!("http://{address}"), Auth::None).unwrap();
                 find_mempool_spender(&client, outpoint).map_err(|_| ())
@@ -2848,7 +2848,7 @@ mod tests {
                 }
             }),
         );
-        let (address, server) = crate::high_storm::test_rpc::serve(app).await;
+        let (address, server) = crate::test_support::serve(app).await;
         let result = tokio::task::spawn_blocking(move || {
             let client = Client::new(&format!("http://{address}"), Auth::None).unwrap();
             let find = |pool| {
@@ -3587,7 +3587,7 @@ mod tests {
                 },
             ),
         );
-        let (address, server) = crate::high_storm::test_rpc::serve(app).await;
+        let (address, server) = crate::test_support::serve(app).await;
         let client = Client::new(&format!("http://{address}"), Auth::None).unwrap();
         let fee = |txid: u8, output_index: u32| FeeUtxo {
             txid: [txid; 32],

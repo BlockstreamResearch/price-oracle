@@ -761,10 +761,6 @@ mod tests {
                 .await
                 .unwrap()
         };
-        let block = |height: u64| IndexedBlock {
-            height,
-            hash: [height as u8; 32],
-        };
         let deposit = TreasuryTransaction {
             txid: [4; 32],
             inputs: vec![],
@@ -780,14 +776,19 @@ mod tests {
             exchange_member: Some(member),
         };
         store
-            .apply_block("droplets-v1", &block(10), &[deposit], &[member])
+            .apply_block("droplets-v1", &IndexedBlock::at(10), &[deposit], &[member])
             .await
             .unwrap();
         store.lock_exchange(member, 1_000, 10, &[1]).await.unwrap();
 
         // The second confirmed spend overdraws a balance already reduced to 500.
         store
-            .apply_block("droplets-v1", &block(11), &[spend(5, 0)], &[member])
+            .apply_block(
+                "droplets-v1",
+                &IndexedBlock::at(11),
+                &[spend(5, 0)],
+                &[member],
+            )
             .await
             .unwrap();
         sqlx::query("UPDATE droplets SET amount = 500 WHERE xonly_pubkey = $1")
@@ -796,7 +797,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .apply_block("droplets-v1", &block(12), &[spend(6, 1)], &[member])
+            .apply_block(
+                "droplets-v1",
+                &IndexedBlock::at(12),
+                &[spend(6, 1)],
+                &[member],
+            )
             .await
             .unwrap();
         let balance = store.balance(member).await.unwrap().unwrap();
