@@ -6,7 +6,7 @@ mod common;
 use common::{assert_covenant_rejects, issue_asset, wait_for_confirmation};
 
 use simplex::transaction::utxo::UTXO;
-use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, RequiredSignature};
+use simplex::transaction::{FinalTransaction, NativeSignature, PartialInput, PartialOutput};
 
 use contracts::treasury::{Treasury, TreasuryParameters};
 
@@ -25,7 +25,7 @@ fn fund_treasury(
     let mut ft = FinalTransaction::new();
     ft.add_input(
         PartialInput::new(funding_utxo),
-        RequiredSignature::NativeEcdsa,
+        Some(NativeSignature::Ecdsa),
     );
 
     treasury.attach_treasury_creation(&mut ft, amount, context.get_network().policy_asset());
@@ -52,7 +52,7 @@ fn spend_transaction(
     treasury.attach_spend(&mut ft, treasury_utxo, 1);
     ft.add_input(
         PartialInput::new(auth_utxo.clone()),
-        RequiredSignature::NativeEcdsa,
+        Some(NativeSignature::Ecdsa),
     );
 
     treasury.attach_treasury_creation(

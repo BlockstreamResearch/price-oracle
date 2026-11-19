@@ -12,6 +12,7 @@ concurrency:
 
 env:
   SIMPLEX_VERSION: 0.2.0
+  SIMPLEX_COMMIT: 299c1e61add3d7b62466399d17eace06005b917b
 
 jobs:
   ci:
@@ -27,10 +28,28 @@ jobs:
           rustup show active-toolchain
           rustup component add rustfmt clippy
 
-      - name: Install pinned Simplex CLI
-        uses: BlockstreamResearch/simplicityhl-toolchain@v0.0.2
+      # No Simplex release has SimplicityHL 0.9 yet: simplex is built from the
+      # commit the crates pin, and the tools it runs come from the release.
+      - name: Cache Simplex CLI
+        id: simplex-cache
+        uses: actions/cache@v4
         with:
-          components: simplex@${{ env.SIMPLEX_VERSION }}
+          path: ~/.simplex
+          key: simplex-${{ runner.os }}-${{ env.SIMPLEX_VERSION }}-${{ env.SIMPLEX_COMMIT }}
+
+      - name: Install pinned Simplex CLI
+        if: steps.simplex-cache.outputs.cache-hit != 'true'
+        run: |
+          # simplexup installs under $XDG_CONFIG_HOME, which the runners set to
+          # ~/.config; keep it where the cache and PATH look.
+          export SIMPLEX_DIR="$HOME/.simplex"
+          curl -sSfL --retry 5 -o "$RUNNER_TEMP/simplexup" \
+            "https://raw.githubusercontent.com/BlockstreamResearch/smplx/${SIMPLEX_COMMIT}/simplexup/simplexup"
+          chmod +x "$RUNNER_TEMP/simplexup"
+          "$RUNNER_TEMP/simplexup" --install "v${SIMPLEX_VERSION}" --commit "${SIMPLEX_COMMIT}"
+
+      - name: Add Simplex CLI to PATH
+        run: echo "$HOME/.simplex/bin" >> "$GITHUB_PATH"
 
       - name: Generate contract artifacts
         working-directory: contracts

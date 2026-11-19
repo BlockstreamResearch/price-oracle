@@ -1,6 +1,6 @@
 FROM rust:1.97.1-bookworm AS builder
 
-ARG SIMPLEX_VERSION=0.1.1
+ARG SIMPLEX_COMMIT=299c1e61add3d7b62466399d17eace06005b917b
 
 WORKDIR /workspace
 RUN apt-get update \
@@ -8,7 +8,7 @@ RUN apt-get update \
 	&& rm -rf /var/lib/apt/lists/*
 RUN cargo install --locked \
 	--git https://github.com/BlockstreamResearch/smplx.git \
-	--tag "v${SIMPLEX_VERSION}" \
+	--rev "${SIMPLEX_COMMIT}" \
 	smplx-cli
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY contracts ./contracts

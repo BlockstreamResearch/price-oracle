@@ -9,7 +9,7 @@ use simplex::simplicityhl::elements::{AssetId, Script};
 use simplex::transaction::partial_input::IssuanceInput;
 use simplex::transaction::utxo::UTXO;
 use simplex::transaction::{
-    FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
+    FinalTransaction, NativeSignature, PartialInput, PartialOutput, ProgramInput,
 };
 
 use contracts::auth::{StormTreeBloom, WITNESS_DEPTH};
@@ -79,7 +79,7 @@ pub fn issue(
     let issuance = ft.add_issuance_input(
         PartialInput::new(funding_utxo),
         IssuanceInput::new_issuance(amount, 0, [1u8; 32]),
-        RequiredSignature::NativeEcdsa,
+        Some(NativeSignature::Ecdsa),
     );
     attach_output(&mut ft, amount, issuance.asset_id);
 
@@ -135,7 +135,7 @@ impl Consumer {
         ft.add_program_input(
             PartialInput::new(utxo.clone()),
             ProgramInput::new(Box::new(self.program.clone()), witness),
-            RequiredSignature::None,
+            None,
         );
     }
 
@@ -196,7 +196,7 @@ impl Consumer {
         let auth_utxo = signer.get_utxos_asset(auth_asset)?[0].clone();
         ft.add_input(
             PartialInput::new(auth_utxo.clone()),
-            RequiredSignature::NativeEcdsa,
+            Some(NativeSignature::Ecdsa),
         );
         ft.add_output(PartialOutput::new(
             signer.get_address().script_pubkey(),

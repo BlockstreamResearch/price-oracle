@@ -2,11 +2,12 @@
 
 use simplex::{
     constants::DUMMY_SIGNATURE,
+    program::ProgramError,
     provider::SimplicityNetwork,
     signer::SignerError,
     simplicityhl::elements::{AssetId, Script},
     transaction::{
-        FinalTransaction, PartialInput, RequiredSignature, partial_input::IssuanceInput, utxo::UTXO,
+        FinalTransaction, NativeSignature, PartialInput, partial_input::IssuanceInput, utxo::UTXO,
     },
 };
 
@@ -57,7 +58,7 @@ fn issue_storm_eye_asset(context: &simplex::TestContext, auth: &Auth) -> anyhow:
     let issuance = final_utxo.add_issuance_input(
         PartialInput::new(funding_utxo),
         IssuanceInput::new_issuance(STORM_EYE_SUPPLY, 0, [1u8; 32]),
-        RequiredSignature::NativeEcdsa,
+        Some(NativeSignature::Ecdsa),
     );
     auth.attach_storm_eye_creation(&mut final_utxo, STORM_EYE_SUPPLY, issuance.asset_id);
 
@@ -192,8 +193,12 @@ impl StormEyeFixture {
 #[track_caller]
 pub fn assert_covenant_rejects(context: &simplex::TestContext, tx: &FinalTransaction) {
     match context.get_default_signer().broadcast(tx) {
-        Err(SignerError::CovenantExecution { index, source, .. }) => {
-            println!("covenant rejected input {index} as expected: {source}");
+        Err(SignerError::Program(ProgramError::ProgramExecution {
+            input_index,
+            source,
+            ..
+        })) => {
+            println!("covenant rejected input {input_index} as expected: {source}");
         }
         Err(other) => panic!("expected the covenant to reject the transaction, got: {other}"),
         Ok(_) => panic!("expected the covenant to reject the transaction, but it was accepted"),

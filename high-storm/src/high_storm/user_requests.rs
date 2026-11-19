@@ -27,8 +27,8 @@ use simplex::{
         pset::PartiallySignedTransaction,
     },
     transaction::{
-        FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
-        partial_input::IssuanceInput, utxo::UTXO,
+        FinalTransaction, PartialInput, PartialOutput, ProgramInput, ProgramSignature, SigMessage,
+        UtxoError, partial_input::IssuanceInput, utxo::UTXO,
     },
 };
 use url::Url;
@@ -201,6 +201,8 @@ pub enum UserRequestError {
     Encoding(#[from] postcard::Error),
     #[error("failed to extract final transaction: {0}")]
     Pset(String),
+    #[error("UTXO asset or amount is unknown: {0}")]
+    Utxo(#[from] simplex::transaction::UtxoError),
     #[error("the instructed price was refused: {0}")]
     InstructedPrice(#[from] price_feed::ValidationError),
 }
@@ -461,7 +463,7 @@ impl UserRequestProcessor {
                         ));
                         break;
                     };
-                    if utxo.asset() != network.policy_asset()
+                    if utxo.asset()? != network.policy_asset()
                         || utxo.txout.script_pubkey != account_script
                     {
                         unavailable = Some(format!(
@@ -563,7 +565,11 @@ impl UserRequestProcessor {
                     )),
                 },
             ),
-            RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+            Some(
+                ProgramSignature::new("PATH")
+                    .at_path(["Left", "1", "0"])
+                    .tagged(STORM_EYE_TAG),
+            ),
         );
         let treasury = TreasuryProgram::new(&TreasuryArguments {
             storm_eye_asset_id: storm_eye.asset_id,
@@ -586,7 +592,7 @@ impl UserRequestProcessor {
                         ))
                     })?,
                 ),
-                RequiredSignature::None,
+                None,
             );
         }
 
@@ -605,7 +611,7 @@ impl UserRequestProcessor {
             let mut input_total = 0u64;
             for utxo in fee_utxos {
                 input_total = input_total
-                    .checked_add(utxo.amount())
+                    .checked_add(utxo.amount()?)
                     .ok_or_else(|| UserRequestError::Invalid("fee input overflow".into()))?;
                 spent_utxo_secrets.push(explicit_txout_secrets(&utxo.txout)?);
                 spent_utxos.push(utxo.txout.clone());
@@ -617,15 +623,15 @@ impl UserRequestProcessor {
                             storm_eye_input_index: 0,
                         },
                     ),
-                    RequiredSignature::None,
+                    None,
                 );
             }
             account_balances.push(input_total);
         }
 
-        final_transaction.add_output(output_from_utxo(&storm_eye_utxo));
+        final_transaction.add_output(output_from_utxo(&storm_eye_utxo)?);
         for token in &tokens {
-            final_transaction.add_output(output_from_utxo(&token.utxo));
+            final_transaction.add_output(output_from_utxo(&token.utxo)?);
         }
         let first_reserve_output = 1 + tokens.len() + issued_count;
         let mut request_results = Vec::with_capacity(decoded.len());
@@ -716,7 +722,9 @@ impl UserRequestProcessor {
             policy_asset,
         ));
 
-        let (mut pset, _) = final_transaction.extract_pst();
+        let (mut pset, _) = final_transaction
+            .extract_pst()
+            .map_err(|error| UserRequestError::Pset(error.to_string()))?;
         reblind_tokens(&mut pset, &tokens, &spent_utxo_secrets)?;
         let transaction = RoundTransaction {
             pset,
@@ -1348,7 +1356,7 @@ fn scan_contract_utxos(
         else {
             continue;
         };
-        if matches_expected_asset(utxo.asset(), expected_asset) {
+        if matches_expected_asset(utxo.asset()?, expected_asset) {
             let spent_in_mempool =
                 get_optional_explicit_outpoint(client, txid, unspent.vout)?.is_none();
             candidates.push((utxo, spent_in_mempool));
@@ -1786,12 +1794,12 @@ pub(crate) fn explicit_txout_secrets(txout: &TxOut) -> Result<TxOutSecrets, User
     ))
 }
 
-pub(crate) fn output_from_utxo(utxo: &UTXO) -> PartialOutput {
-    PartialOutput::new(
+pub(crate) fn output_from_utxo(utxo: &UTXO) -> Result<PartialOutput, UtxoError> {
+    Ok(PartialOutput::new(
         utxo.txout.script_pubkey.clone(),
-        utxo.amount(),
-        utxo.asset(),
-    )
+        utxo.amount()?,
+        utxo.asset()?,
+    ))
 }
 
 pub(crate) fn pack_proof(

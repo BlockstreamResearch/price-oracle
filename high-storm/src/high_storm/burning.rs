@@ -20,7 +20,7 @@ use simplex::{
         pset::PartiallySignedTransaction,
     },
     transaction::{
-        FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
+        FinalTransaction, PartialInput, PartialOutput, ProgramInput, ProgramSignature, SigMessage,
         utxo::UTXO,
     },
 };
@@ -85,6 +85,8 @@ pub enum BurningError {
     Program(#[from] simplex::program::ProgramError),
     #[error("failed to extract final transaction: {0}")]
     Pset(String),
+    #[error("UTXO asset or amount is unknown: {0}")]
+    Utxo(#[from] simplex::transaction::UtxoError),
     #[error("shared transaction helper failed: {0}")]
     TransactionHelper(#[from] UserRequestError),
 }
@@ -345,7 +347,7 @@ impl Burning {
                 storm_eye_asset_id: storm_eye.asset_id,
                 account_owner_pubkey: group.owner,
             });
-            if reserve.asset() != policy_asset
+            if reserve.asset()? != policy_asset
                 || reserve.txout.script_pubkey != account.get_script_pubkey(&network)
             {
                 self.quarantine_group(
@@ -397,7 +399,9 @@ impl Burning {
             self.config.burn_transaction_fee_sats,
         )?;
 
-        let (pset, _) = final_transaction.extract_pst();
+        let (pset, _) = final_transaction
+            .extract_pst()
+            .map_err(|error| BurningError::Pset(error.to_string()))?;
         let signing_hash = signing_hash(&pset, &storm_eye, &network)?;
         let request = BurnExpiredUtxos {
             tx: encode::serialize(&pset),
@@ -859,15 +863,19 @@ fn build_burn_transaction(
                 )),
             },
         ),
-        RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+        Some(
+            ProgramSignature::new("PATH")
+                .at_path(["Left", "1", "0"])
+                .tagged(STORM_EYE_TAG),
+        ),
     );
 
     let mut spent_utxos = vec![storm_eye_utxo.txout.clone()];
     let mut selected = Vec::new();
     for (group, _, _, tick_utxos) in burnable_groups {
         for (tick, tick_utxo) in group.ticks.iter().zip(tick_utxos) {
-            if tick_utxo.asset() != burn_assets.of(tick)?
-                || tick_utxo.amount() != tick.amount
+            if tick_utxo.asset()? != burn_assets.of(tick)?
+                || tick_utxo.amount()? != tick.amount
                 || tick_utxo.txout.script_pubkey.as_bytes() != tick.script_pubkey
             {
                 return Err(BurningError::Invalid("indexed issued UTXO changed".into()));
@@ -875,7 +883,7 @@ fn build_burn_transaction(
             final_transaction.add_program_input(
                 PartialInput::new(tick_utxo.clone()),
                 issued_network_input(storm_eye.asset_id, tick, network)?,
-                RequiredSignature::None,
+                None,
             );
             spent_utxos.push(tick_utxo.txout.clone());
             selected.push((tick.txid, tick.output_index));
@@ -898,12 +906,12 @@ fn build_burn_transaction(
                     storm_eye_input_index: 0,
                 },
             ),
-            RequiredSignature::None,
+            None,
         );
         spent_utxos.push(reserve.txout.clone());
     }
 
-    final_transaction.add_output(output_from_utxo(storm_eye_utxo));
+    final_transaction.add_output(output_from_utxo(storm_eye_utxo)?);
     for (asset, amount) in burns {
         final_transaction.add_output(PartialOutput::new(
             Script::new_op_return(&[]),
@@ -914,7 +922,7 @@ fn build_burn_transaction(
     for (index, (_, reserve, account, _)) in burnable_groups.iter().enumerate() {
         let fee_share = fee_share(burn_fee_sats, burnable_groups.len(), index)?;
         let remaining = reserve
-            .amount()
+            .amount()?
             .checked_sub(fee_share)
             .filter(|remaining| *remaining > 0)
             .ok_or(BurningError::ReserveShortfall)?;
@@ -970,8 +978,8 @@ fn validate_group_items(
     tick_utxos: &[UTXO],
 ) -> Result<(), BurningError> {
     for (tick, tick_utxo) in group.ticks.iter().zip(tick_utxos) {
-        if tick_utxo.asset() != burn_assets.of(tick)?
-            || tick_utxo.amount() != tick.amount
+        if tick_utxo.asset()? != burn_assets.of(tick)?
+            || tick_utxo.amount()? != tick.amount
             || tick_utxo.txout.script_pubkey.as_bytes() != tick.script_pubkey
         {
             return Err(BurningError::Invalid("indexed issued UTXO changed".into()));
@@ -1790,7 +1798,7 @@ mod tests {
             vec![unspent.txid]
         );
         assert_eq!(utxos.len(), 1);
-        assert_eq!(utxos[0].amount(), 1_700_000_000);
+        assert_eq!(utxos[0].amount().unwrap(), 1_700_000_000);
         // The mempool spend is tracked; the block spend waits for indexing to delete it.
         let expired = store.list_expired(10).await.unwrap();
         assert_eq!(
@@ -2038,7 +2046,7 @@ mod tests {
         let fixture = BurnFixture::new();
         let groups = [fixture.group(1, 50, false, 100_000)];
         let built = fixture.build(&groups, 500).unwrap();
-        let (pset, _) = built.final_transaction.extract_pst();
+        let (pset, _) = built.final_transaction.extract_pst().unwrap();
         let fee_output = pset.outputs().last().unwrap();
         assert_eq!(fee_output.amount, Some(742));
         assert_eq!(
@@ -2191,7 +2199,7 @@ mod tests {
         let fixture = BurnFixture::new();
         let weight = |groups: &[BurnableGroup]| {
             let built = fixture.build(groups, 500).unwrap();
-            let (pset, _) = built.final_transaction.extract_pst();
+            let (pset, _) = built.final_transaction.extract_pst().unwrap();
             let weight =
                 finalized_dummy_weight(&built.final_transaction, &pset, &fixture.network).unwrap();
             let items = groups.iter().map(|(group, _, _, _)| group.ticks.len());
