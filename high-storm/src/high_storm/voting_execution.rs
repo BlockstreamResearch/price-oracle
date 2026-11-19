@@ -1996,6 +1996,33 @@ mod inventory_tests {
             output.amount == Some(0)
                 && output.script_pubkey == migrated_members_script(&members, [17; 32]).unwrap()
         }));
+        // The Storm Eyes come first, then the Treasury input deferring to input 0.
+        let inputs = prepared.transaction.inputs();
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(
+            inputs[0].partial_input.witness_txid,
+            Txid::from_byte_array([18; 32])
+        );
+        assert_eq!(
+            inputs[1].partial_input.witness_txid,
+            Txid::from_byte_array([19; 32])
+        );
+        assert_eq!(
+            inputs[2].partial_input.witness_txid,
+            Txid::from_byte_array([16; 32])
+        );
+        assert_eq!(
+            inputs[2].partial_input.witness_utxo.script_pubkey,
+            treasury.get_script_pubkey(&network)
+        );
+        assert_eq!(
+            inputs[2].program_input.as_ref().unwrap().witness,
+            simplex::simplicityhl::WitnessValues::from(
+                contracts::artifacts::treasury::derived_treasury::TreasuryWitness {
+                    storm_eye_input_index: 0,
+                }
+            )
+        );
     }
 
     fn stored_reshape(
