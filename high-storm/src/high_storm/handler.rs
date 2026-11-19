@@ -753,6 +753,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spend_messages_wait_for_recovery_and_migration_finality() {
+        use secp256k1_zkp::{Secp256k1, SecretKey};
+        use storm::{MessageContext, Peer, Storm};
+
+        let database = crate::db::Database::connect("sqlite::memory:", 1)
+            .await
+            .unwrap();
+        let secp = Secp256k1::new();
+        let secrets =
+            [[31; 32], [32; 32], [33; 32]].map(|secret| SecretKey::from_slice(&secret).unwrap());
+        let keys = secrets.map(|secret| secret.public_key(&secp).serialize());
+        let storm = Storm::from_peers(secrets[0], keys.into_iter().map(Peer::new).collect());
+        let state =
+            NetworkState::for_tests(&storm, secrets[0].secret_bytes(), keys[0], &database).await;
+        let gated = [
+            NodeMessageKind::ExecuteUserRequests,
+            NodeMessageKind::ExchangeRewards,
+            NodeMessageKind::SigningNonces,
+            NodeMessageKind::PartialSignatures,
+            NodeMessageKind::BurnExpiredUtxos,
+            NodeMessageKind::ExpiredUtxosBurned,
+            NodeMessageKind::ExecuteVotingRequest,
+            NodeMessageKind::RenewStormUtxos,
+        ];
+        // The gate runs before the payload is decoded, so an empty one will do.
+        let run = |kind| {
+            let state = state.clone();
+            let storm = storm.handle();
+            async move {
+                let message = NodeMessage::new(kind, None, &()).unwrap();
+                let context = StormContext {
+                    storm_handle: storm,
+                    storm_message: message.clone().into_storm_message().unwrap(),
+                    message_context: MessageContext {
+                        peer_public_key: keys[0],
+                    },
+                };
+                dispatch(state, message, kind, context, &mut false).await
+            }
+        };
+
+        for kind in gated {
+            assert!(matches!(run(kind).await, Err(HandlerError::Recovering)));
+        }
+        let settings = run(NodeMessageKind::ProtocolSettings).await;
+        assert!(!matches!(
+            settings,
+            Err(HandlerError::Recovering | HandlerError::MigrationFinalizing)
+        ));
+
+        state.indexer().mark_synced();
+        state.set_spending_paused(true).await.unwrap();
+        for kind in gated {
+            assert!(matches!(
+                run(kind).await,
+                Err(HandlerError::MigrationFinalizing)
+            ));
+        }
+        let settings = run(NodeMessageKind::ProtocolSettings).await;
+        assert!(!matches!(
+            settings,
+            Err(HandlerError::Recovering | HandlerError::MigrationFinalizing)
+        ));
+    }
+
+    #[tokio::test]
     async fn a_rejected_notice_of_a_broadcast_is_no_refusal_to_sign() {
         use secp256k1_zkp::{Secp256k1, SecretKey};
         use storm::{MessageContext, Peer, Storm};
