@@ -510,6 +510,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_changes_that_match_no_row_keep_fee_utxos_reserved() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.user_requests();
+        let fee_utxo = FeeUtxo {
+            txid: [8; 32],
+            output_index: 3,
+        };
+        store
+            .insert_pending([1; 32], b"first", 42, std::slice::from_ref(&fee_utxo))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .mark_processing([1; 32], b"result", b"transaction")
+                .await
+                .unwrap()
+        );
+
+        // Neither applies to a request that is still processing.
+        assert!(!store.mark_executed([1; 32]).await.unwrap());
+        assert!(!store.mark_failed([1; 32], b"reason").await.unwrap());
+        assert_eq!(
+            store
+                .insert_pending([2; 32], b"second", 43, std::slice::from_ref(&fee_utxo))
+                .await
+                .unwrap(),
+            InsertPendingResult::FeeUtxoReserved(fee_utxo.clone())
+        );
+    }
+
+    #[tokio::test]
     async fn failing_pending_request_releases_fee_utxos() {
         let database = Database::connect("sqlite::memory:", 1).await.unwrap();
         let store = database.user_requests();

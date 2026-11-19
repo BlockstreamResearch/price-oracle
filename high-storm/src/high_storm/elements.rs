@@ -245,4 +245,33 @@ mod tests {
         assert_eq!(network.genesis_block_hash().to_string(), genesis_hash);
         assert_eq!(network.policy_asset().to_string(), policy_asset);
     }
+
+    #[test]
+    fn storm_eye_witnesses_keep_the_covenant_layout() {
+        let data = StormEyeContractData {
+            storm_tree_root: [1; 32],
+            rescue_height: 42,
+            rescue_output_script_hash: [2; 32],
+        };
+        let empty_proof: PackedStormTreeProof = std::array::from_fn(|_| Either::Left(()));
+        assert!(matches!(
+            placeholder_storm_eye_witness(&data, Either::Left(0)).path,
+            Either::Left((
+                (root, 42),
+                (signature, branch, proof),
+                Either::Left(0),
+            )) if root == [1; 32] && signature == [0; 64] && branch == [1; 32] && proof == empty_proof
+        ));
+
+        let mut packed = empty_proof;
+        packed[0] = Either::Right((true, [3; 32]));
+        assert!(matches!(
+            storm_eye_witness(&data, [4; 64], [5; 32], packed, Either::Left(7)).path,
+            Either::Left((
+                (root, 42),
+                (signature, branch, proof),
+                Either::Left(7),
+            )) if root == [1; 32] && signature == [4; 64] && branch == [5; 32] && proof == packed
+        ));
+    }
 }

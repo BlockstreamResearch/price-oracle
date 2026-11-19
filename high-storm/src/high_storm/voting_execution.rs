@@ -1857,9 +1857,14 @@ mod inventory_tests {
             witness.path,
             Either::Left((
                 (old_root, rescue_height),
-                _,
+                (signature, branch, proof),
                 Either::Right(Either::Left(Either::Left((root, 2))))
-            )) if old_root == [8; 32] && rescue_height == 42 && root == expected_root
+            )) if old_root == [8; 32]
+                && rescue_height == 42
+                && root == expected_root
+                && signature == [0; 64]
+                && branch == [8; 32]
+                && proof.iter().all(|step| matches!(step, Either::Left(())))
         ));
     }
 
