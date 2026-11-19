@@ -39,7 +39,6 @@ pub(crate) struct RawTransactionInfo {
     pub(crate) block_hash: Option<String>,
 }
 
-/// Adds each of `utxos` as a Treasury input that defers to the Storm Eye at input 0.
 /// The spend arm of a Storm Eye witness, as `AuthKind` in `auth.simf`.
 pub(crate) type StormEyeSpend =
     Either<u32, Either<Either<([u8; 32], u32), (u32, u32)>, Either<u8, u8>>>;
@@ -90,6 +89,7 @@ pub(crate) fn add_storm_eye_input(
     );
 }
 
+/// Adds each of `utxos` as a Treasury input that defers to the Storm Eye at input 0.
 pub(crate) fn add_treasury_inputs<'a>(
     transaction: &mut FinalTransaction,
     treasury: &TreasuryProgram,

@@ -637,14 +637,7 @@ fn placeholder_witness(
     new_rescue_height: u32,
     output_index: u32,
 ) -> AuthWitness {
-    renewal_witness(
-        data,
-        new_rescue_height,
-        output_index,
-        [0; 64],
-        data.storm_tree_root,
-        std::array::from_fn(|_| Either::Left(())),
-    )
+    elements::placeholder_storm_eye_witness(data, renewal_spend(new_rescue_height, output_index))
 }
 
 fn renewal_witness(
@@ -653,18 +646,23 @@ fn renewal_witness(
     output_index: u32,
     signature: [u8; 64],
     branch: [u8; 32],
-    proof: [Either<(), (bool, [u8; 32])>; storm_tree::TREE_DEPTH as usize],
+    proof: super::user_requests::PackedStormTreeProof,
 ) -> AuthWitness {
     elements::storm_eye_witness(
         data,
         signature,
         branch,
         proof,
-        Either::Right(Either::Left(Either::Right((
-            new_rescue_height,
-            output_index,
-        )))),
+        renewal_spend(new_rescue_height, output_index),
     )
+}
+
+/// The witness spend arm that moves the rescue height and keeps output `output_index`.
+fn renewal_spend(new_rescue_height: u32, output_index: u32) -> elements::StormEyeSpend {
+    Either::Right(Either::Left(Either::Right((
+        new_rescue_height,
+        output_index,
+    ))))
 }
 
 fn renewal_due(block_height: u64, rescue_height: u32) -> bool {
