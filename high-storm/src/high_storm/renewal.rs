@@ -14,7 +14,6 @@ use simplex::{
         FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, UTXO,
     },
 };
-use storm::{PeerStatus, StormHandle};
 
 use crate::high_storm::elements;
 use crate::high_storm::elements::RawTransactionInfo;
@@ -34,7 +33,7 @@ use super::{
         storm_eye_contract_data, storm_eye_program,
     },
     droplets::member_script,
-    message::{NodeMessage, NodeMessageKind, RenewStormUtxos},
+    message::RenewStormUtxos,
     signing::SigningError,
     user_requests::{STORM_EYE_TAG, asset_id, pack_proof},
     voting_execution::{
@@ -725,29 +724,6 @@ fn live_treasury_utxo(
             )?,
         )
     }
-}
-
-pub(crate) async fn announce(
-    storm: &StormHandle,
-    request: &RenewStormUtxos,
-) -> Result<(), RenewalError> {
-    let recipients = storm
-        .peers()
-        .await
-        .into_iter()
-        .filter(|peer| peer.status == PeerStatus::Active)
-        .map(|peer| {
-            secp256k1_zkp::PublicKey::from_slice(&peer.compressed_public_key)
-                .map_err(|_| RenewalError::Invalid("invalid renewal recipient".into()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if recipients.is_empty() {
-        return Ok(());
-    }
-    let message =
-        NodeMessage::new(NodeMessageKind::RenewStormUtxos, None, request)?.into_storm_message()?;
-    storm.send_message(message, &recipients).await?;
-    Ok(())
 }
 
 #[cfg(test)]

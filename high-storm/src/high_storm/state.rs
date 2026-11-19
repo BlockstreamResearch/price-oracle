@@ -104,16 +104,16 @@ impl NetworkState {
     ) -> Self {
         let HighStormDependencies {
             network_store,
-            chain,
-            voting_store,
-            network_assets,
-            monitored_utxos,
-            droplets,
-            user_requests,
-            price_attestations,
             elements_rpc,
             protocol_config,
         } = dependencies;
+        let chain = network_store.chain();
+        let voting_store = network_store.voting();
+        let network_assets = network_store.network_assets();
+        let monitored_utxos = network_store.monitored_utxos();
+        let droplets = network_store.droplets();
+        let user_requests = network_store.user_requests();
+        let price_attestations = network_store.price_attestations();
 
         let initial_members = x_only_keys(storm.peers().await);
         let migration_paused = chain

@@ -177,18 +177,24 @@ fn rejected(
 }
 
 /// Whether `kind` asks for, or reports, a spend of the network's covenant outputs.
+/// Exhaustive, so a new kind fails to compile until it is classified.
 fn signs_or_reports_a_spend(kind: NodeMessageKind) -> bool {
-    matches!(
-        kind,
+    match kind {
         NodeMessageKind::ExecuteUserRequests
-            | NodeMessageKind::ExchangeRewards
-            | NodeMessageKind::SigningNonces
-            | NodeMessageKind::PartialSignatures
-            | NodeMessageKind::BurnExpiredUtxos
-            | NodeMessageKind::ExpiredUtxosBurned
-            | NodeMessageKind::ExecuteVotingRequest
-            | NodeMessageKind::RenewStormUtxos
-    )
+        | NodeMessageKind::ExchangeRewards
+        | NodeMessageKind::SigningNonces
+        | NodeMessageKind::PartialSignatures
+        | NodeMessageKind::BurnExpiredUtxos
+        | NodeMessageKind::ExpiredUtxosBurned
+        | NodeMessageKind::ExecuteVotingRequest
+        | NodeMessageKind::RenewStormUtxos => true,
+        NodeMessageKind::NetworkVoteRequest
+        | NodeMessageKind::ApproveVotingRequest
+        | NodeMessageKind::AskAboutVotings
+        | NodeMessageKind::AttestPrice
+        | NodeMessageKind::NetworkAssets
+        | NodeMessageKind::ProtocolSettings => false,
+    }
 }
 
 /// Sets `requests_signature` once the payload shows the message asks this

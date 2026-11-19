@@ -58,13 +58,6 @@ pub struct HighStorm {
 
 pub(crate) struct HighStormDependencies {
     network_store: crate::db::network::NetworkStore,
-    chain: crate::db::chain::ChainStore,
-    voting_store: crate::db::voting::VotingStore,
-    network_assets: crate::db::network_asset::NetworkAssetStore,
-    monitored_utxos: crate::db::monitored_utxo::MonitoredUtxoStore,
-    droplets: crate::db::droplet::DropletStore,
-    user_requests: crate::db::user_request::UserRequestStore,
-    price_attestations: crate::db::price_attestation::PriceAttestationStore,
     elements_rpc: crate::config::ElementsRpcConfig,
     protocol_config: crate::config::ProtocolConfig,
 }
@@ -76,13 +69,6 @@ impl HighStormDependencies {
         protocol_config: crate::config::ProtocolConfig,
     ) -> Self {
         Self {
-            chain: network_store.chain(),
-            voting_store: network_store.voting(),
-            network_assets: network_store.network_assets(),
-            monitored_utxos: network_store.monitored_utxos(),
-            droplets: network_store.droplets(),
-            user_requests: network_store.user_requests(),
-            price_attestations: network_store.price_attestations(),
             network_store,
             elements_rpc,
             protocol_config,
@@ -377,6 +363,7 @@ impl HighStorm {
             NodeMessageKind::ProtocolSettings,
             None,
             &self.state.protocol_settings(),
+            SigningError::InvalidMessage,
             "invalid protocol settings recipient",
         )
         .await
@@ -388,6 +375,7 @@ impl HighStorm {
             NodeMessageKind::ExchangeRewards,
             None,
             notification,
+            SigningError::InvalidMessage,
             "invalid exchange notification recipient",
         )
         .await
@@ -484,7 +472,15 @@ impl HighStorm {
             && self.is_coordinator().await
             && let Some(request) = self.state.renewal().pending_request().await?
         {
-            renewal::announce(&self.storm.handle(), &request).await?;
+            announce(
+                &self.storm.handle(),
+                NodeMessageKind::RenewStormUtxos,
+                None,
+                &request,
+                RenewalError::Invalid,
+                "invalid renewal recipient",
+            )
+            .await?;
         }
         Ok(confirmed)
     }
@@ -554,7 +550,16 @@ impl HighStorm {
             .renewal()
             .record_and_broadcast(&notification)
             .await?;
-        if let Err(error) = renewal::announce(&self.storm.handle(), &notification).await {
+        if let Err(error) = announce(
+            &self.storm.handle(),
+            NodeMessageKind::RenewStormUtxos,
+            None,
+            &notification,
+            RenewalError::Invalid,
+            "invalid renewal recipient",
+        )
+        .await
+        {
             tracing::warn!(%error, "failed to announce Storm Eye timelock renewal");
         }
 
@@ -842,6 +847,7 @@ impl HighStorm {
             NodeMessageKind::ExpiredUtxosBurned,
             None,
             notification,
+            SigningError::InvalidMessage,
             "invalid burn notification recipient",
         )
         .await
@@ -1401,6 +1407,7 @@ impl HighStormHandle {
             NodeMessageKind::ExecuteVotingRequest,
             Some(request_hash),
             notification,
+            SigningError::InvalidMessage,
             "invalid voting notification recipient",
         )
         .await
@@ -1442,13 +1449,18 @@ fn round_outcome<E>(result: &Result<usize, E>) -> Option<&'static str> {
 
 /// Sends `payload` as a `kind` message to every active peer of `storm`, if there
 /// is any; `invalid_recipient` is the error for a peer whose key does not parse.
-async fn announce<T: serde::Serialize>(
+async fn announce<T, E>(
     storm: &StormHandle,
     kind: NodeMessageKind,
     linked_to: Option<[u8; 32]>,
     payload: &T,
+    invalid: fn(String) -> E,
     invalid_recipient: &str,
-) -> Result<(), SigningError> {
+) -> Result<(), E>
+where
+    T: serde::Serialize,
+    E: From<postcard::Error> + From<storm::MessageError> + From<storm::Error>,
+{
     let recipients = storm
         .peers()
         .await
@@ -1456,7 +1468,7 @@ async fn announce<T: serde::Serialize>(
         .filter(|peer| peer.status == PeerStatus::Active)
         .map(|peer| {
             PublicKey::from_slice(&peer.compressed_public_key)
-                .map_err(|_| SigningError::InvalidMessage(invalid_recipient.into()))
+                .map_err(|_| invalid(invalid_recipient.into()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     if recipients.is_empty() {
