@@ -1,4 +1,7 @@
 use super::*;
+use crate::high_storm::utxo::{
+    matches_expected_asset, matches_scanned_asset, storm_eye_pool_index,
+};
 use bitcoincore_rpc::Auth;
 use secp256k1::{Keypair, SecretKey, schnorr};
 
