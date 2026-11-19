@@ -1895,3 +1895,67 @@ async fn discovery_coordinator_broadcasts_complete_table_and_clients_connect() {
         Some(second_address.to_string().as_str())
     );
 }
+
+/// A local node and two peers, with a migration staged to `members` over
+/// `table`; each table entry is (peer, active, has an address).
+fn staged_state(local_is_member: bool, table: &[(usize, bool, bool)]) -> StormState {
+    let keys = [random_key_pair(), random_key_pair(), random_key_pair()];
+    let mut state = StormState::new(keys[0].0, vec![Peer::new(keys[1].1), Peer::new(keys[2].1)]);
+    let mut members = std::collections::BTreeSet::from([
+        StormState::x_only_public_key(&keys[1].1),
+        StormState::x_only_public_key(&keys[2].1),
+    ]);
+    if local_is_member {
+        members.insert(StormState::x_only_public_key(&keys[0].1));
+    }
+    state.migration_members = Some(members);
+    state.migration_peers = table
+        .iter()
+        .map(|&(index, active, addressed)| {
+            let mut peer = Peer::new(keys[index].1);
+            if active {
+                peer.status = PeerStatus::Active;
+            }
+            if addressed {
+                peer.socket_address = Some(format!("127.0.0.1:{}", 9000 + index));
+            }
+            peer
+        })
+        .collect();
+    state
+}
+
+#[test]
+fn migration_activation_needs_a_staged_complete_and_ready_table() {
+    let (secret_key, _) = random_key_pair();
+    let unstaged = StormState::new(secret_key, Vec::new());
+    assert!(matches!(
+        unstaged.ensure_migration_activatable(),
+        Err(Error::MigrationNotStaged)
+    ));
+
+    // Peer 2 is a member but missing from the table.
+    let missing = staged_state(false, &[(1, true, true)]);
+    assert!(matches!(
+        missing.ensure_migration_activatable(),
+        Err(Error::MigrationNotReady)
+    ));
+
+    // The local node is in the table but not a member.
+    let outsider = staged_state(false, &[(0, true, true), (1, true, true), (2, true, true)]);
+    assert!(matches!(
+        outsider.ensure_migration_activatable(),
+        Err(Error::InvalidMigrationPeerTable)
+    ));
+
+    // A staged member waits until every member is connected, addresses or not.
+    let member_waiting = staged_state(true, &[(0, false, true), (1, true, true), (2, false, true)]);
+    assert!(matches!(
+        member_waiting.ensure_migration_activatable(),
+        Err(Error::MigrationNotReady)
+    ));
+
+    // A node leaving the network only needs every member connected.
+    let leaving = staged_state(false, &[(1, true, true), (2, true, false)]);
+    leaving.ensure_migration_activatable().unwrap();
+}
