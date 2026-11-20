@@ -90,18 +90,18 @@ pub(super) fn scan_contract_utxos(
     Ok(candidates)
 }
 
-pub(super) fn matches_expected_asset(actual: AssetId, expected: Option<[u8; 32]>) -> bool {
+fn matches_expected_asset(actual: AssetId, expected: Option<[u8; 32]>) -> bool {
     expected.is_none_or(|expected| actual == AssetId::from_byte_array(expected))
 }
 
-pub(super) fn matches_scanned_asset(actual: Option<&str>, expected: Option<[u8; 32]>) -> bool {
+fn matches_scanned_asset(actual: Option<&str>, expected: Option<[u8; 32]>) -> bool {
     expected.is_none_or(|expected| {
         actual.and_then(|asset| AssetId::from_str(asset).ok())
             == Some(AssetId::from_byte_array(expected))
     })
 }
 
-pub(super) fn storm_eye_pool_index(candidate_count: usize, pool: StormEyePool) -> Option<usize> {
+fn storm_eye_pool_index(candidate_count: usize, pool: StormEyePool) -> Option<usize> {
     let coordinator_count = candidate_count / 2;
     let index = match pool {
         StormEyePool::UserRequests(lane) if lane < coordinator_count => lane,
@@ -300,3 +300,6 @@ pub(super) struct ScannedUtxo {
     asset: Option<String>,
     pub(super) height: Option<u64>,
 }
+
+#[cfg(test)]
+mod tests;
