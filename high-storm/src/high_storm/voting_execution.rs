@@ -1616,4 +1616,4 @@ pub(crate) fn network(client: &Client) -> Result<SimplicityNetwork, VotingExecut
 }
 
 #[cfg(test)]
-mod inventory_tests;
+mod tests;

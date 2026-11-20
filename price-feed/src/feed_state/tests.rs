@@ -1,6 +1,22 @@
 use super::*;
 use crate::{constants::VALIDITY_WINDOW, registry::Asset};
 
+impl FeedState {
+    /// `Clock::Fixed` is a frozen instant, so a test that needs time to pass
+    /// swaps the clock rather than waiting.
+    fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock;
+    }
+}
+
+impl FeedStates {
+    fn set_clock(&mut self, clock: Clock) {
+        for state in self.states.values_mut() {
+            state.set_clock(clock);
+        }
+    }
+}
+
 const NOW: u64 = 1_700_000_000;
 const LBTC_USD: FeedId = 0;
 const USDT_USD: FeedId = 1;

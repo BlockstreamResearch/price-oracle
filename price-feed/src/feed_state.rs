@@ -273,22 +273,4 @@ impl FeedStates {
 }
 
 #[cfg(test)]
-impl FeedState {
-    /// `Clock::Fixed` is a frozen instant, so a test that needs time to pass
-    /// swaps the clock rather than waiting.
-    fn set_clock(&mut self, clock: Clock) {
-        self.clock = clock;
-    }
-}
-
-#[cfg(test)]
-impl FeedStates {
-    fn set_clock(&mut self, clock: Clock) {
-        for state in self.states.values_mut() {
-            state.set_clock(clock);
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests;

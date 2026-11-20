@@ -2,8 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use secp256k1_zkp::PublicKey;
-#[cfg(test)]
-use secp256k1_zkp::Secp256k1;
 
 use crate::{
     MessageContext, Peer, PeerStatus, StormHandle, StormMessage, StormState,

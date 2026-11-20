@@ -1,6 +1,6 @@
 use super::*;
 use crate::constants;
-use secp256k1_zkp::{SecretKey, rand};
+use secp256k1_zkp::{Secp256k1, SecretKey, rand};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
