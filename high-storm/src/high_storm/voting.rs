@@ -1006,4 +1006,4 @@ fn transport_keys(keys: &[[u8; 33]]) -> Result<Vec<TransportPublicKey>, VotingEr
 }
 
 #[cfg(test)]
-mod reshape_tests;
+mod tests;
