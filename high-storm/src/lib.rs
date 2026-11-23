@@ -24,9 +24,9 @@ pub use high_storm::{
     FeedSources, HighStorm, HighStormHandle, MergeStormEyes, NetworkAsset, NetworkAssets,
     NetworkVoteKind, NetworkVoteRequest, NodeMessage, NodeMessageKind, PriceAttestation,
     PriceError, PriceSourceError, PriceSourceInfo, SigningError, SigningResult, SplitStormEye,
-    StormEyeInventoryItem, StormEyeState, StormEyeUtxo, UpdateNetworkMembers, UserRequestError,
-    VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError, VotingExecutionError, VotingRequest,
-    VotingStatus,
+    StormEyeInventoryItem, StormEyeState, StormEyeUtxo, TransactionHelperError,
+    UpdateNetworkMembers, UserRequestError, VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError,
+    VotingExecutionError, VotingRequest, VotingStatus,
 };
 
 #[derive(Debug, thiserror::Error)]

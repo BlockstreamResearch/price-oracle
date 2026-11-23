@@ -16,7 +16,19 @@ use simplex::{
     transaction::{FinalTransaction, PartialInput, ProgramInput, RequiredSignature, UTXO},
 };
 
-use super::{assets::StormEyeContractData, user_requests::UserRequestError};
+use super::assets::StormEyeContractData;
+
+/// Why a shared transaction helper of the issuance, burn, exchange, renewal and
+/// voting rounds failed.
+#[derive(Debug, thiserror::Error)]
+pub enum TransactionHelperError {
+    #[error("Elements RPC operation failed: {0}")]
+    Rpc(#[from] bitcoincore_rpc::Error),
+    #[error("invalid transaction: {0}")]
+    Invalid(String),
+    #[error("failed to extract final transaction: {0}")]
+    Pset(String),
+}
 
 #[derive(Deserialize)]
 pub(crate) struct ChainInfo {
@@ -189,10 +201,10 @@ pub(crate) fn finalized_dummy_weight(
     transaction: &FinalTransaction,
     pset: &PartiallySignedTransaction,
     network: &SimplicityNetwork,
-) -> Result<usize, UserRequestError> {
+) -> Result<usize, TransactionHelperError> {
     let mut pset = pset.clone();
     let storm_eye_input = pset.inputs_mut().get_mut(0).ok_or_else(|| {
-        UserRequestError::Invalid("cannot estimate a transaction without inputs".into())
+        TransactionHelperError::Invalid("cannot estimate a transaction without inputs".into())
     })?;
     storm_eye_input.final_script_witness = Some(
         STORM_EYE_AUTH_WITNESS_TEMPLATE
@@ -211,7 +223,7 @@ pub(crate) fn finalized_dummy_weight(
             .program
             .finalize(&pset, &program_input.witness, index, network)
             .map_err(|error| {
-                UserRequestError::Invalid(format!(
+                TransactionHelperError::Invalid(format!(
                     "failed to estimate covenant input {index} weight: {error}"
                 ))
             })?;
@@ -219,16 +231,16 @@ pub(crate) fn finalized_dummy_weight(
     }
     let transaction = pset
         .extract_tx()
-        .map_err(|error| UserRequestError::Pset(error.to_string()))?;
+        .map_err(|error| TransactionHelperError::Pset(error.to_string()))?;
 
     Ok(transaction.weight())
 }
 
 pub(crate) fn pack_proof(
     proof: &storm_tree::StormTreeProof,
-) -> Result<PackedStormTreeProof, UserRequestError> {
+) -> Result<PackedStormTreeProof, TransactionHelperError> {
     if proof.siblings.len() > storm_tree::TREE_DEPTH as usize {
-        return Err(UserRequestError::Invalid(
+        return Err(TransactionHelperError::Invalid(
             "Storm Tree proof is too deep".into(),
         ));
     }
@@ -241,7 +253,7 @@ pub(crate) fn pack_proof(
     }))
 }
 
-pub(crate) fn asset_id(bytes: [u8; 32]) -> Result<AssetId, UserRequestError> {
+pub(crate) fn asset_id(bytes: [u8; 32]) -> Result<AssetId, TransactionHelperError> {
     Ok(AssetId::from_byte_array(bytes))
 }
 

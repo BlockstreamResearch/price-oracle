@@ -37,7 +37,6 @@ use super::{
     issuance::voucher_program,
     message::{BurnExpiredUtxos, ExpiredUtxosBurned, StormEyeUtxo},
     signing::SigningError,
-    user_requests::UserRequestError,
     utxo::{
         StormEyePool, find_contract_utxo, get_explicit_outpoint, get_optional_explicit_outpoint,
         output_from_utxo, require_explicit_utxo, require_preserved_output, witness_utxo,
@@ -81,7 +80,7 @@ pub enum BurningError {
     #[error("failed to extract final transaction: {0}")]
     Pset(String),
     #[error("shared transaction helper failed: {0}")]
-    TransactionHelper(#[from] UserRequestError),
+    TransactionHelper(#[from] super::elements::TransactionHelperError),
 }
 
 pub(crate) struct PreparedBurn {

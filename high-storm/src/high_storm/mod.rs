@@ -32,6 +32,7 @@ pub(crate) use assets::{StormEyeContractData, storm_eye_contract_data};
 pub use burning::BurningError;
 pub use droplets::DropletsError;
 pub(crate) use droplets::exchange_recipient_amount;
+pub use elements::TransactionHelperError;
 pub use indexer::IndexerError;
 pub use message::{
     ApproveVotingRequest, AttestPriceMsg, BurnExpiredUtxos, ChainTip, ExchangeRewards,

@@ -63,7 +63,7 @@ pub enum RenewalError {
     #[error("failed to evaluate the Storm Eye covenant: {0}")]
     Program(#[from] simplex::program::ProgramError),
     #[error("shared transaction validation failed: {0}")]
-    TransactionHelper(#[from] super::user_requests::UserRequestError),
+    TransactionHelper(#[from] super::elements::TransactionHelperError),
     #[error("shared voting transaction validation failed: {0}")]
     VotingTransaction(#[from] VotingExecutionError),
     #[error("distributed signing failed: {0}")]

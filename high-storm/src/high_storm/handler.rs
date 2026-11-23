@@ -76,8 +76,8 @@ impl HandlerError {
     /// wrong, and `other` for a local failure that is not the proposer's doing.
     fn refusal_reason(&self) -> Option<&'static str> {
         use super::{
-            renewal::RenewalError, user_requests::UserRequestError,
-            voting_execution::VotingExecutionError,
+            elements::TransactionHelperError, renewal::RenewalError,
+            user_requests::UserRequestError, voting_execution::VotingExecutionError,
         };
 
         let invalid = match self {
@@ -89,6 +89,9 @@ impl HandlerError {
                 UserRequestError::Invalid(_)
                     | UserRequestError::Transaction(_)
                     | UserRequestError::Pset(_)
+                    | UserRequestError::TransactionHelper(
+                        TransactionHelperError::Invalid(_) | TransactionHelperError::Pset(_)
+                    )
             ),
             Self::Burning(error) => matches!(
                 error,
