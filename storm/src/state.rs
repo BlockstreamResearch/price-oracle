@@ -172,9 +172,8 @@ impl StormState {
         {
             return Err(Error::MigrationNotReady);
         }
-        if !self.migration_peer_table_matches_members() {
-            return Err(Error::InvalidMigrationPeerTable);
-        }
+        // Ready and complete both require the table to match the members.
+        debug_assert!(self.migration_peer_table_matches_members());
         Ok(())
     }
 
