@@ -130,22 +130,10 @@ impl Indexer {
 
     pub(crate) async fn sync(&self) -> Result<u64, IndexerError> {
         let _guard = self.sync_lock.lock().await;
-        let mut storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(IndexerError::MissingAsset(STORM_EYE_KIND))?;
-        let tick_asset = self
-            .assets
-            .get(TICK_ASSET_KIND)
-            .await?
-            .ok_or(IndexerError::MissingAsset(TICK_ASSET_KIND))?;
+        let mut storm_eye = self.asset(STORM_EYE_KIND).await?;
+        let tick_asset = self.asset(TICK_ASSET_KIND).await?;
         // Required, or a Verifier-only issuance would be skipped.
-        let verifier_asset = self
-            .assets
-            .get(ORACLE_VERIFIER_KIND)
-            .await?
-            .ok_or(IndexerError::MissingAsset(ORACLE_VERIFIER_KIND))?;
+        let verifier_asset = self.asset(ORACLE_VERIFIER_KIND).await?;
         let issued_assets = [&tick_asset, &verifier_asset];
         let client = self.client()?;
         let network = network(&client)?;
@@ -219,11 +207,7 @@ impl Indexer {
             let fork_height = ancestor.map_or(0, |height| height.saturating_add(1));
             self.chain.set_recovering(fork_height).await?;
             recovered_locks = self.chain.reset_projections().await?;
-            storm_eye = self
-                .assets
-                .get(STORM_EYE_KIND)
-                .await?
-                .ok_or(IndexerError::MissingAsset(STORM_EYE_KIND))?;
+            storm_eye = self.asset(STORM_EYE_KIND).await?;
             issued_cursor = None;
             droplets_cursor = None;
             tracing::warn!(
@@ -553,6 +537,10 @@ impl Indexer {
             }
         }
         Ok(())
+    }
+
+    async fn asset(&self, kind: &'static str) -> Result<crate::NetworkAsset, IndexerError> {
+        self.assets.require(kind, IndexerError::MissingAsset).await
     }
 
     fn client(&self) -> Result<Client, IndexerError> {

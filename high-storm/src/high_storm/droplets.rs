@@ -1,12 +1,9 @@
 use std::str::FromStr;
 
 use bitcoincore_rpc::{Client, RpcApi};
-use contracts::artifacts::{
-    auth::derived_auth::AuthWitness,
-    treasury::{
-        TreasuryProgram,
-        derived_treasury::{TreasuryArguments, TreasuryWitness},
-    },
+use contracts::artifacts::treasury::{
+    TreasuryProgram,
+    derived_treasury::{TreasuryArguments, TreasuryWitness},
 };
 use secp256k1_zkp::{Message, PublicKey, Secp256k1, XOnlyPublicKey, schnorr::Signature};
 use simplex::{
@@ -19,9 +16,7 @@ use simplex::{
             Address, AddressParams, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction,
         },
     },
-    transaction::{
-        FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
-    },
+    transaction::{FinalTransaction, PartialOutput, SigMessage},
 };
 
 use crate::high_storm::elements;
@@ -192,11 +187,7 @@ impl Droplets {
         Address::from_str(destination)
             .map_err(|_| DropletsError::Invalid("invalid destination address".into()))?;
 
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(DropletsError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let indexed_utxos = self.store.treasury_utxos().await?;
         let (transaction, signing_hash) = self.prepare_exchange_transaction(
             amount,
@@ -282,23 +273,11 @@ impl Droplets {
             .map_err(|error| DropletsError::Invalid(error.to_string()))?;
         let auth_program = storm_eye_program(storm_eye)?;
         let mut transaction = FinalTransaction::new();
-        transaction.add_program_input(
-            PartialInput::new(storm_eye_utxo.clone()),
-            ProgramInput::new(
-                Box::new(auth_program.as_ref().clone()),
-                AuthWitness {
-                    path: Either::Left((
-                        (contract_data.storm_tree_root, contract_data.rescue_height),
-                        (
-                            [0; 64],
-                            contract_data.storm_tree_root,
-                            std::array::from_fn(|_| Either::Left(())),
-                        ),
-                        Either::Left(0),
-                    )),
-                },
-            ),
-            RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+        elements::add_storm_eye_input(
+            &mut transaction,
+            &storm_eye_utxo,
+            &auth_program,
+            elements::placeholder_storm_eye_witness(&contract_data, Either::Left(0)),
         );
         elements::add_treasury_inputs(&mut transaction, &treasury, &selected);
 
@@ -404,11 +383,7 @@ impl Droplets {
                 "Droplets ledger is halted at block {height}: {reason}"
             )));
         }
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(DropletsError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let pset: PartiallySignedTransaction = encode::deserialize(transaction)?;
         let client = self.client()?;
         for (index, input) in pset.inputs().iter().enumerate() {
@@ -470,11 +445,7 @@ impl Droplets {
         proof: storm_tree::StormTreeProof,
         exchange: &ValidatedExchange,
     ) -> Result<([u8; 32], Vec<u8>), DropletsError> {
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(DropletsError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let network = self.network(&self.client()?)?;
         let contract_data: StormEyeContractData =
             postcard::from_bytes(storm_eye.contract_data.as_deref().ok_or_else(|| {
@@ -511,17 +482,13 @@ impl Droplets {
 
         let mut pset: PartiallySignedTransaction = encode::deserialize(&request.tx)?;
         let auth_program = storm_eye_program(&storm_eye)?;
-        let auth_witness = AuthWitness {
-            path: Either::Left((
-                (contract_data.storm_tree_root, contract_data.rescue_height),
-                (
-                    *signature.as_ref(),
-                    signing.signing_storm_tree_branch,
-                    pack_proof(&proof)?,
-                ),
-                Either::Left(0),
-            )),
-        };
+        let auth_witness = elements::storm_eye_witness(
+            &contract_data,
+            *signature.as_ref(),
+            signing.signing_storm_tree_branch,
+            pack_proof(&proof)?,
+            Either::Left(0),
+        );
         pset.inputs_mut()[0].final_script_witness = Some(
             auth_program
                 .as_ref()
@@ -586,6 +553,10 @@ impl Droplets {
             ));
         }
         Ok((txid.to_byte_array(), final_bytes))
+    }
+
+    async fn asset(&self, kind: &'static str) -> Result<crate::NetworkAsset, DropletsError> {
+        self.assets.require(kind, DropletsError::MissingAsset).await
     }
 
     fn client(&self) -> Result<Client, DropletsError> {

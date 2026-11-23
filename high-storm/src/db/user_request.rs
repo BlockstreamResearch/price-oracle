@@ -242,18 +242,7 @@ impl UserRequestStore {
         .bind(request_hash.to_vec())
         .execute(&mut *transaction)
         .await?;
-        if result.rows_affected() == 0 {
-            transaction.rollback().await?;
-            return Ok(false);
-        }
-
-        sqlx::query("DELETE FROM network_user_request_fee_utxos WHERE request_hash = $1")
-            .bind(request_hash.to_vec())
-            .execute(&mut *transaction)
-            .await?;
-        transaction.commit().await?;
-
-        Ok(true)
+        release_fee_utxos(transaction, result.rows_affected(), request_hash).await
     }
 
     pub async fn mark_failed(&self, request_hash: [u8; 32], reason: &[u8]) -> Result<bool, Error> {
@@ -266,18 +255,7 @@ impl UserRequestStore {
         .bind(reason)
         .execute(&mut *transaction)
         .await?;
-        if result.rows_affected() == 0 {
-            transaction.rollback().await?;
-            return Ok(false);
-        }
-
-        sqlx::query("DELETE FROM network_user_request_fee_utxos WHERE request_hash = $1")
-            .bind(request_hash.to_vec())
-            .execute(&mut *transaction)
-            .await?;
-        transaction.commit().await?;
-
-        Ok(true)
+        release_fee_utxos(transaction, result.rows_affected(), request_hash).await
     }
 
     pub async fn count_by_status(&self) -> Result<Vec<(String, u64)>, Error> {
@@ -321,6 +299,27 @@ impl UserRequestStore {
         };
         Ok(Some(decode_request(row)?))
     }
+}
+
+/// Finishes a status change: when it updated a row, drops the request's fee
+/// UTXOs and commits; otherwise rolls back.
+async fn release_fee_utxos(
+    mut transaction: sqlx::Transaction<'_, sqlx::Any>,
+    rows_affected: u64,
+    request_hash: [u8; 32],
+) -> Result<bool, Error> {
+    if rows_affected == 0 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+
+    sqlx::query("DELETE FROM network_user_request_fee_utxos WHERE request_hash = $1")
+        .bind(request_hash.to_vec())
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+
+    Ok(true)
 }
 
 fn decode_request(row: sqlx::any::AnyRow) -> Result<StoredUserRequest, Error> {
@@ -507,6 +506,37 @@ mod tests {
                 .await
                 .unwrap(),
             InsertPendingResult::Inserted
+        );
+    }
+
+    #[tokio::test]
+    async fn status_changes_that_match_no_row_keep_fee_utxos_reserved() {
+        let database = Database::connect("sqlite::memory:", 1).await.unwrap();
+        let store = database.user_requests();
+        let fee_utxo = FeeUtxo {
+            txid: [8; 32],
+            output_index: 3,
+        };
+        store
+            .insert_pending([1; 32], b"first", 42, std::slice::from_ref(&fee_utxo))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .mark_processing([1; 32], b"result", b"transaction")
+                .await
+                .unwrap()
+        );
+
+        // Neither applies to a request that is still processing.
+        assert!(!store.mark_executed([1; 32]).await.unwrap());
+        assert!(!store.mark_failed([1; 32], b"reason").await.unwrap());
+        assert_eq!(
+            store
+                .insert_pending([2; 32], b"second", 43, std::slice::from_ref(&fee_utxo))
+                .await
+                .unwrap(),
+            InsertPendingResult::FeeUtxoReserved(fee_utxo.clone())
         );
     }
 

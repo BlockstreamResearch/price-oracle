@@ -6,7 +6,6 @@ use std::{
 use bitcoincore_rpc::{Client, RpcApi};
 use contracts::artifacts::{
     account::{AccountProgram, derived_account::AccountArguments},
-    auth::derived_auth::AuthWitness,
     treasury::{
         TreasuryProgram,
         derived_treasury::{TreasuryArguments, TreasuryWitness},
@@ -241,11 +240,7 @@ impl UserRequestProcessor {
         &self,
         request: &ExecuteUserRequests,
     ) -> Result<Option<PriceFeedData>, UserRequestError> {
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(UserRequestError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let tick_asset = self.assets.get(TICK_ASSET_KIND).await?;
         let verifier_asset = self.assets.get(ORACLE_VERIFIER_KIND).await?;
         let network = self.network()?;
@@ -351,11 +346,7 @@ impl UserRequestProcessor {
         if pending.is_empty() {
             return Ok(None);
         }
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(UserRequestError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let network = self.network()?;
         let rpc = self.client()?;
         let storm_eye_utxo = find_contract_utxo(
@@ -547,24 +538,11 @@ impl UserRequestProcessor {
             postcard::from_bytes(storm_eye.contract_data.as_deref().ok_or_else(|| {
                 UserRequestError::Invalid("Storm Eye contract data is missing".into())
             })?)?;
-        let signing_branch = contract_data.storm_tree_root;
-        final_transaction.add_program_input(
-            PartialInput::new(storm_eye_utxo.clone()),
-            ProgramInput::new(
-                Box::new(auth_program.as_ref().clone()),
-                AuthWitness {
-                    path: Either::Left((
-                        (contract_data.storm_tree_root, contract_data.rescue_height),
-                        (
-                            [0; 64],
-                            signing_branch,
-                            std::array::from_fn(|_| Either::Left(())),
-                        ),
-                        Either::Left(0),
-                    )),
-                },
-            ),
-            RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+        elements::add_storm_eye_input(
+            &mut final_transaction,
+            &storm_eye_utxo,
+            &auth_program,
+            elements::placeholder_storm_eye_witness(&contract_data, Either::Left(0)),
         );
         let treasury = TreasuryProgram::new(&TreasuryArguments {
             storm_eye_asset_id: storm_eye.asset_id,
@@ -760,17 +738,12 @@ impl UserRequestProcessor {
 
     async fn asset(&self, kind: &'static str) -> Result<NetworkAsset, UserRequestError> {
         self.assets
-            .get(kind)
-            .await?
-            .ok_or(UserRequestError::MissingAsset(kind))
+            .require(kind, UserRequestError::MissingAsset)
+            .await
     }
 
     pub(crate) async fn storm_eye_utxo_count(&self) -> Result<usize, UserRequestError> {
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(UserRequestError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let client = self.client()?;
 
         Ok(scan_contract_utxos(
@@ -836,13 +809,13 @@ impl UserRequestProcessor {
             .program_input
             .as_mut()
             .expect("Storm Eye is a program input")
-            .witness = AuthWitness {
-            path: Either::Left((
-                (contract_data.storm_tree_root, contract_data.rescue_height),
-                (signature, signing.signing_storm_tree_branch, proof),
-                Either::Left(0),
-            )),
-        }
+            .witness = elements::storm_eye_witness(
+            &contract_data,
+            signature,
+            signing.signing_storm_tree_branch,
+            proof,
+            Either::Left(0),
+        )
         .into();
 
         for (index, input) in transaction.inputs().iter().enumerate() {

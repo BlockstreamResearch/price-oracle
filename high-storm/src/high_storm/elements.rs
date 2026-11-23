@@ -1,15 +1,24 @@
 use std::str::FromStr;
 
 use bitcoincore_rpc::{Client, RpcApi};
-use contracts::artifacts::treasury::{TreasuryProgram, derived_treasury::TreasuryWitness};
+use contracts::artifacts::{
+    auth::{AuthProgram, derived_auth::AuthWitness},
+    treasury::{TreasuryProgram, derived_treasury::TreasuryWitness},
+};
 use serde::Deserialize;
 use simplex::{
+    either::Either,
     program::ProgramError,
     provider::SimplicityNetwork,
     simplicityhl::elements::{
         AssetId, BlockHash, Script, opcodes, pset::PartiallySignedTransaction, script::Instruction,
     },
     transaction::{FinalTransaction, PartialInput, ProgramInput, RequiredSignature, UTXO},
+};
+
+use super::{
+    assets::StormEyeContractData,
+    user_requests::{PackedStormTreeProof, STORM_EYE_TAG},
 };
 
 #[derive(Deserialize)]
@@ -28,6 +37,56 @@ pub(crate) struct RawTransactionInfo {
     pub(crate) confirmations: u64,
     #[serde(default, rename = "blockhash")]
     pub(crate) block_hash: Option<String>,
+}
+
+/// The spend arm of a Storm Eye witness, as `AuthKind` in `auth.simf`.
+pub(crate) type StormEyeSpend =
+    Either<u32, Either<Either<([u8; 32], u32), (u32, u32)>, Either<u8, u8>>>;
+
+/// A Storm Eye witness for the authorized spend `kind`, signed by `branch`.
+pub(crate) fn storm_eye_witness(
+    data: &StormEyeContractData,
+    signature: [u8; 64],
+    branch: [u8; 32],
+    proof: PackedStormTreeProof,
+    kind: StormEyeSpend,
+) -> AuthWitness {
+    AuthWitness {
+        path: Either::Left((
+            (data.storm_tree_root, data.rescue_height),
+            (signature, branch, proof),
+            kind,
+        )),
+    }
+}
+
+/// The witness a Storm Eye input carries until it is signed: a zero
+/// signature, the root as branch and an empty proof.
+pub(crate) fn placeholder_storm_eye_witness(
+    data: &StormEyeContractData,
+    kind: StormEyeSpend,
+) -> AuthWitness {
+    storm_eye_witness(
+        data,
+        [0; 64],
+        data.storm_tree_root,
+        std::array::from_fn(|_| Either::Left(())),
+        kind,
+    )
+}
+
+/// Adds a Storm Eye input signed through the tagged `PATH` witness.
+pub(crate) fn add_storm_eye_input(
+    transaction: &mut FinalTransaction,
+    utxo: &UTXO,
+    program: &AuthProgram,
+    witness: AuthWitness,
+) {
+    transaction.add_program_input(
+        PartialInput::new(utxo.clone()),
+        ProgramInput::new(Box::new(program.as_ref().clone()), witness),
+        RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+    );
 }
 
 /// Adds each of `utxos` as a Treasury input that defers to the Storm Eye at input 0.
@@ -185,5 +244,34 @@ mod tests {
 
         assert_eq!(network.genesis_block_hash().to_string(), genesis_hash);
         assert_eq!(network.policy_asset().to_string(), policy_asset);
+    }
+
+    #[test]
+    fn storm_eye_witnesses_keep_the_covenant_layout() {
+        let data = StormEyeContractData {
+            storm_tree_root: [1; 32],
+            rescue_height: 42,
+            rescue_output_script_hash: [2; 32],
+        };
+        let empty_proof: PackedStormTreeProof = std::array::from_fn(|_| Either::Left(()));
+        assert!(matches!(
+            placeholder_storm_eye_witness(&data, Either::Left(0)).path,
+            Either::Left((
+                (root, 42),
+                (signature, branch, proof),
+                Either::Left(0),
+            )) if root == [1; 32] && signature == [0; 64] && branch == [1; 32] && proof == empty_proof
+        ));
+
+        let mut packed = empty_proof;
+        packed[0] = Either::Right((true, [3; 32]));
+        assert!(matches!(
+            storm_eye_witness(&data, [4; 64], [5; 32], packed, Either::Left(7)).path,
+            Either::Left((
+                (root, 42),
+                (signature, branch, proof),
+                Either::Left(7),
+            )) if root == [1; 32] && signature == [4; 64] && branch == [5; 32] && proof == packed
+        ));
     }
 }

@@ -52,20 +52,7 @@ pub(super) async fn get_droplets(
         .droplet_state()
         .await
         .map_err(ApiError::internal)?;
-    let history = state
-        .node
-        .droplet_history()
-        .await
-        .map_err(ApiError::internal)?;
-    let next_leader_block = state.node.next_local_leader_height().await;
-    Ok(Json(response(
-        balance,
-        request,
-        history,
-        state.node.droplet_exchange_fee_sats(),
-        state.node.block_height(),
-        next_leader_block,
-    )?))
+    Ok(Json(response(&state, balance, request).await?))
 }
 
 pub(super) async fn exchange_droplets(
@@ -87,34 +74,28 @@ pub(super) async fn exchange_droplets(
         .await
         .map_err(ApiError::internal)?
         .0;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(response(&state, balance, Some(queued)).await?),
+    ))
+}
+
+/// The Droplets view: `balance` and `request` with the exchange history and
+/// the node's fee, height and next leader block.
+async fn response(
+    state: &ExternalApiState,
+    balance: Option<DropletBalance>,
+    request: Option<DropletExchangeRequest>,
+) -> Result<DropletsResponse, ApiError> {
     let history = state
         .node
         .droplet_history()
         .await
         .map_err(ApiError::internal)?;
     let next_leader_block = state.node.next_local_leader_height().await;
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(response(
-            balance,
-            Some(queued),
-            history,
-            state.node.droplet_exchange_fee_sats(),
-            state.node.block_height(),
-            next_leader_block,
-        )?),
-    ))
-}
-
-fn response(
-    balance: Option<DropletBalance>,
-    request: Option<DropletExchangeRequest>,
-    history: Vec<DropletExchangeRequest>,
-    exchange_fee_sats: u64,
-    block_height: u64,
-    next_leader_block: Option<u64>,
-) -> Result<DropletsResponse, ApiError> {
+    let exchange_fee_sats = state.node.droplet_exchange_fee_sats();
+    let block_height = state.node.block_height();
     let request = request.map(exchange_request_response).transpose()?;
     let history = history
         .into_iter()
