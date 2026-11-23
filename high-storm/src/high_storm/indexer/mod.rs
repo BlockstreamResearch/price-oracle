@@ -40,8 +40,8 @@ use super::{
         storm_eye_contract_data, treasury_blinding_secret,
     },
     droplets::member_from_script,
+    elements::asset_id,
     issuance::IssuedUtxoDescriptor,
-    user_requests::asset_id,
 };
 
 const ISSUED_UTXO_RULE_SET: &str = "issued-utxo-burning-v1";

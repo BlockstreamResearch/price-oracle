@@ -33,14 +33,14 @@ use crate::{
 use super::{
     SigningResult,
     assets::{StormEyeContractData, storm_eye_program},
+    elements::{STORM_EYE_TAG, asset_id, finalized_dummy_weight, pack_proof},
     issuance::voucher_program,
     message::{BurnExpiredUtxos, ExpiredUtxosBurned, StormEyeUtxo},
     signing::SigningError,
-    user_requests::{
-        STORM_EYE_TAG, StormEyePool, UserRequestError, asset_id, finalized_dummy_weight,
-        find_contract_utxo, get_explicit_outpoint, get_optional_explicit_outpoint,
-        output_from_utxo, pack_proof, require_explicit_utxo, require_preserved_output,
-        witness_utxo,
+    user_requests::UserRequestError,
+    utxo::{
+        StormEyePool, find_contract_utxo, get_explicit_outpoint, get_optional_explicit_outpoint,
+        output_from_utxo, require_explicit_utxo, require_preserved_output, witness_utxo,
     },
 };
 
