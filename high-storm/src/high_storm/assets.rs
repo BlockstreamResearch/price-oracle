@@ -16,7 +16,6 @@ use simplex::utils::hash_script;
 use std::str::FromStr;
 use storm::{PeerStatus, StormContext, StormHandle};
 use storm_tree::StormTree;
-use url::Url;
 
 use crate::high_storm::elements;
 use crate::high_storm::elements::{ChainInfo, SidechainInfo};
@@ -851,12 +850,7 @@ struct ElementsAssetIssuer {
 
 impl ElementsAssetIssuer {
     fn new(config: &ElementsRpcConfig) -> Result<Self, AssetError> {
-        let mut url = Url::parse(&config.url)?;
-        url.path_segments_mut()
-            .map_err(|_| AssetError::InvalidRpcResponse("wallet URL"))?
-            .pop_if_empty()
-            .push("wallet")
-            .push(&config.wallet);
+        let url = config.wallet_url()?;
 
         Ok(Self {
             rpc_url: url.to_string(),

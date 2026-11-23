@@ -101,17 +101,26 @@ pub(crate) fn network<E: From<bitcoincore_rpc::Error>>(
         "elementsregtest" => {
             let sidechain: SidechainInfo = client.call("getsidechaininfo", &[])?;
             let genesis_hash: String = client.call("getblockhash", &[0.into()])?;
-            Ok(SimplicityNetwork::ElementsCustom {
-                policy_asset: AssetId::from_str(&sidechain.pegged_asset)
-                    .map_err(|_| invalid("invalid regtest policy asset".into()))?,
-                genesis_hash: BlockHash::from_str(&genesis_hash)
-                    .map_err(|_| invalid("invalid regtest genesis hash".into()))?,
-            })
+            elements_regtest_network(&sidechain.pegged_asset, &genesis_hash, invalid)
         }
         _ => Err(unsupported(chain.chain)),
     }
 }
 
+/// The regtest network whose policy asset and genesis hash Elements reported;
+/// either one that does not parse becomes `invalid(message)`.
+pub(crate) fn elements_regtest_network<E>(
+    policy_asset: &str,
+    genesis_hash: &str,
+    invalid: fn(String) -> E,
+) -> Result<SimplicityNetwork, E> {
+    Ok(SimplicityNetwork::ElementsCustom {
+        policy_asset: AssetId::from_str(policy_asset)
+            .map_err(|_| invalid("invalid regtest policy asset".into()))?,
+        genesis_hash: BlockHash::from_str(genesis_hash)
+            .map_err(|_| invalid("invalid regtest genesis block hash".into()))?,
+    })
+}
 #[cfg(test)]
 mod tests {
     use simplex::simplicityhl::elements::{OutPoint, TxOut, script::Builder};
@@ -161,5 +170,20 @@ mod tests {
             &SimplicityNetwork::Liquid,
             "every input is a program input",
         );
+    }
+
+    #[test]
+    fn uses_stock_regtest_genesis_for_simplicity_environment() {
+        let policy_asset = SimplicityNetwork::default_regtest()
+            .policy_asset()
+            .to_string();
+        let genesis_hash = "cd179c84c35f51825f20a3b91a18d45f0c53b5ceb744a5b6ef8f0babe809396f";
+
+        let network =
+            elements_regtest_network(&policy_asset, genesis_hash, |message: String| message)
+                .unwrap();
+
+        assert_eq!(network.genesis_block_hash().to_string(), genesis_hash);
+        assert_eq!(network.policy_asset().to_string(), policy_asset);
     }
 }

@@ -32,8 +32,8 @@ use simplex::{
     },
 };
 
+use crate::high_storm::elements;
 use crate::high_storm::elements::RawTransactionInfo;
-use crate::high_storm::elements::{ChainInfo, SidechainInfo};
 use crate::{
     NetworkAsset,
     config::{ElementsRpcConfig, ProtocolConfig},
@@ -991,19 +991,11 @@ impl UserRequestProcessor {
     }
 
     fn network(&self) -> Result<SimplicityNetwork, UserRequestError> {
-        let client = self.client()?;
-        let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
-
-        match chain.chain.as_str() {
-            "liquidv1" => Ok(SimplicityNetwork::Liquid),
-            "liquidtestnet" => Ok(SimplicityNetwork::LiquidTestnet),
-            "elementsregtest" => {
-                let sidechain: SidechainInfo = client.call("getsidechaininfo", &[])?;
-                let genesis_hash: String = client.call("getblockhash", &[0.into()])?;
-                elements_regtest_network(&sidechain.pegged_asset, &genesis_hash)
-            }
-            _ => Err(UserRequestError::UnsupportedChain(chain.chain)),
-        }
+        elements::network(
+            &self.client()?,
+            UserRequestError::Invalid,
+            UserRequestError::UnsupportedChain,
+        )
     }
 
     fn client(&self) -> Result<Client, UserRequestError> {
@@ -1275,18 +1267,6 @@ pub(crate) fn finalized_dummy_weight(
         .map_err(|error| UserRequestError::Pset(error.to_string()))?;
 
     Ok(transaction.weight())
-}
-
-fn elements_regtest_network(
-    policy_asset: &str,
-    genesis_hash: &str,
-) -> Result<SimplicityNetwork, UserRequestError> {
-    Ok(SimplicityNetwork::ElementsCustom {
-        policy_asset: AssetId::from_str(policy_asset)
-            .map_err(|_| UserRequestError::Invalid("invalid regtest policy asset".into()))?,
-        genesis_hash: BlockHash::from_str(genesis_hash)
-            .map_err(|_| UserRequestError::Invalid("invalid regtest genesis block hash".into()))?,
-    })
 }
 
 /// Lanes index the block's confirmed Storm Eyes, so one lane's broadcast never shifts another's.
@@ -2915,19 +2895,6 @@ mod tests {
 
         assert!(matches!(error, UserRequestError::Invalid(message)
             if message == "insufficient funds for the issuance transaction fee"));
-    }
-
-    #[test]
-    fn uses_stock_regtest_genesis_for_simplicity_environment() {
-        let policy_asset = SimplicityNetwork::default_regtest()
-            .policy_asset()
-            .to_string();
-        let genesis_hash = "cd179c84c35f51825f20a3b91a18d45f0c53b5ceb744a5b6ef8f0babe809396f";
-
-        let network = elements_regtest_network(&policy_asset, genesis_hash).unwrap();
-
-        assert_eq!(network.genesis_block_hash().to_string(), genesis_hash);
-        assert_eq!(network.policy_asset().to_string(), policy_asset);
     }
 
     #[test]
