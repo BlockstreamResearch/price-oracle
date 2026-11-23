@@ -176,6 +176,27 @@ fn rejected(
     error
 }
 
+/// Whether `kind` asks for, or reports, a spend of the network's covenant outputs.
+/// Exhaustive, so a new kind fails to compile until it is classified.
+fn signs_or_reports_a_spend(kind: NodeMessageKind) -> bool {
+    match kind {
+        NodeMessageKind::ExecuteUserRequests
+        | NodeMessageKind::ExchangeRewards
+        | NodeMessageKind::SigningNonces
+        | NodeMessageKind::PartialSignatures
+        | NodeMessageKind::BurnExpiredUtxos
+        | NodeMessageKind::ExpiredUtxosBurned
+        | NodeMessageKind::ExecuteVotingRequest
+        | NodeMessageKind::RenewStormUtxos => true,
+        NodeMessageKind::NetworkVoteRequest
+        | NodeMessageKind::ApproveVotingRequest
+        | NodeMessageKind::AskAboutVotings
+        | NodeMessageKind::AttestPrice
+        | NodeMessageKind::NetworkAssets
+        | NodeMessageKind::ProtocolSettings => false,
+    }
+}
+
 /// Sets `requests_signature` once the payload shows the message asks this
 /// node to sign: the same kinds also carry notices of a broadcast transaction.
 async fn dispatch(
@@ -185,34 +206,10 @@ async fn dispatch(
     context: StormContext,
     requests_signature: &mut bool,
 ) -> Result<(), HandlerError> {
-    if state.is_recovering()
-        && matches!(
-            kind,
-            NodeMessageKind::ExecuteUserRequests
-                | NodeMessageKind::ExchangeRewards
-                | NodeMessageKind::SigningNonces
-                | NodeMessageKind::PartialSignatures
-                | NodeMessageKind::BurnExpiredUtxos
-                | NodeMessageKind::ExpiredUtxosBurned
-                | NodeMessageKind::ExecuteVotingRequest
-                | NodeMessageKind::RenewStormUtxos
-        )
-    {
+    if state.is_recovering() && signs_or_reports_a_spend(kind) {
         return Err(HandlerError::Recovering);
     }
-    if state.is_spending_paused()
-        && matches!(
-            kind,
-            NodeMessageKind::ExecuteUserRequests
-                | NodeMessageKind::ExchangeRewards
-                | NodeMessageKind::SigningNonces
-                | NodeMessageKind::PartialSignatures
-                | NodeMessageKind::BurnExpiredUtxos
-                | NodeMessageKind::ExpiredUtxosBurned
-                | NodeMessageKind::ExecuteVotingRequest
-                | NodeMessageKind::RenewStormUtxos
-        )
-    {
+    if state.is_spending_paused() && signs_or_reports_a_spend(kind) {
         return Err(HandlerError::MigrationFinalizing);
     }
     authorize_sender(
@@ -753,6 +750,72 @@ mod tests {
         assert_eq!(off_price.refusal_reason(), Some("price_deviation_exceeded"));
         assert_eq!(bad_burn.refusal_reason(), Some("invalid"));
         assert_eq!(local.refusal_reason(), Some("other"));
+    }
+
+    #[tokio::test]
+    async fn spend_messages_wait_for_recovery_and_migration_finality() {
+        use secp256k1_zkp::{Secp256k1, SecretKey};
+        use storm::{MessageContext, Peer, Storm};
+
+        let database = crate::db::Database::connect("sqlite::memory:", 1)
+            .await
+            .unwrap();
+        let secp = Secp256k1::new();
+        let secrets =
+            [[31; 32], [32; 32], [33; 32]].map(|secret| SecretKey::from_slice(&secret).unwrap());
+        let keys = secrets.map(|secret| secret.public_key(&secp).serialize());
+        let storm = Storm::from_peers(secrets[0], keys.into_iter().map(Peer::new).collect());
+        let state =
+            NetworkState::for_tests(&storm, secrets[0].secret_bytes(), keys[0], &database).await;
+        let gated = [
+            NodeMessageKind::ExecuteUserRequests,
+            NodeMessageKind::ExchangeRewards,
+            NodeMessageKind::SigningNonces,
+            NodeMessageKind::PartialSignatures,
+            NodeMessageKind::BurnExpiredUtxos,
+            NodeMessageKind::ExpiredUtxosBurned,
+            NodeMessageKind::ExecuteVotingRequest,
+            NodeMessageKind::RenewStormUtxos,
+        ];
+        // The gate runs before the payload is decoded, so an empty one will do.
+        let run = |kind| {
+            let state = state.clone();
+            let storm = storm.handle();
+            async move {
+                let message = NodeMessage::new(kind, None, &()).unwrap();
+                let context = StormContext {
+                    storm_handle: storm,
+                    storm_message: message.clone().into_storm_message().unwrap(),
+                    message_context: MessageContext {
+                        peer_public_key: keys[0],
+                    },
+                };
+                dispatch(state, message, kind, context, &mut false).await
+            }
+        };
+
+        for kind in gated {
+            assert!(matches!(run(kind).await, Err(HandlerError::Recovering)));
+        }
+        let settings = run(NodeMessageKind::ProtocolSettings).await;
+        assert!(!matches!(
+            settings,
+            Err(HandlerError::Recovering | HandlerError::MigrationFinalizing)
+        ));
+
+        state.indexer().mark_synced();
+        state.set_spending_paused(true).await.unwrap();
+        for kind in gated {
+            assert!(matches!(
+                run(kind).await,
+                Err(HandlerError::MigrationFinalizing)
+            ));
+        }
+        let settings = run(NodeMessageKind::ProtocolSettings).await;
+        assert!(!matches!(
+            settings,
+            Err(HandlerError::Recovering | HandlerError::MigrationFinalizing)
+        ));
     }
 
     #[tokio::test]
