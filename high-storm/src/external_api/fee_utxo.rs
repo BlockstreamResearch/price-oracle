@@ -389,10 +389,7 @@ mod tests {
         monitored_utxos
             .apply_block(
                 "burning-v1",
-                &IndexedBlock {
-                    height: 1,
-                    hash: [1; 32],
-                },
+                &IndexedBlock::at(1),
                 &[MonitoredUtxo {
                     txid: [2; 32],
                     output_index: 3,

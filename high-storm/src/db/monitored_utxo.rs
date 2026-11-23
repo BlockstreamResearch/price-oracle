@@ -10,6 +10,17 @@ pub struct IndexedBlock {
     pub hash: [u8; 32],
 }
 
+#[cfg(test)]
+impl IndexedBlock {
+    /// A block at `height` whose hash repeats the height's low byte.
+    pub(crate) fn at(height: u64) -> Self {
+        Self {
+            height,
+            hash: [height as u8; 32],
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MonitoredUtxo {
     pub txid: [u8; 32],
@@ -474,14 +485,16 @@ mod tests {
     async fn reports_statuses_the_oldest_unburned_utxo_and_reverted_burns() {
         let database = Database::connect("sqlite::memory:", 1).await.unwrap();
         let store = database.monitored_utxos();
-        let block = |height: u64| IndexedBlock {
-            height,
-            hash: [height as u8; 32],
-        };
         let mut second = monitored(10);
         second.output_index = 4;
         store
-            .apply_block("burning-v1", &block(10), &[monitored(10), second], &[], 60)
+            .apply_block(
+                "burning-v1",
+                &IndexedBlock::at(10),
+                &[monitored(10), second],
+                &[],
+                60,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -491,7 +504,7 @@ mod tests {
         assert_eq!(store.oldest_unburned_block_height().await.unwrap(), None);
 
         store
-            .apply_block("burning-v1", &block(70), &[], &[], 60)
+            .apply_block("burning-v1", &IndexedBlock::at(70), &[], &[], 60)
             .await
             .unwrap();
         store
@@ -511,10 +524,15 @@ mod tests {
 
         // Unconfirmed after five blocks, the burn goes back to the queue.
         let mut transaction = store.pool.begin().await.unwrap();
-        let reverted =
-            MonitoredUtxoStore::apply_block_in(&mut transaction, &block(75), &[], &[], 60)
-                .await
-                .unwrap();
+        let reverted = MonitoredUtxoStore::apply_block_in(
+            &mut transaction,
+            &IndexedBlock::at(75),
+            &[],
+            &[],
+            60,
+        )
+        .await
+        .unwrap();
         transaction.commit().await.unwrap();
         assert_eq!(reverted, 1);
         assert_eq!(
@@ -535,10 +553,7 @@ mod tests {
         store
             .apply_block(
                 "burning-v1",
-                &IndexedBlock {
-                    height: 10,
-                    hash: [10; 32],
-                },
+                &IndexedBlock::at(10),
                 &[first.clone(), second.clone()],
                 &[],
                 60,
@@ -563,16 +578,7 @@ mod tests {
         );
 
         store
-            .apply_block(
-                "burning-v1",
-                &IndexedBlock {
-                    height: 70,
-                    hash: [70; 32],
-                },
-                &[],
-                &[],
-                60,
-            )
+            .apply_block("burning-v1", &IndexedBlock::at(70), &[], &[], 60)
             .await
             .unwrap();
         store
@@ -606,10 +612,7 @@ mod tests {
         store
             .apply_block(
                 "burning-v1",
-                &IndexedBlock {
-                    height: 10,
-                    hash: [10; 32],
-                },
+                &IndexedBlock::at(10),
                 std::slice::from_ref(&issued),
                 &[],
                 60,
@@ -631,16 +634,7 @@ mod tests {
         );
 
         store
-            .apply_block(
-                "burning-v1",
-                &IndexedBlock {
-                    height: 70,
-                    hash: [70; 32],
-                },
-                &[],
-                &[],
-                60,
-            )
+            .apply_block("burning-v1", &IndexedBlock::at(70), &[], &[], 60)
             .await
             .unwrap();
         let expired = store.list_expired(10).await.unwrap();
@@ -663,16 +657,7 @@ mod tests {
             1
         );
         store
-            .apply_block(
-                "burning-v1",
-                &IndexedBlock {
-                    height: 75,
-                    hash: [75; 32],
-                },
-                &[],
-                &[],
-                60,
-            )
+            .apply_block("burning-v1", &IndexedBlock::at(75), &[], &[], 60)
             .await
             .unwrap();
         assert_eq!(store.list_expired(10).await.unwrap()[0].status, "expired");
@@ -687,10 +672,7 @@ mod tests {
         store
             .apply_block(
                 "burning-v1",
-                &IndexedBlock {
-                    height: 100,
-                    hash: [100; 32],
-                },
+                &IndexedBlock::at(100),
                 std::slice::from_ref(&issued),
                 &[],
                 60,
@@ -700,16 +682,7 @@ mod tests {
 
         for _ in 0..3 {
             store
-                .apply_block(
-                    "burning-v1",
-                    &IndexedBlock {
-                        height: 159,
-                        hash: [159; 32],
-                    },
-                    &[],
-                    &[],
-                    60,
-                )
+                .apply_block("burning-v1", &IndexedBlock::at(159), &[], &[], 60)
                 .await
                 .unwrap();
             assert!(store.list_expired(10).await.unwrap().is_empty());
@@ -717,16 +690,7 @@ mod tests {
 
         for height in [160, 161] {
             store
-                .apply_block(
-                    "burning-v1",
-                    &IndexedBlock {
-                        height,
-                        hash: [height as u8; 32],
-                    },
-                    &[],
-                    &[],
-                    60,
-                )
+                .apply_block("burning-v1", &IndexedBlock::at(height), &[], &[], 60)
                 .await
                 .unwrap();
             let expired = store.list_expired(10).await.unwrap();
@@ -745,10 +709,7 @@ mod tests {
         store
             .apply_block(
                 "burning-v1",
-                &IndexedBlock {
-                    height: 160,
-                    hash: [160; 32],
-                },
+                &IndexedBlock::at(160),
                 std::slice::from_ref(&issued),
                 &[],
                 60,
@@ -765,16 +726,7 @@ mod tests {
 
         for height in [160, 164, 164, 165] {
             store
-                .apply_block(
-                    "burning-v1",
-                    &IndexedBlock {
-                        height,
-                        hash: [height as u8; 32],
-                    },
-                    &[],
-                    &[],
-                    60,
-                )
+                .apply_block("burning-v1", &IndexedBlock::at(height), &[], &[], 60)
                 .await
                 .unwrap();
             assert!(
@@ -888,10 +840,7 @@ mod tests {
         store
             .apply_block(
                 "burning-v1",
-                &IndexedBlock {
-                    height: 1,
-                    hash: [1; 32],
-                },
+                &IndexedBlock::at(1),
                 &[first.clone(), second.clone()],
                 &[],
                 60,
@@ -902,10 +851,7 @@ mod tests {
         store
             .apply_block(
                 "burning-v1",
-                &IndexedBlock {
-                    height: 2,
-                    hash: [2; 32],
-                },
+                &IndexedBlock::at(2),
                 &[],
                 &[(first.txid, first.output_index, [8; 32])],
                 60,
@@ -922,10 +868,7 @@ mod tests {
         store
             .apply_block(
                 "burning-v1",
-                &IndexedBlock {
-                    height: 3,
-                    hash: [3; 32],
-                },
+                &IndexedBlock::at(3),
                 &[],
                 &[(second.txid, second.output_index, [9; 32])],
                 60,

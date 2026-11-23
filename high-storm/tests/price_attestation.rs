@@ -2,15 +2,13 @@ mod common;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use high_storm::{
-    HighStorm, PriceAttestation, initialize_host, initialize_join, start_initialized,
-};
+use high_storm::{HighStorm, PriceAttestation, start_initialized};
 use price_feed::{FeedId, SourceObservation};
 use secp256k1::{PublicKey, SecretKey};
 use storm::PeerStatus;
 use tokio::time::timeout;
 
-use common::TestNode;
+use common::{TestNode, wait_for_all_connections, wait_for_peer_status};
 
 const LBTC_USD: FeedId = 0;
 const USDT_USD: FeedId = 1;
@@ -26,48 +24,10 @@ struct TestNetwork {
 impl TestNetwork {
     async fn start() -> Self {
         let test_guard = PRICE_TEST_LOCK.lock().await;
-        let first = TestNode::new(31).await;
-        let second = TestNode::new(32).await;
-        let third = TestNode::new(33).await;
-
-        let host_config = first.config.clone();
-        let host_store = first.store.clone();
-        let members = vec![second.public_key.clone(), third.public_key.clone()];
-        let host =
-            tokio::spawn(async move { initialize_host(&host_config, &host_store, &members).await });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let host_address = first.address();
-        let (second_node, third_node) = tokio::join!(
-            initialize_join(
-                &second.config,
-                &second.store,
-                &first.public_key,
-                &host_address,
-            ),
-            initialize_join(
-                &third.config,
-                &third.store,
-                &first.public_key,
-                &host_address,
-            ),
-        );
-
-        let nodes = [
-            timeout(Duration::from_secs(5), host)
-                .await
-                .expect("host initialization timed out")
-                .expect("host task failed")
-                .expect("host initialization failed"),
-            second_node.expect("second node initialization failed"),
-            third_node.expect("third node initialization failed"),
-        ];
-
-        wait_for_all_connections(&nodes).await;
-
+        let (definitions, nodes) = common::start_network([31, 32, 33]).await;
         Self {
             _test_guard: test_guard,
-            definitions: [first, second, third],
+            definitions,
             nodes,
         }
     }
@@ -380,47 +340,4 @@ async fn wait_for_price(node: &HighStorm, feed: FeedId, price: u64) -> Vec<Price
     })
     .await
     .expect("updated attestation did not propagate")
-}
-
-async fn wait_for_peer_status(node: &HighStorm, peer: [u8; 32], status: PeerStatus) {
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let matches = node.peers().await.iter().any(|candidate| {
-                PublicKey::from_slice(&candidate.compressed_public_key)
-                    .unwrap()
-                    .x_only_public_key()
-                    .0
-                    .serialize()
-                    == peer
-                    && candidate.status == status
-            });
-            if matches {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("peer status did not change");
-}
-
-async fn wait_for_all_connections(nodes: &[HighStorm; 3]) {
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let mut connected = true;
-            for node in nodes {
-                connected &= node
-                    .peers()
-                    .await
-                    .iter()
-                    .all(|peer| peer.status != PeerStatus::Inactive);
-            }
-            if connected {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("nodes did not connect");
 }

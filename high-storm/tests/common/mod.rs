@@ -1,13 +1,19 @@
 use std::{
     net::TcpListener,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use high_storm::{
+    HighStorm,
     config::{Config, DbConfig, ElementsRpcConfig, ProtocolConfig, ServiceConfig, SignerConfig},
     db::{Database, network::NetworkStore, network_asset::NetworkAssetStore},
+    initialize_host, initialize_join,
 };
+use secp256k1::PublicKey;
 use secp256k1_zkp::{Secp256k1, SecretKey};
+use storm::PeerStatus;
+use tokio::time::timeout;
 
 pub struct TestNode {
     pub config: Config,
@@ -90,6 +96,96 @@ impl TestNode {
     pub fn address(&self) -> String {
         format!("127.0.0.1:{}", self.config.service.port)
     }
+}
+
+/// Starts three nodes from `key_bytes` as one network hosted by the first, and
+/// waits until they are all connected.
+#[allow(dead_code)]
+pub async fn start_network(key_bytes: [u8; 3]) -> ([TestNode; 3], [HighStorm; 3]) {
+    let first = TestNode::new(key_bytes[0]).await;
+    let second = TestNode::new(key_bytes[1]).await;
+    let third = TestNode::new(key_bytes[2]).await;
+
+    let host_config = first.config.clone();
+    let host_store = first.store.clone();
+    let members = vec![second.public_key.clone(), third.public_key.clone()];
+    let host =
+        tokio::spawn(async move { initialize_host(&host_config, &host_store, &members).await });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let host_address = first.address();
+    let (second_node, third_node) = tokio::join!(
+        initialize_join(
+            &second.config,
+            &second.store,
+            &first.public_key,
+            &host_address,
+        ),
+        initialize_join(
+            &third.config,
+            &third.store,
+            &first.public_key,
+            &host_address,
+        ),
+    );
+
+    let nodes = [
+        timeout(Duration::from_secs(5), host)
+            .await
+            .expect("host initialization timed out")
+            .expect("host task failed")
+            .expect("host initialization failed"),
+        second_node.expect("second node initialization failed"),
+        third_node.expect("third node initialization failed"),
+    ];
+
+    wait_for_all_connections(&nodes).await;
+    ([first, second, third], nodes)
+}
+
+#[allow(dead_code)]
+pub async fn wait_for_all_connections(nodes: &[HighStorm; 3]) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let mut connected = true;
+            for node in nodes {
+                connected &= node
+                    .peers()
+                    .await
+                    .iter()
+                    .all(|peer| peer.status != PeerStatus::Inactive);
+            }
+            if connected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("nodes did not establish all connections");
+}
+
+#[allow(dead_code)]
+pub async fn wait_for_peer_status(node: &HighStorm, peer: [u8; 32], status: PeerStatus) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let matches = node.peers().await.iter().any(|candidate| {
+                PublicKey::from_slice(&candidate.compressed_public_key)
+                    .unwrap()
+                    .x_only_public_key()
+                    .0
+                    .serialize()
+                    == peer
+                    && candidate.status == status
+            });
+            if matches {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer status did not change");
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {

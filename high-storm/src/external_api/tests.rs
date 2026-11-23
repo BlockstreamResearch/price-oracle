@@ -118,11 +118,7 @@ async fn stalled_uploads_do_not_take_execution_slots() {
             }
         },
     ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let (address, server) = crate::test_support::serve(app).await;
     let mut uploads = Vec::new();
     for _ in 0..MAX_API_BODY_READS {
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
@@ -455,12 +451,7 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
 
     let unauthorized = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/operators/voting")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(get_request("/operators/voting"))
         .await
         .unwrap();
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
@@ -493,33 +484,18 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
     assert_eq!(token.status(), StatusCode::OK);
     let token: serde_json::Value = response_json(token).await;
 
+    let authorization = format!("Bearer {}", token["token"].as_str().unwrap());
     let voting = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/operators/voting")
-                .header(
-                    header::AUTHORIZATION,
-                    format!("Bearer {}", token["token"].as_str().unwrap()),
-                )
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authorized_get_request("/operators/voting", &authorization))
         .await
         .unwrap();
     assert_eq!(voting.status(), StatusCode::OK);
     assert_eq!(response_json(voting).await, serde_json::json!([]));
 
-    let authorization = format!("Bearer {}", token["token"].as_str().unwrap());
     let network = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/operators/state")
-                .header(header::AUTHORIZATION, &authorization)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authorized_get_request("/operators/state", &authorization))
         .await
         .unwrap();
     assert_eq!(network.status(), StatusCode::OK);
@@ -532,13 +508,10 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
 
     let peers = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/operators/state/peers")
-                .header(header::AUTHORIZATION, &authorization)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authorized_get_request(
+            "/operators/state/peers",
+            &authorization,
+        ))
         .await
         .unwrap();
     assert_eq!(peers.status(), StatusCode::OK);
@@ -551,13 +524,10 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
 
     let droplets = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/operators/droplets")
-                .header(header::AUTHORIZATION, authorization)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authorized_get_request(
+            "/operators/droplets",
+            &authorization,
+        ))
         .await
         .unwrap();
     assert_eq!(droplets.status(), StatusCode::OK);
@@ -574,15 +544,7 @@ async fn authenticates_operator_reads_with_a_real_bip322_signature() {
         })
     );
 
-    let users = app
-        .oneshot(
-            Request::builder()
-                .uri("/users/pending")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let users = app.oneshot(get_request("/users/pending")).await.unwrap();
     assert_eq!(users.status(), StatusCode::NOT_FOUND);
 }
 
@@ -599,12 +561,7 @@ async fn authenticates_operator_reads_with_a_humid_signature() {
 
     let config = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/operators/auth/config")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(get_request("/operators/auth/config"))
         .await
         .unwrap();
     assert_eq!(config.status(), StatusCode::OK);
@@ -649,16 +606,10 @@ async fn authenticates_operator_reads_with_a_humid_signature() {
     let token = response_json(token).await;
 
     let voting = app
-        .oneshot(
-            Request::builder()
-                .uri("/operators/voting")
-                .header(
-                    header::AUTHORIZATION,
-                    format!("Bearer {}", token["token"].as_str().unwrap()),
-                )
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authorized_get_request(
+            "/operators/voting",
+            &format!("Bearer {}", token["token"].as_str().unwrap()),
+        ))
         .await
         .unwrap();
     assert_eq!(voting.status(), StatusCode::OK);
@@ -677,10 +628,7 @@ fn assert_xonly_public_key(value: &serde_json::Value) {
 #[tokio::test]
 async fn creates_and_approves_voting_with_signed_requests() {
     let (app, private_key, public_key) = setup().await;
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let timestamp = now();
     let proposal = serde_json::json!({
         "kind": "split_storm_eye",
         "utxo_to_split": {
@@ -755,10 +703,7 @@ async fn creates_and_approves_voting_with_signed_requests() {
 #[tokio::test]
 async fn rejects_invalid_droplets_exchange_fields_before_registration() {
     let (app, private_key, public_key) = setup().await;
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let timestamp = now();
     let response = app
         .oneshot(signed_request(
             &private_key,
@@ -784,10 +729,7 @@ async fn rejects_invalid_droplets_exchange_fields_before_registration() {
 #[tokio::test]
 async fn rejects_malformed_droplets_destination_before_registration() {
     let (app, private_key, public_key) = setup().await;
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let timestamp = now();
     let response = app
         .oneshot(signed_request(
             &private_key,
@@ -823,12 +765,7 @@ async fn registers_tick_requests_and_returns_pending_status() {
 
     let status = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/users/requests/{request_hash}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(get_request(&format!("/users/requests/{request_hash}")))
         .await
         .unwrap();
     assert_eq!(status.status(), StatusCode::OK);
@@ -848,10 +785,7 @@ async fn classifies_fee_utxos_reserved_for_burning() {
         .monitored_utxos()
         .apply_block(
             "burning-v1",
-            &IndexedBlock {
-                height: 10,
-                hash: [10; 32],
-            },
+            &IndexedBlock::at(10),
             &[MonitoredUtxo {
                 txid: [1; 32],
                 output_index: 2,
@@ -975,12 +909,7 @@ async fn derives_oracle_account_from_the_active_storm_eye() {
     let (app, _, public_key) = setup().await;
 
     let response = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/users/account/{public_key}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(get_request(&format!("/users/account/{public_key}")))
         .await
         .unwrap();
 
@@ -1047,12 +976,10 @@ async fn rejects_unsupported_or_invalid_user_requests() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     let response = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/users/requests/{}", hex::encode([9; 32])))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(get_request(&format!(
+            "/users/requests/{}",
+            hex::encode([9; 32])
+        )))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1196,13 +1123,10 @@ async fn lets_an_operator_freeze_and_unfreeze_a_price_source() {
     let authorization = bearer(&app, &private_key, &public_key).await;
     let listed = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/operators/price-sources")
-                .header(header::AUTHORIZATION, &authorization)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authorized_get_request(
+            "/operators/price-sources",
+            &authorization,
+        ))
         .await
         .unwrap();
     assert_eq!(listed.status(), StatusCode::OK);
@@ -1580,6 +1504,14 @@ fn get_request(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
+fn authorized_get_request(uri: &str, authorization: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header(header::AUTHORIZATION, authorization)
+        .body(Body::empty())
+        .unwrap()
+}
+
 /// Records the metrics of what runs on this thread until it is dropped.
 fn local_recorder() -> metrics_exporter_prometheus::PrometheusRecorder {
     metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder()
@@ -1729,7 +1661,7 @@ async fn response_json(response: Response) -> serde_json::Value {
     serde_json::from_slice(&body).unwrap()
 }
 
-fn sign(private_key: &PrivateKey, message: &str) -> String {
+pub(crate) fn sign(private_key: &PrivateKey, message: &str) -> String {
     let public_key = private_key
         .public_key(&secp256k1::Secp256k1::new())
         .inner
@@ -1750,7 +1682,7 @@ fn sign(private_key: &PrivateKey, message: &str) -> String {
     .unwrap()
 }
 
-fn sign_humid(private_key: &PrivateKey, message: &str) -> String {
+pub(crate) fn sign_humid(private_key: &PrivateKey, message: &str) -> String {
     let message = Message::from_digest(signed_msg_hash(message).to_byte_array());
     let signature =
         secp256k1::Secp256k1::signing_only().sign_ecdsa_recoverable(&message, &private_key.inner);
