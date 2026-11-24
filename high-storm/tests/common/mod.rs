@@ -17,6 +17,7 @@ use tokio::time::timeout;
 
 pub struct TestNode {
     pub config: Config,
+    #[allow(dead_code)]
     pub public_key: String,
     pub store: NetworkStore,
     #[allow(dead_code)]
@@ -93,6 +94,7 @@ impl TestNode {
         }
     }
 
+    #[allow(dead_code)]
     pub fn address(&self) -> String {
         format!("127.0.0.1:{}", self.config.service.port)
     }
