@@ -115,6 +115,23 @@ pub struct ElementsRpcConfig {
     pub wallet: String,
 }
 
+impl ElementsRpcConfig {
+    /// The RPC endpoint of `wallet`: `url` with `/wallet/<wallet>` appended.
+    pub(crate) fn wallet_url(&self) -> Result<Url, url::ParseError> {
+        let mut url = Url::parse(&self.url)?;
+        url.path_segments_mut()
+            .map_err(|_| url::ParseError::RelativeUrlWithCannotBeABaseBase)?
+            .pop_if_empty()
+            .push("wallet")
+            .push(&self.wallet);
+        Ok(url)
+    }
+
+    pub(crate) fn auth(&self) -> bitcoincore_rpc::Auth {
+        bitcoincore_rpc::Auth::UserPass(self.username.clone(), self.password.clone())
+    }
+}
+
 fn default_elements_wallet() -> String {
     "funded-key".to_string()
 }

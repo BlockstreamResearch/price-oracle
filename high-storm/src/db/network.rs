@@ -90,46 +90,10 @@ impl NetworkStore {
         tracing::debug!(peer_count = peers.len(), "persisting network state");
 
         let mut transaction = self.pool.begin().await?;
-        sqlx::query("DELETE FROM network_peers")
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::query("DELETE FROM network_state")
-            .execute(&mut *transaction)
-            .await?;
-
-        let initialized_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        sqlx::query(
-            "INSERT INTO network_state (id, initialized_at, coordinator_public_key) \
-             VALUES (1, $1, $2)",
-        )
-        .bind(i64::try_from(initialized_at).map_err(|_| Error::TimestampOutOfRange)?)
-        .bind(hex::encode(coordinator_public_key))
-        .execute(&mut *transaction)
-        .await?;
+        reset_network_state(&mut transaction, coordinator_public_key).await?;
 
         for (position, peer) in peers.iter().enumerate() {
-            let last_seen = peer
-                .last_seen
-                .map(i64::try_from)
-                .transpose()
-                .map_err(|_| Error::TimestampOutOfRange)?;
-
-            sqlx::query(
-                "INSERT INTO network_peers (\
-					peer_order, public_key, socket_address, last_seen, status, discovery\
-				) VALUES ($1, $2, $3, $4, $5, $6)",
-            )
-            .bind(i64::try_from(position).map_err(|_| Error::TimestampOutOfRange)?)
-            .bind(hex::encode(peer.compressed_public_key))
-            .bind(&peer.socket_address)
-            .bind(last_seen)
-            .bind(status_name(peer.status))
-            .bind(i64::from(peer.discovery))
-            .execute(&mut *transaction)
-            .await?;
+            insert_peer(&mut transaction, position, peer, peer_last_seen(peer)?).await?;
         }
 
         transaction.commit().await?;
@@ -141,11 +105,7 @@ impl NetworkStore {
         let mut transaction = self.pool.begin().await?;
 
         for peer in peers {
-            let last_seen = peer
-                .last_seen
-                .map(i64::try_from)
-                .transpose()
-                .map_err(|_| Error::TimestampOutOfRange)?;
+            let last_seen = peer_last_seen(peer)?;
 
             sqlx::query(
                 "UPDATE network_peers SET \
@@ -221,43 +181,10 @@ impl NetworkStore {
         .bind(execution.request_hash.to_vec())
         .execute(&mut *transaction)
         .await?;
-        sqlx::query("DELETE FROM network_peers")
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::query("DELETE FROM network_state")
-            .execute(&mut *transaction)
-            .await?;
-        let initialized_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        sqlx::query(
-            "INSERT INTO network_state (id, initialized_at, coordinator_public_key) \
-             VALUES (1, $1, $2)",
-        )
-        .bind(i64::try_from(initialized_at).map_err(|_| Error::TimestampOutOfRange)?)
-        .bind(hex::encode(coordinator_public_key))
-        .execute(&mut *transaction)
-        .await?;
+        reset_network_state(&mut transaction, coordinator_public_key).await?;
         for (position, peer) in peers.iter().enumerate() {
-            let last_seen = peer
-                .last_seen
-                .map(i64::try_from)
-                .transpose()
-                .map_err(|_| Error::TimestampOutOfRange)?;
-            sqlx::query(
-                "INSERT INTO network_peers (
-                    peer_order, public_key, socket_address, last_seen, status, discovery
-                 ) VALUES ($1, $2, $3, $4, $5, $6)",
-            )
-            .bind(i64::try_from(position).map_err(|_| Error::TimestampOutOfRange)?)
-            .bind(hex::encode(peer.compressed_public_key))
-            .bind(&peer.socket_address)
-            .bind(last_seen)
-            .bind(status_name(peer.status))
-            .bind(i64::from(peer.discovery))
-            .execute(&mut *transaction)
-            .await?;
+            let last_seen = peer_last_seen(peer)?;
+            insert_peer(&mut transaction, position, peer, last_seen).await?;
             sqlx::query(
                 "INSERT INTO network_member_migration_peers \
                  (request_hash, snapshot_kind, peer_order, public_key, socket_address, last_seen, status, discovery) \
@@ -389,6 +316,62 @@ fn validate_unique_member_identities(peers: &[Peer]) -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+/// Empties `network_peers` and rewrites the single `network_state` row.
+async fn reset_network_state(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+    coordinator_public_key: [u8; 33],
+) -> Result<(), Error> {
+    sqlx::query("DELETE FROM network_peers")
+        .execute(&mut **transaction)
+        .await?;
+    sqlx::query("DELETE FROM network_state")
+        .execute(&mut **transaction)
+        .await?;
+
+    let initialized_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    sqlx::query(
+        "INSERT INTO network_state (id, initialized_at, coordinator_public_key) \
+         VALUES (1, $1, $2)",
+    )
+    .bind(i64::try_from(initialized_at).map_err(|_| Error::TimestampOutOfRange)?)
+    .bind(hex::encode(coordinator_public_key))
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn insert_peer(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+    position: usize,
+    peer: &Peer,
+    last_seen: Option<i64>,
+) -> Result<(), Error> {
+    sqlx::query(
+        "INSERT INTO network_peers (\
+            peer_order, public_key, socket_address, last_seen, status, discovery\
+        ) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(i64::try_from(position).map_err(|_| Error::TimestampOutOfRange)?)
+    .bind(hex::encode(peer.compressed_public_key))
+    .bind(&peer.socket_address)
+    .bind(last_seen)
+    .bind(status_name(peer.status))
+    .bind(i64::from(peer.discovery))
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+fn peer_last_seen(peer: &Peer) -> Result<Option<i64>, Error> {
+    peer.last_seen
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| Error::TimestampOutOfRange)
 }
 
 fn status_name(status: PeerStatus) -> &'static str {

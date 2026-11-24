@@ -1,26 +1,20 @@
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Client, RpcApi};
 use contracts::artifacts::{
     auth::derived_auth::AuthWitness,
-    treasury::{
-        TreasuryProgram,
-        derived_treasury::{TreasuryArguments, TreasuryWitness},
-    },
+    treasury::{TreasuryProgram, derived_treasury::TreasuryArguments},
 };
 use secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
-use serde::Deserialize;
 use simplex::{
     either::Either,
     provider::SimplicityNetwork,
     simplicityhl::elements::{
         BlockHash, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction,
     },
-    transaction::{
-        FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, UTXO,
-    },
+    transaction::{FinalTransaction, PartialOutput, UTXO},
 };
-use storm::{PeerStatus, StormHandle};
-use url::Url;
 
+use crate::high_storm::elements;
+use crate::high_storm::elements::RawTransactionInfo;
 use crate::{
     NetworkAsset,
     config::ElementsRpcConfig,
@@ -37,9 +31,9 @@ use super::{
         storm_eye_contract_data, storm_eye_program,
     },
     droplets::member_script,
-    message::{NodeMessage, NodeMessageKind, RenewStormUtxos},
+    message::RenewStormUtxos,
     signing::SigningError,
-    user_requests::{STORM_EYE_TAG, asset_id, pack_proof},
+    user_requests::{asset_id, pack_proof},
     voting_execution::{
         VotingExecutionError, network, scan_storm_eye_utxos, scan_storm_eye_utxos_ignoring_mempool,
         signing_hashes, verify_voting_amounts,
@@ -135,11 +129,7 @@ impl Renewal {
         if self.assets.pending_storm_eye_renewal().await?.is_some() {
             return Ok(None);
         }
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(RenewalError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let data = storm_eye_contract_data(&storm_eye)?;
         Ok(renewal_due(block_height, data.rescue_height).then_some(storm_eye))
     }
@@ -183,11 +173,7 @@ impl Renewal {
         request: &RenewStormUtxos,
         include_mempool: bool,
     ) -> Result<(), RenewalError> {
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(RenewalError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let expected = self
             .prepare_transaction(request.block_height, storm_eye, include_mempool)
             .await?;
@@ -261,23 +247,12 @@ impl Renewal {
             )
             .into();
         }
-        for (index, input) in prepared.transaction.inputs().iter().enumerate() {
-            let program_input = input
-                .program_input
-                .as_ref()
-                .expect("all renewal inputs are covenant inputs");
-            prepared.pset.inputs_mut()[index].final_script_witness = Some(
-                program_input
-                    .program
-                    .finalize(
-                        &prepared.pset,
-                        &program_input.witness,
-                        index,
-                        &prepared.network,
-                    )?
-                    .into(),
-            );
-        }
+        elements::finalize_program_inputs(
+            &mut prepared.pset,
+            &prepared.transaction,
+            &prepared.network,
+            "all renewal inputs are covenant inputs",
+        )?;
         if signing_hashes(
             &prepared.pset,
             &prepared.old_storm_eye,
@@ -305,11 +280,7 @@ impl Renewal {
         request: &RenewStormUtxos,
     ) -> Result<[u8; 32], RenewalError> {
         let (txid, final_tx) = finalized_transaction(request)?;
-        let current = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(RenewalError::MissingAsset(STORM_EYE_KIND))?;
+        let current = self.asset(STORM_EYE_KIND).await?;
         let renewed = renewed_storm_eye(&current, &network(&self.client()?)?)?;
         if storm_eye_contract_data(&renewed)?.rescue_height != request.new_rescue_height {
             return Err(RenewalError::Invalid(
@@ -472,19 +443,15 @@ impl Renewal {
         ))
     }
 
+    async fn asset(&self, kind: &'static str) -> Result<crate::NetworkAsset, RenewalError> {
+        self.assets.require(kind, RenewalError::MissingAsset).await
+    }
+
     fn client(&self) -> Result<Client, RenewalError> {
-        let mut url = Url::parse(&self.elements_rpc.url)?;
-        url.path_segments_mut()
-            .map_err(|_| url::ParseError::RelativeUrlWithCannotBeABaseBase)?
-            .pop_if_empty()
-            .push("wallet")
-            .push(&self.elements_rpc.wallet);
+        let url = self.elements_rpc.wallet_url()?;
         Ok(crate::monitoring::elements_client(
             url.as_str(),
-            Auth::UserPass(
-                self.elements_rpc.username.clone(),
-                self.elements_rpc.password.clone(),
-            ),
+            self.elements_rpc.auth(),
             "renewal",
         )?)
     }
@@ -600,30 +567,17 @@ fn build_transaction(
 
     let mut transaction = FinalTransaction::new();
     for (output_index, utxo) in storm_eye_utxos.iter().enumerate() {
-        transaction.add_program_input(
-            PartialInput::new(utxo.clone()),
-            ProgramInput::new(
-                Box::new(auth_program.as_ref().clone()),
-                placeholder_witness(&data, new_rescue_height, output_index as u32),
-            ),
-            RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+        elements::add_storm_eye_input(
+            &mut transaction,
+            utxo,
+            &auth_program,
+            placeholder_witness(&data, new_rescue_height, output_index as u32),
         );
     }
     let treasury = TreasuryProgram::new(&TreasuryArguments {
         storm_eye_asset_id: storm_eye.asset_id,
     });
-    for utxo in &treasury_utxos {
-        transaction.add_program_input(
-            PartialInput::new(utxo.clone()),
-            ProgramInput::new(
-                Box::new(treasury.as_ref().clone()),
-                TreasuryWitness {
-                    storm_eye_input_index: 0,
-                },
-            ),
-            RequiredSignature::None,
-        );
-    }
+    elements::add_treasury_inputs(&mut transaction, &treasury, &treasury_utxos);
     let storm_eye_asset = asset_id(storm_eye.asset_id)?;
     let renewed_script = Script::from(renewed_storm_eye.contract_script.clone());
     for utxo in &storm_eye_utxos {
@@ -683,14 +637,7 @@ fn placeholder_witness(
     new_rescue_height: u32,
     output_index: u32,
 ) -> AuthWitness {
-    renewal_witness(
-        data,
-        new_rescue_height,
-        output_index,
-        [0; 64],
-        data.storm_tree_root,
-        std::array::from_fn(|_| Either::Left(())),
-    )
+    elements::placeholder_storm_eye_witness(data, renewal_spend(new_rescue_height, output_index))
 }
 
 fn renewal_witness(
@@ -699,18 +646,23 @@ fn renewal_witness(
     output_index: u32,
     signature: [u8; 64],
     branch: [u8; 32],
-    proof: [Either<(), (bool, [u8; 32])>; storm_tree::TREE_DEPTH as usize],
+    proof: super::user_requests::PackedStormTreeProof,
 ) -> AuthWitness {
-    AuthWitness {
-        path: Either::Left((
-            (data.storm_tree_root, data.rescue_height),
-            (signature, branch, proof),
-            Either::Right(Either::Left(Either::Right((
-                new_rescue_height,
-                output_index,
-            )))),
-        )),
-    }
+    elements::storm_eye_witness(
+        data,
+        signature,
+        branch,
+        proof,
+        renewal_spend(new_rescue_height, output_index),
+    )
+}
+
+/// The witness spend arm that moves the rescue height and keeps output `output_index`.
+fn renewal_spend(new_rescue_height: u32, output_index: u32) -> elements::StormEyeSpend {
+    Either::Right(Either::Left(Either::Right((
+        new_rescue_height,
+        output_index,
+    ))))
 }
 
 fn renewal_due(block_height: u64, rescue_height: u32) -> bool {
@@ -758,37 +710,6 @@ fn live_treasury_utxo(
             )?,
         )
     }
-}
-
-#[derive(Deserialize)]
-struct RawTransactionInfo {
-    #[serde(default)]
-    confirmations: u64,
-    #[serde(default, rename = "blockhash")]
-    block_hash: Option<String>,
-}
-
-pub(crate) async fn announce(
-    storm: &StormHandle,
-    request: &RenewStormUtxos,
-) -> Result<(), RenewalError> {
-    let recipients = storm
-        .peers()
-        .await
-        .into_iter()
-        .filter(|peer| peer.status == PeerStatus::Active)
-        .map(|peer| {
-            secp256k1_zkp::PublicKey::from_slice(&peer.compressed_public_key)
-                .map_err(|_| RenewalError::Invalid("invalid renewal recipient".into()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if recipients.is_empty() {
-        return Ok(());
-    }
-    let message =
-        NodeMessage::new(NodeMessageKind::RenewStormUtxos, None, request)?.into_storm_message()?;
-    storm.send_message(message, &recipients).await?;
-    Ok(())
 }
 
 #[cfg(test)]

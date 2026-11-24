@@ -117,6 +117,22 @@ impl Database {
     }
 }
 
+// Conversions for the stores that keep heights, amounts and hashes as SQL integers and blobs.
+
+fn encode_u64(value: u64) -> Result<i64, sqlx::Error> {
+    i64::try_from(value).map_err(|error| sqlx::Error::Encode(Box::new(error)))
+}
+
+fn decode_u64(value: i64) -> Result<u64, sqlx::Error> {
+    u64::try_from(value).map_err(|error| sqlx::Error::Decode(Box::new(error)))
+}
+
+fn decode_hash(value: Vec<u8>) -> Result<[u8; 32], sqlx::Error> {
+    value
+        .try_into()
+        .map_err(|_| sqlx::Error::Decode("invalid hash length".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;

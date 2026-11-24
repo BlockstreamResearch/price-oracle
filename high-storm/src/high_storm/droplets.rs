@@ -1,15 +1,11 @@
 use std::str::FromStr;
 
-use bitcoincore_rpc::{Auth, Client, RpcApi};
-use contracts::artifacts::{
-    auth::derived_auth::AuthWitness,
-    treasury::{
-        TreasuryProgram,
-        derived_treasury::{TreasuryArguments, TreasuryWitness},
-    },
+use bitcoincore_rpc::{Client, RpcApi};
+use contracts::artifacts::treasury::{
+    TreasuryProgram,
+    derived_treasury::{TreasuryArguments, TreasuryWitness},
 };
 use secp256k1_zkp::{Message, PublicKey, Secp256k1, XOnlyPublicKey, schnorr::Signature};
-use simplex::simplicityhl::elements::{opcodes, script::Instruction};
 use simplex::{
     either::Either,
     program::ProgramTrait,
@@ -17,16 +13,13 @@ use simplex::{
     simplicityhl::{
         WitnessValues,
         elements::{
-            Address, AddressParams, AssetId, BlockHash, Script, TxOut, Txid, encode,
-            pset::PartiallySignedTransaction,
+            Address, AddressParams, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction,
         },
     },
-    transaction::{
-        FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
-    },
+    transaction::{FinalTransaction, PartialOutput, SigMessage},
 };
-use url::Url;
 
+use crate::high_storm::elements;
 use crate::{
     NetworkAsset,
     config::ElementsRpcConfig,
@@ -194,11 +187,7 @@ impl Droplets {
         Address::from_str(destination)
             .map_err(|_| DropletsError::Invalid("invalid destination address".into()))?;
 
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(DropletsError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let indexed_utxos = self.store.treasury_utxos().await?;
         let (transaction, signing_hash) = self.prepare_exchange_transaction(
             amount,
@@ -284,36 +273,13 @@ impl Droplets {
             .map_err(|error| DropletsError::Invalid(error.to_string()))?;
         let auth_program = storm_eye_program(storm_eye)?;
         let mut transaction = FinalTransaction::new();
-        transaction.add_program_input(
-            PartialInput::new(storm_eye_utxo.clone()),
-            ProgramInput::new(
-                Box::new(auth_program.as_ref().clone()),
-                AuthWitness {
-                    path: Either::Left((
-                        (contract_data.storm_tree_root, contract_data.rescue_height),
-                        (
-                            [0; 64],
-                            contract_data.storm_tree_root,
-                            std::array::from_fn(|_| Either::Left(())),
-                        ),
-                        Either::Left(0),
-                    )),
-                },
-            ),
-            RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+        elements::add_storm_eye_input(
+            &mut transaction,
+            &storm_eye_utxo,
+            &auth_program,
+            elements::placeholder_storm_eye_witness(&contract_data, Either::Left(0)),
         );
-        for utxo in &selected {
-            transaction.add_program_input(
-                PartialInput::new(utxo.clone()),
-                ProgramInput::new(
-                    Box::new(treasury.as_ref().clone()),
-                    TreasuryWitness {
-                        storm_eye_input_index: 0,
-                    },
-                ),
-                RequiredSignature::None,
-            );
-        }
+        elements::add_treasury_inputs(&mut transaction, &treasury, &selected);
 
         transaction.add_output(output_from_utxo(&storm_eye_utxo));
         transaction.add_output(PartialOutput::new(
@@ -325,11 +291,7 @@ impl Droplets {
         if change > 0 {
             transaction.add_output(PartialOutput::new(treasury_script, change, policy_asset));
         }
-        let member = PublicKey::from_slice(&expected_member)
-            .map_err(|_| DropletsError::Invalid("invalid local public key".into()))?
-            .x_only_public_key()
-            .0
-            .serialize();
+        let member = local_member_key(&expected_member)?;
         transaction.add_output(PartialOutput::new(member_script(member), 0, policy_asset));
         transaction.add_output(PartialOutput::new(
             Script::new(),
@@ -421,11 +383,7 @@ impl Droplets {
                 "Droplets ledger is halted at block {height}: {reason}"
             )));
         }
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(DropletsError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let pset: PartiallySignedTransaction = encode::deserialize(transaction)?;
         let client = self.client()?;
         for (index, input) in pset.inputs().iter().enumerate() {
@@ -487,11 +445,7 @@ impl Droplets {
         proof: storm_tree::StormTreeProof,
         exchange: &ValidatedExchange,
     ) -> Result<([u8; 32], Vec<u8>), DropletsError> {
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(DropletsError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let network = self.network(&self.client()?)?;
         let contract_data: StormEyeContractData =
             postcard::from_bytes(storm_eye.contract_data.as_deref().ok_or_else(|| {
@@ -528,17 +482,13 @@ impl Droplets {
 
         let mut pset: PartiallySignedTransaction = encode::deserialize(&request.tx)?;
         let auth_program = storm_eye_program(&storm_eye)?;
-        let auth_witness = AuthWitness {
-            path: Either::Left((
-                (contract_data.storm_tree_root, contract_data.rescue_height),
-                (
-                    *signature.as_ref(),
-                    signing.signing_storm_tree_branch,
-                    pack_proof(&proof)?,
-                ),
-                Either::Left(0),
-            )),
-        };
+        let auth_witness = elements::storm_eye_witness(
+            &contract_data,
+            *signature.as_ref(),
+            signing.signing_storm_tree_branch,
+            pack_proof(&proof)?,
+            Either::Left(0),
+        );
         pset.inputs_mut()[0].final_script_witness = Some(
             auth_program
                 .as_ref()
@@ -605,55 +555,33 @@ impl Droplets {
         Ok((txid.to_byte_array(), final_bytes))
     }
 
+    async fn asset(&self, kind: &'static str) -> Result<crate::NetworkAsset, DropletsError> {
+        self.assets.require(kind, DropletsError::MissingAsset).await
+    }
+
     fn client(&self) -> Result<Client, DropletsError> {
-        let mut url = Url::parse(&self.elements_rpc.url)?;
-        url.path_segments_mut()
-            .map_err(|_| url::ParseError::RelativeUrlWithCannotBeABaseBase)?
-            .pop_if_empty()
-            .push("wallet")
-            .push(&self.elements_rpc.wallet);
+        let url = self.elements_rpc.wallet_url()?;
         Ok(crate::monitoring::elements_client(
             url.as_str(),
-            Auth::UserPass(
-                self.elements_rpc.username.clone(),
-                self.elements_rpc.password.clone(),
-            ),
+            self.elements_rpc.auth(),
             "exchange",
         )?)
     }
 
     fn network(&self, client: &Client) -> Result<SimplicityNetwork, DropletsError> {
-        #[derive(serde::Deserialize)]
-        struct ChainInfo {
-            chain: String,
-        }
-        #[derive(serde::Deserialize)]
-        struct SidechainInfo {
-            pegged_asset: String,
-        }
-
-        let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
-        match chain.chain.as_str() {
-            "liquidv1" => Ok(SimplicityNetwork::Liquid),
-            "liquidtestnet" => Ok(SimplicityNetwork::LiquidTestnet),
-            "elementsregtest" => {
-                let sidechain: SidechainInfo = client.call("getsidechaininfo", &[])?;
-                let genesis_hash: String = client.call("getblockhash", &[0.into()])?;
-                Ok(SimplicityNetwork::ElementsCustom {
-                    policy_asset: AssetId::from_str(&sidechain.pegged_asset).map_err(|_| {
-                        DropletsError::Invalid("invalid regtest policy asset".into())
-                    })?,
-                    genesis_hash: BlockHash::from_str(&genesis_hash).map_err(|_| {
-                        DropletsError::Invalid("invalid regtest genesis hash".into())
-                    })?,
-                })
-            }
-            _ => Err(DropletsError::Invalid(format!(
-                "unsupported Elements chain '{}'",
-                chain.chain
-            ))),
-        }
+        elements::network(client, DropletsError::Invalid, |chain| {
+            DropletsError::Invalid(format!("unsupported Elements chain '{chain}'"))
+        })
     }
+}
+
+/// The x-only key a member holds Droplets under, from its compressed key.
+pub(crate) fn local_member_key(compressed: &[u8; 33]) -> Result<[u8; 32], DropletsError> {
+    Ok(PublicKey::from_slice(compressed)
+        .map_err(|_| DropletsError::Invalid("invalid local public key".into()))?
+        .x_only_public_key()
+        .0
+        .serialize())
 }
 
 pub(crate) fn member_script(member: [u8; 32]) -> Script {
@@ -675,21 +603,8 @@ fn address_params(network: &SimplicityNetwork) -> &'static AddressParams {
 }
 
 pub(crate) fn member_from_script(script: &Script) -> Option<[u8; 32]> {
-    let mut instructions = script.instructions_minimal();
-    if !matches!(
-        instructions.next(),
-        Some(Ok(Instruction::Op(opcodes::all::OP_RETURN)))
-    ) {
-        return None;
-    }
-    let Some(Ok(Instruction::PushBytes(data))) = instructions.next() else {
-        return None;
-    };
-    if instructions.next().is_some()
-        || data.len() != MEMBER_DATA_LEN
-        || data[..2] != MEMBER_MAGIC
-        || data[2] != MEMBER_VERSION
-    {
+    let data = elements::op_return_data(script)?;
+    if data.len() != MEMBER_DATA_LEN || data[..2] != MEMBER_MAGIC || data[2] != MEMBER_VERSION {
         return None;
     }
     data[3..].try_into().ok()
@@ -892,7 +807,7 @@ mod tests {
     use crate::NetworkAsset;
     use secp256k1_zkp::SecretKey;
     use simplex::simplicityhl::elements::{
-        LockTime, OutPoint, Transaction, TxIn, TxOut, TxOutSecrets, Txid,
+        AssetId, BlockHash, LockTime, OutPoint, Transaction, TxIn, TxOut, TxOutSecrets, Txid,
         confidential::{self, AssetBlindingFactor, ValueBlindingFactor},
     };
 

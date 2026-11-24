@@ -3,13 +3,10 @@ use std::{
     str::FromStr,
 };
 
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Client, RpcApi};
 use contracts::artifacts::{
     auth::derived_auth::AuthWitness,
-    treasury::{
-        TreasuryProgram,
-        derived_treasury::{TreasuryArguments, TreasuryWitness},
-    },
+    treasury::{TreasuryProgram, derived_treasury::TreasuryArguments},
 };
 use secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
 use serde::Deserialize;
@@ -20,14 +17,12 @@ use simplex::{
     simplicityhl::elements::{
         AssetId, BlockHash, Script, TxOut, Txid, encode, pset::PartiallySignedTransaction,
     },
-    transaction::{
-        FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
-        UTXO,
-    },
+    transaction::{FinalTransaction, PartialOutput, SigMessage, UTXO},
 };
 use storm_tree::{StormTree, StormTreeProof};
-use url::Url;
 
+use crate::high_storm::elements;
+use crate::high_storm::elements::RawTransactionInfo;
 use crate::{
     ExecuteVotingRequest, MergeStormEyes, NetworkAsset, NetworkVoteKind, NodeMessage,
     SplitStormEye, StormEyeUtxo, UpdateNetworkMembers,
@@ -195,11 +190,7 @@ impl VotingExecution {
         let ReshapeOperation::UpdateMembers { new_root, .. } = operation else {
             return Ok(None);
         };
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(VotingExecutionError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let network = network(&self.client()?)?;
         Ok(Some(migrated_storm_eye(&storm_eye, new_root, &network)?))
     }
@@ -208,11 +199,7 @@ impl VotingExecution {
         &self,
         block_height: u64,
     ) -> Result<Vec<StormEyeInventoryItem>, VotingExecutionError> {
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(VotingExecutionError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let reservations = storm_eye_reservations(&self.votes.list().await?)?;
         let client = self.client()?;
         let descriptor = format!("raw({})", hex::encode(&storm_eye.contract_script));
@@ -290,11 +277,7 @@ impl VotingExecution {
             .proposer_public_key
             .ok_or(VotingExecutionError::MissingProposer)?;
         let operation = decode_operation(stored, current_members)?;
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(VotingExecutionError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let indexed_treasury = self.droplets.treasury_utxos().await?;
         let client = self.client()?;
         let network = network(&client)?;
@@ -410,11 +393,7 @@ impl VotingExecution {
             ));
         }
         let operation = decode_operation(&stored, current_members)?;
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(VotingExecutionError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let indexed_treasury = self.droplets.treasury_utxos().await?;
         let client = self.client()?;
         let network = network(&client)?;
@@ -457,23 +436,12 @@ impl VotingExecution {
                 .expect("Storm Eye is a program input")
                 .witness = witness.into();
         }
-        for (index, input) in prepared.transaction.inputs().iter().enumerate() {
-            let program_input = input
-                .program_input
-                .as_ref()
-                .expect("all voting transaction inputs are covenant inputs");
-            prepared.pset.inputs_mut()[index].final_script_witness = Some(
-                program_input
-                    .program
-                    .finalize(
-                        &prepared.pset,
-                        &program_input.witness,
-                        index,
-                        &prepared.network,
-                    )?
-                    .into(),
-            );
-        }
+        elements::finalize_program_inputs(
+            &mut prepared.pset,
+            &prepared.transaction,
+            &prepared.network,
+            "all voting transaction inputs are covenant inputs",
+        )?;
         if signing_hashes(
             &prepared.pset,
             &prepared.storm_eye,
@@ -777,19 +745,17 @@ impl VotingExecution {
         ))
     }
 
+    async fn asset(&self, kind: &'static str) -> Result<crate::NetworkAsset, VotingExecutionError> {
+        self.assets
+            .require(kind, VotingExecutionError::MissingAsset)
+            .await
+    }
+
     fn client(&self) -> Result<Client, VotingExecutionError> {
-        let mut url = Url::parse(&self.elements_rpc.url)?;
-        url.path_segments_mut()
-            .map_err(|_| url::ParseError::RelativeUrlWithCannotBeABaseBase)?
-            .pop_if_empty()
-            .push("wallet")
-            .push(&self.elements_rpc.wallet);
+        let url = self.elements_rpc.wallet_url()?;
         Ok(crate::monitoring::elements_client(
             url.as_str(),
-            Auth::UserPass(
-                self.elements_rpc.username.clone(),
-                self.elements_rpc.password.clone(),
-            ),
+            self.elements_rpc.auth(),
             "voting",
         )?)
     }
@@ -938,14 +904,6 @@ struct ScannedUtxo {
     #[serde(default)]
     asset: Option<String>,
     height: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct RawTransactionInfo {
-    #[serde(default)]
-    confirmations: u64,
-    #[serde(default, rename = "blockhash")]
-    block_hash: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1126,31 +1084,18 @@ fn build_transaction(
 
     let mut transaction = FinalTransaction::new();
     for (output_index, utxo) in storm_eye_utxos.iter().enumerate() {
-        transaction.add_program_input(
-            PartialInput::new(utxo.clone()),
-            ProgramInput::new(
-                Box::new(auth_program.as_ref().clone()),
-                placeholder_witness(&contract_data, &operation, output_index as u32),
-            ),
-            RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+        elements::add_storm_eye_input(
+            &mut transaction,
+            utxo,
+            &auth_program,
+            placeholder_witness(&contract_data, &operation, output_index as u32),
         );
     }
 
     let treasury = TreasuryProgram::new(&TreasuryArguments {
         storm_eye_asset_id: storm_eye.asset_id,
     });
-    for utxo in &treasury_utxos {
-        transaction.add_program_input(
-            PartialInput::new(utxo.clone()),
-            ProgramInput::new(
-                Box::new(treasury.as_ref().clone()),
-                TreasuryWitness {
-                    storm_eye_input_index: 0,
-                },
-            ),
-            RequiredSignature::None,
-        );
-    }
+    elements::add_treasury_inputs(&mut transaction, &treasury, &treasury_utxos);
 
     let storm_eye_asset = asset_id(storm_eye.asset_id)?;
     let storm_eye_script = Script::from(storm_eye.contract_script.clone());
@@ -1529,7 +1474,12 @@ fn placeholder_witness(
     operation: &ReshapeOperation,
     output_index: u32,
 ) -> AuthWitness {
-    let kind = match operation {
+    elements::placeholder_storm_eye_witness(data, reshape_spend(operation, output_index))
+}
+
+/// The witness spend arm of a reshape `operation` writing output `output_index`.
+fn reshape_spend(operation: &ReshapeOperation, output_index: u32) -> elements::StormEyeSpend {
+    match operation {
         ReshapeOperation::Split(_, count) => Either::Right(Either::Right(Either::Left(*count))),
         ReshapeOperation::Merge(outpoints) => {
             Either::Right(Either::Right(Either::Right(outpoints.len() as u8)))
@@ -1537,17 +1487,6 @@ fn placeholder_witness(
         ReshapeOperation::UpdateMembers { new_root, .. } => {
             Either::Right(Either::Left(Either::Left((*new_root, output_index))))
         }
-    };
-    AuthWitness {
-        path: Either::Left((
-            (data.storm_tree_root, data.rescue_height),
-            (
-                [0; 64],
-                data.storm_tree_root,
-                std::array::from_fn(|_| Either::Left(())),
-            ),
-            kind,
-        )),
     }
 }
 
@@ -1613,26 +1552,13 @@ fn reshape_witness(
     signature: [u8; 64],
     output_index: u32,
 ) -> Result<AuthWitness, VotingExecutionError> {
-    let kind = match operation {
-        ReshapeOperation::Split(_, count) => Either::Right(Either::Right(Either::Left(*count))),
-        ReshapeOperation::Merge(outpoints) => {
-            Either::Right(Either::Right(Either::Right(outpoints.len() as u8)))
-        }
-        ReshapeOperation::UpdateMembers { new_root, .. } => {
-            Either::Right(Either::Left(Either::Left((*new_root, output_index))))
-        }
-    };
-    Ok(AuthWitness {
-        path: Either::Left((
-            (data.storm_tree_root, data.rescue_height),
-            (
-                signature,
-                signing.signing_storm_tree_branch,
-                pack_proof(proof)?,
-            ),
-            kind,
-        )),
-    })
+    Ok(elements::storm_eye_witness(
+        data,
+        signature,
+        signing.signing_storm_tree_branch,
+        pack_proof(proof)?,
+        reshape_spend(operation, output_index),
+    ))
 }
 
 fn migrated_storm_eye_script(
@@ -1684,36 +1610,9 @@ pub(crate) fn signing_hashes(
 }
 
 pub(crate) fn network(client: &Client) -> Result<SimplicityNetwork, VotingExecutionError> {
-    #[derive(serde::Deserialize)]
-    struct ChainInfo {
-        chain: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct SidechainInfo {
-        pegged_asset: String,
-    }
-
-    let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
-    match chain.chain.as_str() {
-        "liquidv1" => Ok(SimplicityNetwork::Liquid),
-        "liquidtestnet" => Ok(SimplicityNetwork::LiquidTestnet),
-        "elementsregtest" => {
-            let sidechain: SidechainInfo = client.call("getsidechaininfo", &[])?;
-            let genesis_hash: String = client.call("getblockhash", &[0.into()])?;
-            Ok(SimplicityNetwork::ElementsCustom {
-                policy_asset: AssetId::from_str(&sidechain.pegged_asset).map_err(|_| {
-                    VotingExecutionError::Invalid("invalid regtest policy asset".into())
-                })?,
-                genesis_hash: BlockHash::from_str(&genesis_hash).map_err(|_| {
-                    VotingExecutionError::Invalid("invalid regtest genesis hash".into())
-                })?,
-            })
-        }
-        _ => Err(VotingExecutionError::Invalid(format!(
-            "unsupported Elements chain '{}'",
-            chain.chain
-        ))),
-    }
+    elements::network(client, VotingExecutionError::Invalid, |chain| {
+        VotingExecutionError::Invalid(format!("unsupported Elements chain '{chain}'"))
+    })
 }
 
 #[cfg(test)]
@@ -1958,9 +1857,14 @@ mod inventory_tests {
             witness.path,
             Either::Left((
                 (old_root, rescue_height),
-                _,
+                (signature, branch, proof),
                 Either::Right(Either::Left(Either::Left((root, 2))))
-            )) if old_root == [8; 32] && rescue_height == 42 && root == expected_root
+            )) if old_root == [8; 32]
+                && rescue_height == 42
+                && root == expected_root
+                && signature == [0; 64]
+                && branch == [8; 32]
+                && proof.iter().all(|step| matches!(step, Either::Left(())))
         ));
     }
 
@@ -2063,6 +1967,33 @@ mod inventory_tests {
             output.amount == Some(0)
                 && output.script_pubkey == migrated_members_script(&members, [17; 32]).unwrap()
         }));
+        // The Storm Eyes come first, then the Treasury input deferring to input 0.
+        let inputs = prepared.transaction.inputs();
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(
+            inputs[0].partial_input.witness_txid,
+            Txid::from_byte_array([18; 32])
+        );
+        assert_eq!(
+            inputs[1].partial_input.witness_txid,
+            Txid::from_byte_array([19; 32])
+        );
+        assert_eq!(
+            inputs[2].partial_input.witness_txid,
+            Txid::from_byte_array([16; 32])
+        );
+        assert_eq!(
+            inputs[2].partial_input.witness_utxo.script_pubkey,
+            treasury.get_script_pubkey(&network)
+        );
+        assert_eq!(
+            inputs[2].program_input.as_ref().unwrap().witness,
+            simplex::simplicityhl::WitnessValues::from(
+                contracts::artifacts::treasury::derived_treasury::TreasuryWitness {
+                    storm_eye_input_index: 0,
+                }
+            )
+        );
     }
 
     fn stored_reshape(

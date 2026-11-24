@@ -1,10 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::{
-    MessageContext, MessageError, StormContext, StormHandle, StormMessage, StormMessageHeader,
-    constants, message::StormErrorCode,
+    MessageContext, MessageError, StormContext, StormHandle, StormMessage, message::StormErrorCode,
 };
 
 /// An application-defined payload namespaced by a domain string.
@@ -20,19 +17,11 @@ impl CustomMsg {
     /// Encodes this custom payload as a versioned [`StormMessage`].
     pub fn into_storm_message(self) -> Result<StormMessage, MessageError> {
         let payload = postcard::to_stdvec(&self)?;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
 
-        Ok(StormMessage {
-            header: StormMessageHeader {
-                payload_id: super::StormMessagePayloadType::Custom as u32,
-                timestamp,
-                protocol_version: constants::PROTOCOL_VERSION,
-            },
+        Ok(StormMessage::new(
+            super::StormMessagePayloadType::Custom,
             payload,
-        })
+        ))
     }
 }
 

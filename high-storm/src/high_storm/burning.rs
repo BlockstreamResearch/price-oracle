@@ -3,29 +3,24 @@ use std::{
     str::FromStr,
 };
 
-use bitcoincore_rpc::{Auth, Client, RpcApi};
-use contracts::artifacts::{
-    account::{AccountProgram, derived_account::AccountArguments},
-    auth::derived_auth::AuthWitness,
-};
+use bitcoincore_rpc::{Client, RpcApi};
+use contracts::artifacts::account::{AccountProgram, derived_account::AccountArguments};
 use contracts::voucher::VoucherSpendPath;
 use secp256k1_zkp::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
-use serde::Deserialize;
 use simplex::{
     either::Either,
     program::ProgramTrait,
     provider::SimplicityNetwork,
     simplicityhl::elements::{
-        AssetId, BlockHash, Script, Transaction, TxOut, Txid, encode,
-        pset::PartiallySignedTransaction,
+        AssetId, Script, Transaction, TxOut, Txid, encode, pset::PartiallySignedTransaction,
     },
     transaction::{
         FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature, SigMessage,
         utxo::UTXO,
     },
 };
-use url::Url;
 
+use crate::high_storm::elements;
 use crate::{
     NetworkAsset,
     config::{ElementsRpcConfig, ProtocolConfig},
@@ -293,11 +288,7 @@ impl Burning {
             return Ok(None);
         }
 
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(BurningError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let burn_assets = self.burn_assets().await?;
         let network = self.network()?;
         let client = self.client()?;
@@ -424,11 +415,7 @@ impl Burning {
         &self,
         request: &BurnExpiredUtxos,
     ) -> Result<(), BurningError> {
-        let storm_eye = self
-            .assets
-            .get(STORM_EYE_KIND)
-            .await?
-            .ok_or(BurningError::MissingAsset(STORM_EYE_KIND))?;
+        let storm_eye = self.asset(STORM_EYE_KIND).await?;
         let burn_assets = self.burn_assets().await?;
         let expired = self.store.list_expired(u32::MAX).await?;
         let pset: PartiallySignedTransaction = encode::deserialize(&request.tx)?;
@@ -641,17 +628,13 @@ impl Burning {
             .program_input
             .as_mut()
             .expect("Storm Eye is a program input")
-            .witness = AuthWitness {
-            path: Either::Left((
-                (contract_data.storm_tree_root, contract_data.rescue_height),
-                (
-                    *signature.as_ref(),
-                    signing.signing_storm_tree_branch,
-                    pack_proof(&proof)?,
-                ),
-                Either::Left(0),
-            )),
-        }
+            .witness = elements::storm_eye_witness(
+            &contract_data,
+            *signature.as_ref(),
+            signing.signing_storm_tree_branch,
+            pack_proof(&proof)?,
+            Either::Left(0),
+        )
         .into();
         let mut pset = prepared.pset;
         for (index, input) in transaction.inputs().iter().enumerate() {
@@ -725,39 +708,22 @@ impl Burning {
 
     fn network(&self) -> Result<SimplicityNetwork, BurningError> {
         let client = self.client()?;
-        let chain: ChainInfo = client.call("getblockchaininfo", &[])?;
-        match chain.chain.as_str() {
-            "liquidv1" => Ok(SimplicityNetwork::Liquid),
-            "liquidtestnet" => Ok(SimplicityNetwork::LiquidTestnet),
-            "elementsregtest" => {
-                let sidechain: SidechainInfo = client.call("getsidechaininfo", &[])?;
-                let genesis_hash: String = client.call("getblockhash", &[0.into()])?;
-                Ok(SimplicityNetwork::ElementsCustom {
-                    policy_asset: AssetId::from_str(&sidechain.pegged_asset).map_err(|_| {
-                        BurningError::Invalid("invalid regtest policy asset".into())
-                    })?,
-                    genesis_hash: BlockHash::from_str(&genesis_hash).map_err(|_| {
-                        BurningError::Invalid("invalid regtest genesis hash".into())
-                    })?,
-                })
-            }
-            _ => Err(BurningError::UnsupportedChain(chain.chain)),
-        }
+        elements::network(
+            &client,
+            BurningError::Invalid,
+            BurningError::UnsupportedChain,
+        )
+    }
+
+    async fn asset(&self, kind: &'static str) -> Result<crate::NetworkAsset, BurningError> {
+        self.assets.require(kind, BurningError::MissingAsset).await
     }
 
     fn client(&self) -> Result<Client, BurningError> {
-        let mut url = Url::parse(&self.elements_rpc.url)?;
-        url.path_segments_mut()
-            .map_err(|_| url::ParseError::RelativeUrlWithCannotBeABaseBase)?
-            .pop_if_empty()
-            .push("wallet")
-            .push(&self.elements_rpc.wallet);
+        let url = self.elements_rpc.wallet_url()?;
         Ok(crate::monitoring::elements_client(
             url.as_str(),
-            Auth::UserPass(
-                self.elements_rpc.username.clone(),
-                self.elements_rpc.password.clone(),
-            ),
+            self.elements_rpc.auth(),
             "burn",
         )?)
     }
@@ -843,23 +809,11 @@ fn build_burn_transaction(
     let signing_branch = contract_data.storm_tree_root;
 
     let mut final_transaction = FinalTransaction::new();
-    final_transaction.add_program_input(
-        PartialInput::new(storm_eye_utxo.clone()),
-        ProgramInput::new(
-            Box::new(auth_program.as_ref().clone()),
-            AuthWitness {
-                path: Either::Left((
-                    (contract_data.storm_tree_root, contract_data.rescue_height),
-                    (
-                        [0; 64],
-                        signing_branch,
-                        std::array::from_fn(|_| Either::Left(())),
-                    ),
-                    Either::Left(0),
-                )),
-            },
-        ),
-        RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+    elements::add_storm_eye_input(
+        &mut final_transaction,
+        storm_eye_utxo,
+        &auth_program,
+        elements::placeholder_storm_eye_witness(&contract_data, Either::Left(0)),
     );
 
     let mut spent_utxos = vec![storm_eye_utxo.txout.clone()];
@@ -1317,20 +1271,11 @@ fn decode_32(bytes: &[u8]) -> Result<[u8; 32], BurningError> {
         .map_err(|_| BurningError::Invalid("invalid 32-byte covenant argument".into()))
 }
 
-#[derive(Deserialize)]
-struct ChainInfo {
-    chain: String,
-}
-
-#[derive(Deserialize)]
-struct SidechainInfo {
-    pegged_asset: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{external_api::users::UtxoAuthMethod, high_storm::issuance::IssuedUtxoDescriptor};
+    use simplex::simplicityhl::elements::BlockHash;
 
     /// x of the secp256k1 generator, a valid signing branch.
     const SIGNER: [u8; 32] = [

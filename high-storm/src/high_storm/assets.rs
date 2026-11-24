@@ -9,15 +9,16 @@ use simplex::provider::SimplicityNetwork;
 use simplex::simplicityhl::elements::{
     AssetId, Script, Transaction, TxIn, TxOut, TxOutSecrets,
     confidential::{AssetBlindingFactor, ValueBlindingFactor},
-    encode, opcodes,
+    encode,
     script::Instruction,
 };
 use simplex::utils::hash_script;
 use std::str::FromStr;
 use storm::{PeerStatus, StormContext, StormHandle};
 use storm_tree::StormTree;
-use url::Url;
 
+use crate::high_storm::elements;
+use crate::high_storm::elements::{ChainInfo, SidechainInfo};
 use crate::{
     NetworkAsset, NetworkAssets,
     config::ElementsRpcConfig,
@@ -137,18 +138,10 @@ fn members_script(
 pub(crate) fn initial_members_from_script(
     script: &Script,
 ) -> Result<Option<Vec<[u8; 32]>>, AssetError> {
-    let mut instructions = script.instructions_minimal();
-    if !matches!(
-        instructions.next(),
-        Some(Ok(Instruction::Op(opcodes::all::OP_RETURN)))
-    ) {
-        return Ok(None);
-    }
-    let Some(Ok(Instruction::PushBytes(data))) = instructions.next() else {
+    let Some(data) = elements::op_return_data(script) else {
         return Ok(None);
     };
-    if instructions.next().is_some()
-        || data.len() < INITIAL_MEMBERS_MAGIC.len()
+    if data.len() < INITIAL_MEMBERS_MAGIC.len()
         || data[..INITIAL_MEMBERS_MAGIC.len()] != INITIAL_MEMBERS_MAGIC
     {
         return Ok(None);
@@ -173,18 +166,8 @@ pub(crate) fn initial_members_from_script(
 
 /// Parses third-party chain data, so a malformed payload is "not a marker" rather than an error.
 pub(crate) fn migrated_members_proposer_from_script(script: &Script) -> Option<[u8; 32]> {
-    let mut instructions = script.instructions_minimal();
-    if !matches!(
-        instructions.next(),
-        Some(Ok(Instruction::Op(opcodes::all::OP_RETURN)))
-    ) {
-        return None;
-    }
-    let Some(Ok(Instruction::PushBytes(data))) = instructions.next() else {
-        return None;
-    };
-    if instructions.next().is_some()
-        || data.len() < INITIAL_MEMBERS_MAGIC.len()
+    let data = elements::op_return_data(script)?;
+    if data.len() < INITIAL_MEMBERS_MAGIC.len()
         || data[..INITIAL_MEMBERS_MAGIC.len()] != INITIAL_MEMBERS_MAGIC
     {
         return None;
@@ -312,10 +295,7 @@ impl Assets {
         };
         let client = crate::monitoring::elements_client(
             &self.elements_rpc.url,
-            Auth::UserPass(
-                self.elements_rpc.username.clone(),
-                self.elements_rpc.password.clone(),
-            ),
+            self.elements_rpc.auth(),
             "asset",
         )?;
         let asset = asset.clone();
@@ -451,38 +431,10 @@ impl Assets {
     where
         I: AssetIssuer + Clone + Send + 'static,
     {
-        if let Some(asset) = self.store.get(STORM_EYE_KIND).await? {
-            return Ok(asset);
-        }
-
-        let pending = if let Some(pending) = self.store.get_pending(STORM_EYE_KIND).await? {
-            pending
-        } else {
-            let issuer = issuer.clone();
-            let pending = tokio::task::spawn_blocking(move || {
-                issuer.prepare(storm_tree_root, &initial_members)
-            })
-            .await??;
-
-            if !self.store.insert_pending(&pending).await? {
-                self.store
-                    .get_pending(STORM_EYE_KIND)
-                    .await?
-                    .ok_or_else(|| AssetError::Conflict(STORM_EYE_KIND.to_string()))?
-            } else {
-                pending
-            }
-        };
-
-        let issuer = issuer.clone();
-        let issuance_tx = pending.issuance_tx.clone();
-        let issuance_txid = pending.asset.issuance_txid;
-        tokio::task::spawn_blocking(move || issuer.broadcast(&issuance_tx, issuance_txid))
-            .await??;
-
-        self.store.activate(STORM_EYE_KIND).await?;
-
-        Ok(pending.asset)
+        self.ensure_asset(STORM_EYE_KIND, issuer, move |issuer| {
+            issuer.prepare(storm_tree_root, &initial_members)
+        })
+        .await
     }
 
     async fn ensure_reissuable_asset<I>(
@@ -495,6 +447,25 @@ impl Assets {
     where
         I: ReissuableAssetIssuer + Clone + Send + 'static,
     {
+        self.ensure_asset(kind, issuer, move |issuer| {
+            issuer.prepare_reissuable_asset(kind, name, storm_eye_asset_id)
+        })
+        .await
+    }
+
+    /// Returns the active asset of `kind`. Otherwise takes the pending
+    /// issuance, or prepares and stores one with `prepare`, then broadcasts and
+    /// activates it.
+    async fn ensure_asset<I, P>(
+        &self,
+        kind: &'static str,
+        issuer: I,
+        prepare: P,
+    ) -> Result<NetworkAsset, AssetError>
+    where
+        I: AssetIssuer + Clone + Send + 'static,
+        P: FnOnce(I) -> Result<PendingNetworkAsset, AssetError> + Send + 'static,
+    {
         if let Some(asset) = self.store.get(kind).await? {
             return Ok(asset);
         }
@@ -503,10 +474,7 @@ impl Assets {
             pending
         } else {
             let issuer = issuer.clone();
-            let pending = tokio::task::spawn_blocking(move || {
-                issuer.prepare_reissuable_asset(kind, name, storm_eye_asset_id)
-            })
-            .await??;
+            let pending = tokio::task::spawn_blocking(move || prepare(issuer)).await??;
 
             if !self.store.insert_pending(&pending).await? {
                 self.store
@@ -870,16 +838,11 @@ struct ElementsAssetIssuer {
 
 impl ElementsAssetIssuer {
     fn new(config: &ElementsRpcConfig) -> Result<Self, AssetError> {
-        let mut url = Url::parse(&config.url)?;
-        url.path_segments_mut()
-            .map_err(|_| AssetError::InvalidRpcResponse("wallet URL"))?
-            .pop_if_empty()
-            .push("wallet")
-            .push(&config.wallet);
+        let url = config.wallet_url()?;
 
         Ok(Self {
             rpc_url: url.to_string(),
-            auth: Auth::UserPass(config.username.clone(), config.password.clone()),
+            auth: config.auth(),
         })
     }
 
@@ -1291,16 +1254,6 @@ impl ReissuableAssetIssuer for ElementsAssetIssuer {
     ) -> Result<PendingNetworkAsset, AssetError> {
         self.prepare_reissuable_asset(kind, name, storm_eye_asset_id)
     }
-}
-
-#[derive(Deserialize)]
-struct ChainInfo {
-    chain: String,
-}
-
-#[derive(Deserialize)]
-struct SidechainInfo {
-    pegged_asset: String,
 }
 
 #[derive(Deserialize)]

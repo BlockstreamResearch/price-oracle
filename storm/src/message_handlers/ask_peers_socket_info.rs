@@ -1,21 +1,11 @@
 use crate::{
-    Error, MessageContext, StormHandle, StormMessage, StormMessageHeader, constants,
+    Error, MessageContext, StormHandle, StormMessage,
     message::StormErrorCode,
     message_handlers::{StormMessagePayloadType, peers_socket_info},
 };
 
 pub(crate) fn message() -> StormMessage {
-    StormMessage {
-        header: StormMessageHeader {
-            payload_id: StormMessagePayloadType::AskPeersSocketInfo as u32,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            protocol_version: constants::PROTOCOL_VERSION,
-        },
-        payload: Vec::new(),
-    }
+    StormMessage::new(StormMessagePayloadType::AskPeersSocketInfo, Vec::new())
 }
 
 pub(super) async fn handle(

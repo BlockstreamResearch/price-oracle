@@ -11,6 +11,7 @@ use crate::monitoring::{self, RenewalOutcome};
 mod assets;
 mod burning;
 mod droplets;
+pub(crate) mod elements;
 mod handler;
 mod indexer;
 mod issuance;
@@ -57,43 +58,44 @@ pub struct HighStorm {
 
 pub(crate) struct HighStormDependencies {
     network_store: crate::db::network::NetworkStore,
-    chain: crate::db::chain::ChainStore,
-    voting_store: crate::db::voting::VotingStore,
-    network_assets: crate::db::network_asset::NetworkAssetStore,
-    monitored_utxos: crate::db::monitored_utxo::MonitoredUtxoStore,
-    droplets: crate::db::droplet::DropletStore,
-    user_requests: crate::db::user_request::UserRequestStore,
-    price_attestations: crate::db::price_attestation::PriceAttestationStore,
     elements_rpc: crate::config::ElementsRpcConfig,
     protocol_config: crate::config::ProtocolConfig,
 }
 
 impl HighStormDependencies {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         network_store: crate::db::network::NetworkStore,
-        voting_store: crate::db::voting::VotingStore,
-        network_assets: crate::db::network_asset::NetworkAssetStore,
-        monitored_utxos: crate::db::monitored_utxo::MonitoredUtxoStore,
-        droplets: crate::db::droplet::DropletStore,
-        user_requests: crate::db::user_request::UserRequestStore,
-        price_attestations: crate::db::price_attestation::PriceAttestationStore,
         elements_rpc: crate::config::ElementsRpcConfig,
         protocol_config: crate::config::ProtocolConfig,
     ) -> Self {
-        let chain = network_store.chain();
         Self {
             network_store,
-            chain,
-            voting_store,
-            network_assets,
-            monitored_utxos,
-            droplets,
-            user_requests,
-            price_attestations,
             elements_rpc,
             protocol_config,
         }
+    }
+
+    /// The stores of `database`, with an Elements node nothing listens on.
+    #[cfg(test)]
+    pub(crate) fn for_tests(database: &crate::db::Database) -> Self {
+        Self::new(
+            database.network(),
+            crate::config::ElementsRpcConfig {
+                url: "http://127.0.0.1:18884".to_string(),
+                username: "unused".to_string(),
+                password: "unused".to_string(),
+                wallet: "unused".to_string(),
+            },
+            crate::config::ProtocolConfig {
+                operational_fee_sats: 1_000,
+                tick_burn_reserve_sats: 1_000,
+                issuance_transaction_fee_sats: 1_000,
+                burn_transaction_fee_sats: 500,
+                exchange_transaction_fee_sats: 500,
+                tick_lifetime_blocks: 60,
+                finality_confirmations: 2,
+            },
+        )
     }
 }
 
@@ -316,11 +318,7 @@ impl HighStorm {
         let Some(local) = leader::local_public_key(&peers) else {
             return Ok(None);
         };
-        let member = PublicKey::from_slice(&local)
-            .map_err(|_| DropletsError::Invalid("invalid local public key".into()))?
-            .x_only_public_key()
-            .0
-            .serialize();
+        let member = droplets::local_member_key(&local)?;
         let Some(request) = self.state.droplets().state(member).await?.1 else {
             return Ok(None);
         };
@@ -360,51 +358,27 @@ impl HighStorm {
     }
 
     pub async fn announce_protocol_settings(&self) -> Result<(), SigningError> {
-        let recipients = self
-            .peers()
-            .await
-            .into_iter()
-            .filter(|peer| peer.status == PeerStatus::Active)
-            .map(|peer| {
-                PublicKey::from_slice(&peer.compressed_public_key).map_err(|_| {
-                    SigningError::InvalidMessage("invalid protocol settings recipient".into())
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if recipients.is_empty() {
-            return Ok(());
-        }
-        let message = NodeMessage::new(
+        announce(
+            &self.storm.handle(),
             NodeMessageKind::ProtocolSettings,
             None,
             &self.state.protocol_settings(),
-        )?
-        .into_storm_message()?;
-        self.storm.send_message(message, &recipients).await?;
-
-        Ok(())
+            SigningError::InvalidMessage,
+            "invalid protocol settings recipient",
+        )
+        .await
     }
 
     async fn announce_exchange(&self, notification: &ExchangeRewards) -> Result<(), SigningError> {
-        let recipients = self
-            .peers()
-            .await
-            .into_iter()
-            .filter(|peer| peer.status == PeerStatus::Active)
-            .map(|peer| {
-                PublicKey::from_slice(&peer.compressed_public_key).map_err(|_| {
-                    SigningError::InvalidMessage("invalid exchange notification recipient".into())
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if recipients.is_empty() {
-            return Ok(());
-        }
-        let message = NodeMessage::new(NodeMessageKind::ExchangeRewards, None, notification)?
-            .into_storm_message()?;
-        self.storm.send_message(message, &recipients).await?;
-
-        Ok(())
+        announce(
+            &self.storm.handle(),
+            NodeMessageKind::ExchangeRewards,
+            None,
+            notification,
+            SigningError::InvalidMessage,
+            "invalid exchange notification recipient",
+        )
+        .await
     }
 
     pub async fn create_voting_request(
@@ -498,7 +472,15 @@ impl HighStorm {
             && self.is_coordinator().await
             && let Some(request) = self.state.renewal().pending_request().await?
         {
-            renewal::announce(&self.storm.handle(), &request).await?;
+            announce(
+                &self.storm.handle(),
+                NodeMessageKind::RenewStormUtxos,
+                None,
+                &request,
+                RenewalError::Invalid,
+                "invalid renewal recipient",
+            )
+            .await?;
         }
         Ok(confirmed)
     }
@@ -568,7 +550,16 @@ impl HighStorm {
             .renewal()
             .record_and_broadcast(&notification)
             .await?;
-        if let Err(error) = renewal::announce(&self.storm.handle(), &notification).await {
+        if let Err(error) = announce(
+            &self.storm.handle(),
+            NodeMessageKind::RenewStormUtxos,
+            None,
+            &notification,
+            RenewalError::Invalid,
+            "invalid renewal recipient",
+        )
+        .await
+        {
             tracing::warn!(%error, "failed to announce Storm Eye timelock renewal");
         }
 
@@ -596,18 +587,7 @@ impl HighStorm {
         }
 
         let storm_tree_root = self.state.signing().storm_tree_root().await?;
-        let initial_members = self
-            .peers()
-            .await
-            .into_iter()
-            .map(|peer| {
-                PublicKey::from_slice(&peer.compressed_public_key)
-                    .expect("Storm peers contain validated public keys")
-                    .x_only_public_key()
-                    .0
-                    .serialize()
-            })
-            .collect();
+        let initial_members = state::x_only_keys(self.peers().await);
         self.state
             .assets()
             .initialize_storm_eye(
@@ -862,25 +842,15 @@ impl HighStorm {
     }
 
     async fn announce_burn(&self, notification: &ExpiredUtxosBurned) -> Result<(), SigningError> {
-        let recipients = self
-            .peers()
-            .await
-            .into_iter()
-            .filter(|peer| peer.status == PeerStatus::Active)
-            .map(|peer| {
-                PublicKey::from_slice(&peer.compressed_public_key).map_err(|_| {
-                    SigningError::InvalidMessage("invalid burn notification recipient".into())
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if recipients.is_empty() {
-            return Ok(());
-        }
-        let message = NodeMessage::new(NodeMessageKind::ExpiredUtxosBurned, None, notification)?
-            .into_storm_message()?;
-        self.storm.send_message(message, &recipients).await?;
-
-        Ok(())
+        announce(
+            &self.storm.handle(),
+            NodeMessageKind::ExpiredUtxosBurned,
+            None,
+            notification,
+            SigningError::InvalidMessage,
+            "invalid burn notification recipient",
+        )
+        .await
     }
 
     pub async fn reconcile_user_requests(&self) -> Result<usize, user_requests::UserRequestError> {
@@ -1057,6 +1027,13 @@ impl HighStormHandle {
         leader::next_local_leader_height(&self.peers().await, self.state.block_height())
     }
 
+    /// The x-only key this node holds Droplets under.
+    async fn local_droplet_member(&self) -> Result<[u8; 32], DropletsError> {
+        let local = leader::local_public_key(&self.peers().await)
+            .ok_or_else(|| DropletsError::Invalid("local network member is missing".into()))?;
+        droplets::local_member_key(&local)
+    }
+
     pub(crate) async fn droplet_state(
         &self,
     ) -> Result<
@@ -1066,26 +1043,14 @@ impl HighStormHandle {
         ),
         DropletsError,
     > {
-        let local = leader::local_public_key(&self.peers().await)
-            .ok_or_else(|| DropletsError::Invalid("local network member is missing".into()))?;
-        let member = PublicKey::from_slice(&local)
-            .map_err(|_| DropletsError::Invalid("invalid local public key".into()))?
-            .x_only_public_key()
-            .0
-            .serialize();
+        let member = self.local_droplet_member().await?;
         self.state.droplets().state(member).await
     }
 
     pub(crate) async fn droplet_history(
         &self,
     ) -> Result<Vec<crate::db::droplet::DropletExchangeRequest>, DropletsError> {
-        let local = leader::local_public_key(&self.peers().await)
-            .ok_or_else(|| DropletsError::Invalid("local network member is missing".into()))?;
-        let member = PublicKey::from_slice(&local)
-            .map_err(|_| DropletsError::Invalid("invalid local public key".into()))?
-            .x_only_public_key()
-            .0
-            .serialize();
+        let member = self.local_droplet_member().await?;
         self.state.droplets().history(member).await
     }
 
@@ -1437,28 +1402,15 @@ impl HighStormHandle {
         request_hash: [u8; 32],
         notification: &ExecuteVotingRequest,
     ) -> Result<(), SigningError> {
-        let recipients = self
-            .peers()
-            .await
-            .into_iter()
-            .filter(|peer| peer.status == PeerStatus::Active)
-            .map(|peer| {
-                PublicKey::from_slice(&peer.compressed_public_key).map_err(|_| {
-                    SigningError::InvalidMessage("invalid voting notification recipient".into())
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if recipients.is_empty() {
-            return Ok(());
-        }
-        let message = NodeMessage::new(
+        announce(
+            &self.storm,
             NodeMessageKind::ExecuteVotingRequest,
             Some(request_hash),
             notification,
-        )?
-        .into_storm_message()?;
-        self.storm.send_message(message, &recipients).await?;
-        Ok(())
+            SigningError::InvalidMessage,
+            "invalid voting notification recipient",
+        )
+        .await
     }
 
     pub async fn voting_request(
@@ -1493,6 +1445,39 @@ fn round_outcome<E>(result: &Result<usize, E>) -> Option<&'static str> {
         Ok(_) => Some("broadcast"),
         Err(_) => Some("failed"),
     }
+}
+
+/// Sends `payload` as a `kind` message to every active peer of `storm`, if there
+/// is any; `invalid_recipient` is the error for a peer whose key does not parse.
+async fn announce<T, E>(
+    storm: &StormHandle,
+    kind: NodeMessageKind,
+    linked_to: Option<[u8; 32]>,
+    payload: &T,
+    invalid: fn(String) -> E,
+    invalid_recipient: &str,
+) -> Result<(), E>
+where
+    T: serde::Serialize,
+    E: From<postcard::Error> + From<storm::MessageError> + From<storm::Error>,
+{
+    let recipients = storm
+        .peers()
+        .await
+        .into_iter()
+        .filter(|peer| peer.status == PeerStatus::Active)
+        .map(|peer| {
+            PublicKey::from_slice(&peer.compressed_public_key)
+                .map_err(|_| invalid(invalid_recipient.into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if recipients.is_empty() {
+        return Ok(());
+    }
+    let message = NodeMessage::new(kind, linked_to, payload)?.into_storm_message()?;
+    storm.send_message(message, &recipients).await?;
+
+    Ok(())
 }
 
 fn voting_member_keys(peers: &[storm::Peer]) -> Result<BTreeSet<[u8; 32]>, VotingExecutionError> {
