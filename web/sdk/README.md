@@ -11,19 +11,19 @@ import {
   publicKeyFromPrivateKey,
   verifyExecutedTick,
 } from "@price-oracle/sdk";
+import { loadLeafCompiler } from "@price-oracle/sdk/leaves";
 
 const privateKey = "<development-only 32-byte hex key>";
 const publicKey = publicKeyFromPrivateKey(privateKey);
 const oracle = new PriceOracleClient("http://127.0.0.1:9100");
-const verification = {
+const leaves = await loadLeafCompiler();
+const verification = leaves.accountVerification({
   ownerPublicKey: publicKey,
-  network: "elementsregtest" as const,
+  network: "elementsregtest",
   stormEyeAssetId: "<independently verified Storm Eye asset ID>",
   tickAssetId: "<independently verified Tick asset ID>",
   verifierAssetId: "<independently verified Verifier asset ID>",
-  accountTapleafHash: "<locally compiled Account leaf for this owner>",
-  tickTapleafHash: "<locally compiled signature-authorized voucher leaf>",
-};
+});
 const account = await oracle.getAccount(publicKey, verification);
 
 const chain = new EsploraClient("<independently trusted Esplora URL>");
@@ -39,6 +39,57 @@ const { request_hash } = await oracle.submitTickRequest(request);
 const status = await oracle.waitForTickRequest(request_hash);
 const tick = await verifyExecutedTick(status, verification, chain);
 ```
+
+## Contract Leaves
+
+`getAccount` and the chain checks pin two tapleaf hashes that only a compiler
+can produce. `@price-oracle/sdk/leaves` ships that compiler: the SimplicityHL
+compiler the nodes run, built for WebAssembly together with the contract
+sources of this SDK's revision. It is a separate entry point, so a page that
+compiles nothing does not download its module, about 0.9 MB and a third of
+that compressed.
+
+```ts
+import { loadLeafCompiler } from "@price-oracle/sdk/leaves";
+
+const leaves = await loadLeafCompiler();
+const accountTapleafHash = leaves.accountTapleafHash(stormEyeAssetId, owner);
+const tickTapleafHash = leaves.voucherTapleafHash(stormEyeAssetId, {
+  kind: "signature-auth",
+  auth_data: owner,
+});
+```
+
+`voucherTapleafHash` takes the authentication method a request names, and its
+leaf is the one a Tick and a Verifier of that method share. The `auth_data` of
+`asset-id-auth` goes into the covenant as it is given: the asset ID's bytes in
+the order the chain stores them, which is the reverse of how Elements and
+explorers print an asset ID.
+`accountVerification(context)` fills both leaves of an `AccountVerification`:
+the Tick for `authScriptPubKey` when one is given, for the owner's signature
+otherwise. A leaf belongs to its arguments, so each owner, Storm Eye asset and
+authentication method is compiled for separately; one compilation takes tens
+of milliseconds.
+
+`loadLeafCompiler()` fetches `leaves.wasm` from beside the module, and reads it
+from disk outside a browser. A bundler that does not follow
+`new URL("./leaves.wasm", import.meta.url)` needs the address spelled out:
+import `@price-oracle/sdk/leaves.wasm` as an asset and pass its URL, a
+`Response`, or the bytes. A page with a Content Security Policy has to allow
+WebAssembly (`'wasm-unsafe-eval'`).
+
+The compiler replaces the local Rust build, not the judgement behind it: the
+leaves are those of the contract version built into this SDK, and the Storm Eye
+asset ID given to it is still a trust anchor to obtain independently.
+
+The module is a build product and is not kept in the repository.
+`bun run build:leaves` builds `dist/leaves.wasm` in a container from the
+workspace's contracts and its locked compiler version. Build it before using
+this entry point from a checkout or packing the SDK, and again whenever a
+contract or the compiler changes. `cargo test` in `leaves` holds every leaf
+against the one the `contracts` crate compiles, and `bun test` holds the built
+module against leaves pinned from Rust, skipping those tests while the module
+is not built.
 
 ## Chain Access
 
@@ -191,7 +242,8 @@ script, asset ID and network must match before the method returns. The returned
 object contains locally derived values, not unchecked coordinator fields.
 
 Obtain asset IDs from independently verified issuance or trusted configuration,
-not the same coordinator response. Obtain `accountTapleafHash` from
+not the same coordinator response. Obtain the leaves from the leaf compiler
+described above, or in Rust: `accountTapleafHash` from
 `AccountProgram::get_tapleaf_hash()` after local Rust/Simplex compilation with
 `AccountArguments` containing the verified Storm Eye asset's consensus bytes
 and the intended owner's x-only key. Obtain `tickTapleafHash` from
@@ -250,8 +302,8 @@ const executed = await verifyExecutedSignedPrice(status, {
 
 Import these helpers from `@price-oracle/sdk`. The `chain` client must use an
 independently trusted Elements RPC or Esplora endpoint. Pin the asset ID from
-verified network issuance and the voucher leaf from local Rust/Simplex
-compilation for the requested authentication method and network.
+verified network issuance and the voucher leaf from the leaf compiler or a
+local Rust/Simplex compilation for the requested authentication method.
 Neither value should come unchecked from the coordinator. The check reads the
 output with mempool spends
 included, requires at least one confirmation, the explicit Verifier asset and

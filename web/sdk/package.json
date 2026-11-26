@@ -7,7 +7,12 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    }
+    },
+    "./leaves": {
+      "types": "./dist/leaves.d.ts",
+      "import": "./dist/leaves.js"
+    },
+    "./leaves.wasm": "./dist/leaves.wasm"
   },
   "files": ["dist"],
   "scripts": {
