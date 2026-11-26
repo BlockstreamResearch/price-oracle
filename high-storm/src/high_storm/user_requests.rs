@@ -71,7 +71,7 @@ const MAX_TICK_TIME_SKEW_SECS: u64 = 120;
 /// Ten blocks, about ten minutes at the target interval: long enough to ride
 /// out a restart or a slow poll, short enough not to strand a user's fees on a
 /// feed this node never prices.
-const MAX_UNPRICED_REQUEST_BLOCKS: u64 = 10;
+pub(crate) const MAX_UNPRICED_REQUEST_BLOCKS: u64 = 10;
 /// How many pending requests a round reads at a time while looking for ones it
 /// can issue.
 const PENDING_SCAN_PAGE: u32 = 100;
@@ -1854,6 +1854,17 @@ fn round_rate(
 /// instead, and the round is rebuilt on the same rate until the feed polls again.
 fn usable_for_round(rate: &PriceFeedData, timestamp: u64) -> bool {
     rate.valid_until > timestamp.saturating_add(SIGNING_SESSION_TIMEOUT.as_secs())
+}
+
+/// Whether a round prepared now would hold a rate to issue this feed at.
+pub(crate) async fn has_round_rate(prices: &Prices, feed: FeedId) -> bool {
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    prices
+        .value(feed)
+        .await
+        .is_some_and(|rate| usable_for_round(&rate, now.as_secs()))
 }
 
 /// Its fee UTXOs stay reserved while it waits, so it does not wait forever. A

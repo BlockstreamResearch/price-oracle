@@ -48,6 +48,7 @@ pub(crate) use prices::{PriceHealth, SourceHealth};
 pub use renewal::RenewalError;
 pub use signing::{SigningError, SigningResult};
 use state::NetworkState;
+pub(crate) use user_requests::MAX_UNPRICED_REQUEST_BLOCKS;
 pub use user_requests::UserRequestError;
 pub use voting::{VOTING_TIMEOUT_BLOCKS, VotingApproval, VotingError, VotingRequest, VotingStatus};
 pub use voting_execution::{StormEyeInventoryItem, StormEyeState, VotingExecutionError};
@@ -75,6 +76,12 @@ impl HighStormDependencies {
             elements_rpc,
             protocol_config,
         }
+    }
+
+    /// The protocol the node is given, for what else a test builds beside it.
+    #[cfg(test)]
+    pub(crate) fn protocol_config(&self) -> &crate::config::ProtocolConfig {
+        &self.protocol_config
     }
 
     /// The stores of `database`, with an Elements node nothing listens on.
