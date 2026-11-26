@@ -20,7 +20,9 @@ import {
   tickRequestSigningHash,
   verifySignedPriceData,
   verifyExecutedSignedPrice,
+  verifyExecutedTick,
   type AccountVerification,
+  type NetworkVerification,
 } from "../src";
 
 const PRIVATE_KEY = "1f".repeat(32);
@@ -801,5 +803,306 @@ describe("Price Oracle SDK", () => {
         rpc,
       ),
     ).rejects.toThrow("Verifier");
+  });
+
+  test("reads network metadata and holds it against pinned values", async () => {
+    const network = {
+      network: "elementsregtest",
+      storm_eye_asset_id: "01".repeat(32),
+      storm_tree_root: VERIFICATION.stormTreeRoot,
+      tick_asset_id: "02".repeat(32),
+      oracle_verifier_asset_id: "04".repeat(32),
+    };
+    const pinned = {
+      network: "elementsregtest" as const,
+      stormEyeAssetId: "01".repeat(32),
+      stormTreeRoot: VERIFICATION.stormTreeRoot,
+      tickAssetId: "02".repeat(32),
+      verifierAssetId: "04".repeat(32),
+    };
+    let body: unknown = network;
+    let fetched = 0;
+    const client = new PriceOracleClient(
+      "https://coordinator.test",
+      async (request) => {
+        fetched += 1;
+        expect(String(request)).toBe("https://coordinator.test/users/network");
+        return Response.json(body);
+      },
+    );
+
+    expect(await client.getNetwork()).toEqual(network);
+    expect(await client.getNetwork(pinned)).toEqual(network);
+    expect(await client.getNetwork({ tickAssetId: "02".repeat(32) })).toEqual(
+      network,
+    );
+
+    for (const [field, value] of Object.entries({
+      network: "liquidv1",
+      stormEyeAssetId: "97".repeat(32),
+      stormTreeRoot: "96".repeat(32),
+      tickAssetId: "95".repeat(32),
+      verifierAssetId: "94".repeat(32),
+    }))
+      await expect(
+        client.getNetwork({ ...pinned, [field]: value }),
+      ).rejects.toThrow("trusted value");
+
+    // Hex is compared and returned without regard to its case.
+    body = {
+      ...network,
+      storm_tree_root: network.storm_tree_root.toUpperCase(),
+    };
+    expect(await client.getNetwork(pinned)).toEqual(network);
+
+    // A response that cannot be read is refused with nothing pinned too.
+    for (const malformed of [
+      null,
+      {},
+      { ...network, network: "bitcoin" },
+      { ...network, storm_tree_root: "00" },
+      { ...network, tick_asset_id: 5 },
+    ]) {
+      body = malformed;
+      await expect(client.getNetwork()).rejects.toThrow("coordinator network");
+    }
+
+    fetched = 0;
+    for (const invalid of [
+      { network: "bitcoin" },
+      { stormTreeRoot: "not-hex" },
+      { tickAssetId: 5 },
+    ])
+      await expect(
+        client.getNetwork(invalid as NetworkVerification),
+      ).rejects.toThrow("trusted network values");
+    expect(fetched).toBe(0);
+  });
+
+  test("waits for a request to finalize and surfaces failure, timeout and abort", async () => {
+    const hash = "ab".repeat(32);
+    const pending = { status: "pending", payload: null };
+    const executed = { status: "executed", payload: "{}" };
+    let reads = 0;
+    // Answers with each status in turn, then keeps repeating the last.
+    const client = (statuses: object[]) => {
+      reads = 0;
+      return new PriceOracleClient(
+        "https://coordinator.test",
+        async (request) => {
+          expect(String(request)).toBe(
+            `https://coordinator.test/users/requests/${hash}`,
+          );
+          return Response.json(
+            statuses[Math.min(reads++, statuses.length - 1)],
+          );
+        },
+      );
+    };
+
+    const seen: string[] = [];
+    expect(
+      await client([
+        pending,
+        { status: "processing", payload: "{}" },
+        { status: "included", payload: "{}" },
+        executed,
+      ]).waitForTickRequest(hash, {
+        intervalMs: 1,
+        onStatus: ({ status }) => seen.push(status),
+      }),
+    ).toEqual(executed);
+    expect(seen).toEqual(["pending", "processing", "included", "executed"]);
+
+    await expect(
+      client([
+        pending,
+        { status: "failed", payload: "feed 9 has no price" },
+      ]).waitForTickRequest(hash, { intervalMs: 1 }),
+    ).rejects.toThrow("feed 9 has no price");
+    await expect(
+      client([pending]).waitForTickRequest(hash, {
+        intervalMs: 1,
+        timeoutMs: 20,
+      }),
+    ).rejects.toThrow("still pending");
+
+    // An abort ends the pause between reads rather than waiting it out.
+    const controller = new AbortController();
+    const waiting = client([pending]).waitForTickRequest(hash, {
+      intervalMs: 60_000,
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(new Error("left the page")), 5);
+    await expect(waiting).rejects.toThrow("left the page");
+    expect(reads).toBe(1);
+
+    await expect(
+      client([executed]).waitForTickRequest(hash, {
+        signal: AbortSignal.abort(new Error("already gone")),
+      }),
+    ).rejects.toThrow("already gone");
+    expect(reads).toBe(0);
+
+    for (const options of [
+      { intervalMs: 0 },
+      { timeoutMs: -1 },
+      { intervalMs: Number.NaN },
+    ])
+      await expect(
+        client([executed]).waitForTickRequest(hash, options),
+      ).rejects.toThrow("positive");
+  });
+
+  test("orders a Tick beside a priced request under one signature", () => {
+    const feeUtxos = [`${"ab".repeat(32)}:1`];
+    const request = createSignedPriceRequest(
+      PRIVATE_KEY,
+      feeUtxos,
+      4,
+      undefined,
+      { withTick: true },
+    );
+    const auth = {
+      kind: "signature-auth",
+      auth_data: publicKeyFromPrivateKey(PRIVATE_KEY),
+    };
+
+    expect(request.requests.map(({ kind }) => kind)).toEqual([
+      "signed-price-data",
+      "tick-utxo",
+    ]);
+    // Only the priced request names the feed: a Tick naming one is rejected.
+    expect(request.requests.map(({ payload }) => JSON.parse(payload))).toEqual([
+      { utxo_auth_method: auth, price_feed_id: 4 },
+      { utxo_auth_method: auth },
+    ]);
+    expect(
+      schnorr.verify(
+        request.header.signature,
+        tickRequestSigningHash(request),
+        request.header.public_key,
+      ),
+    ).toBe(true);
+    // The signature covers both payloads, so neither can be dropped.
+    request.requests.pop();
+    expect(
+      schnorr.verify(
+        request.header.signature,
+        tickRequestSigningHash(request),
+        request.header.public_key,
+      ),
+    ).toBe(false);
+
+    expect(
+      createSignedPriceRequest(PRIVATE_KEY, feeUtxos, 4).requests,
+    ).toHaveLength(1);
+  });
+
+  test("checks a confirmed unspent Tick carrying the reported time under the trusted leaf", async () => {
+    const time = 1_794_394_600;
+    const tick = (timestamp: unknown) => ({
+      kind: "tick-utxo",
+      vout: 2,
+      payload: JSON.stringify({ timestamp }),
+    });
+    const batch = (results: object[]) => ({
+      status: "executed" as const,
+      payload: JSON.stringify({ txid: "ab".repeat(32), results }),
+    });
+    const status = batch([tick(time)]);
+    // The amount is the time in satoshis, as Elements reports a Tick.
+    const utxo = {
+      confirmations: 2,
+      asset: ACCOUNT.tick_asset_id,
+      value: 17.943946,
+      scriptPubKey: { hex: ACCOUNT.tick_script_pubkey },
+    };
+    const issued = {
+      txid: "ab".repeat(32),
+      vout: 2,
+      asset: ACCOUNT.tick_asset_id,
+      timestamp: time,
+      scriptPubKey: ACCOUNT.tick_script_pubkey,
+    };
+    let rpcResult: unknown = utxo;
+    let calls = 0;
+    const rpc = new ElementsRpcClient({
+      url: "http://127.0.0.1:18884",
+      fetch: async (_, init) => {
+        calls += 1;
+        const request = JSON.parse(String(init?.body));
+        expect(request.method).toBe("gettxout");
+        expect(request.params).toEqual(["ab".repeat(32), 2, true]);
+        return Response.json({ result: rpcResult, error: null });
+      },
+    });
+
+    expect(await verifyExecutedTick(status, ACCOUNT_VERIFICATION, rpc)).toEqual(
+      issued,
+    );
+    // A Tick ordered beside a price is picked out of the batch's results.
+    expect(
+      await verifyExecutedTick(
+        batch([
+          { kind: "signed-price-data", vout: 3, payload: "{}" },
+          tick(time),
+        ]),
+        ACCOUNT_VERIFICATION,
+        rpc,
+      ),
+    ).toEqual(issued);
+
+    calls = 0;
+    for (const premature of ["pending", "processing", "included"] as const)
+      expect(
+        await verifyExecutedTick(
+          { ...status, status: premature },
+          ACCOUNT_VERIFICATION,
+          rpc,
+        ),
+      ).toBeNull();
+    expect(calls).toBe(0);
+
+    for (const result of [
+      null,
+      { ...utxo, confirmations: 0 },
+      { ...utxo, asset: "06".repeat(32) },
+      { ...utxo, asset: undefined },
+      { ...utxo, value: 17.94394601 },
+      { ...utxo, value: undefined },
+      { ...utxo, scriptPubKey: { hex: ACCOUNT.script_pubkey } },
+    ]) {
+      rpcResult = result;
+      await expect(
+        verifyExecutedTick(status, ACCOUNT_VERIFICATION, rpc),
+      ).rejects.toThrow("Tick");
+    }
+    rpcResult = utxo;
+    await expect(
+      verifyExecutedTick(
+        status,
+        { ...ACCOUNT_VERIFICATION, tickTapleafHash: "06".repeat(32) },
+        rpc,
+      ),
+    ).rejects.toThrow("Tick");
+
+    for (const malformed of [
+      batch([]),
+      batch([tick(time), tick(time)]),
+      batch([tick(-1)]),
+      batch([tick("soon")]),
+      batch([{ ...tick(time), vout: -1 }]),
+    ])
+      await expect(
+        verifyExecutedTick(malformed, ACCOUNT_VERIFICATION, rpc),
+      ).rejects.toThrow();
+    await expect(
+      verifyExecutedTick(
+        status,
+        { ...ACCOUNT_VERIFICATION, tickAssetId: "not-hex" },
+        rpc,
+      ),
+    ).rejects.toThrow("32-byte hex");
   });
 });
