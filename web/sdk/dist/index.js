@@ -643,46 +643,61 @@ export function decodePriceData(priceData) {
  */
 export function verifySignedPriceData(details, verification) {
     try {
-        if (!HEX_32.test(verification.stormTreeRoot))
-            return false;
-        assertFeedId(verification.feedId);
-        assertFeedId(verification.decimals);
         if (typeof verification.now !== "bigint" || verification.now < 0n)
             return false;
+        const price = authenticatedPrice(details, verification);
+        return (price !== null &&
+            price.receivedAt <= verification.now &&
+            verification.now < price.validUntil);
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * The rate, when a member of the trusted Storm Tree signed it for the expected
+ * feed and decimals; null otherwise. The time it is read at is the caller's.
+ */
+function authenticatedPrice(details, verification) {
+    try {
+        if (!HEX_32.test(verification.stormTreeRoot))
+            return null;
+        assertFeedId(verification.feedId);
+        assertFeedId(verification.decimals);
         const price = decodePriceData(details.price_data);
         if (price.feedId !== verification.feedId ||
             price.decimals !== verification.decimals ||
-            price.receivedAt > verification.now ||
-            price.validUntil <= verification.now ||
             price.validUntil <= price.receivedAt ||
             price.validUntil - price.receivedAt > PRICE_VALIDITY_SECONDS)
-            return false;
+            return null;
         const { signature, branch, proof } = details.storm_tree_bloom;
         if (!HEX_32.test(branch) ||
             !/^[0-9a-f]{128}$/i.test(signature) ||
             !Array.isArray(proof) ||
             proof.length < 1 ||
             proof.length > MAX_STORM_TREE_DEPTH)
-            return false;
+            return null;
         let root = sha256(new Uint8Array([...hexToBytes(branch), 0x01]));
         for (const sibling of proof) {
             if (typeof sibling.right !== "boolean" || !HEX_32.test(sibling.hash))
-                return false;
+                return null;
             const hash = hexToBytes(sibling.hash);
             root = sha256(new Uint8Array(sibling.right ? [...hash, ...root] : [...root, ...hash]));
         }
         if (bytesToHex(root) !== verification.stormTreeRoot.toLowerCase())
-            return false;
+            return null;
         const tagHash = sha256(utf8ToBytes(PRICE_TAG));
         const message = sha256(new Uint8Array([
             ...tagHash,
             ...tagHash,
             ...hexToBytes(details.price_data),
         ]));
-        return schnorr.verify(hexToBytes(signature), message, hexToBytes(branch));
+        return schnorr.verify(hexToBytes(signature), message, hexToBytes(branch))
+            ? price
+            : null;
     }
     catch {
-        return false;
+        return null;
     }
 }
 export function parseExecutedTick(status) {
@@ -732,14 +747,26 @@ export function parseExecutedSignedPrice(status, verification) {
 }
 /** Check a finalized price and its confirmed, unspent Verifier via an independent chain source. */
 export async function verifyExecutedSignedPrice(status, verification, chain) {
-    if (!HEX_32.test(verification.verifierAssetId) ||
-        !HEX_32.test(verification.verifierTapleafHash))
-        throw new Error("trusted Verifier asset and tapleaf hash must be 32-byte hex");
+    assertVerifierContext(verification);
     const executed = parseExecutedSignedPrice(status, verification);
     if (!executed)
         return null;
-    const branch = executed.signedPrice.storm_tree_bloom.branch;
-    const scriptPubKey = elementsTaprootScript(branch, verification.verifierTapleafHash);
+    await assertIssuedVerifier(executed, verification, chain);
+    return executed;
+}
+function assertTickContext(verification) {
+    if (!HEX_32.test(verification.tickAssetId) ||
+        !HEX_32.test(verification.tickTapleafHash))
+        throw new Error("trusted Tick asset and tapleaf hash must be 32-byte hex");
+}
+function assertVerifierContext(verification) {
+    if (!HEX_32.test(verification.verifierAssetId) ||
+        !HEX_32.test(verification.verifierTapleafHash))
+        throw new Error("trusted Verifier asset and tapleaf hash must be 32-byte hex");
+}
+/** One unit of the Verifier asset, confirmed, unspent and locked to the signing branch. */
+async function assertIssuedVerifier(executed, verification, chain) {
+    const scriptPubKey = elementsTaprootScript(executed.signedPrice.storm_tree_bloom.branch, verification.verifierTapleafHash);
     const utxo = await chain.getUnspentOutput(executed.txid, executed.verifierVout);
     if (!utxo ||
         !Number.isSafeInteger(utxo.confirmations) ||
@@ -748,7 +775,6 @@ export async function verifyExecutedSignedPrice(status, verification, chain) {
         utxo.amountSats !== 1 ||
         utxo.scriptPubKey.toLowerCase() !== scriptPubKey)
         throw new Error("confirmed unspent Verifier does not match the trusted context");
-    return executed;
 }
 /**
  * Check a finalized Tick via an independent chain source: confirmed, unspent,
@@ -756,9 +782,7 @@ export async function verifyExecutedSignedPrice(status, verification, chain) {
  * reported time.
  */
 export async function verifyExecutedTick(status, verification, chain) {
-    if (!HEX_32.test(verification.tickAssetId) ||
-        !HEX_32.test(verification.tickTapleafHash))
-        throw new Error("trusted Tick asset and tapleaf hash must be 32-byte hex");
+    assertTickContext(verification);
     const executed = executedResult(status, "tick-utxo", "Tick");
     if (!executed)
         return null;
@@ -781,6 +805,37 @@ export async function verifyExecutedTick(status, verification, chain) {
         timestamp,
         scriptPubKey,
     };
+}
+/**
+ * Check the Tick and the Verifier one batch issued, as a contract spending
+ * them together does: each is the confirmed, unspent output its covenant
+ * expects, a current member signed the rate, and the rate is still valid at
+ * the time the Tick carries. No clock is read: the pair is held against the
+ * Tick's time alone, which is what `verify_tick_with_price` enforces.
+ */
+export async function verifyExecutedTickWithPrice(status, verification, chain) {
+    assertVerifierContext(verification);
+    assertTickContext(verification);
+    const executed = executedResult(status, "signed-price-data", "Verifier");
+    if (!executed)
+        return null;
+    // The signature is checked before the chain is asked about either output.
+    const signedPrice = JSON.parse(executed.result.payload);
+    const price = authenticatedPrice(signedPrice, verification);
+    if (!price)
+        throw new Error("oracle price does not verify against the trusted context");
+    const tick = await verifyExecutedTick(status, verification, chain);
+    if (!tick)
+        return null;
+    if (BigInt(tick.timestamp) >= price.validUntil)
+        throw new Error("oracle price is not valid at the time of its Tick");
+    const verifier = {
+        txid: executed.txid,
+        verifierVout: executed.result.vout,
+        signedPrice,
+    };
+    await assertIssuedVerifier(verifier, verification, chain);
+    return { ...verifier, tick, price };
 }
 function elementsTaprootScript(internalPublicKey, tapleafHash) {
     const tagHash = sha256(utf8ToBytes("TapTweak/elements"));

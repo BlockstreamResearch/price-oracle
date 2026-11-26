@@ -25,7 +25,9 @@ import {
   verifySignedPriceData,
   verifyExecutedSignedPrice,
   verifyExecutedTick,
+  verifyExecutedTickWithPrice,
   type AccountVerification,
+  type ChainClient,
   type ChainOutput,
   type NetworkVerification,
 } from "../src";
@@ -1596,5 +1598,169 @@ describe("Price Oracle SDK", () => {
     await expect(esplora.getUnspentOutput(txid, -1)).rejects.toThrow(
       "outpoint",
     );
+  });
+
+  test("holds a price against the time of the Tick issued beside it, as the contract does", async () => {
+    const txid = "ab".repeat(32);
+    const verification = {
+      stormTreeRoot: VERIFICATION.stormTreeRoot,
+      feedId: 4,
+      decimals: 8,
+      verifierAssetId: "04".repeat(32),
+      verifierTapleafHash: "05".repeat(32),
+      tickAssetId: ACCOUNT.tick_asset_id,
+      tickTapleafHash: ACCOUNT_VERIFICATION.tickTapleafHash,
+    };
+    const signedPrice = {
+      price_data: PRICE_DATA,
+      storm_tree_bloom: {
+        branch: BRANCH,
+        signature: signSchnorrDigest(PRIVATE_KEY, PRICE_MESSAGE),
+        proof: PROOF,
+      },
+    };
+    const price = {
+      kind: "signed-price-data",
+      vout: 3,
+      payload: JSON.stringify(signedPrice),
+    };
+    // PRICE_DATA is valid from 1700000000 until 1700000300.
+    const batch = (timestamp: number, results: object[] = [price]) => ({
+      status: "executed" as const,
+      payload: JSON.stringify({
+        txid,
+        results: [
+          ...results,
+          {
+            kind: "tick-utxo",
+            vout: 4,
+            payload: JSON.stringify({ timestamp }),
+          },
+        ],
+      }),
+    });
+    const verifier: ChainOutput = {
+      confirmations: 2,
+      asset: verification.verifierAssetId,
+      amountSats: 1,
+      scriptPubKey:
+        "512048bd0653a96f933e9132843281a8d981037ca8342a6a8941039293c69d0b8e91",
+    };
+    const outputs = (
+      timestamp: number,
+    ): Record<number, ChainOutput | null> => ({
+      3: verifier,
+      4: {
+        confirmations: 2,
+        asset: verification.tickAssetId,
+        amountSats: timestamp,
+        scriptPubKey: ACCOUNT.tick_script_pubkey,
+      },
+    });
+    // Any chain source will do: the checks read it through `ChainClient` alone.
+    let reads: number[] = [];
+    const chain = (found: Record<number, ChainOutput | null>): ChainClient => ({
+      getScriptUtxos: async () => [],
+      getUnspentOutput: async (id, vout) => {
+        expect(id).toBe(txid);
+        reads.push(vout);
+        return found[vout] ?? null;
+      },
+    });
+    const verify = (timestamp: number, found = outputs(timestamp)) =>
+      verifyExecutedTickWithPrice(batch(timestamp), verification, chain(found));
+
+    const time = 1_700_000_100;
+    const pair = await verify(time);
+    expect(pair).toMatchObject({
+      txid,
+      verifierVout: 3,
+      signedPrice,
+      tick: { txid, vout: 4, timestamp: time },
+      price: { feedId: 4, price: 10_000_000_000n, validUntil: 1_700_000_300n },
+    });
+    expect(reads).toEqual([4, 3]);
+
+    // The last second the rate covers, and the first it does not.
+    expect((await verify(1_700_000_299))?.tick.timestamp).toBe(1_700_000_299);
+    await expect(verify(1_700_000_300)).rejects.toThrow("time of its Tick");
+    // The contract sets no lower bound: only `time < valid_until`.
+    expect((await verify(1_699_999_000))?.tick.timestamp).toBe(1_699_999_000);
+
+    for (const found of [
+      { ...outputs(time), 3: null },
+      { ...outputs(time), 3: { ...verifier, amountSats: 2 } },
+      { ...outputs(time), 3: { ...verifier, confirmations: 0 } },
+    ])
+      await expect(verify(time, found)).rejects.toThrow("Verifier");
+    for (const found of [
+      { ...outputs(time), 4: null },
+      { ...outputs(time), 4: { ...verifier, amountSats: time } },
+      outputs(time - 1),
+    ])
+      await expect(verify(time, found)).rejects.toThrow("Tick");
+
+    // A forged rate is refused before the chain is asked about anything.
+    reads = [];
+    const forged = {
+      ...price,
+      payload: JSON.stringify({
+        ...signedPrice,
+        price_data: `${PRICE_DATA.slice(0, 31)}1${PRICE_DATA.slice(32)}`,
+      }),
+    };
+    await expect(
+      verifyExecutedTickWithPrice(
+        batch(time, [forged]),
+        verification,
+        chain(outputs(time)),
+      ),
+    ).rejects.toThrow("oracle price does not verify");
+    await expect(
+      verifyExecutedTickWithPrice(
+        batch(time),
+        { ...verification, feedId: 5 },
+        chain(outputs(time)),
+      ),
+    ).rejects.toThrow("oracle price does not verify");
+    expect(reads).toEqual([]);
+
+    // A batch has to hold exactly one of each.
+    await expect(
+      verifyExecutedTickWithPrice(
+        batch(time, []),
+        verification,
+        chain(outputs(time)),
+      ),
+    ).rejects.toThrow("Verifier");
+    await expect(
+      verifyExecutedTickWithPrice(
+        {
+          status: "executed",
+          payload: JSON.stringify({ txid, results: [price] }),
+        },
+        verification,
+        chain(outputs(time)),
+      ),
+    ).rejects.toThrow("Tick");
+    for (const status of ["processing", "included"] as const)
+      expect(
+        await verifyExecutedTickWithPrice(
+          { ...batch(time), status },
+          verification,
+          chain(outputs(time)),
+        ),
+      ).toBeNull();
+    for (const broken of [
+      { verifierAssetId: "not-hex" },
+      { tickTapleafHash: "not-hex" },
+    ])
+      await expect(
+        verifyExecutedTickWithPrice(
+          batch(time),
+          { ...verification, ...broken },
+          chain(outputs(time)),
+        ),
+      ).rejects.toThrow("32-byte hex");
   });
 });
