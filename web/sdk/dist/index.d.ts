@@ -1,4 +1,22 @@
 export declare const WALLET_REQUEST_SIGNATURE_SCHEME = "bitcoin-signed-message-ecdsa-v1";
+/** `fetch`, as far as the SDK calls it. */
+export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+export type OracleErrorCode = "invalid_request" | "unauthorized" | "not_found" | "conflict"
+/** A 408, or no answer within the client's `timeoutMs` (status 0). */
+ | "timeout" | "rate_limited"
+/** The node answered, but only the coordinator serves this route. */
+ | "not_coordinator" | "unavailable" | "server_error"
+/** A success whose body is not JSON. */
+ | "invalid_response"
+/** No node answered. */
+ | "network";
+/** A node answer that is not a success, or no answer at all. */
+export declare class OracleApiError extends Error {
+    readonly code: OracleErrorCode;
+    /** The HTTP status; 0 when the node did not answer. */
+    readonly status: number;
+    constructor(message: string, code: OracleErrorCode, status: number, options?: ErrorOptions);
+}
 export type OracleNetwork = "liquidv1" | "liquidtestnet" | "elementsregtest";
 /** The active network assets and Storm Tree root, as the coordinator reports them. */
 export type OracleNetworkInfo = {
@@ -195,7 +213,7 @@ export type RpcOptions = {
     url: string;
     username?: string;
     password?: string;
-    fetch?: typeof globalThis.fetch;
+    fetch?: FetchLike;
 };
 export declare class ElementsRpcClient {
     #private;
@@ -205,9 +223,28 @@ export declare class ElementsRpcClient {
     getTransactionConfirmations(txid: string): Promise<number>;
     broadcast(transactionHex: string, maxBurnSats?: number): Promise<string>;
 }
+export type OracleClientOptions = {
+    fetch?: FetchLike;
+    /**
+     * Extra attempts for a read no node answered in time, or answered with 408,
+     * 429 or a server error; 2 by default. A submission is never repeated.
+     */
+    retries?: number;
+    /** Pause before the first retry, doubled for each later one; 500 ms by default. */
+    retryDelayMs?: number;
+    /** How long one node is given to answer; 15 seconds by default. */
+    timeoutMs?: number;
+};
 export declare class PriceOracleClient {
     #private;
-    constructor(coordinatorUrl: string, fetcher?: typeof fetch);
+    /**
+     * `nodeUrls` is the coordinator, or several members of the network: only
+     * the coordinator serves requests and prices, and the role moves, so the
+     * client asks the others when one answers that it is not the coordinator.
+     */
+    constructor(nodeUrls: string | readonly string[], options?: FetchLike | OracleClientOptions);
+    /** The node the next call goes to first. */
+    get nodeUrl(): string;
     /**
      * Read the active network assets and Storm Tree root. They are the
      * coordinator's own claims: pin the values held from an independent source

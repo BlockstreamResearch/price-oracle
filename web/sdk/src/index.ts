@@ -18,6 +18,49 @@ const NETWORKS: readonly string[] = [
   "liquidtestnet",
   "elementsregtest",
 ];
+const NOT_COORDINATOR = "this node is not the coordinator";
+
+/** `fetch`, as far as the SDK calls it. */
+export type FetchLike = (
+  input: string,
+  init?: RequestInit,
+) => Promise<Response>;
+
+export type OracleErrorCode =
+  | "invalid_request"
+  | "unauthorized"
+  | "not_found"
+  | "conflict"
+  /** A 408, or no answer within the client's `timeoutMs` (status 0). */
+  | "timeout"
+  | "rate_limited"
+  /** The node answered, but only the coordinator serves this route. */
+  | "not_coordinator"
+  | "unavailable"
+  | "server_error"
+  /** A success whose body is not JSON. */
+  | "invalid_response"
+  /** No node answered. */
+  | "network";
+
+/** A node answer that is not a success, or no answer at all. */
+export class OracleApiError extends Error {
+  readonly code: OracleErrorCode;
+  /** The HTTP status; 0 when the node did not answer. */
+  readonly status: number;
+
+  constructor(
+    message: string,
+    code: OracleErrorCode,
+    status: number,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "OracleApiError";
+    this.code = code;
+    this.status = status;
+  }
+}
 
 export type OracleNetwork = "liquidv1" | "liquidtestnet" | "elementsregtest";
 
@@ -225,7 +268,7 @@ export type RpcOptions = {
   url: string;
   username?: string;
   password?: string;
-  fetch?: typeof globalThis.fetch;
+  fetch?: FetchLike;
 };
 
 export class ElementsRpcClient {
@@ -314,17 +357,63 @@ export class ElementsRpcClient {
   }
 }
 
-export class PriceOracleClient {
-  readonly #coordinatorUrl: string;
-  readonly #fetch: typeof globalThis.fetch;
+export type OracleClientOptions = {
+  fetch?: FetchLike;
+  /**
+   * Extra attempts for a read no node answered in time, or answered with 408,
+   * 429 or a server error; 2 by default. A submission is never repeated.
+   */
+  retries?: number;
+  /** Pause before the first retry, doubled for each later one; 500 ms by default. */
+  retryDelayMs?: number;
+  /** How long one node is given to answer; 15 seconds by default. */
+  timeoutMs?: number;
+};
 
-  constructor(coordinatorUrl: string, fetcher = globalThis.fetch) {
-    const url = new URL(coordinatorUrl);
-    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-    if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
-      throw new Error("coordinator URL must use HTTPS (HTTP is loopback-only)");
-    this.#coordinatorUrl = coordinatorUrl.replace(/\/$/, "");
+export class PriceOracleClient {
+  readonly #urls: string[];
+  readonly #fetch: FetchLike;
+  readonly #retries: number;
+  readonly #retryDelayMs: number;
+  readonly #timeoutMs: number;
+  /** The node that answered last; the next call starts from it. */
+  #active = 0;
+
+  /**
+   * `nodeUrls` is the coordinator, or several members of the network: only
+   * the coordinator serves requests and prices, and the role moves, so the
+   * client asks the others when one answers that it is not the coordinator.
+   */
+  constructor(
+    nodeUrls: string | readonly string[],
+    options: FetchLike | OracleClientOptions = {},
+  ) {
+    const {
+      fetch: fetcher = globalThis.fetch,
+      retries = 2,
+      retryDelayMs = 500,
+      timeoutMs = 15_000,
+    } = typeof options === "function" ? { fetch: options } : options;
+    const urls = typeof nodeUrls === "string" ? [nodeUrls] : [...nodeUrls];
+    if (urls.length === 0)
+      throw new Error("at least one coordinator URL is required");
+    for (const url of urls) assertSecureUrl(url, "coordinator URL");
+    if (!Number.isInteger(retries) || retries < 0 || !(retryDelayMs >= 0))
+      throw new Error(
+        "retries must be a non-negative integer and their delay non-negative milliseconds",
+      );
+    if (!(timeoutMs > 0))
+      throw new Error("timeoutMs must be positive milliseconds");
+    this.#urls = urls.map((url) => url.replace(/\/$/, ""));
     this.#fetch = fetcher.bind(globalThis);
+    this.#retries = retries;
+    this.#retryDelayMs = retryDelayMs;
+    this.#timeoutMs = timeoutMs;
+  }
+
+  /** The node the next call goes to first. */
+  get nodeUrl(): string {
+    return this.#urls[this.#active] as string;
   }
 
   /**
@@ -416,18 +505,34 @@ export class PriceOracleClient {
   async submitTickRequest(
     request: TickRequest,
   ): Promise<{ request_hash: string }> {
-    return this.#json("/users/requests", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(request),
-    });
+    return this.#json(
+      "/users/requests",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request),
+      },
+      false,
+    );
   }
 
   getTickRequest(requestHash: string): Promise<TickRequestStatus> {
+    return this.#tickRequest(requestHash);
+  }
+
+  #tickRequest(
+    requestHash: string,
+    signal?: AbortSignal,
+  ): Promise<TickRequestStatus> {
     if (!HEX_32.test(requestHash)) {
       throw new Error("request hash must be 32-byte hex");
     }
-    return this.#json(`/users/requests/${requestHash}`);
+    return this.#json(
+      `/users/requests/${requestHash}`,
+      undefined,
+      true,
+      signal,
+    );
   }
 
   /**
@@ -442,21 +547,36 @@ export class PriceOracleClient {
     if (!(timeoutMs > 0) || !(intervalMs > 0))
       throw new Error("timeout and interval must be positive milliseconds");
 
+    signal?.throwIfAborted();
+
+    // Ends a status read or a pause that the caller aborts or that would
+    // outlast the wait, so a node that stops answering cannot hold it.
+    const stop = new AbortController();
+    const expired = new Error("the wait expired");
+    const timer = setTimeout(() => stop.abort(expired), timeoutMs);
+    const forward = () => stop.abort(signal?.reason);
+    signal?.addEventListener("abort", forward, { once: true });
     const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      signal?.throwIfAborted();
-      const status = await this.getTickRequest(requestHash);
-      options.onStatus?.(status);
-      if (status.status === "executed") return status;
-      if (status.status === "failed")
-        throw new Error(
-          `user request failed: ${status.payload ?? "no reason given"}`,
-        );
-      if (Date.now() + intervalMs > deadline)
-        throw new Error(
-          `user request is still ${status.status} after ${timeoutMs} ms`,
-        );
-      await sleep(intervalMs, signal);
+    let status: TickRequestStatus | undefined;
+    try {
+      for (;;) {
+        status = await this.#tickRequest(requestHash, stop.signal);
+        options.onStatus?.(status);
+        if (status.status === "executed") return status;
+        if (status.status === "failed")
+          throw new Error(
+            `user request failed: ${status.payload ?? "no reason given"}`,
+          );
+        if (Date.now() + intervalMs > deadline)
+          throw stillWaiting(status, timeoutMs);
+        await sleep(intervalMs, stop.signal);
+      }
+    } catch (error) {
+      if (error === expired) throw stillWaiting(status, timeoutMs);
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", forward);
     }
   }
 
@@ -469,19 +589,90 @@ export class PriceOracleClient {
     return this.#json(`/price-feeds/${feedId}`);
   }
 
-  async #json<Result>(path: string, init?: RequestInit): Promise<Result> {
-    const response = await this.#fetch(`${this.#coordinatorUrl}${path}`, {
-      ...init,
-      redirect: "error",
-    });
-    const body = (await response.json()) as Result | { error: string };
-    if (!response.ok) {
-      throw new Error(
-        "error" in (body as object)
-          ? (body as { error: string }).error
-          : `HTTP ${response.status}`,
+  /**
+   * `repeatable` is false for a submission: a node that did not answer may
+   * still have queued it, so it is neither retried nor sent to another node.
+   */
+  async #json<Result>(
+    path: string,
+    init?: RequestInit,
+    repeatable = true,
+    signal?: AbortSignal,
+  ): Promise<Result> {
+    for (let attempt = 0; ; attempt++) {
+      let failure: OracleApiError | undefined;
+      // One pass over the nodes, from the one that answered last.
+      for (let offset = 0; offset < this.#urls.length; offset++) {
+        const index = (this.#active + offset) % this.#urls.length;
+        try {
+          const result = await this.#request<Result>(index, path, init, signal);
+          this.#active = index;
+          return result;
+        } catch (error) {
+          if (!(error instanceof OracleApiError)) throw error;
+          // "Not the coordinator" says the least about why the call failed.
+          if (failure === undefined || failure.code === "not_coordinator")
+            failure = error;
+          const elsewhere =
+            error.code === "not_coordinator" ||
+            (repeatable && isTransient(error));
+          if (!elsewhere) break;
+        }
+      }
+      const error = failure as OracleApiError;
+      if (!repeatable || !isTransient(error) || attempt >= this.#retries)
+        throw error;
+      await sleep(this.#retryDelayMs * 2 ** attempt, signal);
+    }
+  }
+
+  async #request<Result>(
+    node: number,
+    path: string,
+    init?: RequestInit,
+    signal?: AbortSignal,
+  ): Promise<Result> {
+    let response: Response;
+    let text: string;
+    try {
+      ({ response, text } = await fetchText(
+        this.#fetch,
+        `${this.#urls[node]}${path}`,
+        { ...init, redirect: "error" },
+        this.#timeoutMs,
+        signal,
+      ));
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason;
+      const late = error instanceof RequestTimeout;
+      throw new OracleApiError(
+        late
+          ? `node did not answer within ${this.#timeoutMs} ms`
+          : error instanceof Error
+            ? error.message
+            : String(error),
+        late ? "timeout" : "network",
+        0,
+        { cause: error },
       );
     }
+    const body = parseJson(text);
+    if (!response.ok) {
+      const reported = (body as { error?: unknown } | null | undefined)?.error;
+      const message =
+        typeof reported === "string" ? reported : `HTTP ${response.status}`;
+      throw new OracleApiError(
+        message,
+        oracleErrorCode(response.status, message),
+        response.status,
+      );
+    }
+    if (body === undefined)
+      throw new OracleApiError(
+        "coordinator returned a response that is not JSON",
+        "invalid_response",
+        response.status,
+      );
     return body as Result;
   }
 }
@@ -1051,6 +1242,72 @@ export function createTickSpendPlan(
   };
 }
 
+/** Why a wait ended before the request was final. */
+function stillWaiting(
+  status: TickRequestStatus | undefined,
+  timeoutMs: number,
+): Error {
+  return new Error(
+    status === undefined
+      ? `user request status was not read within ${timeoutMs} ms`
+      : `user request is still ${status.status} after ${timeoutMs} ms`,
+  );
+}
+
+/** A failure that asking again, or asking another node, may get past. */
+function isTransient(error: OracleApiError): boolean {
+  return [
+    "network",
+    "timeout",
+    "rate_limited",
+    "unavailable",
+    "server_error",
+  ].includes(error.code);
+}
+
+/** No answer, or no whole body, within the time a request is given. */
+class RequestTimeout extends Error {}
+
+/**
+ * `fetch` and the body of its answer, given up once `timeoutMs` pass or
+ * `signal` aborts, whether or not the fetch implementation heeds its signal.
+ */
+async function fetchText(
+  fetcher: FetchLike,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<{ response: Response; text: string }> {
+  signal?.throwIfAborted();
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () =>
+      controller.abort(new RequestTimeout(`no answer within ${timeoutMs} ms`)),
+    timeoutMs,
+  );
+  const forward = () => controller.abort(signal?.reason);
+  signal?.addEventListener("abort", forward, { once: true });
+  const stopped = new Promise<never>((_, reject) =>
+    controller.signal.addEventListener(
+      "abort",
+      () => reject(controller.signal.reason),
+      { once: true },
+    ),
+  );
+  try {
+    const response = await Promise.race([
+      fetcher(url, { ...init, signal: controller.signal }),
+      stopped,
+    ]);
+    const text = await Promise.race([response.text(), stopped]);
+    return { response, text };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", forward);
+  }
+}
+
 function sleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(signal.reason);
@@ -1088,6 +1345,34 @@ function assertXOnlyPublicKey(publicKey: string): void {
     throw new Error("public key must be 32-byte x-only hex");
   }
   schnorr.utils.lift_x(BigInt(`0x${publicKey}`));
+}
+
+function assertSecureUrl(value: string, name: string): void {
+  const url = new URL(value);
+  const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
+    throw new Error(`${name} must use HTTPS (HTTP is loopback-only)`);
+}
+
+function oracleErrorCode(status: number, message: string): OracleErrorCode {
+  if (status === 503)
+    return message === NOT_COORDINATOR ? "not_coordinator" : "unavailable";
+  if (status >= 500) return "server_error";
+  if (status === 401 || status === 403) return "unauthorized";
+  if (status === 404) return "not_found";
+  if (status === 408) return "timeout";
+  if (status === 409) return "conflict";
+  if (status === 429) return "rate_limited";
+  return "invalid_request";
+}
+
+/** The parsed body, or undefined when it is not JSON. */
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
 }
 
 function assertHex(value: string, name: string): void {

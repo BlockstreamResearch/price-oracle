@@ -38,6 +38,48 @@ const status = await oracle.waitForTickRequest(request_hash);
 const tick = await verifyExecutedTick(status, verification, elements);
 ```
 
+## Errors, Retries and Several Nodes
+
+A failed coordinator call throws an `OracleApiError`. Its `message` is the
+node's reason, `status` the HTTP status, and `code` what kind of failure it
+was: `invalid_request`, `unauthorized`, `not_found`, `conflict`, `timeout`,
+`rate_limited`, `not_coordinator`, `unavailable`, `server_error`,
+`invalid_response`, or `network` when no node answered. A node is given 15
+seconds to answer; one that does not counts as a `timeout` with `status` 0.
+
+```ts
+try {
+  await oracle.submitTickRequest(request);
+} catch (error) {
+  if (error instanceof OracleApiError && error.code === "conflict") {
+    // Already queued, or a fee UTXO is taken by another request.
+  }
+}
+```
+
+A read is repeated when no node answered it in time or one answered 408, 429
+or a server error (5xx): twice by default, after 500 ms and then 1 s.
+`new PriceOracleClient(url, { retries, retryDelayMs, timeoutMs })` changes
+that, and `retries: 0` turns it off. A submission is never repeated: a node that
+did not answer, or failed while handling it, may still have queued it, and
+sending it again answers `conflict` if it did.
+
+Only the coordinator serves requests and prices, and the role moves between
+members. Given several node URLs, the client asks the next one when a node
+answers that it is not the coordinator, and for reads also when a node fails
+in a way worth repeating, then stays with the one that answered:
+
+```ts
+const oracle = new PriceOracleClient([
+  "https://node-1.example",
+  "https://node-2.example",
+  "https://node-3.example",
+]);
+```
+
+`oracle.nodeUrl` is the node the next call goes to first. Every URL must be a
+member of the same network; none of them replaces the trust anchors below.
+
 ## Network Metadata
 
 `getNetwork()` reads the active `network`, the Storm Eye, Tick and Oracle
@@ -70,7 +112,10 @@ orphan. A `failed` request rejects with the coordinator's reason.
 `options` takes `timeoutMs` (15 minutes by default), `intervalMs` (5 seconds),
 an `AbortSignal`, and an `onStatus` callback called with every status read. A
 timeout or abort ends the wait, not the request: it stays queued and can be
-waited on again. An error from a status read is not retried.
+waited on again. A status read is retried like any other read, and an error
+that outlasts the retries ends the wait. The timeout and the signal also cut
+short a status read in progress, so a node that stops answering cannot hold the
+wait past them.
 
 Issuance follows block production. With one-minute blocks and two finality
 confirmations a request takes a few minutes, and a priced one can wait up to ten

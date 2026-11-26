@@ -15,6 +15,19 @@ const NETWORKS = [
     "liquidtestnet",
     "elementsregtest",
 ];
+const NOT_COORDINATOR = "this node is not the coordinator";
+/** A node answer that is not a success, or no answer at all. */
+export class OracleApiError extends Error {
+    code;
+    /** The HTTP status; 0 when the node did not answer. */
+    status;
+    constructor(message, code, status, options) {
+        super(message, options);
+        this.name = "OracleApiError";
+        this.code = code;
+        this.status = status;
+    }
+}
 export class ElementsRpcClient {
     #options;
     #requestId = 0;
@@ -79,15 +92,38 @@ export class ElementsRpcClient {
     }
 }
 export class PriceOracleClient {
-    #coordinatorUrl;
+    #urls;
     #fetch;
-    constructor(coordinatorUrl, fetcher = globalThis.fetch) {
-        const url = new URL(coordinatorUrl);
-        const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-        if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
-            throw new Error("coordinator URL must use HTTPS (HTTP is loopback-only)");
-        this.#coordinatorUrl = coordinatorUrl.replace(/\/$/, "");
+    #retries;
+    #retryDelayMs;
+    #timeoutMs;
+    /** The node that answered last; the next call starts from it. */
+    #active = 0;
+    /**
+     * `nodeUrls` is the coordinator, or several members of the network: only
+     * the coordinator serves requests and prices, and the role moves, so the
+     * client asks the others when one answers that it is not the coordinator.
+     */
+    constructor(nodeUrls, options = {}) {
+        const { fetch: fetcher = globalThis.fetch, retries = 2, retryDelayMs = 500, timeoutMs = 15_000, } = typeof options === "function" ? { fetch: options } : options;
+        const urls = typeof nodeUrls === "string" ? [nodeUrls] : [...nodeUrls];
+        if (urls.length === 0)
+            throw new Error("at least one coordinator URL is required");
+        for (const url of urls)
+            assertSecureUrl(url, "coordinator URL");
+        if (!Number.isInteger(retries) || retries < 0 || !(retryDelayMs >= 0))
+            throw new Error("retries must be a non-negative integer and their delay non-negative milliseconds");
+        if (!(timeoutMs > 0))
+            throw new Error("timeoutMs must be positive milliseconds");
+        this.#urls = urls.map((url) => url.replace(/\/$/, ""));
         this.#fetch = fetcher.bind(globalThis);
+        this.#retries = retries;
+        this.#retryDelayMs = retryDelayMs;
+        this.#timeoutMs = timeoutMs;
+    }
+    /** The node the next call goes to first. */
+    get nodeUrl() {
+        return this.#urls[this.#active];
     }
     /**
      * Read the active network assets and Storm Tree root. They are the
@@ -149,13 +185,16 @@ export class PriceOracleClient {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(request),
-        });
+        }, false);
     }
     getTickRequest(requestHash) {
+        return this.#tickRequest(requestHash);
+    }
+    #tickRequest(requestHash, signal) {
         if (!HEX_32.test(requestHash)) {
             throw new Error("request hash must be 32-byte hex");
         }
-        return this.#json(`/users/requests/${requestHash}`);
+        return this.#json(`/users/requests/${requestHash}`, undefined, true, signal);
     }
     /**
      * Poll a request until it is `executed`. A `failed` request rejects with the
@@ -165,18 +204,37 @@ export class PriceOracleClient {
         const { timeoutMs = 900_000, intervalMs = 5_000, signal } = options;
         if (!(timeoutMs > 0) || !(intervalMs > 0))
             throw new Error("timeout and interval must be positive milliseconds");
+        signal?.throwIfAborted();
+        // Ends a status read or a pause that the caller aborts or that would
+        // outlast the wait, so a node that stops answering cannot hold it.
+        const stop = new AbortController();
+        const expired = new Error("the wait expired");
+        const timer = setTimeout(() => stop.abort(expired), timeoutMs);
+        const forward = () => stop.abort(signal?.reason);
+        signal?.addEventListener("abort", forward, { once: true });
         const deadline = Date.now() + timeoutMs;
-        for (;;) {
-            signal?.throwIfAborted();
-            const status = await this.getTickRequest(requestHash);
-            options.onStatus?.(status);
-            if (status.status === "executed")
-                return status;
-            if (status.status === "failed")
-                throw new Error(`user request failed: ${status.payload ?? "no reason given"}`);
-            if (Date.now() + intervalMs > deadline)
-                throw new Error(`user request is still ${status.status} after ${timeoutMs} ms`);
-            await sleep(intervalMs, signal);
+        let status;
+        try {
+            for (;;) {
+                status = await this.#tickRequest(requestHash, stop.signal);
+                options.onStatus?.(status);
+                if (status.status === "executed")
+                    return status;
+                if (status.status === "failed")
+                    throw new Error(`user request failed: ${status.payload ?? "no reason given"}`);
+                if (Date.now() + intervalMs > deadline)
+                    throw stillWaiting(status, timeoutMs);
+                await sleep(intervalMs, stop.signal);
+            }
+        }
+        catch (error) {
+            if (error === expired)
+                throw stillWaiting(status, timeoutMs);
+            throw error;
+        }
+        finally {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", forward);
         }
     }
     getPriceFeeds() {
@@ -186,17 +244,63 @@ export class PriceOracleClient {
         assertFeedId(feedId);
         return this.#json(`/price-feeds/${feedId}`);
     }
-    async #json(path, init) {
-        const response = await this.#fetch(`${this.#coordinatorUrl}${path}`, {
-            ...init,
-            redirect: "error",
-        });
-        const body = (await response.json());
-        if (!response.ok) {
-            throw new Error("error" in body
-                ? body.error
-                : `HTTP ${response.status}`);
+    /**
+     * `repeatable` is false for a submission: a node that did not answer may
+     * still have queued it, so it is neither retried nor sent to another node.
+     */
+    async #json(path, init, repeatable = true, signal) {
+        for (let attempt = 0;; attempt++) {
+            let failure;
+            // One pass over the nodes, from the one that answered last.
+            for (let offset = 0; offset < this.#urls.length; offset++) {
+                const index = (this.#active + offset) % this.#urls.length;
+                try {
+                    const result = await this.#request(index, path, init, signal);
+                    this.#active = index;
+                    return result;
+                }
+                catch (error) {
+                    if (!(error instanceof OracleApiError))
+                        throw error;
+                    // "Not the coordinator" says the least about why the call failed.
+                    if (failure === undefined || failure.code === "not_coordinator")
+                        failure = error;
+                    const elsewhere = error.code === "not_coordinator" ||
+                        (repeatable && isTransient(error));
+                    if (!elsewhere)
+                        break;
+                }
+            }
+            const error = failure;
+            if (!repeatable || !isTransient(error) || attempt >= this.#retries)
+                throw error;
+            await sleep(this.#retryDelayMs * 2 ** attempt, signal);
         }
+    }
+    async #request(node, path, init, signal) {
+        let response;
+        let text;
+        try {
+            ({ response, text } = await fetchText(this.#fetch, `${this.#urls[node]}${path}`, { ...init, redirect: "error" }, this.#timeoutMs, signal));
+        }
+        catch (error) {
+            if (signal?.aborted)
+                throw signal.reason;
+            const late = error instanceof RequestTimeout;
+            throw new OracleApiError(late
+                ? `node did not answer within ${this.#timeoutMs} ms`
+                : error instanceof Error
+                    ? error.message
+                    : String(error), late ? "timeout" : "network", 0, { cause: error });
+        }
+        const body = parseJson(text);
+        if (!response.ok) {
+            const reported = body?.error;
+            const message = typeof reported === "string" ? reported : `HTTP ${response.status}`;
+            throw new OracleApiError(message, oracleErrorCode(response.status, message), response.status);
+        }
+        if (body === undefined)
+            throw new OracleApiError("coordinator returned a response that is not JSON", "invalid_response", response.status);
         return body;
     }
 }
@@ -593,6 +697,49 @@ export function createTickSpendPlan(tick, resolution) {
         },
     };
 }
+/** Why a wait ended before the request was final. */
+function stillWaiting(status, timeoutMs) {
+    return new Error(status === undefined
+        ? `user request status was not read within ${timeoutMs} ms`
+        : `user request is still ${status.status} after ${timeoutMs} ms`);
+}
+/** A failure that asking again, or asking another node, may get past. */
+function isTransient(error) {
+    return [
+        "network",
+        "timeout",
+        "rate_limited",
+        "unavailable",
+        "server_error",
+    ].includes(error.code);
+}
+/** No answer, or no whole body, within the time a request is given. */
+class RequestTimeout extends Error {
+}
+/**
+ * `fetch` and the body of its answer, given up once `timeoutMs` pass or
+ * `signal` aborts, whether or not the fetch implementation heeds its signal.
+ */
+async function fetchText(fetcher, url, init, timeoutMs, signal) {
+    signal?.throwIfAborted();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new RequestTimeout(`no answer within ${timeoutMs} ms`)), timeoutMs);
+    const forward = () => controller.abort(signal?.reason);
+    signal?.addEventListener("abort", forward, { once: true });
+    const stopped = new Promise((_, reject) => controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true }));
+    try {
+        const response = await Promise.race([
+            fetcher(url, { ...init, signal: controller.signal }),
+            stopped,
+        ]);
+        const text = await Promise.race([response.text(), stopped]);
+        return { response, text };
+    }
+    finally {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", forward);
+    }
+}
 function sleep(milliseconds, signal) {
     return new Promise((resolve, reject) => {
         if (signal?.aborted)
@@ -628,6 +775,38 @@ function assertXOnlyPublicKey(publicKey) {
         throw new Error("public key must be 32-byte x-only hex");
     }
     schnorr.utils.lift_x(BigInt(`0x${publicKey}`));
+}
+function assertSecureUrl(value, name) {
+    const url = new URL(value);
+    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
+        throw new Error(`${name} must use HTTPS (HTTP is loopback-only)`);
+}
+function oracleErrorCode(status, message) {
+    if (status === 503)
+        return message === NOT_COORDINATOR ? "not_coordinator" : "unavailable";
+    if (status >= 500)
+        return "server_error";
+    if (status === 401 || status === 403)
+        return "unauthorized";
+    if (status === 404)
+        return "not_found";
+    if (status === 408)
+        return "timeout";
+    if (status === 409)
+        return "conflict";
+    if (status === 429)
+        return "rate_limited";
+    return "invalid_request";
+}
+/** The parsed body, or undefined when it is not JSON. */
+function parseJson(text) {
+    try {
+        return JSON.parse(text);
+    }
+    catch {
+        return undefined;
+    }
 }
 function assertHex(value, name) {
     if (value.length === 0 ||
