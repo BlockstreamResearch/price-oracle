@@ -55,6 +55,16 @@ jobs:
         run: >
           cargo test --workspace --exclude contracts --all-targets --all-features --locked
 
+      # The web SDK's leaf compiler is a workspace of its own, built against
+      # the nodes' locked compiler and tested against the contracts crate.
+      - name: Check the web SDK leaf compiler
+        timeout-minutes: 20
+        run: |
+          cp Cargo.lock web/sdk/leaves/Cargo.lock
+          cargo fmt --manifest-path web/sdk/leaves/Cargo.toml --check
+          cargo clippy --manifest-path web/sdk/leaves/Cargo.toml --target-dir target --all-targets -- -D warnings
+          cargo test --manifest-path web/sdk/leaves/Cargo.toml --target-dir target
+
   prometheus:
     name: Prometheus rules
     runs-on: ubuntu-latest

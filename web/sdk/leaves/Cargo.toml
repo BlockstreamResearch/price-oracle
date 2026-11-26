@@ -1,0 +1,31 @@
+[package]
+name = "price-oracle-leaves"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# The compiler alone: the contracts crate also brings its test and network
+# tooling, which does not build for WebAssembly. The tests hold every leaf
+# against the one that crate compiles.
+[dependencies]
+simplicityhl = { version = "0.8.0", features = ["serde"] }
+hex = "0.4.3"
+
+[dev-dependencies]
+contracts = { path = "../../../contracts" }
+simplex = { package = "smplx-std", version = "0.1.1" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Built on its own, outside the node workspace: the node images copy only the
+# workspace members, and this crate targets WebAssembly. Cargo.lock is copied
+# from the workspace, so the compiler is the version the nodes run.
+[workspace]
