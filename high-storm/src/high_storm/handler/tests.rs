@@ -292,3 +292,16 @@ async fn a_rejected_notice_of_a_broadcast_is_no_refusal_to_sign() {
         assert!(rendered.contains(&line), "missing {line:?} in:\n{rendered}");
     }
 }
+
+#[test]
+fn shared_helper_failures_in_user_requests_still_count_as_invalid_proposals() {
+    use crate::high_storm::{TransactionHelperError, UserRequestError};
+
+    for helper in [
+        TransactionHelperError::Invalid("required UTXO is unavailable".into()),
+        TransactionHelperError::Pset("missing input".into()),
+    ] {
+        let error = HandlerError::UserRequest(UserRequestError::TransactionHelper(helper));
+        assert_eq!(error.refusal_reason(), Some("invalid"));
+    }
+}

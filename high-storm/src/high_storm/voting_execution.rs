@@ -82,7 +82,7 @@ pub enum VotingExecutionError {
     #[error("failed to evaluate network covenant: {0}")]
     Program(#[from] simplex::program::ProgramError),
     #[error("shared transaction validation failed: {0}")]
-    TransactionHelper(#[from] super::user_requests::UserRequestError),
+    TransactionHelper(#[from] super::elements::TransactionHelperError),
     #[error("distributed signing failed: {0}")]
     Signing(#[from] super::signing::SigningError),
     #[error("failed to extract final voting transaction: {0}")]

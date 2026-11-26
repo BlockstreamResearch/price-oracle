@@ -196,6 +196,8 @@ pub enum UserRequestError {
     Pset(String),
     #[error("the instructed price was refused: {0}")]
     InstructedPrice(#[from] price_feed::ValidationError),
+    #[error(transparent)]
+    TransactionHelper(#[from] super::elements::TransactionHelperError),
 }
 
 #[derive(Clone)]
@@ -976,11 +978,11 @@ impl UserRequestProcessor {
 
 impl PreparedRound {
     fn estimated_weight(&self) -> Result<usize, UserRequestError> {
-        finalized_dummy_weight(
+        Ok(finalized_dummy_weight(
             &self.final_transaction,
             &self.transaction.pset,
             &self.transaction.network,
-        )
+        )?)
     }
 }
 
@@ -1447,7 +1449,11 @@ fn get_confirmed_fee_outpoint(
         return Ok(None);
     }
 
-    explicit_outpoint(txid, outpoint.output_index, output).map(Some)
+    Ok(Some(explicit_outpoint(
+        txid,
+        outpoint.output_index,
+        output,
+    )?))
 }
 
 fn get_raw_transaction(

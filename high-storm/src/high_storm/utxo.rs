@@ -15,7 +15,7 @@ use simplex::{
 
 use crate::external_api::fee_utxo::parse_coin_value;
 
-use super::user_requests::UserRequestError;
+use super::elements::TransactionHelperError;
 
 #[derive(Clone, Copy)]
 pub(crate) enum StormEyePool {
@@ -31,9 +31,10 @@ pub(crate) fn find_contract_utxo(
     script: &[u8],
     expected_asset: Option<[u8; 32]>,
     pool: StormEyePool,
-) -> Result<UTXO, UserRequestError> {
+) -> Result<UTXO, TransactionHelperError> {
     let candidates = scan_contract_utxos(client, script, expected_asset)?;
-    let unavailable = || UserRequestError::Invalid("required Storm Eye pool is unavailable".into());
+    let unavailable =
+        || TransactionHelperError::Invalid("required Storm Eye pool is unavailable".into());
     if let StormEyePool::AnyNetworkLeader = pool {
         return candidates[candidates.len() / 2..]
             .iter()
@@ -46,7 +47,7 @@ pub(crate) fn find_contract_utxo(
         .and_then(|index| candidates.get(index))
         .ok_or_else(unavailable)?;
     if *spent_in_mempool {
-        return Err(UserRequestError::Invalid(
+        return Err(TransactionHelperError::Invalid(
             "Storm Eye lane was already used in this block".into(),
         ));
     }
@@ -59,7 +60,7 @@ pub(super) fn scan_contract_utxos(
     client: &Client,
     script: &[u8],
     expected_asset: Option<[u8; 32]>,
-) -> Result<Vec<(UTXO, bool)>, UserRequestError> {
+) -> Result<Vec<(UTXO, bool)>, TransactionHelperError> {
     let descriptor = format!("raw({})", hex::encode(script));
     let scan: ScanResult = client.call(
         "scantxoutset",
@@ -71,7 +72,7 @@ pub(super) fn scan_contract_utxos(
             continue;
         }
         let txid = Txid::from_str(&unspent.txid)
-            .map_err(|_| UserRequestError::Invalid("invalid scanned UTXO txid".into()))?;
+            .map_err(|_| TransactionHelperError::Invalid("invalid scanned UTXO txid".into()))?;
         let Some(utxo) =
             get_optional_explicit_outpoint_ignoring_mempool(client, txid, unspent.vout)?
         else {
@@ -131,16 +132,16 @@ pub(crate) fn get_explicit_outpoint(
     client: &Client,
     txid: Txid,
     output_index: u32,
-) -> Result<UTXO, UserRequestError> {
+) -> Result<UTXO, TransactionHelperError> {
     get_optional_explicit_outpoint(client, txid, output_index)?
-        .ok_or_else(|| UserRequestError::Invalid("required UTXO is unavailable".into()))
+        .ok_or_else(|| TransactionHelperError::Invalid("required UTXO is unavailable".into()))
 }
 
 pub(crate) fn get_optional_explicit_outpoint(
     client: &Client,
     txid: Txid,
     output_index: u32,
-) -> Result<Option<UTXO>, UserRequestError> {
+) -> Result<Option<UTXO>, TransactionHelperError> {
     get_optional_explicit_outpoint_with_mempool(client, txid, output_index, true)
 }
 
@@ -148,7 +149,7 @@ pub(crate) fn get_optional_explicit_outpoint_ignoring_mempool(
     client: &Client,
     txid: Txid,
     output_index: u32,
-) -> Result<Option<UTXO>, UserRequestError> {
+) -> Result<Option<UTXO>, TransactionHelperError> {
     get_optional_explicit_outpoint_with_mempool(client, txid, output_index, false)
 }
 
@@ -157,7 +158,7 @@ fn get_optional_explicit_outpoint_with_mempool(
     txid: Txid,
     output_index: u32,
     include_mempool: bool,
-) -> Result<Option<UTXO>, UserRequestError> {
+) -> Result<Option<UTXO>, TransactionHelperError> {
     let Some(output) = get_txout_optional(client, txid, output_index, include_mempool)? else {
         return Ok(None);
     };
@@ -169,23 +170,19 @@ pub(super) fn explicit_outpoint(
     txid: Txid,
     output_index: u32,
     output: GetTxOut,
-) -> Result<UTXO, UserRequestError> {
-    let asset = AssetId::from_str(
-        output
-            .asset
-            .as_deref()
-            .ok_or_else(|| UserRequestError::Invalid("UTXO asset must be explicit".into()))?,
-    )
-    .map_err(|_| UserRequestError::Invalid("invalid UTXO asset".into()))?;
-    let value = parse_coin_value(
-        output
-            .value
-            .as_ref()
-            .ok_or_else(|| UserRequestError::Invalid("UTXO value must be explicit".into()))?,
-    )
-    .ok_or_else(|| UserRequestError::Invalid("invalid UTXO value".into()))?;
+) -> Result<UTXO, TransactionHelperError> {
+    let asset =
+        AssetId::from_str(output.asset.as_deref().ok_or_else(|| {
+            TransactionHelperError::Invalid("UTXO asset must be explicit".into())
+        })?)
+        .map_err(|_| TransactionHelperError::Invalid("invalid UTXO asset".into()))?;
+    let value =
+        parse_coin_value(output.value.as_ref().ok_or_else(|| {
+            TransactionHelperError::Invalid("UTXO value must be explicit".into())
+        })?)
+        .ok_or_else(|| TransactionHelperError::Invalid("invalid UTXO value".into()))?;
     let script = hex::decode(output.script_pub_key.hex)
-        .map_err(|_| UserRequestError::Invalid("invalid UTXO script".into()))?;
+        .map_err(|_| TransactionHelperError::Invalid("invalid UTXO script".into()))?;
 
     Ok(UTXO {
         outpoint: OutPoint::new(txid, output_index),
@@ -204,7 +201,7 @@ pub(super) fn get_txout_optional(
     txid: Txid,
     output_index: u32,
     include_mempool: bool,
-) -> Result<Option<GetTxOut>, UserRequestError> {
+) -> Result<Option<GetTxOut>, TransactionHelperError> {
     Ok(client.call::<Option<GetTxOut>>(
         "gettxout",
         &[
@@ -242,11 +239,13 @@ pub(crate) fn is_fully_explicit_output(
 pub(crate) fn witness_utxo(
     pset: &PartiallySignedTransaction,
     index: usize,
-) -> Result<&simplex::simplicityhl::elements::TxOut, UserRequestError> {
+) -> Result<&simplex::simplicityhl::elements::TxOut, TransactionHelperError> {
     pset.inputs()
         .get(index)
         .and_then(|input| input.witness_utxo.as_ref())
-        .ok_or_else(|| UserRequestError::Invalid(format!("input {index} has no witness UTXO")))
+        .ok_or_else(|| {
+            TransactionHelperError::Invalid(format!("input {index} has no witness UTXO"))
+        })
 }
 
 pub(crate) fn require_explicit_utxo(
@@ -254,12 +253,14 @@ pub(crate) fn require_explicit_utxo(
     asset: AssetId,
     script: &[u8],
     name: &str,
-) -> Result<(), UserRequestError> {
+) -> Result<(), TransactionHelperError> {
     if utxo.asset.explicit() != Some(asset) || utxo.script_pubkey.as_bytes() != script {
-        return Err(UserRequestError::Invalid(format!("invalid {name} input")));
+        return Err(TransactionHelperError::Invalid(format!(
+            "invalid {name} input"
+        )));
     }
     if utxo.value.explicit().is_none() {
-        return Err(UserRequestError::Invalid(format!(
+        return Err(TransactionHelperError::Invalid(format!(
             "{name} input must be explicit"
         )));
     }
@@ -271,17 +272,17 @@ pub(crate) fn require_preserved_output(
     index: usize,
     input: &simplex::simplicityhl::elements::TxOut,
     name: &str,
-) -> Result<(), UserRequestError> {
+) -> Result<(), TransactionHelperError> {
     let output = pset
         .outputs()
         .get(index)
-        .ok_or_else(|| UserRequestError::Invalid(format!("missing {name} output")))?;
+        .ok_or_else(|| TransactionHelperError::Invalid(format!("missing {name} output")))?;
     let output = output.to_txout();
     if output.asset != input.asset
         || output.value != input.value
         || output.script_pubkey != input.script_pubkey
     {
-        return Err(UserRequestError::Invalid(format!(
+        return Err(TransactionHelperError::Invalid(format!(
             "{name} is not preserved"
         )));
     }

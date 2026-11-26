@@ -64,7 +64,7 @@ pub enum DropletsError {
     #[error("failed to evaluate network covenant: {0}")]
     Program(#[from] simplex::program::ProgramError),
     #[error("shared transaction validation failed: {0}")]
-    TransactionHelper(#[from] super::user_requests::UserRequestError),
+    TransactionHelper(#[from] super::elements::TransactionHelperError),
     #[error("distributed signing failed: {0}")]
     Signing(#[from] SigningError),
     #[error("failed to extract final Droplets exchange transaction: {0}")]
