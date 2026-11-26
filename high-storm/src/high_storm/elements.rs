@@ -13,7 +13,7 @@ use simplex::{
     simplicityhl::elements::{
         AssetId, BlockHash, Script, opcodes, pset::PartiallySignedTransaction, script::Instruction,
     },
-    transaction::{FinalTransaction, PartialInput, ProgramInput, RequiredSignature, UTXO},
+    transaction::{FinalTransaction, PartialInput, ProgramInput, ProgramSignature, UTXO},
 };
 
 use super::{assets::StormEyeContractData, user_requests::UserRequestError};
@@ -82,7 +82,11 @@ pub(crate) fn add_storm_eye_input(
     transaction.add_program_input(
         PartialInput::new(utxo.clone()),
         ProgramInput::new(Box::new(program.as_ref().clone()), witness),
-        RequiredSignature::witness_tagged("PATH", ["Left", "1", "0"], STORM_EYE_TAG),
+        Some(
+            ProgramSignature::new("PATH")
+                .at_path(["Left", "1", "0"])
+                .tagged(STORM_EYE_TAG),
+        ),
     );
 }
 
@@ -101,7 +105,7 @@ pub(crate) fn add_treasury_inputs<'a>(
                     storm_eye_input_index: 0,
                 },
             ),
-            RequiredSignature::None,
+            None,
         );
     }
 }
@@ -285,7 +289,7 @@ mod tests {
                 txout: TxOut::default(),
                 secrets: None,
             }),
-            RequiredSignature::None,
+            None,
         );
         let mut pset = PartiallySignedTransaction::new_v2();
         let _ = finalize_program_inputs(

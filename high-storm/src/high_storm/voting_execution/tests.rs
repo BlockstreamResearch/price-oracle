@@ -350,15 +350,15 @@ fn member_update_migrates_every_storm_eye_to_the_new_root() {
     let inputs = prepared.transaction.inputs();
     assert_eq!(inputs.len(), 3);
     assert_eq!(
-        inputs[0].partial_input.witness_txid,
+        inputs[0].partial_input.outpoint.txid,
         Txid::from_byte_array([18; 32])
     );
     assert_eq!(
-        inputs[1].partial_input.witness_txid,
+        inputs[1].partial_input.outpoint.txid,
         Txid::from_byte_array([19; 32])
     );
     assert_eq!(
-        inputs[2].partial_input.witness_txid,
+        inputs[2].partial_input.outpoint.txid,
         Txid::from_byte_array([16; 32])
     );
     assert_eq!(

@@ -408,7 +408,7 @@ async fn a_round_leaves_out_items_spent_after_reconciliation() {
         vec![unspent.txid]
     );
     assert_eq!(utxos.len(), 1);
-    assert_eq!(utxos[0].amount(), 1_700_000_000);
+    assert_eq!(utxos[0].amount().unwrap(), 1_700_000_000);
     // The mempool spend is tracked; the block spend waits for indexing to delete it.
     let expired = store.list_expired(10).await.unwrap();
     assert_eq!(
@@ -652,7 +652,7 @@ fn signers_recompute_the_sized_fee_of_a_large_burn() {
     let fixture = BurnFixture::new();
     let groups = [fixture.group(1, 50, false, 100_000)];
     let built = fixture.build(&groups, 500).unwrap();
-    let (pset, _) = built.final_transaction.extract_pst();
+    let (pset, _) = built.final_transaction.extract_pst().unwrap();
     let fee_output = pset.outputs().last().unwrap();
     assert_eq!(fee_output.amount, Some(742));
     assert_eq!(
@@ -783,7 +783,7 @@ fn measures_burn_transaction_weight() {
     let fixture = BurnFixture::new();
     let weight = |groups: &[BurnableGroup]| {
         let built = fixture.build(groups, 500).unwrap();
-        let (pset, _) = built.final_transaction.extract_pst();
+        let (pset, _) = built.final_transaction.extract_pst().unwrap();
         let weight =
             finalized_dummy_weight(&built.final_transaction, &pset, &fixture.network).unwrap();
         let items = groups.iter().map(|(group, _, _, _)| group.ticks.len());

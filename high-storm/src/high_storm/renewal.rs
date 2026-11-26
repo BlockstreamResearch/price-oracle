@@ -74,6 +74,8 @@ pub enum RenewalError {
     Storm(#[from] storm::Error),
     #[error("failed to extract final renewal transaction: {0}")]
     Pset(String),
+    #[error("UTXO asset or amount is unknown: {0}")]
+    Utxo(#[from] simplex::transaction::UtxoError),
 }
 
 pub(crate) struct PreparedRenewal {
@@ -427,11 +429,11 @@ impl Renewal {
             let Some(utxo) = live_treasury_utxo(client, &indexed, include_mempool)? else {
                 continue;
             };
-            if utxo.asset() != policy_asset || utxo.amount() != indexed.amount {
+            if utxo.asset()? != policy_asset || utxo.amount()? != indexed.amount {
                 continue;
             }
             total = total
-                .checked_add(utxo.amount())
+                .checked_add(utxo.amount()?)
                 .ok_or_else(|| RenewalError::Invalid("Treasury input overflow".into()))?;
             selected.push(utxo);
             if total >= self.transaction_fee_sats {
@@ -558,7 +560,7 @@ fn build_transaction(
     let storm_eye_inputs = storm_eye_utxos.len();
     let treasury_amount = treasury_utxos.iter().try_fold(0u64, |total, utxo| {
         total
-            .checked_add(utxo.amount())
+            .checked_add(utxo.amount()?)
             .ok_or_else(|| RenewalError::Invalid("Treasury amount overflow".into()))
     })?;
     let treasury_change = treasury_amount
@@ -583,7 +585,7 @@ fn build_transaction(
     for utxo in &storm_eye_utxos {
         transaction.add_output(PartialOutput::new(
             renewed_script.clone(),
-            utxo.amount(),
+            utxo.amount()?,
             storm_eye_asset,
         ));
     }
@@ -610,7 +612,9 @@ fn build_transaction(
         .chain(&treasury_utxos)
         .map(|utxo| utxo.txout.clone())
         .collect();
-    let (pset, _) = transaction.extract_pst();
+    let (pset, _) = transaction
+        .extract_pst()
+        .map_err(|error| RenewalError::Pset(error.to_string()))?;
     let request = RenewStormUtxos {
         tx: encode::serialize(&pset),
         final_tx: None,

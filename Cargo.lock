@@ -804,6 +804,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "cookie"
+version = "0.18.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
+dependencies = [
+ "percent-encoding",
+ "time",
+ "version_check",
+]
+
+[[package]]
+name = "cookie_store"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15b2c103cf610ec6cae3da84a766285b42fd16aad564758459e6ecf128c75206"
+dependencies = [
+ "cookie",
+ "document-features",
+ "idna",
+ "indexmap",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "time",
+ "url",
+]
+
+[[package]]
 name = "core_detect"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2056,7 +2085,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3662a38d341d77efecb73caf01420cfa5aa63c0253fd7bc05289ef9f6616e1bf"
 dependencies = [
  "base64 0.13.1",
- "minreq 2.14.1",
+ "minreq",
  "serde",
  "serde_json",
 ]
@@ -2352,19 +2381,6 @@ checksum = "05015102dad0f7d61691ca347e9d9d9006685a64aefb3d79eecf62665de2153d"
 dependencies = [
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "minreq"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "659579df697b372ef9e36f02fcbb41f6d6f157dcec7db9c9618fa0f23cf0fc20"
-dependencies = [
- "rustls",
- "rustls-webpki",
- "serde",
- "serde_json",
- "webpki-roots",
 ]
 
 [[package]]
@@ -3219,13 +3235,14 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -3578,9 +3595,9 @@ dependencies = [
 
 [[package]]
 name = "simplicityhl"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e110f12190a4df92970b50d701f7da979638a60c5bf8294d55e4a55aceebf3e"
+checksum = "850c93fc9906e3324a299f50912d6176cdb381d31959362a7dd116fd2d0679a3"
 dependencies = [
  "ariadne",
  "base64 0.21.7",
@@ -3619,9 +3636,9 @@ dependencies = [
 
 [[package]]
 name = "smplx-build"
-version = "0.1.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f886393537eaf341fb389d6cdb5365630d09daf99bcb4b570b228a0cad18dca2"
+checksum = "5460c78e995cbdbfd82d95606948ad42a16bf125dff7e3789ec42e2629d76682"
 dependencies = [
  "globwalk",
  "pathdiff",
@@ -3639,9 +3656,9 @@ dependencies = [
 
 [[package]]
 name = "smplx-macros"
-version = "0.1.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c798548362bb93281d5cc553fbd2b8af2eda9417a51243c85efc3ae665f5f23b"
+checksum = "00aa74926b2b64f5f1ec833e505ac71fa0657426539bc422ecd6eb45c4783525"
 dependencies = [
  "smplx-build",
  "smplx-test",
@@ -3650,9 +3667,9 @@ dependencies = [
 
 [[package]]
 name = "smplx-regtest"
-version = "0.1.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd6bcd96bdbc865762ba32f4f9998be9d8974340fc5c28a7c81557e9c9d3eba8"
+checksum = "4b358e4e18f4385434b0d2d02a349b5bff974471237a1c5307acc533b6197f19"
 dependencies = [
  "electrsd",
  "hex",
@@ -3666,28 +3683,27 @@ dependencies = [
 
 [[package]]
 name = "smplx-sdk"
-version = "0.1.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "160e1785e326d8cb7f8cc89ef1b0be5c49c63a20ee15cd7f179af6988f577163"
+checksum = "9fa1cf061f90f8e04ddb9e2c8e16b5f7102932e85300de33266a7dc97ed8db54"
 dependencies = [
  "bip39",
  "bitcoincore-rpc",
  "dyn-clone",
  "elements-miniscript",
  "hex",
- "minreq 3.0.0",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "simplicityhl",
  "thiserror",
+ "ureq",
 ]
 
 [[package]]
 name = "smplx-std"
-version = "0.1.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16413a15bb3c65af6357f2f91ddb1400dc945b303d17db46f0230e77f818762e"
+checksum = "814bbf7c16aafe1fb8e12c90d24c23f2174a3dacaf260c4441779a1919f9d6a8"
 dependencies = [
  "either",
  "rand 0.10.3",
@@ -3701,9 +3717,9 @@ dependencies = [
 
 [[package]]
 name = "smplx-test"
-version = "0.1.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05907f61baf71916ed46c7daa76fd528e5605681902686137c8e6261b82a55d3"
+checksum = "488bcd394a025a3120f946770eaca79f37d2f03750b94359c0b4ffd243bf2c25"
 dependencies = [
  "electrsd",
  "proc-macro2",
@@ -4184,6 +4200,7 @@ dependencies = [
  "powerfmt",
  "serde_core",
  "time-core",
+ "time-macros",
 ]
 
 [[package]]
@@ -4191,6 +4208,16 @@ name = "time-core"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
+
+[[package]]
+name = "time-macros"
+version = "0.2.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
+dependencies = [
+ "num-conv",
+ "time-core",
+]
 
 [[package]]
 name = "tinystr"
@@ -4519,6 +4546,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "3.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ac5cecf619ca81f66a96482db09687c9f7465af65f4300a8c30cca05bd5a59d"
+dependencies = [
+ "base64 0.23.1",
+ "cookie_store",
+ "log",
+ "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "ureq-proto",
+ "utf8-zero",
+ "webpki-roots",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "622dce33c252115466d83f63e9744a18f12b4406aae51a01c15ad8fcf1185eb3"
+dependencies = [
+ "base64 0.23.1",
+ "http",
+ "httparse",
+ "log",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4529,6 +4587,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf8-zero"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"
@@ -4676,9 +4740,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
 dependencies = [
  "rustls-pki-types",
 ]

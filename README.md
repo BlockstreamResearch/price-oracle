@@ -83,7 +83,9 @@ initialization and the external API.
 
 ## Development
 
-Requires Rust 1.97.1, which [`rust-toolchain.toml`](rust-toolchain.toml) pins.
+Requires Rust 1.97.1, which [`rust-toolchain.toml`](rust-toolchain.toml) pins,
+and Git 2.49 or newer, which `simplex install` needs to fetch the contracts'
+dependencies.
 
 ```sh
 cargo build --workspace

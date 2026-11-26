@@ -3,8 +3,8 @@
 use simplex::{
     simplicityhl::elements::AssetId,
     transaction::{
-        FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
-        partial_input::IssuanceInput,
+        FinalTransaction, NativeSignature, PartialInput, PartialOutput, ProgramInput,
+        ProgramSignature, partial_input::IssuanceInput,
     },
 };
 
@@ -32,7 +32,7 @@ fn issue_asset_to(
     let issuance = final_utxo.add_issuance_input(
         PartialInput::new(funding_utxo),
         IssuanceInput::new_issuance(SUPPLY, 0, [1u8; 32]),
-        RequiredSignature::NativeEcdsa,
+        Some(NativeSignature::Ecdsa),
     );
     final_utxo.add_output(PartialOutput::new(
         program.get_script_pubkey(context.get_network()),
@@ -73,10 +73,10 @@ fn accepts_a_valid_inclusion_proof(context: simplex::TestContext) -> anyhow::Res
                 storm_tree_bloom: ([0u8; 64], signing_branch, proof),
             },
         ),
-        RequiredSignature::witness_tagged(
-            "STORM_TREE_BLOOM",
-            vec!["0".to_string()],
-            "OracleNetworkV1/StormEye",
+        Some(
+            ProgramSignature::new("STORM_TREE_BLOOM")
+                .at_path(["0"])
+                .tagged("OracleNetworkV1/StormEye"),
         ),
     );
 

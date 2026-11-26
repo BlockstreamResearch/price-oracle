@@ -1,11 +1,21 @@
 FROM rust:1.97.1-bookworm AS builder
 
-ARG SIMPLEX_VERSION=0.1.1
+ARG SIMPLEX_VERSION=0.3.0
 
 WORKDIR /workspace
 RUN apt-get update \
 	&& apt-get install --yes --no-install-recommends jq \
 	&& rm -rf /var/lib/apt/lists/*
+# Simplex fetches a `tag` dependency with `git clone --revision`, which needs
+# Git 2.49; Debian bookworm ships 2.39.
+ARG GIT_VERSION=2.56.1
+ARG GIT_SHA256=f0b0bf89264b9bd2e1c640363e7529643989da76281600473c50745cd34a607f
+RUN curl -sSfL "https://mirrors.edge.kernel.org/pub/software/scm/git/git-${GIT_VERSION}.tar.xz" -o /tmp/git.tar.xz \
+	&& echo "${GIT_SHA256}  /tmp/git.tar.xz" | sha256sum -c - \
+	&& tar -xf /tmp/git.tar.xz -C /tmp \
+	&& make -C "/tmp/git-${GIT_VERSION}" -j"$(nproc)" prefix=/usr/local \
+		NO_TCLTK=1 NO_GETTEXT=1 NO_PERL=1 NO_PYTHON=1 install \
+	&& rm -rf /tmp/git.tar.xz "/tmp/git-${GIT_VERSION}"
 RUN cargo install --locked \
 	--git https://github.com/BlockstreamResearch/smplx.git \
 	--tag "v${SIMPLEX_VERSION}" \

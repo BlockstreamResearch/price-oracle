@@ -69,6 +69,8 @@ pub enum DropletsError {
     Signing(#[from] SigningError),
     #[error("failed to extract final Droplets exchange transaction: {0}")]
     Pset(String),
+    #[error("UTXO asset or amount is unknown: {0}")]
+    Utxo(#[from] simplex::transaction::UtxoError),
 }
 
 impl DropletsError {
@@ -238,8 +240,8 @@ impl Droplets {
             else {
                 continue;
             };
-            if utxo.asset() != policy_asset
-                || utxo.amount() != indexed.amount
+            if utxo.asset()? != policy_asset
+                || utxo.amount()? != indexed.amount
                 || utxo.txout.script_pubkey != treasury_script
             {
                 return Err(DropletsError::Invalid(
@@ -247,7 +249,7 @@ impl Droplets {
                 ));
             }
             selected_amount = selected_amount
-                .checked_add(utxo.amount())
+                .checked_add(utxo.amount()?)
                 .ok_or_else(|| DropletsError::Invalid("Treasury input overflow".into()))?;
             selected.push(utxo);
             if selected_amount >= required {
@@ -281,7 +283,7 @@ impl Droplets {
         );
         elements::add_treasury_inputs(&mut transaction, &treasury, &selected);
 
-        transaction.add_output(output_from_utxo(&storm_eye_utxo));
+        transaction.add_output(output_from_utxo(&storm_eye_utxo)?);
         transaction.add_output(PartialOutput::new(
             destination.script_pubkey(),
             amount,
@@ -299,7 +301,9 @@ impl Droplets {
             policy_asset,
         ));
 
-        let (pset, _) = transaction.extract_pst();
+        let (pset, _) = transaction
+            .extract_pst()
+            .map_err(|error| DropletsError::Pset(error.to_string()))?;
         let signing_hash = signing_hash(&pset, storm_eye, &network)?;
         Ok((encode::serialize(&pset), signing_hash))
     }

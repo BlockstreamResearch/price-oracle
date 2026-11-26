@@ -4,7 +4,7 @@ mod common;
 use common::{assert_covenant_rejects, issue_asset, wait_for_confirmation};
 
 use simplex::transaction::utxo::UTXO;
-use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, RequiredSignature};
+use simplex::transaction::{FinalTransaction, NativeSignature, PartialInput, PartialOutput};
 
 use contracts::account::{Account, AccountParameters};
 
@@ -25,7 +25,7 @@ fn fund_account(
     let mut ft = FinalTransaction::new();
     ft.add_input(
         PartialInput::new(funding_utxo),
-        RequiredSignature::NativeEcdsa,
+        Some(NativeSignature::Ecdsa),
     );
 
     account.attach_account_creation(&mut ft, amount, context.get_network().policy_asset());
@@ -53,7 +53,7 @@ fn spend_transaction(
     account.attach_spend(&mut ft, account_utxo, 1);
     ft.add_input(
         PartialInput::new(auth_utxo.clone()),
-        RequiredSignature::NativeEcdsa,
+        Some(NativeSignature::Ecdsa),
     );
 
     account.attach_account_creation(

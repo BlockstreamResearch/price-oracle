@@ -1,9 +1,7 @@
 use simplex::provider::SimplicityNetwork;
 use simplex::simplicityhl::elements::{AssetId, Script};
 use simplex::transaction::utxo::UTXO;
-use simplex::transaction::{
-    FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
-};
+use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, ProgramInput};
 
 use crate::artifacts::account::AccountProgram;
 use crate::artifacts::account::derived_account::{AccountArguments, AccountWitness};
@@ -55,7 +53,7 @@ impl Account {
                     storm_eye_input_index,
                 },
             ),
-            RequiredSignature::None,
+            None,
         );
     }
 
