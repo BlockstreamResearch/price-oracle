@@ -48,6 +48,7 @@ jobs:
       # two sources that use it are left out until a simfmt release can.
       - name: Check contracts formatting
         working-directory: contracts
+        # TODO: Switch back to `simplex fmt --check` once a simfmt release can parse `raw_hash`
         run: |
           find simf -name '*.simf' \
             ! -path simf/voucher.simf ! -path simf/lib/taproot.simf -print0 |
