@@ -12,7 +12,7 @@ use simplex::simplicityhl::elements::{
 };
 use simplex::transaction::partial_input::IssuanceInput;
 use simplex::transaction::utxo::UTXO;
-use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, RequiredSignature};
+use simplex::transaction::{FinalTransaction, NativeSignature, PartialInput, PartialOutput};
 use simplex::utils::hash_script;
 
 use contracts::voucher::{
@@ -124,7 +124,7 @@ impl VoucherFixture {
         // Input 1: whatever is meant to authorise the spend.
         ft.add_input(
             PartialInput::new(auth_utxo.clone()),
-            RequiredSignature::NativeEcdsa,
+            Some(NativeSignature::Ecdsa),
         );
 
         // Output 0: the burn the covenant inspects.
@@ -154,7 +154,7 @@ fn issue_voucher(
     let issuance = ft.add_issuance_input(
         PartialInput::new(funding_utxo),
         IssuanceInput::new_issuance(amount * 2, 0, [1u8; 32]),
-        RequiredSignature::NativeEcdsa,
+        Some(NativeSignature::Ecdsa),
     );
     for _ in 0..2 {
         voucher.attach_voucher_creation(&mut ft, amount, issuance.asset_id);
@@ -215,12 +215,12 @@ fn execute_voucher(
     input_index: usize,
     version: u32,
 ) -> Result<(), simplex::program::ProgramError> {
-    let (mut pset, _) = ft.extract_pst();
+    let (mut pset, _) = ft.extract_pst().unwrap();
     pset.global.tx_data.version = version;
     let input = ft.inputs()[input_index].program_input.as_ref().unwrap();
     input
         .program
-        .execute(&pset, &input.witness, input_index, network)
+        .finalize(&pset, &input.witness, input_index, network)
         .map(|_| ())
 }
 
@@ -230,7 +230,7 @@ fn permissionless_burn_checks_this_inputs_bip68_delay() {
     for amount in [VOUCHER_TIMESTAMP, 1] {
         let (network, voucher, utxo) = permissionless_fixture(amount);
         let ft = permissionless_transaction(&voucher, &utxo);
-        let (pset, _) = ft.extract_pst();
+        let (pset, _) = ft.extract_pst().unwrap();
         assert_eq!(pset.global.tx_data.version, 2);
         assert_eq!(
             pset.inputs()[0].sequence,
@@ -261,7 +261,7 @@ fn permissionless_burn_checks_this_inputs_bip68_delay() {
             other.outpoint.vout = 1;
             tx.add_input(
                 PartialInput::new(other).with_sequence(Sequence::from_512_second_intervals(9)),
-                RequiredSignature::None,
+                None,
             );
             assert!(
                 execute_voucher(&tx, &network, 0, 2).is_err(),
@@ -278,11 +278,11 @@ fn permissionless_burn_requires_the_full_same_asset_in_a_tagged_unspendable_outp
         let ft = permissionless_transaction(&voucher, &utxo);
         execute_voucher(&ft, &network, 0, 2).unwrap();
         for output in [
-            PartialOutput::new(Script::from(vec![0x51]), amount, utxo.asset()),
-            op_return_output(amount, utxo.asset()),
-            burn_output(1, amount, utxo.asset()),
-            burn_output(0, amount - 1, utxo.asset()),
-            burn_output(0, amount + 1, utxo.asset()),
+            PartialOutput::new(Script::from(vec![0x51]), amount, utxo.asset().unwrap()),
+            op_return_output(amount, utxo.asset().unwrap()),
+            burn_output(1, amount, utxo.asset().unwrap()),
+            burn_output(0, amount - 1, utxo.asset().unwrap()),
+            burn_output(0, amount + 1, utxo.asset().unwrap()),
             burn_output(0, amount, AssetId::from_byte_array([5; 32])),
         ] {
             let mut tx = ft.clone();
@@ -323,7 +323,7 @@ fn permissionless_burns_cannot_share_one_burn_output() {
         ft.add_output(PartialOutput::new(
             Script::from(vec![0x51]),
             amount,
-            utxo.asset(),
+            utxo.asset().unwrap(),
         ));
         execute_voucher(&ft, &network, 0, 2).unwrap();
         assert!(execute_voucher(&ft, &network, 1, 2).is_err());
@@ -334,7 +334,7 @@ fn permissionless_burns_cannot_share_one_burn_output() {
             }
             .build_witness()
             .into();
-        ft.outputs_mut()[1] = burn_output(1, amount, utxo.asset());
+        ft.outputs_mut()[1] = burn_output(1, amount, utxo.asset().unwrap());
         execute_voucher(&ft, &network, 0, 2).unwrap();
         execute_voucher(&ft, &network, 1, 2).unwrap();
     }
@@ -440,7 +440,7 @@ fn permissionless_burn_matures_at_exactly_nine_time_intervals() -> anyhow::Resul
         );
         network_ft.add_input(
             PartialInput::new(storm_eye_utxo.clone()),
-            RequiredSignature::NativeEcdsa,
+            Some(NativeSignature::Ecdsa),
         );
         network_ft.add_output(op_return_output(amount, asset));
         network_ft.add_output(PartialOutput::new(
@@ -857,7 +857,7 @@ fn burns_multiple_voucher_utxos_to_one_empty_op_return(
     }
     transaction.add_input(
         PartialInput::new(storm_eye_utxo.clone()),
-        RequiredSignature::NativeEcdsa,
+        Some(NativeSignature::Ecdsa),
     );
     transaction.add_output(op_return_output(
         VOUCHER_TIMESTAMP * 2,

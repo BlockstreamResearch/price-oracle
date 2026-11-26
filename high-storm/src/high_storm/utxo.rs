@@ -10,7 +10,7 @@ use simplex::{
     simplicityhl::elements::{
         AssetId, OutPoint, Script, TxOut, Txid, confidential, pset::PartiallySignedTransaction,
     },
-    transaction::{PartialOutput, utxo::UTXO},
+    transaction::{PartialOutput, UtxoError, utxo::UTXO},
 };
 
 use crate::external_api::fee_utxo::parse_coin_value;
@@ -77,7 +77,7 @@ pub(super) fn scan_contract_utxos(
         else {
             continue;
         };
-        if matches_expected_asset(utxo.asset(), expected_asset) {
+        if matches_expected_asset(utxo.asset()?, expected_asset) {
             let spent_in_mempool =
                 get_optional_explicit_outpoint(client, txid, unspent.vout)?.is_none();
             candidates.push((utxo, spent_in_mempool));
@@ -215,12 +215,12 @@ pub(super) fn get_txout_optional(
     )?)
 }
 
-pub(crate) fn output_from_utxo(utxo: &UTXO) -> PartialOutput {
-    PartialOutput::new(
+pub(crate) fn output_from_utxo(utxo: &UTXO) -> Result<PartialOutput, UtxoError> {
+    Ok(PartialOutput::new(
         utxo.txout.script_pubkey.clone(),
-        utxo.amount(),
-        utxo.asset(),
-    )
+        utxo.amount()?,
+        utxo.asset()?,
+    ))
 }
 
 pub(crate) fn is_fully_explicit_output(

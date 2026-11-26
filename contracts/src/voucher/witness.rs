@@ -1,6 +1,6 @@
 use simplex::constants::DUMMY_SIGNATURE;
 use simplex::either::Either;
-use simplex::transaction::RequiredSignature;
+use simplex::transaction::ProgramSignature;
 
 use crate::artifacts::voucher::derived_voucher::VoucherWitness;
 
@@ -29,12 +29,12 @@ pub enum VoucherSpendPath {
 
 impl VoucherSpendPath {
     #[must_use]
-    pub fn required_signature(&self) -> RequiredSignature {
+    pub fn required_signature(&self) -> Option<ProgramSignature> {
         match self {
             Self::SignatureAuth { .. } => {
-                RequiredSignature::witness_with_path("PATH", ["Right", "Left", "0"])
+                Some(ProgramSignature::new("PATH").at_path(["Right", "Left", "0"]))
             }
-            _ => RequiredSignature::None,
+            _ => None,
         }
     }
 

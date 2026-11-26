@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SIMPLEX_VERSION: 0.2.0
+  SIMPLEX_VERSION: 0.3.0
 
 jobs:
   ci:
@@ -28,9 +28,9 @@ jobs:
           rustup component add rustfmt clippy
 
       - name: Install pinned Simplex CLI
-        uses: BlockstreamResearch/simplicityhl-toolchain@v0.0.2
+        uses: BlockstreamResearch/simplicityhl-toolchain@v0.0.3
         with:
-          components: simplex@${{ env.SIMPLEX_VERSION }}
+          simplex: ${{ env.SIMPLEX_VERSION }}
 
       - name: Generate contract artifacts
         working-directory: contracts
