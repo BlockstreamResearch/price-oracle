@@ -1,11 +1,11 @@
 # @price-oracle/sdk
 
-Browser-oriented TypeScript SDK for the Price Oracle coordinator and public
-Elements JSON-RPC endpoints.
+Browser-oriented TypeScript SDK for the Price Oracle network: the API of its
+nodes, and the chain through Esplora or Elements JSON-RPC.
 
 ```ts
 import {
-  ElementsRpcClient,
+  EsploraClient,
   PriceOracleClient,
   createTickRequest,
   publicKeyFromPrivateKey,
@@ -26,8 +26,10 @@ const verification = {
 };
 const account = await oracle.getAccount(publicKey, verification);
 
-const elements = new ElementsRpcClient({ url: "<CORS-enabled public RPC URL>" });
-const feeUtxos = await elements.getScriptUtxos(account.script_pubkey);
+const chain = new EsploraClient("<independently trusted Esplora URL>");
+// A fresh Account. Later on, leave out the change an issuance returned to it:
+// that is the burn reserve of what the issuance created.
+const feeUtxos = await chain.getScriptUtxos(account.script_pubkey);
 const request = createTickRequest(
   privateKey,
   feeUtxos.map(({ txid, vout }) => `${txid}:${vout}`),
@@ -35,8 +37,28 @@ const request = createTickRequest(
 const { request_hash } = await oracle.submitTickRequest(request);
 
 const status = await oracle.waitForTickRequest(request_hash);
-const tick = await verifyExecutedTick(status, verification, elements);
+const tick = await verifyExecutedTick(status, verification, chain);
 ```
+
+## Chain Access
+
+The chain is read through a `ChainClient`, which two classes implement:
+
+- `EsploraClient(url)` reads an Esplora HTTP API, which public Liquid explorers
+  serve to browsers. It lists a script's confirmed, explicit UTXOs, the ones a
+  request can be paid from, and checks one output; it does not broadcast.
+- `ElementsRpcClient({ url, username, password })` calls a node's JSON-RPC. It
+  also broadcasts, with the burn allowance a Tick redemption needs, and its
+  `getScriptUtxos` runs `scantxoutset`, which public endpoints seldom allow.
+
+Every chain check takes either. Whichever is used is a trust anchor: it must
+not be an endpoint the coordinator chose. An Esplora URL must use HTTPS, except
+HTTP on loopback, and redirects are rejected.
+
+A failed RPC call throws an `ElementsRpcError` with the node's own message and
+JSON-RPC `code`, and a failed Esplora read an `EsploraError`; both carry the
+HTTP `status`. Each endpoint is given 15 seconds to answer, `timeoutMs` in the
+options of either client, and one that does not throws with `status` 0.
 
 ## Errors, Retries and Several Nodes
 
@@ -123,9 +145,9 @@ blocks for a feed the coordinator cannot price before it fails.
 
 ## Tick Verification
 
-`verifyExecutedTick(status, verification, elements)` is the Tick counterpart of
+`verifyExecutedTick(status, verification, chain)` is the Tick counterpart of
 `verifyExecutedSignedPrice`. It takes the batch's single `tick-utxo` result and
-checks it through an independently trusted Elements RPC endpoint: the output is
+checks it through an independently trusted chain source: the output is
 unspent, mempool spends included, has at least one confirmation, carries the
 trusted Tick asset, an amount equal to the reported timestamp, and the Elements
 Taproot script of the trusted voucher leaf under the fixed unspendable internal
@@ -223,14 +245,15 @@ const executed = await verifyExecutedSignedPrice(status, {
   ...verification,
   verifierAssetId: trustedVerifierAssetId,
   verifierTapleafHash: locallyCompiledVoucherTapleafHash,
-}, elements);
+}, chain);
 ```
 
-Import these helpers from `@price-oracle/sdk`. The `elements` client must use an
-independently trusted Elements RPC endpoint. Pin the asset ID from verified
-network issuance and the voucher leaf from local Rust/Simplex compilation for
-the requested authentication method and network. Neither value should come
-unchecked from the coordinator. The check uses `gettxout` with mempool spends
+Import these helpers from `@price-oracle/sdk`. The `chain` client must use an
+independently trusted Elements RPC or Esplora endpoint. Pin the asset ID from
+verified network issuance and the voucher leaf from local Rust/Simplex
+compilation for the requested authentication method and network.
+Neither value should come unchecked from the coordinator. The check reads the
+output with mempool spends
 included, requires at least one confirmation, the explicit Verifier asset and
 one-unit amount, and the Elements Taproot script committing to the signed branch
 and trusted leaf. This is a point-in-time check, not a guarantee against later

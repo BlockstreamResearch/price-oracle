@@ -62,6 +62,31 @@ export class OracleApiError extends Error {
   }
 }
 
+/** An Elements RPC failure, with the node's own message when it sent one. */
+export class ElementsRpcError extends Error {
+  readonly status: number;
+  /** The JSON-RPC error code, such as -5 for an unknown transaction. */
+  readonly code: number | undefined;
+
+  constructor(message: string, status: number, code?: number) {
+    super(message);
+    this.name = "ElementsRpcError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+/** An Esplora answer that is not a success. */
+export class EsploraError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "EsploraError";
+    this.status = status;
+  }
+}
+
 export type OracleNetwork = "liquidv1" | "liquidtestnet" | "elementsregtest";
 
 /** The active network assets and Storm Tree root, as the coordinator reports them. */
@@ -230,6 +255,22 @@ export type IssuedTickVerification = {
   tickTapleafHash: string;
 };
 
+/** An output as the chain checks read it; a confidential one has no asset or amount. */
+export type ChainOutput = {
+  confirmations: number;
+  scriptPubKey: string;
+  asset?: string;
+  amountSats?: number;
+};
+
+/** Read access to the chain, through Elements RPC or Esplora. */
+export interface ChainClient {
+  /** The script's confirmed, explicit outputs: those a request can be paid from. */
+  getScriptUtxos(scriptPubKey: string): Promise<OracleUtxo[]>;
+  /** The output while it is unspent, mempool spends included; null otherwise. */
+  getUnspentOutput(txid: string, vout: number): Promise<ChainOutput | null>;
+}
+
 export type PredictionResolution = {
   predictionId: string;
   occurredAt: number;
@@ -269,13 +310,17 @@ export type RpcOptions = {
   username?: string;
   password?: string;
   fetch?: FetchLike;
+  /** How long the node is given to answer; 15 seconds by default. */
+  timeoutMs?: number;
 };
 
-export class ElementsRpcClient {
+export class ElementsRpcClient implements ChainClient {
   readonly #options: RpcOptions;
   #requestId = 0;
 
   constructor(options: RpcOptions) {
+    if (options.timeoutMs !== undefined && !(options.timeoutMs > 0))
+      throw new Error("timeoutMs must be positive milliseconds");
     this.#options = options;
   }
 
@@ -286,27 +331,75 @@ export class ElementsRpcClient {
       headers.set("authorization", `Basic ${btoa(credentials)}`);
     }
     const fetcher = this.#options.fetch ?? globalThis.fetch;
-    const response = await fetcher(this.#options.url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: ++this.#requestId,
-        method,
-        params,
-      }),
-    });
-    if (!response.ok) {
-      throw new Error(`Elements RPC returned HTTP ${response.status}`);
+    const timeoutMs = this.#options.timeoutMs ?? 15_000;
+    let response: Response;
+    let text: string;
+    try {
+      ({ response, text } = await fetchText(
+        fetcher,
+        this.#options.url,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: ++this.#requestId,
+            method,
+            params,
+          }),
+        },
+        timeoutMs,
+      ));
+    } catch (error) {
+      if (error instanceof RequestTimeout)
+        throw new ElementsRpcError(
+          `Elements RPC did not answer within ${timeoutMs} ms`,
+          0,
+        );
+      throw error;
     }
-    const body = (await response.json()) as {
-      result: Result;
-      error: { message: string } | null;
-    };
-    if (body.error) {
-      throw new Error(body.error.message);
-    }
+    // The node reports a failed call in the body of an HTTP error, so the
+    // body is read before the status is judged.
+    const body = parseJson(text) as
+      | { result: Result; error: { message?: string; code?: number } | null }
+      | undefined;
+    if (body?.error)
+      throw new ElementsRpcError(
+        body.error.message ?? `Elements RPC returned HTTP ${response.status}`,
+        response.status,
+        body.error.code,
+      );
+    if (!response.ok || body === undefined)
+      throw new ElementsRpcError(
+        response.ok
+          ? "Elements RPC returned a response that is not JSON"
+          : `Elements RPC returned HTTP ${response.status}`,
+        response.status,
+      );
     return body.result;
+  }
+
+  async getUnspentOutput(
+    txid: string,
+    vout: number,
+  ): Promise<ChainOutput | null> {
+    assertOutpoint(txid, vout);
+    const utxo = await this.call<{
+      confirmations: number;
+      asset?: string;
+      value?: number;
+      scriptPubKey: { hex: string };
+    } | null>("gettxout", [txid, vout, true]);
+    if (!utxo) return null;
+
+    return {
+      confirmations: utxo.confirmations,
+      scriptPubKey: utxo.scriptPubKey.hex,
+      ...(utxo.asset === undefined ? {} : { asset: utxo.asset }),
+      ...(utxo.value === undefined
+        ? {}
+        : { amountSats: Math.round(utxo.value * 100_000_000) }),
+    };
   }
 
   async getScriptUtxos(scriptPubKey: string): Promise<OracleUtxo[]> {
@@ -354,6 +447,158 @@ export class ElementsRpcClient {
       params.push(0.1, maxBurnSats / 100_000_000);
     }
     return this.call<string>("sendrawtransaction", params);
+  }
+}
+
+type EsploraStatus = { confirmed: boolean; block_height?: number };
+
+/**
+ * Chain reads through an Esplora HTTP API, which public Liquid explorers
+ * serve to browsers. It does not broadcast: a Tick redemption burns, and only
+ * a node asked directly lifts its burn limit for one transaction.
+ */
+export type EsploraClientOptions = {
+  fetch?: FetchLike;
+  /** How long Esplora is given to answer; 15 seconds by default. */
+  timeoutMs?: number;
+};
+
+export class EsploraClient implements ChainClient {
+  readonly #url: string;
+  readonly #fetch: FetchLike;
+  readonly #timeoutMs: number;
+
+  constructor(url: string, options: FetchLike | EsploraClientOptions = {}) {
+    const { fetch: fetcher = globalThis.fetch, timeoutMs = 15_000 } =
+      typeof options === "function" ? { fetch: options } : options;
+    assertSecureUrl(url, "Esplora URL");
+    if (!(timeoutMs > 0))
+      throw new Error("timeoutMs must be positive milliseconds");
+    this.#url = url.replace(/\/$/, "");
+    this.#fetch = fetcher.bind(globalThis);
+    this.#timeoutMs = timeoutMs;
+  }
+
+  /**
+   * Confirmed, explicit outputs, as Elements RPC lists them: an unconfirmed
+   * one cannot pay a request yet, and a confidential one has no amount to report.
+   */
+  async getScriptUtxos(scriptPubKey: string): Promise<OracleUtxo[]> {
+    assertHex(scriptPubKey, "scriptPubKey");
+    const scriptHash = bytesToHex(sha256(hexToBytes(scriptPubKey)));
+    const utxos = await this.#json<
+      Array<{
+        txid: string;
+        vout: number;
+        value?: number;
+        asset?: string;
+        status: EsploraStatus;
+      }>
+    >(`/scripthash/${scriptHash}/utxo`);
+    if (!Array.isArray(utxos))
+      throw new EsploraError("Esplora returned an invalid UTXO list", 200);
+
+    return utxos.flatMap((utxo) =>
+      Number.isSafeInteger(utxo.value) &&
+      utxo.status?.confirmed === true &&
+      Number.isSafeInteger(utxo.status.block_height)
+        ? [
+            {
+              txid: utxo.txid,
+              vout: utxo.vout,
+              scriptPubKey: scriptPubKey.toLowerCase(),
+              amountSats: utxo.value as number,
+              ...(utxo.asset === undefined ? {} : { asset: utxo.asset }),
+              height: utxo.status.block_height as number,
+            },
+          ]
+        : [],
+    );
+  }
+
+  async getUnspentOutput(
+    txid: string,
+    vout: number,
+  ): Promise<ChainOutput | null> {
+    assertOutpoint(txid, vout);
+    const [transaction, outspend] = await Promise.all([
+      this.#json<{
+        vout: Array<{ scriptpubkey: string; value?: number; asset?: string }>;
+        status: EsploraStatus;
+      } | null>(`/tx/${txid}`, true),
+      this.#json<{ spent: boolean } | null>(
+        `/tx/${txid}/outspend/${vout}`,
+        true,
+      ),
+    ]);
+    const output = transaction?.vout?.[vout];
+    // Anything but a plain "not spent" reads as spent.
+    if (!transaction || !output || outspend?.spent !== false) return null;
+    if (typeof output.scriptpubkey !== "string")
+      throw new EsploraError("Esplora returned an invalid output", 200);
+
+    return {
+      confirmations: await this.#confirmations(transaction.status),
+      scriptPubKey: output.scriptpubkey,
+      ...(output.asset === undefined ? {} : { asset: output.asset }),
+      ...(output.value === undefined ? {} : { amountSats: output.value }),
+    };
+  }
+
+  async getTransactionConfirmations(txid: string): Promise<number> {
+    if (!HEX_32.test(txid)) {
+      throw new Error("txid must be 32-byte hex");
+    }
+    const status = await this.#json<EsploraStatus | null>(
+      `/tx/${txid}/status`,
+      true,
+    );
+    return status ? this.#confirmations(status) : 0;
+  }
+
+  async #confirmations(status: EsploraStatus): Promise<number> {
+    if (!status?.confirmed) return 0;
+    const tip = await this.#json<number>("/blocks/tip/height");
+    if (
+      !Number.isSafeInteger(tip) ||
+      !Number.isSafeInteger(status.block_height)
+    )
+      throw new EsploraError("Esplora returned an invalid block height", 200);
+    // A tip read from a backend lagging behind the transaction counts as none.
+    return Math.max(0, tip - (status.block_height as number) + 1);
+  }
+
+  async #json<Result>(path: string, optional = false): Promise<Result> {
+    let response: Response;
+    let text: string;
+    try {
+      ({ response, text } = await fetchText(
+        this.#fetch,
+        `${this.#url}${path}`,
+        { redirect: "error" },
+        this.#timeoutMs,
+      ));
+    } catch (error) {
+      if (error instanceof RequestTimeout)
+        throw new EsploraError(
+          `Esplora did not answer within ${this.#timeoutMs} ms`,
+          0,
+        );
+      throw error;
+    }
+    if (optional && response.status === 404) return null as Result;
+    if (!response.ok)
+      throw new EsploraError(
+        `Esplora returned HTTP ${response.status}${text ? `: ${text.slice(0, 200)}` : ""}`,
+        response.status,
+      );
+    const body = parseJson(text);
+    if (body === undefined)
+      throw new EsploraError(
+        "Esplora returned a response that is not JSON",
+        response.status,
+      );
+    return body as Result;
   }
 }
 
@@ -1068,19 +1313,11 @@ export function parseExecutedSignedPrice(
   };
 }
 
-/** `gettxout` for an explicit output; null once it is spent, mempool included. */
-type UnspentOutput = {
-  confirmations: number;
-  asset?: string;
-  value?: number;
-  scriptPubKey: { hex: string };
-} | null;
-
-/** Check a finalized price and its confirmed, unspent Verifier via independent RPC. */
+/** Check a finalized price and its confirmed, unspent Verifier via an independent chain source. */
 export async function verifyExecutedSignedPrice(
   status: TickRequestStatus,
   verification: IssuedPriceVerification,
-  elements: ElementsRpcClient,
+  chain: ChainClient,
 ): Promise<ReturnType<typeof parseExecutedSignedPrice>> {
   if (
     !HEX_32.test(verification.verifierAssetId) ||
@@ -1098,18 +1335,17 @@ export async function verifyExecutedSignedPrice(
     verification.verifierTapleafHash,
   );
 
-  const utxo = await elements.call<UnspentOutput>("gettxout", [
+  const utxo = await chain.getUnspentOutput(
     executed.txid,
     executed.verifierVout,
-    true,
-  ]);
+  );
   if (
     !utxo ||
     !Number.isSafeInteger(utxo.confirmations) ||
     utxo.confirmations < 1 ||
     utxo.asset?.toLowerCase() !== verification.verifierAssetId.toLowerCase() ||
-    utxo.value !== 0.00000001 ||
-    utxo.scriptPubKey.hex.toLowerCase() !== scriptPubKey
+    utxo.amountSats !== 1 ||
+    utxo.scriptPubKey.toLowerCase() !== scriptPubKey
   )
     throw new Error(
       "confirmed unspent Verifier does not match the trusted context",
@@ -1119,13 +1355,14 @@ export async function verifyExecutedSignedPrice(
 }
 
 /**
- * Check a finalized Tick via independent RPC: confirmed, unspent, in the Tick
- * asset, locked by the trusted voucher leaf, and carrying the reported time.
+ * Check a finalized Tick via an independent chain source: confirmed, unspent,
+ * in the Tick asset, locked by the trusted voucher leaf, and carrying the
+ * reported time.
  */
 export async function verifyExecutedTick(
   status: TickRequestStatus,
   verification: IssuedTickVerification,
-  elements: ElementsRpcClient,
+  chain: ChainClient,
 ): Promise<IssuedTick | null> {
   if (
     !HEX_32.test(verification.tickAssetId) ||
@@ -1145,19 +1382,17 @@ export async function verifyExecutedTick(
     verification.tickTapleafHash,
   );
 
-  const utxo = await elements.call<UnspentOutput>("gettxout", [
+  const utxo = await chain.getUnspentOutput(
     executed.txid,
     executed.result.vout,
-    true,
-  ]);
+  );
   if (
     !utxo ||
     !Number.isSafeInteger(utxo.confirmations) ||
     utxo.confirmations < 1 ||
     utxo.asset?.toLowerCase() !== verification.tickAssetId.toLowerCase() ||
-    utxo.value === undefined ||
-    Math.round(utxo.value * 100_000_000) !== timestamp ||
-    utxo.scriptPubKey.hex.toLowerCase() !== scriptPubKey
+    utxo.amountSats !== timestamp ||
+    utxo.scriptPubKey.toLowerCase() !== scriptPubKey
   )
     throw new Error(
       "confirmed unspent Tick does not match the trusted context",
@@ -1345,6 +1580,16 @@ function assertXOnlyPublicKey(publicKey: string): void {
     throw new Error("public key must be 32-byte x-only hex");
   }
   schnorr.utils.lift_x(BigInt(`0x${publicKey}`));
+}
+
+function assertOutpoint(txid: string, vout: number): void {
+  if (
+    !HEX_32.test(txid) ||
+    !Number.isInteger(vout) ||
+    vout < 0 ||
+    vout > 0xffffffff
+  )
+    throw new Error("outpoint must be a 32-byte hex txid and an output index");
 }
 
 function assertSecureUrl(value: string, name: string): void {
