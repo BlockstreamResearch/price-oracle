@@ -46,6 +46,31 @@ export type NetworkVerification = {
     verifierAssetId?: string;
     stormTreeRoot?: string;
 };
+/** What a batch has to bring and how long the network holds its results. */
+export type OraclePolicy = {
+    /** Charged for every request of a batch. */
+    operational_fee_sats: number;
+    /** Held back for every request of a batch, to pay for burning what it issued. */
+    tick_burn_reserve_sats: number;
+    /** Charged once for the transaction issuing a batch. */
+    issuance_transaction_fee_sats: number;
+    min_fee_utxo_confirmations: number;
+    /** Confirmations after which an included batch reads `executed`. */
+    finality_confirmations: number;
+    /** Blocks after which the network burns a Tick nobody spent. */
+    tick_lifetime_blocks: number;
+    /** Blocks a priced batch waits for a rate before it fails. */
+    max_unpriced_request_blocks: number;
+};
+export type FeeEstimate = {
+    /** The least the batch's fee UTXOs must hold for it to be accepted. */
+    required: number;
+    /**
+     * The most its issuance takes: the fee of every request, and the whole
+     * transaction fee, which batches issued in one round share.
+     */
+    charged: number;
+};
 export type OracleAccount = {
     address: string;
     script_pubkey: string;
@@ -111,6 +136,19 @@ export type TickRequestResult = {
 export type TickRequestStatus = {
     status: "pending" | "processing" | "included" | "executed" | "failed";
     payload: string | null;
+    /** What a `pending` request waits for; absent in every other status. */
+    waiting?: {
+        /**
+         * `price` while the coordinator holds no rate to issue the named feed at,
+         * `round` once only the next issuance round is awaited.
+         */
+        reason: "round" | "price";
+        price_feed_id?: number;
+        /** Blocks since the request was queued. */
+        blocks: number;
+        /** A priced request fails once it has waited more blocks than this. */
+        fails_after_blocks?: number;
+    };
 };
 export type WaitOptions = {
     /** Give up after this long; 15 minutes by default. */
@@ -311,6 +349,12 @@ export declare class PriceOracleClient {
      * to have the response checked against them.
      */
     getNetwork(verification?: NetworkVerification): Promise<OracleNetworkInfo>;
+    /**
+     * Read what a batch costs and how long the network holds its results, as
+     * the answering node is configured. Every signer validates a round against
+     * its own fees and Tick lifetime, so the members share those.
+     */
+    getPolicy(): Promise<OraclePolicy>;
     getAccount(publicKey: string, verification: AccountVerification): Promise<OracleAccount>;
     submitTickRequest(request: TickRequest): Promise<{
         request_hash: string;
@@ -324,6 +368,12 @@ export declare class PriceOracleClient {
     getPriceFeeds(): Promise<PriceFeedInfo[]>;
     getPriceFeed(feedId: number): Promise<PriceFeedRate>;
 }
+/**
+ * What a batch of `requests` needs in its fee UTXOs and what issuing it
+ * takes. The rest returns to the Account as change, which the network holds
+ * as the burn reserve of what the batch issued.
+ */
+export declare function estimateRequestFee(policy: Pick<OraclePolicy, "operational_fee_sats" | "tick_burn_reserve_sats" | "issuance_transaction_fee_sats">, requests: number | TickRequest): FeeEstimate;
 /** Derive an Account and Tick from independently trusted contract leaves and asset IDs. */
 export declare function deriveAccount(verification: AccountVerification): OracleAccount;
 export declare function publicKeyFromPrivateKey(privateKey: string): string;

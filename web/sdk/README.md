@@ -8,6 +8,7 @@ import {
   EsploraClient,
   PriceOracleClient,
   createTickRequest,
+  estimateRequestFee,
   publicKeyFromPrivateKey,
   verifyExecutedTick,
 } from "@price-oracle/sdk";
@@ -34,6 +35,8 @@ const request = createTickRequest(
   privateKey,
   feeUtxos.map(({ txid, vout }) => `${txid}:${vout}`),
 );
+// What the fee UTXOs have to hold before the request is worth sending.
+const { required } = estimateRequestFee(await oracle.getPolicy(), request);
 const { request_hash } = await oracle.submitTickRequest(request);
 
 const status = await oracle.waitForTickRequest(request_hash);
@@ -110,6 +113,32 @@ A failed RPC call throws an `ElementsRpcError` with the node's own message and
 JSON-RPC `code`, and a failed Esplora read an `EsploraError`; both carry the
 HTTP `status`. Each endpoint is given 15 seconds to answer, `timeoutMs` in the
 options of either client, and one that does not throws with `status` 0.
+
+## Fees and Lifetimes
+
+`getPolicy()` reads what the network charges and how long it holds results:
+the fee and the burn reserve of each request, the fee of the issuance
+transaction, the confirmations a fee UTXO needs, the confirmations after which
+a batch reads `executed`, the blocks after which an unspent Tick is burned, and
+the blocks a priced request waits for a rate. The fees and the Tick lifetime
+are shared by every member, since each signer validates a round against its
+own; the rest is the configuration of the node that answers. A node built
+before `GET /users/policy` existed answers it with `not_found`.
+
+`estimateRequestFee(policy, request)` applies the coordinator's own rule to a
+request, or to a number of requests:
+
+```ts
+const policy = await oracle.getPolicy();
+const { required, charged } = estimateRequestFee(policy, request);
+```
+
+`required` is the least the fee UTXOs must hold for the batch to be accepted:
+the fee and the reserve of every request, and the transaction fee. `charged` is
+the most its issuance takes: the fees without the reserve. The rest returns to
+the Account as change, and that change is the burn reserve of what the batch
+issued, so it is not a fee UTXO for another request until those outputs are
+burned.
 
 ## Errors, Retries and Several Nodes
 
@@ -189,6 +218,13 @@ waited on again. A status read is retried like any other read, and an error
 that outlasts the retries ends the wait. The timeout and the signal also cut
 short a status read in progress, so a node that stops answering cannot hold the
 wait past them.
+
+A `pending` status says what it waits for. `waiting.reason` is `price` while
+the coordinator holds no rate to issue the named feed at, and `round` once only
+the next issuance round is awaited; `waiting.blocks` counts the blocks since
+the request was queued, and a priced request fails once that passes
+`waiting.fails_after_blocks`. A timeout names the feed a request was still
+waiting on. A node built before `waiting` existed leaves it out.
 
 Issuance follows block production. With one-minute blocks and two finality
 confirmations a request takes a few minutes, and a priced one can wait up to ten
