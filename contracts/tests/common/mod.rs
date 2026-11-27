@@ -1,4 +1,10 @@
+// Each `tests/*.rs` is a separate crate that mounts this module but uses only
+// part of it, so per-crate dead-code analysis would warn about the rest.
 #![allow(dead_code)]
+
+pub mod case;
+pub mod fuzz;
+pub mod unit;
 use simplex::program::ProgramError;
 use simplex::provider::ProviderError;
 use simplex::signer::SignerError;

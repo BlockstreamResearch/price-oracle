@@ -82,10 +82,14 @@ jobs:
           # code (crates/cli/src/commands/test.rs). That printed line is the only
           # reliable signal, so read it back out of the log. A missing line means
           # the child was killed by a signal ("Process terminated.") and also fails.
-          for mode in simplex rust; do
+          for mode in simplex rust fuzz; do
             args=(--test-threads 1)
             if [ "$mode" = rust ]; then
               args+=(--no-simplex)
+            fi
+            # Fuzz runs in memory, without the regtest node, so it can go wide.
+            if [ "$mode" = fuzz ]; then
+              args=(--fuzz --test-threads 4)
             fi
             simplex test "${args[@]}" 2>&1 | tee "simplex-$mode.log"
 
@@ -95,3 +99,12 @@ jobs:
               exit 1
             fi
           done
+
+      # Each fuzz run draws a new seed: keep the failing cases to replay them locally.
+      - name: Upload fuzz failures
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-failures
+          path: contracts/fuzz-failures/
+          if-no-files-found: ignore

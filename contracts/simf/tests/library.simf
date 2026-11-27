@@ -1,0 +1,61 @@
+use std::lib::asserts::assert_eq_256;
+
+use crate::lib::taproot::get_p2tr_script_hash;
+use crate::sdk::voucher_verifier::{PriceFeedData, encode_price_feed_data, get_price_message};
+use crate::storm_eye::storage::get_script_hash_for_storage;
+use crate::storm_eye::storm_tree::{StormTreeBloom, assert_network_authorization};
+
+/// Indices stay in lockstep with `FunctionToTest` in `tests/library/case.rs`.
+fn is_selected(index: u8, fn_idx: u8) -> bool {
+    jet::eq_8(index, fn_idx)
+}
+
+fn main() {
+    let fn_idx: u8 = witness::FUNCTION_INDEX;
+
+    let merkle_root: u256 = witness::MERKLE_ROOT;
+    let bloom: StormTreeBloom = witness::STORM_TREE_BLOOM;
+    let rescue_block_number: u32 = witness::RESCUE_BLOCK_NUMBER;
+    let price_feed_data: PriceFeedData = witness::PRICE_FEED_DATA;
+    let internal_key: Pubkey = witness::INTERNAL_KEY;
+    let tap_node: u256 = witness::TAP_NODE;
+    let expected: u256 = witness::EXPECTED;
+
+    // storm_eye::storm_tree
+    match is_selected(0, fn_idx) {
+        true => {
+            assert_network_authorization(merkle_root, bloom);
+        },
+        false => (),
+    };
+
+    // storm_eye::storage
+    match is_selected(1, fn_idx) {
+        true => {
+            assert_eq_256(get_script_hash_for_storage(merkle_root, rescue_block_number), expected);
+        },
+        false => (),
+    };
+
+    // sdk::voucher_verifier
+    match is_selected(2, fn_idx) {
+        true => {
+            assert_eq_256(encode_price_feed_data(price_feed_data), expected);
+        },
+        false => (),
+    };
+    match is_selected(3, fn_idx) {
+        true => {
+            assert_eq_256(get_price_message(price_feed_data), expected);
+        },
+        false => (),
+    };
+
+    // lib::taproot
+    match is_selected(4, fn_idx) {
+        true => {
+            assert_eq_256(get_p2tr_script_hash(internal_key, tap_node), expected);
+        },
+        false => (),
+    };
+}

@@ -13,3 +13,5 @@ contracts/src/artifacts
 
 node_modules/
 .vite/
+# Simplex fuzz failures
+contracts/fuzz-failures
